@@ -1,0 +1,11 @@
+[package]
+name = "hops-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fern = "0.7.1"
+log = "0.4.27"
+colored = "3.0.0"
+clap = { version = "4.5.35", features = ["derive"] }
+openssl-sys = { version = "0.9.106", features = ["vendored"] }

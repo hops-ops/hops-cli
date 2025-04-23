@@ -1,0 +1,24 @@
+# Rust-specific ignores
+/target
+**/*.rs.bk
+Cargo.lock  # Optional: include this if you’re building a binary, exclude for libraries
+
+# General ignores
+*.log
+*.out
+*.bak
+*.swp
+*.tmp
+*.temp
+
+# IDE/Editor files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+.cache/
