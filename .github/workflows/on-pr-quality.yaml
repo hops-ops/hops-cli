@@ -7,6 +7,15 @@ on:
 
 jobs:
   quality:
-    uses: harmony-labs/workflow-rust-quality/.github/workflows/workflow.yaml@v1.0.2
+    uses: harmony-labs/workflows-rust/.github/workflows/quality.yaml@v1.0.0
     with:
-      lint: false
+      cargo_incremental: true
+      runs-on: |
+        [
+          {
+            "runs-on": "runs-on=${{ github.run_id }}", 
+            "runner": "2cpu-linux-x64", 
+            "extras": "s3-cache", 
+          }
+        ]
+
