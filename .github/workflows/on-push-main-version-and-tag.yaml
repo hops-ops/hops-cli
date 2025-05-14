@@ -21,6 +21,7 @@ jobs:
             "extras": "s3-cache" 
           }
         ]
+      setup-runs-on: runs-on=${{ github.run_id }}/runner=1cpu-linux-x64
 
 
   # This uses commit logs and tags from git to determine the next version number and create a tag for the release
