@@ -41,3 +41,4 @@ jobs:
             "extras": "s3-cache"
           }
         ]
+      setup-runs-on: runs-on=${{ github.run_id }}/runner=1cpu-linux-x64

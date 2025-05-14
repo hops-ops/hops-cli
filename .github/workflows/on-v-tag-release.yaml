@@ -13,6 +13,7 @@ jobs:
     with:
       binary_name: ${{ github.event.repository.name }}
       build_args: "--release --features vendored"
+      setup-runs-on: runs-on=${{ github.run_id }}/runner=1cpu-linux-x64
       runs-on: |
         [
           {
