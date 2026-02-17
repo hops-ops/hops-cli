@@ -73,29 +73,50 @@ pub fn run(path: &str) -> Result<(), Box<dyn Error>> {
     }
 
     // Tag and push all images to the local registry.
-    // Render function images need a rebuild: `up project build` produces them
-    // with an empty rootfs.type in the OCI config. Crossplane requires
-    // rootfs.type == "layers". A `docker build FROM` re-creates the config
-    // with the correct field.
+    // Render function images are rebuilt via `docker build FROM` to fix the
+    // empty rootfs.type in the OCI config (`up project build` bug).
     for img in &loaded {
         let push_ref = rewrite_registry(img, REGISTRY_PUSH);
         let (img_path, _) = split_ref(img);
 
         if img_path.ends_with("_render") {
-            log::info!("Rebuilding {} (fix OCI config)...", img);
+            log::info!("Rebuilding {} (fix OCI config)...", push_ref);
             docker_build_from(img, &push_ref)?;
         } else {
             run_cmd("docker", &["tag", img, &push_ref])?;
         }
-
-        log::info!("Pushing {} -> {}", img, push_ref);
+        log::info!("Pushing {}...", push_ref);
         run_cmd("docker", &["push", &push_ref])?;
+    }
 
-        // Also tag with the cluster-internal reference so the kubelet
-        // finds the image in Docker's local store (IfNotPresent).
-        if img_path.ends_with("_render") {
-            let pull_ref = rewrite_registry(img, REGISTRY_PULL);
-            run_cmd("docker", &["tag", &push_ref, &pull_ref])?;
+    // Install declared dependencies from upbound.yaml before the Configuration.
+    // We use skipDependencyResolution on the Configuration because `up project
+    // build` bakes the render function's OCI digest into the package metadata,
+    // but our rootfs.type fix changes that digest. Manual dep installation
+    // gives the same result without the unresolvable digest check.
+    let upbound_path = dir.join("upbound.yaml");
+    if upbound_path.exists() {
+        let content = fs::read_to_string(&upbound_path)?;
+        let deps = parse_dependencies(&content);
+        for dep in &deps {
+            let name = dep.package.rsplit('/').next().unwrap_or(&dep.package);
+            let api_version = match dep.kind.as_str() {
+                "Provider" => "pkg.crossplane.io/v1",
+                "Function" => "pkg.crossplane.io/v1beta1",
+                _ => continue,
+            };
+            let kind = &dep.kind;
+            let package = &dep.package;
+            log::info!("Installing dependency {} '{}'...", kind, name);
+            kubectl_apply_stdin(&format!(
+"apiVersion: {api_version}
+kind: {kind}
+metadata:
+  name: {name}
+spec:
+  package: {package}
+"
+            ))?;
         }
     }
 
@@ -129,10 +150,6 @@ spec:
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
                 .collect();
             log::info!("Applying Function '{}'...", name);
-            // packagePullPolicy: IfNotPresent causes Crossplane to set
-            // imagePullPolicy: IfNotPresent on the function deployment.
-            // The render image is pre-tagged locally with the cluster-internal
-            // reference so the kubelet finds it without DNS resolution.
             kubectl_apply_stdin(&format!(
 "apiVersion: pkg.crossplane.io/v1beta1
 kind: Function
@@ -140,7 +157,7 @@ metadata:
   name: {name}
 spec:
   package: {pull_ref}
-  packagePullPolicy: IfNotPresent
+  packagePullPolicy: Always
 "
             ))?;
         }
@@ -188,6 +205,64 @@ fn ensure_registry() -> Result<(), Box<dyn Error>> {
     }
 
     Err("Timed out waiting for registry deployment".into())
+}
+
+/// A dependency declared in upbound.yaml's spec.dependsOn list.
+struct Dependency {
+    kind: String,
+    package: String,
+}
+
+/// Parse the dependsOn list from an upbound.yaml file.
+/// Extracts kind and package for each entry.
+fn parse_dependencies(content: &str) -> Vec<Dependency> {
+    let mut deps = Vec::new();
+    let mut in_depends = false;
+    let mut current_kind: Option<String> = None;
+    let mut current_package: Option<String> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if trimmed == "dependsOn:" {
+            in_depends = true;
+            continue;
+        }
+        if !in_depends {
+            continue;
+        }
+
+        // A non-indented, non-empty line ends the dependsOn section.
+        if !trimmed.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
+            break;
+        }
+
+        // New list item — flush the previous entry.
+        if trimmed.starts_with("- ") {
+            if let (Some(k), Some(p)) = (current_kind.take(), current_package.take()) {
+                deps.push(Dependency { kind: k, package: p });
+            }
+            parse_dep_key(&trimmed[2..], &mut current_kind, &mut current_package);
+            continue;
+        }
+
+        parse_dep_key(trimmed, &mut current_kind, &mut current_package);
+    }
+
+    // Flush last entry.
+    if let (Some(k), Some(p)) = (current_kind, current_package) {
+        deps.push(Dependency { kind: k, package: p });
+    }
+
+    deps
+}
+
+fn parse_dep_key(s: &str, kind: &mut Option<String>, package: &mut Option<String>) {
+    if let Some(val) = s.strip_prefix("kind:") {
+        *kind = Some(val.trim().to_string());
+    } else if let Some(val) = s.strip_prefix("package:") {
+        *package = Some(val.trim().trim_matches('\'').trim_matches('"').to_string());
+    }
 }
 
 /// Replace the registry portion of an image reference.
