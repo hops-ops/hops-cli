@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+const DRC: &str = include_str!("../../../bootstrap/drc/local-dev.yaml");
 const PROVIDER_HELM: &str = include_str!("../../../bootstrap/providers/provider-helm.yaml");
 const PROVIDER_K8S: &str = include_str!("../../../bootstrap/providers/provider-kubernetes.yaml");
 const PC_HELM: &str = include_str!("../../../bootstrap/helm/pc.yaml");
@@ -71,27 +72,31 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     log::info!("Waiting for Crossplane to be ready...");
     wait_for_deployment("crossplane-system", "crossplane")?;
 
-    // 6. Install providers
+    // 6. Deploy DRC (cluster-admin SA for provider pods)
+    log::info!("Applying DeploymentRuntimeConfig...");
+    kubectl_apply_stdin(DRC)?;
+
+    // 7. Install providers
     log::info!("Installing providers...");
     kubectl_apply_stdin(PROVIDER_HELM)?;
     kubectl_apply_stdin(PROVIDER_K8S)?;
 
-    // 7. Wait for provider CRDs
+    // 8. Wait for provider CRDs
     log::info!("Waiting for provider CRDs...");
     wait_for_crd("providerconfigs.helm.m.crossplane.io")?;
     wait_for_crd("providerconfigs.kubernetes.m.crossplane.io")?;
 
-    // 8. Apply ProviderConfigs
+    // 9. Apply ProviderConfigs
     log::info!("Applying ProviderConfigs...");
     kubectl_apply_stdin(PC_HELM)?;
     kubectl_apply_stdin(PC_K8S)?;
 
-    // 9. Deploy local OCI registry for Crossplane packages
+    // 10. Deploy local OCI registry for Crossplane packages
     log::info!("Deploying local package registry...");
     kubectl_apply_stdin(REGISTRY)?;
     wait_for_deployment("crossplane-system", "registry")?;
 
-    // 10. Map the registry's cluster-internal hostname to its ClusterIP
+    // 11. Map the registry's cluster-internal hostname to its ClusterIP
     //     inside the VM so the kubelet can resolve it.
     configure_registry_hosts_entry()?;
 

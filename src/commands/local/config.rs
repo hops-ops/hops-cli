@@ -99,14 +99,37 @@ pub fn run(path: &str) -> Result<(), Box<dyn Error>> {
         let content = fs::read_to_string(&upbound_path)?;
         let deps = parse_dependencies(&content);
         for dep in &deps {
-            let name = dep.package.rsplit('/').next().unwrap_or(&dep.package);
+            // Derive name from the package path after the registry host.
+            // e.g. "xpkg.crossplane.io/crossplane-contrib/provider-helm"
+            //   -> "crossplane-contrib-provider-helm"
+            let name = strip_registry(&dep.package).replace('/', "-");
+            let kind_lower = dep.kind.to_lowercase();
+            let kind_plural = format!("{}s.pkg.crossplane.io", kind_lower);
+
+            // Skip if any existing resource already uses this package
+            // (names may differ — e.g. `crossplane-contrib-provider-helm`
+            // vs `provider-helm`).
+            let installed = run_cmd_output(
+                "kubectl",
+                &["get", &kind_plural, "-o", "jsonpath={.items[*].spec.package}"],
+            );
+            if let Ok(packages) = installed {
+                if packages.split_whitespace().any(|p| p.starts_with(&dep.package)) {
+                    log::info!("Dependency {} '{}' already installed, skipping.", dep.kind, name);
+                    continue;
+                }
+            }
+
             let api_version = match dep.kind.as_str() {
                 "Provider" => "pkg.crossplane.io/v1",
                 "Function" => "pkg.crossplane.io/v1beta1",
                 _ => continue,
             };
             let kind = &dep.kind;
-            let package = &dep.package;
+            let package = match &dep.version {
+                Some(v) => format!("{}:{}", dep.package, v),
+                None => dep.package.clone(),
+            };
             log::info!("Installing dependency {} '{}'...", kind, name);
             kubectl_apply_stdin(&format!(
 "apiVersion: {api_version}
@@ -211,6 +234,7 @@ fn ensure_registry() -> Result<(), Box<dyn Error>> {
 struct Dependency {
     kind: String,
     package: String,
+    version: Option<String>,
 }
 
 /// Parse the dependsOn list from an upbound.yaml file.
@@ -220,6 +244,7 @@ fn parse_dependencies(content: &str) -> Vec<Dependency> {
     let mut in_depends = false;
     let mut current_kind: Option<String> = None;
     let mut current_package: Option<String> = None;
+    let mut current_version: Option<String> = None;
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -240,28 +265,39 @@ fn parse_dependencies(content: &str) -> Vec<Dependency> {
         // New list item — flush the previous entry.
         if trimmed.starts_with("- ") {
             if let (Some(k), Some(p)) = (current_kind.take(), current_package.take()) {
-                deps.push(Dependency { kind: k, package: p });
+                deps.push(Dependency { kind: k, package: p, version: current_version.take() });
             }
-            parse_dep_key(&trimmed[2..], &mut current_kind, &mut current_package);
+            current_version = None;
+            parse_dep_key(&trimmed[2..], &mut current_kind, &mut current_package, &mut current_version);
             continue;
         }
 
-        parse_dep_key(trimmed, &mut current_kind, &mut current_package);
+        parse_dep_key(trimmed, &mut current_kind, &mut current_package, &mut current_version);
     }
 
     // Flush last entry.
     if let (Some(k), Some(p)) = (current_kind, current_package) {
-        deps.push(Dependency { kind: k, package: p });
+        deps.push(Dependency { kind: k, package: p, version: current_version });
     }
 
     deps
 }
 
-fn parse_dep_key(s: &str, kind: &mut Option<String>, package: &mut Option<String>) {
+fn parse_dep_key(
+    s: &str,
+    kind: &mut Option<String>,
+    package: &mut Option<String>,
+    version: &mut Option<String>,
+) {
     if let Some(val) = s.strip_prefix("kind:") {
         *kind = Some(val.trim().to_string());
     } else if let Some(val) = s.strip_prefix("package:") {
         *package = Some(val.trim().trim_matches('\'').trim_matches('"').to_string());
+    } else if let Some(val) = s.strip_prefix("version:") {
+        // Strip semver constraint operators (>=, ^, ~) to get a bare version tag.
+        let raw = val.trim().trim_matches('\'').trim_matches('"');
+        let tag = raw.trim_start_matches(|c: char| !c.is_alphanumeric());
+        *version = Some(tag.to_string());
     }
 }
 
