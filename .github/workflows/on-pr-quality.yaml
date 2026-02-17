@@ -7,15 +7,6 @@ on:
 
 jobs:
   quality:
-    uses: harmony-labs/workflows-rust/.github/workflows/quality.yaml@v1.1.0
+    uses: unbounded-tech/workflows-rust/.github/workflows/quality.yaml@v2.2.1
     with:
       cargo_incremental: true
-      runs-on: |
-        [
-          {
-            "runs-on": "runs-on=${{ github.run_id }}", 
-            "runner": "2cpu-linux-x64", 
-            "extras": "s3-cache"
-          }
-        ]
-      setup-runs-on: runs-on=${{ github.run_id }}/runner=1cpu-linux-x64

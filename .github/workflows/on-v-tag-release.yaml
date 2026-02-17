@@ -8,56 +8,8 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    uses: harmony-labs/workflows-rust/.github/workflows/release.yaml@v1.1.0
+  build-and-release:
+    uses: unbounded-tech/workflows-rust/.github/workflows/release.yaml@v2.2.1
     with:
       binary_name: ${{ github.event.repository.name }}
       build_args: "--release --features vendored"
-      setup-runs-on: runs-on=${{ github.run_id }}/runner=1cpu-linux-x64
-      runs-on: |
-        [
-          {
-            "runs-on": "runs-on=${{ github.run_id }}", 
-            "runner": "2cpu-linux-x64", 
-            "extras": "s3-cache", 
-            "target": "x86_64-unknown-freebsd"
-          },
-          {
-            "runs-on": "runs-on=${{ github.run_id }}",
-            "runner": "2cpu-linux-x64",
-            "extras": "s3-cache",
-            "target": "x86_64-unknown-linux-musl"
-          },
-          {
-            "runs-on": "runs-on=${{ github.run_id }}",
-            "runner": "2cpu-linux-arm64",
-            "extras": "s3-cache",
-            "target": "arm-unknown-linux-musleabi"
-          },
-          {
-            "runs-on": "runs-on=${{ github.run_id }}",
-            "runner": "2cpu-linux-x64",
-            "extras": "s3-cache",
-            "target": "i686-unknown-linux-musl"
-          },
-          {
-            "runs-on": "macOS-latest",
-            "target": "x86_64-apple-darwin"
-          },
-          {
-            "runs-on": "macOS-latest",
-            "target": "aarch64-apple-darwin"
-          },
-          {
-            "runs-on": "windows-latest",
-            "target": "i686-pc-windows-msvc"
-          },
-          {
-            "runs-on": "windows-latest",
-            "target": "aarch64-pc-windows-msvc"
-          },
-          {
-            "runs-on": "windows-latest",
-            "target": "x86_64-pc-windows-msvc"
-          }
-        ]
