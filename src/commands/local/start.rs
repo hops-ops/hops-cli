@@ -32,12 +32,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         ],
     )?;
 
-    // 2. Configure Docker in the VM to allow HTTP pulls from the
+    // 2. Wait for the Kubernetes API to become reachable.
+    //    Colima may return immediately ("already running") before the
+    //    API server is ready, or a fresh start needs time to initialise.
+    wait_for_kubernetes()?;
+
+    // 3. Configure Docker in the VM to allow HTTP pulls from the
     //    cluster-internal registry. Without this the kubelet's Docker
     //    daemon defaults to HTTPS and fails.
     configure_docker_insecure_registry()?;
 
-    // 3. Add Crossplane Helm repo
+    // 4. Add Crossplane Helm repo
     log::info!("Adding Crossplane Helm repo...");
     run_cmd(
         "helm",
@@ -50,7 +55,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     )?;
     run_cmd("helm", &["repo", "update"])?;
 
-    // 4. Install Crossplane
+    // 5. Install Crossplane
     log::info!("Installing Crossplane...");
     run_cmd(
         "helm",
@@ -68,35 +73,35 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         ],
     )?;
 
-    // 5. Wait for Crossplane deployment
+    // 6. Wait for Crossplane deployment
     log::info!("Waiting for Crossplane to be ready...");
     wait_for_deployment("crossplane-system", "crossplane")?;
 
-    // 6. Deploy DRC (cluster-admin SA for provider pods)
+    // 7. Deploy DRC (cluster-admin SA for provider pods)
     log::info!("Applying DeploymentRuntimeConfig...");
     kubectl_apply_stdin(DRC)?;
 
-    // 7. Install providers
+    // 8. Install providers
     log::info!("Installing providers...");
     kubectl_apply_stdin(PROVIDER_HELM)?;
     kubectl_apply_stdin(PROVIDER_K8S)?;
 
-    // 8. Wait for provider CRDs
+    // 9. Wait for provider CRDs
     log::info!("Waiting for provider CRDs...");
     wait_for_crd("providerconfigs.helm.m.crossplane.io")?;
     wait_for_crd("providerconfigs.kubernetes.m.crossplane.io")?;
 
-    // 9. Apply ProviderConfigs
+    // 10. Apply ProviderConfigs
     log::info!("Applying ProviderConfigs...");
     kubectl_apply_stdin(PC_HELM)?;
     kubectl_apply_stdin(PC_K8S)?;
 
-    // 10. Deploy local OCI registry for Crossplane packages
+    // 11. Deploy local OCI registry for Crossplane packages
     log::info!("Deploying local package registry...");
     kubectl_apply_stdin(REGISTRY)?;
     wait_for_deployment("crossplane-system", "registry")?;
 
-    // 11. Map the registry's cluster-internal hostname to its ClusterIP
+    // 12. Map the registry's cluster-internal hostname to its ClusterIP
     //     inside the VM so the kubelet can resolve it.
     configure_registry_hosts_entry()?;
 
@@ -153,11 +158,26 @@ fn configure_docker_insecure_registry() -> Result<(), Box<dyn Error>> {
     // Wait for Docker to come back.
     for _ in 0..30 {
         if run_cmd_output("docker", &["info"]).is_ok() {
+            // Docker restart can temporarily disrupt the Kubernetes API.
+            wait_for_kubernetes()?;
             return Ok(());
         }
         thread::sleep(Duration::from_secs(2));
     }
     Err("Docker did not come back after restart".into())
+}
+
+/// Poll until the Kubernetes API server is reachable.
+fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
+    log::info!("Waiting for Kubernetes API...");
+    for _ in 0..60 {
+        let result = run_cmd_output("kubectl", &["cluster-info"]);
+        if result.is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
+    Err("Timed out waiting for Kubernetes API".into())
 }
 
 /// Map the registry's cluster-internal hostname to its ClusterIP in the
