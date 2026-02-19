@@ -1,5 +1,6 @@
 mod config;
 mod destroy;
+mod reset;
 mod setup;
 mod start;
 mod stop;
@@ -19,7 +20,9 @@ pub struct LocalArgs {
 #[derive(Subcommand, Debug)]
 pub enum LocalCommands {
     /// Install Colima via Homebrew
-    Setup,
+    Install,
+    /// Reset local Colima Kubernetes state
+    Reset,
     /// Start local k8s cluster with Crossplane and providers
     Start,
     /// Stop the local cluster
@@ -37,7 +40,8 @@ pub enum LocalCommands {
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
     match &args.command {
-        LocalCommands::Setup => setup::run(),
+        LocalCommands::Install => setup::run(),
+        LocalCommands::Reset => reset::run(),
         LocalCommands::Start => start::run(),
         LocalCommands::Stop => stop::run(),
         LocalCommands::Destroy => destroy::run(),
