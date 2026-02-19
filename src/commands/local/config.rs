@@ -1,9 +1,16 @@
 use super::{kubectl_apply_stdin, run_cmd, run_cmd_output};
+use flate2::read::GzDecoder;
+use serde::Deserialize;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::hash::{Hash, Hasher};
+use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tar::Archive;
 
 const REGISTRY_YAML: &str = include_str!("../../../bootstrap/registry/registry.yaml");
 
@@ -12,6 +19,39 @@ const REGISTRY_PUSH: &str = "localhost:30500";
 
 /// Cluster-internal address used in Crossplane package references
 const REGISTRY_PULL: &str = "registry.crossplane-system.svc.cluster.local:5000";
+
+#[derive(Clone, Debug)]
+struct LoadedImage {
+    source: String,
+    uppkg_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct RenderRewrite {
+    digest: String,
+    target_prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerSaveManifestEntry {
+    #[serde(rename = "Config")]
+    config: String,
+    #[serde(rename = "RepoTags")]
+    repo_tags: Option<Vec<String>>,
+    #[serde(rename = "Layers")]
+    layers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerImageConfig {
+    config: Option<DockerImageConfigSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerImageConfigSection {
+    #[serde(rename = "Labels")]
+    labels: Option<HashMap<String, String>>,
+}
 
 pub fn run(path: &str) -> Result<(), Box<dyn Error>> {
     let dir = Path::new(path);
@@ -46,7 +86,7 @@ pub fn run(path: &str) -> Result<(), Box<dyn Error>> {
         return Err(format!("No .uppkg files found in {}", output_dir.display()).into());
     }
 
-    // Load each package into docker and collect image names
+    // Load each package into docker and collect image names.
     let mut loaded = Vec::new();
     for pkg in &packages {
         let pkg_path = pkg.path();
@@ -63,7 +103,10 @@ pub fn run(path: &str) -> Result<(), Box<dyn Error>> {
 
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             if let Some(img) = line.strip_prefix("Loaded image: ") {
-                loaded.push(img.trim().to_string());
+                loaded.push(LoadedImage {
+                    source: img.trim().to_string(),
+                    uppkg_path: pkg_path.clone(),
+                });
             }
         }
     }
@@ -72,118 +115,119 @@ pub fn run(path: &str) -> Result<(), Box<dyn Error>> {
         return Err("No images were loaded from .uppkg files".into());
     }
 
-    // Tag and push all images to the local registry.
-    // Render function images are rebuilt via `docker build FROM` to fix the
-    // empty rootfs.type in the OCI config (`up project build` bug).
+    // De-duplicate images that can appear multiple times across loaded tarballs.
+    let mut seen = HashSet::new();
+    loaded.retain(|img| seen.insert(img.source.clone()));
+
+    let arch = docker_arch().to_string();
+    let mut render_rewrites: HashMap<String, RenderRewrite> = HashMap::new();
+
+    // Push non-Configuration images first. For local render functions, capture
+    // the pushed digest so we can patch the corresponding configuration package
+    // metadata and keep dependency resolution enabled.
     for img in &loaded {
-        let push_ref = rewrite_registry(img, REGISTRY_PUSH);
-        let (img_path, _) = split_ref(img);
+        if is_configuration_image(&img.source) {
+            continue;
+        }
+
+        let push_ref = rewrite_registry(&img.source, REGISTRY_PUSH);
+        let (img_path, tag) = split_ref(&img.source);
 
         if img_path.ends_with("_render") {
             log::info!("Rebuilding {} (fix OCI config)...", push_ref);
-            docker_build_from(img, &push_ref)?;
+            docker_build_from(&img.source, &push_ref)?;
+
+            if tag == arch {
+                let digest = docker_push_and_get_digest(&push_ref)?;
+                let target_prefix = format!("{}/{}", REGISTRY_PULL, strip_registry(img_path));
+                render_rewrites.insert(
+                    img_path.to_string(),
+                    RenderRewrite {
+                        digest,
+                        target_prefix,
+                    },
+                );
+            } else {
+                log::info!("Pushing {}...", push_ref);
+                run_cmd("docker", &["push", &push_ref])?;
+            }
         } else {
-            run_cmd("docker", &["tag", img, &push_ref])?;
+            run_cmd("docker", &["tag", &img.source, &push_ref])?;
+            log::info!("Pushing {}...", push_ref);
+            run_cmd("docker", &["push", &push_ref])?;
         }
+    }
+
+    // Rewrite local render dependency pulls to local registry while preserving
+    // the original package source in spec.package.
+    for (source, rewrite) in &render_rewrites {
+        log::info!(
+            "Applying ImageConfig rewrite for {} -> {}...",
+            source,
+            rewrite.target_prefix
+        );
+        kubectl_apply_stdin(&format!(
+            "apiVersion: pkg.crossplane.io/v1beta1
+kind: ImageConfig
+metadata:
+  name: {}
+spec:
+  matchImages:
+    - type: Prefix
+      prefix: {}
+  rewriteImage:
+    prefix: {}
+",
+            image_config_name(source),
+            source,
+            rewrite.target_prefix
+        ))?;
+    }
+
+    // Patch and push configuration images.
+    let mut config_pull_refs = Vec::new();
+    for img in &loaded {
+        if !is_configuration_image(&img.source) {
+            continue;
+        }
+
+        let push_ref = rewrite_registry(&img.source, REGISTRY_PUSH);
+        let pull_ref = rewrite_registry(&img.source, REGISTRY_PULL);
+        config_pull_refs.push(pull_ref.clone());
+
+        let mut source_to_push = img.source.clone();
+        let package_yaml = extract_package_yaml_from_uppkg(&img.uppkg_path, &img.source)?;
+        let (patched_yaml, changed) =
+            rewrite_render_dependency_digests(&package_yaml, &render_rewrites);
+        if changed {
+            log::info!(
+                "Patching package metadata for {} to use local render digests...",
+                img.source
+            );
+            source_to_push = build_patched_configuration_image(&img.source, &patched_yaml)?;
+        }
+
+        run_cmd("docker", &["tag", &source_to_push, &push_ref])?;
         log::info!("Pushing {}...", push_ref);
         run_cmd("docker", &["push", &push_ref])?;
     }
 
-    // Install declared dependencies from upbound.yaml before the Configuration.
-    // We use skipDependencyResolution on the Configuration because `up project
-    // build` bakes the render function's OCI digest into the package metadata,
-    // but our rootfs.type fix changes that digest. Manual dep installation
-    // gives the same result without the unresolvable digest check.
-    let upbound_path = dir.join("upbound.yaml");
-    if upbound_path.exists() {
-        let content = fs::read_to_string(&upbound_path)?;
-        let deps = parse_dependencies(&content);
-        for dep in &deps {
-            // Derive name from the package path after the registry host.
-            // e.g. "xpkg.crossplane.io/crossplane-contrib/provider-helm"
-            //   -> "crossplane-contrib-provider-helm"
-            let name = strip_registry(&dep.package).replace('/', "-");
-            let kind_lower = dep.kind.to_lowercase();
-            let kind_plural = format!("{}s.pkg.crossplane.io", kind_lower);
-
-            // Skip if any existing resource already uses this package
-            // (names may differ — e.g. `crossplane-contrib-provider-helm`
-            // vs `provider-helm`).
-            let installed = run_cmd_output(
-                "kubectl",
-                &["get", &kind_plural, "-o", "jsonpath={.items[*].spec.package}"],
-            );
-            if let Ok(packages) = installed {
-                if packages.split_whitespace().any(|p| p.starts_with(&dep.package)) {
-                    log::info!("Dependency {} '{}' already installed, skipping.", dep.kind, name);
-                    continue;
-                }
-            }
-
-            let api_version = match dep.kind.as_str() {
-                "Provider" => "pkg.crossplane.io/v1",
-                "Function" => "pkg.crossplane.io/v1beta1",
-                _ => continue,
-            };
-            let kind = &dep.kind;
-            let package = match &dep.version {
-                Some(v) => format!("{}:{}", dep.package, v),
-                None => dep.package.clone(),
-            };
-            log::info!("Installing dependency {} '{}'...", kind, name);
-            kubectl_apply_stdin(&format!(
-"apiVersion: {api_version}
-kind: {kind}
-metadata:
-  name: {name}
-spec:
-  package: {package}
-"
-            ))?;
-        }
-    }
-
-    // Apply Crossplane resources for the pushed images
-    let arch = docker_arch();
-    for img in &loaded {
-        let pull_ref = rewrite_registry(img, REGISTRY_PULL);
-        let (img_path, tag) = split_ref(img);
-
-        if tag == "configuration" {
-            let name = img_path.rsplit('/').next().unwrap_or(img_path);
-            log::info!("Applying Configuration '{}'...", name);
-            kubectl_apply_stdin(&format!(
-"apiVersion: pkg.crossplane.io/v1
+    // Apply Crossplane Configuration resources and let Crossplane resolve
+    // dependencies (skipDependencyResolution is intentionally not set).
+    for pull_ref in &config_pull_refs {
+        let (img_path, _) = split_ref(pull_ref);
+        let name = img_path.rsplit('/').next().unwrap_or(img_path);
+        log::info!("Applying Configuration '{}'...", name);
+        kubectl_apply_stdin(&format!(
+            "apiVersion: pkg.crossplane.io/v1
 kind: Configuration
 metadata:
   name: {name}
 spec:
   package: {pull_ref}
   packagePullPolicy: Always
-  skipDependencyResolution: true
 "
-            ))?;
-        } else if tag == arch && img_path.ends_with("_render") {
-            // Crossplane derives Function names as DNS labels from the package path:
-            // strip registry, replace / with -, remove non-DNS chars (like _)
-            let path = strip_registry(img_path);
-            let name: String = path
-                .replace('/', "-")
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-                .collect();
-            log::info!("Applying Function '{}'...", name);
-            kubectl_apply_stdin(&format!(
-"apiVersion: pkg.crossplane.io/v1beta1
-kind: Function
-metadata:
-  name: {name}
-spec:
-  package: {pull_ref}
-  packagePullPolicy: Always
-"
-            ))?;
-        }
+        ))?;
     }
 
     Ok(())
@@ -194,9 +238,13 @@ fn ensure_registry() -> Result<(), Box<dyn Error>> {
     let result = run_cmd_output(
         "kubectl",
         &[
-            "get", "deployment", "registry",
-            "-n", "crossplane-system",
-            "-o", "jsonpath={.status.availableReplicas}",
+            "get",
+            "deployment",
+            "registry",
+            "-n",
+            "crossplane-system",
+            "-o",
+            "jsonpath={.status.availableReplicas}",
         ],
     );
 
@@ -214,9 +262,13 @@ fn ensure_registry() -> Result<(), Box<dyn Error>> {
         let out = run_cmd_output(
             "kubectl",
             &[
-                "get", "deployment", "registry",
-                "-n", "crossplane-system",
-                "-o", "jsonpath={.status.availableReplicas}",
+                "get",
+                "deployment",
+                "registry",
+                "-n",
+                "crossplane-system",
+                "-o",
+                "jsonpath={.status.availableReplicas}",
             ],
         );
         if let Ok(r) = out {
@@ -230,75 +282,293 @@ fn ensure_registry() -> Result<(), Box<dyn Error>> {
     Err("Timed out waiting for registry deployment".into())
 }
 
-/// A dependency declared in upbound.yaml's spec.dependsOn list.
-struct Dependency {
-    kind: String,
-    package: String,
-    version: Option<String>,
+fn is_configuration_image(image: &str) -> bool {
+    split_ref(image).1 == "configuration"
 }
 
-/// Parse the dependsOn list from an upbound.yaml file.
-/// Extracts kind and package for each entry.
-fn parse_dependencies(content: &str) -> Vec<Dependency> {
-    let mut deps = Vec::new();
-    let mut in_depends = false;
-    let mut current_kind: Option<String> = None;
-    let mut current_package: Option<String> = None;
-    let mut current_version: Option<String> = None;
+fn extract_package_yaml_from_uppkg(
+    uppkg_path: &Path,
+    configuration_image: &str,
+) -> Result<String, Box<dyn Error>> {
+    let manifest_bytes = read_entry_from_tar(uppkg_path, "manifest.json")?;
+    let manifest: Vec<DockerSaveManifestEntry> = serde_json::from_slice(&manifest_bytes)?;
 
-    for line in content.lines() {
+    let config_entry = manifest
+        .iter()
+        .find(|entry| {
+            entry
+                .repo_tags
+                .as_ref()
+                .map(|tags| tags.iter().any(|t| t == configuration_image))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            format!(
+                "Could not find '{}' in manifest {}",
+                configuration_image,
+                uppkg_path.display()
+            )
+        })?;
+
+    let mut base_layer: Option<String> = None;
+    let config_json = read_entry_from_tar(uppkg_path, &config_entry.config)?;
+    if let Ok(image_config) = serde_json::from_slice::<DockerImageConfig>(&config_json) {
+        if let Some(labels) = image_config.config.and_then(|c| c.labels) {
+            for (key, value) in labels {
+                if value != "base" {
+                    continue;
+                }
+                if let Some(digest) = key.strip_prefix("io.crossplane.xpkg:sha256:") {
+                    let candidate = format!("{}.tar.gz", digest);
+                    if config_entry.layers.iter().any(|l| l == &candidate) {
+                        base_layer = Some(candidate);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let base_layer = base_layer
+        .or_else(|| config_entry.layers.first().cloned())
+        .ok_or_else(|| {
+            format!(
+                "Configuration image '{}' has no layers in {}",
+                configuration_image,
+                uppkg_path.display()
+            )
+        })?;
+    let layer_bytes = read_entry_from_tar(uppkg_path, &base_layer)?;
+    let decoder = GzDecoder::new(Cursor::new(layer_bytes));
+    let mut layer_archive = Archive::new(decoder);
+
+    for entry in layer_archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_string_lossy().into_owned();
+        if path == "package.yaml" {
+            let mut contents = Vec::new();
+            entry.read_to_end(&mut contents)?;
+            return Ok(String::from_utf8(contents)?);
+        }
+    }
+
+    Err(format!(
+        "package.yaml not found in base layer '{}' from {}",
+        &base_layer,
+        uppkg_path.display()
+    )
+    .into())
+}
+
+fn read_entry_from_tar(tar_path: &Path, entry_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let file = fs::File::open(tar_path)?;
+    let mut archive = Archive::new(file);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_string_lossy().into_owned();
+        if path == entry_name {
+            let mut out = Vec::new();
+            entry.read_to_end(&mut out)?;
+            return Ok(out);
+        }
+    }
+
+    Err(format!(
+        "entry '{}' not found in tar {}",
+        entry_name,
+        tar_path.display()
+    )
+    .into())
+}
+
+fn rewrite_render_dependency_digests(
+    package_yaml: &str,
+    rewrites: &HashMap<String, RenderRewrite>,
+) -> (String, bool) {
+    if rewrites.is_empty() {
+        return (package_yaml.to_string(), false);
+    }
+
+    let mut changed = false;
+    let mut in_depends = false;
+    let mut current_package: Option<String> = None;
+    let mut lines: Vec<String> = package_yaml.lines().map(|l| l.to_string()).collect();
+
+    for line in &mut lines {
         let trimmed = line.trim();
 
         if trimmed == "dependsOn:" {
             in_depends = true;
+            current_package = None;
             continue;
         }
+
+        if in_depends && !trimmed.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
+            in_depends = false;
+            current_package = None;
+        }
+
         if !in_depends {
             continue;
         }
 
-        // A non-indented, non-empty line ends the dependsOn section.
-        if !trimmed.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
-            break;
-        }
-
-        // New list item — flush the previous entry.
         if trimmed.starts_with("- ") {
-            if let (Some(k), Some(p)) = (current_kind.take(), current_package.take()) {
-                deps.push(Dependency { kind: k, package: p, version: current_version.take() });
+            current_package = None;
+            let item = trimmed.trim_start_matches("- ").trim();
+            if let Some(value) = item.strip_prefix("package:") {
+                current_package = Some(clean_yaml_scalar(value));
             }
-            current_version = None;
-            parse_dep_key(&trimmed[2..], &mut current_kind, &mut current_package, &mut current_version);
             continue;
         }
 
-        parse_dep_key(trimmed, &mut current_kind, &mut current_package, &mut current_version);
+        if let Some(value) = trimmed.strip_prefix("package:") {
+            current_package = Some(clean_yaml_scalar(value));
+            continue;
+        }
+
+        if trimmed.starts_with("version:") {
+            if let Some(package) = &current_package {
+                if let Some(rewrite) = rewrites.get(package) {
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    *line = format!("{indent}version: {}", rewrite.digest);
+                    changed = true;
+                }
+            }
+        }
     }
 
-    // Flush last entry.
-    if let (Some(k), Some(p)) = (current_kind, current_package) {
-        deps.push(Dependency { kind: k, package: p, version: current_version });
+    let mut out = lines.join("\n");
+    if package_yaml.ends_with('\n') {
+        out.push('\n');
     }
-
-    deps
+    (out, changed)
 }
 
-fn parse_dep_key(
-    s: &str,
-    kind: &mut Option<String>,
-    package: &mut Option<String>,
-    version: &mut Option<String>,
-) {
-    if let Some(val) = s.strip_prefix("kind:") {
-        *kind = Some(val.trim().to_string());
-    } else if let Some(val) = s.strip_prefix("package:") {
-        *package = Some(val.trim().trim_matches('\'').trim_matches('"').to_string());
-    } else if let Some(val) = s.strip_prefix("version:") {
-        // Strip semver constraint operators (>=, ^, ~) to get a bare version tag.
-        let raw = val.trim().trim_matches('\'').trim_matches('"');
-        let tag = raw.trim_start_matches(|c: char| !c.is_alphanumeric());
-        *version = Some(tag.to_string());
+fn clean_yaml_scalar(s: &str) -> String {
+    s.trim().trim_matches('"').trim_matches('\'').to_string()
+}
+
+fn build_patched_configuration_image(
+    source_image: &str,
+    package_yaml: &str,
+) -> Result<String, Box<dyn Error>> {
+    let build_dir = std::env::temp_dir().join(format!(
+        "hops-cli-config-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::create_dir_all(&build_dir)?;
+    fs::write(build_dir.join("package.yaml"), package_yaml)?;
+    fs::write(
+        build_dir.join("Dockerfile"),
+        format!(
+            "FROM {source_image} AS src\n\
+             FROM scratch\n\
+             COPY --from=src / /\n\
+             COPY package.yaml /package.yaml\n"
+        ),
+    )?;
+
+    let target_tag = format!(
+        "hops-local/config-patched-{}:{}",
+        short_hash(source_image),
+        unique_suffix()
+    );
+
+    let status = Command::new("docker")
+        .args([
+            "build",
+            "-t",
+            &target_tag,
+            build_dir.to_string_lossy().as_ref(),
+        ])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+
+    let _ = fs::remove_dir_all(&build_dir);
+
+    if !status.success() {
+        return Err(format!("docker build exited with {}", status).into());
     }
+
+    Ok(target_tag)
+}
+
+fn docker_push_and_get_digest(image: &str) -> Result<String, Box<dyn Error>> {
+    let output = Command::new("docker").args(["push", image]).output()?;
+    std::io::stdout().write_all(&output.stdout)?;
+    std::io::stderr().write_all(&output.stderr)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("docker push failed: {}", stderr).into());
+    }
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_docker_push_digest(&combined).ok_or_else(|| {
+        format!(
+            "Unable to parse digest from docker push output for {}",
+            image
+        )
+        .into()
+    })
+}
+
+fn parse_docker_push_digest(output: &str) -> Option<String> {
+    for line in output.lines() {
+        if let Some(idx) = line.find("digest: sha256:") {
+            let digest = line[idx + "digest: ".len()..]
+                .split_whitespace()
+                .next()?
+                .to_string();
+            return Some(digest);
+        }
+    }
+    None
+}
+
+fn image_config_name(source: &str) -> String {
+    let hash = short_hash(source);
+    let mut body: String = source
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    while body.contains("--") {
+        body = body.replace("--", "-");
+    }
+    body = body.trim_matches('-').to_string();
+    if body.is_empty() {
+        body = "image".to_string();
+    }
+
+    let prefix = "hops-local-rewrite-";
+    let max_body_len = 63usize.saturating_sub(prefix.len() + hash.len() + 1);
+    if body.len() > max_body_len {
+        body.truncate(max_body_len);
+    }
+
+    format!("{prefix}{body}-{hash}")
+}
+
+fn short_hash(input: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    let hex = format!("{:016x}", hasher.finish());
+    hex[..8].to_string()
+}
+
+fn unique_suffix() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 /// Replace the registry portion of an image reference.
@@ -355,4 +625,50 @@ fn docker_build_from(src: &str, tag: &str) -> Result<(), Box<dyn Error>> {
         return Err(format!("docker build exited with {}", status).into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_push_digest() {
+        let out = "latest: digest: sha256:0123456789abcdef size: 1234";
+        assert_eq!(
+            parse_docker_push_digest(out).as_deref(),
+            Some("sha256:0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn rewrite_render_dep_digest() {
+        let yaml = r#"---
+apiVersion: meta.pkg.crossplane.io/v1
+kind: Configuration
+spec:
+  dependsOn:
+  - kind: Function
+    package: ghcr.io/hops-ops/helm-airflow_render
+    version: sha256:old
+  - kind: Function
+    package: xpkg.crossplane.io/crossplane-contrib/function-auto-ready
+    version: '>=v0.6.0'
+"#;
+
+        let mut rewrites = HashMap::new();
+        rewrites.insert(
+            "ghcr.io/hops-ops/helm-airflow_render".to_string(),
+            RenderRewrite {
+                digest: "sha256:new".to_string(),
+                target_prefix:
+                    "registry.crossplane-system.svc.cluster.local:5000/hops-ops/helm-airflow_render"
+                        .to_string(),
+            },
+        );
+
+        let (patched, changed) = rewrite_render_dependency_digests(yaml, &rewrites);
+        assert!(changed);
+        assert!(patched.contains("version: sha256:new"));
+        assert!(patched.contains("version: '>=v0.6.0'"));
+    }
 }
