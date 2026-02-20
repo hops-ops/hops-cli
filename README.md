@@ -12,6 +12,33 @@ This tool manages a local Kubernetes stack and package workflow for Crossplane:
 - Deploys an in-cluster OCI registry (`crossplane-system/registry`)
 - Builds and publishes Crossplane configuration packages from an XRD project
 
+## Installation
+
+### Using ubi
+
+1. **Install ubi:**  
+   Ensure you have ubi installed by running:
+   ```bash
+   curl --silent --location \
+    https://raw.githubusercontent.com/houseabsolute/ubi/master/bootstrap/bootstrap-ubi.sh |
+    sh
+
+   mkdir -p ~/.ubi/bin
+   echo 'export PATH="$HOME/.ubi/bin:$PATH"' >> ~/.zshrc  # or your preferred shell profile
+   ```
+2. **Install vnext with ubi:**  
+   ```bash
+   ubi --project hops-ops/hops-cli --in /usr/local/bin --rename-exe hops
+   ```
+
+Install a specific version:
+
+```bash
+ubi --project hops-ops/hops-cli --tag vx.x.x --in /usr/local/bin/ --rename-exe hops
+```
+
+See "Releases" for available versions and changenotes.
+
 ## Prerequisites
 
 - macOS
@@ -39,8 +66,8 @@ cargo build --features vendored
 ## Usage
 
 ```bash
-hops-cli --help
-hops-cli local --help
+hops --help
+hops local --help
 ```
 
 From source without installing:
