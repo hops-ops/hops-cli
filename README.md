@@ -92,8 +92,6 @@ cargo run -- local config /path/to/project
 
 ## Commands
 
-- `bootstrap`
-  - Placeholder command (currently logs only).
 - `local install`
   - Runs `brew install colima`.
 - `local reset`

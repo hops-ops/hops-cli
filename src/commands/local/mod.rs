@@ -78,6 +78,74 @@ pub fn run_cmd_output(program: &str, args: &[&str]) -> Result<String, Box<dyn Er
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Ensure Colima's /etc/hosts maps a service hostname to the current ClusterIP.
+pub fn sync_registry_hosts_entry(
+    namespace: &str,
+    service: &str,
+    hostname: &str,
+) -> Result<(), Box<dyn Error>> {
+    let cluster_ip = run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "svc",
+            service,
+            "-n",
+            namespace,
+            "-o",
+            "jsonpath={.spec.clusterIP}",
+        ],
+    )?;
+    let cluster_ip = cluster_ip.trim();
+    if cluster_ip.is_empty() {
+        return Err(format!("Service {}/{} has no ClusterIP", namespace, service).into());
+    }
+
+    let current_ip = run_cmd_output(
+        "colima",
+        &[
+            "ssh",
+            "--",
+            "sh",
+            "-c",
+            &format!("awk '$2 == \"{}\" {{print $1; exit}}' /etc/hosts", hostname),
+        ],
+    )
+    .unwrap_or_default();
+    if current_ip.trim() == cluster_ip {
+        return Ok(());
+    }
+
+    log::info!("Updating hosts entry: {} -> {}", hostname, cluster_ip);
+
+    let escaped_host = hostname.replace('.', "\\.");
+    run_cmd(
+        "colima",
+        &[
+            "ssh",
+            "--",
+            "sudo",
+            "sed",
+            "-i",
+            &format!("/{}/d", escaped_host),
+            "/etc/hosts",
+        ],
+    )?;
+    run_cmd(
+        "colima",
+        &[
+            "ssh",
+            "--",
+            "sudo",
+            "sh",
+            "-c",
+            &format!("echo '{} {}' >> /etc/hosts", cluster_ip, hostname),
+        ],
+    )?;
+
+    Ok(())
+}
+
 /// Pipe a YAML string into `kubectl apply -f -`.
 pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
     let mut child = Command::new("kubectl")

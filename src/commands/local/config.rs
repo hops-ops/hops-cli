@@ -1,4 +1,4 @@
-use super::{kubectl_apply_stdin, run_cmd, run_cmd_output};
+use super::{kubectl_apply_stdin, run_cmd, run_cmd_output, sync_registry_hosts_entry};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
@@ -19,6 +19,7 @@ const REGISTRY_PUSH: &str = "localhost:30500";
 
 /// Cluster-internal address used in Crossplane package references
 const REGISTRY_PULL: &str = "registry.crossplane-system.svc.cluster.local:5000";
+const REGISTRY_HOSTNAME: &str = "registry.crossplane-system.svc.cluster.local";
 
 #[derive(Clone, Debug)]
 struct LoadedImage {
@@ -60,6 +61,7 @@ pub fn run(path: &str) -> Result<(), Box<dyn Error>> {
     }
 
     ensure_registry()?;
+    sync_registry_hosts_entry("crossplane-system", "registry", REGISTRY_HOSTNAME)?;
 
     // Build the Crossplane package
     log::info!("Building Crossplane package in {}...", path);

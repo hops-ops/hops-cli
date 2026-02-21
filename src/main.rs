@@ -12,8 +12,6 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Bootstrap the application
-    Bootstrap,
     /// Manage the local development environment
     Local(commands::local::LocalArgs),
 }
@@ -26,9 +24,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     log::debug!("Command line args: {:?}", args);
 
     match &args.command {
-        Some(Commands::Bootstrap) => {
-            log::info!("Bootstrap command was called");
-        }
         Some(Commands::Local(local_args)) => {
             commands::local::run(local_args)?;
         }

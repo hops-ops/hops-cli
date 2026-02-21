@@ -1,4 +1,4 @@
-use super::{kubectl_apply_stdin, run_cmd, run_cmd_output};
+use super::{kubectl_apply_stdin, run_cmd, run_cmd_output, sync_registry_hosts_entry};
 use std::error::Error;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -14,6 +14,7 @@ const REGISTRY: &str = include_str!("../../../bootstrap/registry/registry.yaml")
 
 /// Cluster-internal hostname for the package registry.
 const REGISTRY_HOST: &str = "registry.crossplane-system.svc.cluster.local:5000";
+const REGISTRY_HOSTNAME: &str = "registry.crossplane-system.svc.cluster.local";
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     // 1. Start Colima with Kubernetes
@@ -103,7 +104,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     // 12. Map the registry's cluster-internal hostname to its ClusterIP
     //     inside the VM so the kubelet can resolve it.
-    configure_registry_hosts_entry()?;
+    sync_registry_hosts_entry("crossplane-system", "registry", REGISTRY_HOSTNAME)?;
 
     log::info!("Local environment is ready");
     Ok(())
@@ -113,10 +114,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 /// inside the Colima VM. Docker defaults to HTTPS for non-localhost registries;
 /// our in-cluster registry speaks plain HTTP.
 fn configure_docker_insecure_registry() -> Result<(), Box<dyn Error>> {
-    let config = run_cmd_output(
-        "colima",
-        &["ssh", "--", "cat", "/etc/docker/daemon.json"],
-    )?;
+    let config = run_cmd_output("colima", &["ssh", "--", "cat", "/etc/docker/daemon.json"])?;
 
     if config.contains("insecure-registries") {
         return Ok(());
@@ -178,47 +176,6 @@ fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
         thread::sleep(Duration::from_secs(5));
     }
     Err("Timed out waiting for Kubernetes API".into())
-}
-
-/// Map the registry's cluster-internal hostname to its ClusterIP in the
-/// VM's /etc/hosts so the kubelet (which can't use CoreDNS) can resolve it.
-fn configure_registry_hosts_entry() -> Result<(), Box<dyn Error>> {
-    let hostname = "registry.crossplane-system.svc.cluster.local";
-
-    // Already present?
-    let check = run_cmd_output(
-        "colima",
-        &["ssh", "--", "grep", "-q", hostname, "/etc/hosts"],
-    );
-    if check.is_ok() {
-        return Ok(());
-    }
-
-    let cluster_ip = run_cmd_output(
-        "kubectl",
-        &[
-            "get", "svc", "registry",
-            "-n", "crossplane-system",
-            "-o", "jsonpath={.spec.clusterIP}",
-        ],
-    )?;
-    let cluster_ip = cluster_ip.trim();
-
-    log::info!(
-        "Adding hosts entry: {} -> {}",
-        hostname,
-        cluster_ip
-    );
-    let entry = format!("{} {}", cluster_ip, hostname);
-    run_cmd(
-        "colima",
-        &[
-            "ssh", "--", "sudo", "sh", "-c",
-            &format!("echo '{}' >> /etc/hosts", entry),
-        ],
-    )?;
-
-    Ok(())
 }
 
 /// Poll until a deployment's Available condition is True.
