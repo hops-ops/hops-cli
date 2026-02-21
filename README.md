@@ -6,7 +6,7 @@
 
 This tool manages a local Kubernetes stack and package workflow for Crossplane:
 
-- Installs and manages Colima
+- Installs and manages Colima and kubefwd
 - Starts a local k8s cluster with Crossplane installed via Helm
 - Installs the Kubernetes and Helm Crossplane providers
 - Deploys an in-cluster OCI registry (`crossplane-system/registry`)
@@ -48,8 +48,9 @@ See "Releases" for available versions and changenotes.
 - `kubectl`
 - `helm`
 - `up` (Upbound CLI, used by `up project build`)
+- `kubefwd` (used by `local start` for automatic service forwarding)
 
-Note: `hops-cli local install` installs `colima` through Homebrew.
+Note: `hops-cli local install` installs `colima` and `kubefwd` through Homebrew.
 
 ## Build
 
@@ -80,7 +81,7 @@ cargo run -- local --help
 ## Quick Start
 
 ```bash
-# 1) Install Colima (via Homebrew)
+# 1) Install Colima + kubefwd (via Homebrew)
 cargo run -- local install
 
 # 2) Start local k8s + Crossplane + providers + local registry
@@ -93,8 +94,9 @@ cargo run -- local config /path/to/project
 ## Commands
 
 - `local install`
-  - Runs `brew install colima`.
+  - Runs `brew install colima kubefwd`.
 - `local reset`
+  - Stops the background `kubefwd` process started by `local start`
   - Runs `colima kubernetes reset`.
 - `local start`
   - Runs `colima start --kubernetes --cpu 8 --memory 16 --disk 60`
@@ -102,11 +104,15 @@ cargo run -- local config /path/to/project
   - Applies manifests from `bootstrap/` for runtime config, providers, provider configs, and registry
   - Configures Docker in Colima for insecure pulls from `registry.crossplane-system.svc.cluster.local:5000`
   - Adds host mapping in Colima VM for the registry service DNS name
+  - Starts `kubefwd services -A` in the background (log: `~/.hops/local/kubefwd.log`)
 - `local stop`
+  - Stops the background `kubefwd` process started by `local start`
   - Runs `colima stop`.
 - `local destroy`
+  - Stops the background `kubefwd` process started by `local start`
   - Runs `colima delete --force`.
 - `local uninstall`
+  - Stops the background `kubefwd` process started by `local start`
   - Prompts for confirmation, then runs `brew uninstall colima`.
 - `local config [PATH]`
   - Runs `up project build` in `PATH` (defaults to current directory)

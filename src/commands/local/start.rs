@@ -1,4 +1,6 @@
-use super::{kubectl_apply_stdin, run_cmd, run_cmd_output, sync_registry_hosts_entry};
+use super::{
+    kubectl_apply_stdin, run_cmd, run_cmd_output, start_kubefwd, sync_registry_hosts_entry,
+};
 use std::error::Error;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -105,6 +107,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     // 12. Map the registry's cluster-internal hostname to its ClusterIP
     //     inside the VM so the kubelet can resolve it.
     sync_registry_hosts_entry("crossplane-system", "registry", REGISTRY_HOSTNAME)?;
+
+    // 13. Start kubefwd in the background for local service access.
+    if let Err(err) = start_kubefwd() {
+        log::warn!("kubefwd was not started automatically: {}", err);
+    }
 
     log::info!("Local environment is ready");
     Ok(())

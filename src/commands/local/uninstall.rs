@@ -1,4 +1,4 @@
-use super::run_cmd;
+use super::{run_cmd, stop_kubefwd};
 use std::error::Error;
 use std::io::{self, Write};
 
@@ -10,6 +10,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     io::stdin().read_line(&mut input)?;
 
     if input.trim().eq_ignore_ascii_case("y") {
+        if let Err(err) = stop_kubefwd() {
+            log::warn!("Failed to stop kubefwd cleanly: {}", err);
+        }
+
         log::info!("Uninstalling Colima...");
         run_cmd("brew", &["uninstall", "colima"])?;
         log::info!("Colima uninstalled");
