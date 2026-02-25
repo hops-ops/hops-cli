@@ -1,6 +1,4 @@
-use super::{
-    kubectl_apply_stdin, run_cmd, run_cmd_output, start_kubefwd, sync_registry_hosts_entry,
-};
+use super::{kubectl_apply_stdin, run_cmd, run_cmd_output, sync_registry_hosts_entry};
 use std::error::Error;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -109,7 +107,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     sync_registry_hosts_entry("crossplane-system", "registry", REGISTRY_HOSTNAME)?;
 
     // 13. Start kubefwd in the background for local service access.
-    if let Err(err) = start_kubefwd() {
+    if let Err(err) = super::kubefwd::start() {
         log::warn!("kubefwd was not started automatically: {}", err);
     }
 

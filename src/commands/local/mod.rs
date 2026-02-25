@@ -1,6 +1,8 @@
+mod aws;
 mod config;
 mod destroy;
 mod install;
+mod kubefwd;
 mod reset;
 mod start;
 mod stop;
@@ -18,6 +20,7 @@ use std::time::Duration;
 const KUBEFWD_STATE_DIR: &str = ".hops/local";
 const KUBEFWD_PID_FILE: &str = "kubefwd.pid";
 const KUBEFWD_LOG_FILE: &str = "kubefwd.log";
+const KUBEFWD_RESYNC_INTERVAL: &str = "30s";
 
 #[derive(Args, Debug)]
 pub struct LocalArgs {
@@ -33,6 +36,10 @@ pub enum LocalCommands {
     Reset,
     /// Start local k8s cluster with Crossplane and providers
     Start,
+    /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
+    Aws(aws::AwsArgs),
+    /// Manage background kubefwd forwarding
+    Kubefwd(kubefwd::KubefwdArgs),
     /// Stop the local cluster
     Stop,
     /// Destroy the local cluster VM
@@ -51,6 +58,8 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Install => install::run(),
         LocalCommands::Reset => reset::run(),
         LocalCommands::Start => start::run(),
+        LocalCommands::Aws(aws_args) => aws::run(aws_args),
+        LocalCommands::Kubefwd(kubefwd_args) => kubefwd::run(kubefwd_args),
         LocalCommands::Stop => stop::run(),
         LocalCommands::Destroy => destroy::run(),
         LocalCommands::Uninstall => uninstall::run(),
@@ -129,7 +138,14 @@ pub fn start_kubefwd() -> Result<(), Box<dyn Error>> {
     let log_file_err = log_file.try_clone()?;
 
     let mut child = Command::new("sudo")
-        .args(["-n", "kubefwd", "services", "-A"])
+        .args([
+            "-n",
+            "kubefwd",
+            "services",
+            "-A",
+            "--resync-interval",
+            KUBEFWD_RESYNC_INTERVAL,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err))

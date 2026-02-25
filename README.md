@@ -48,7 +48,8 @@ See "Releases" for available versions and changenotes.
 - `kubectl`
 - `helm`
 - `up` (Upbound CLI, used by `up project build`)
-- `kubefwd` (used by `local start` for automatic service forwarding)
+- `kubefwd` (used by `local start` / `local kubefwd start` for service forwarding)
+- `aws` CLI v2 (used by `local aws` to export profile credentials)
 
 Note: `hops-cli local install` installs `colima` and `kubefwd` through Homebrew.
 
@@ -69,6 +70,7 @@ cargo build --features vendored
 ```bash
 hops --help
 hops local --help
+hops local kubefwd --help
 ```
 
 From source without installing:
@@ -87,7 +89,10 @@ cargo run -- local install
 # 2) Start local k8s + Crossplane + providers + local registry
 cargo run -- local start
 
-# 3) Build and load a Crossplane configuration package from an XRD project
+# 3) Configure AWS provider-family + ProviderConfig from your AWS profile
+cargo run -- local aws --profile <aws-profile>
+
+# 4) Build and load a Crossplane configuration package from an XRD project
 cargo run -- local config /path/to/project
 ```
 
@@ -104,7 +109,13 @@ cargo run -- local config /path/to/project
   - Applies manifests from `bootstrap/` for runtime config, providers, provider configs, and registry
   - Configures Docker in Colima for insecure pulls from `registry.crossplane-system.svc.cluster.local:5000`
   - Adds host mapping in Colima VM for the registry service DNS name
-  - Starts `kubefwd services -A` in the background (log: `~/.hops/local/kubefwd.log`)
+  - Starts `kubefwd services -A --resync-interval 30s` in the background (log: `~/.hops/local/kubefwd.log`)
+- `local kubefwd start`
+  - Starts background `kubefwd` forwarding for all namespaces with a forced resync every 30s.
+- `local kubefwd stop`
+  - Stops the background `kubefwd` process managed by this CLI.
+- `local kubefwd refresh`
+  - Restarts background `kubefwd` immediately (stop + start).
 - `local stop`
   - Stops the background `kubefwd` process started by `local start`
   - Runs `colima stop`.
@@ -119,6 +130,14 @@ cargo run -- local config /path/to/project
   - Loads generated `.uppkg` artifacts from `<PATH>/_output`
   - Pushes package images to local registry (`localhost:30500`)
   - Applies Crossplane `Configuration` resources pointing at `registry.crossplane-system.svc.cluster.local:5000/...`
+- `local aws [--profile <AWS_PROFILE>]`
+  - Exports temporary AWS credentials with `aws configure export-credentials --format process`
+  - Uses profile resolution order: `--profile` -> `AWS_PROFILE` -> `AWS_DEFAULT_PROFILE` -> interactive prompt
+  - If AWS SSO token is missing/expired, runs `aws sso login --profile <profile>` and retries once
+  - Applies `xpkg.crossplane.io/crossplane-contrib/provider-family-aws:v2.4.0`
+  - Waits for `providerconfigs.aws.m.upbound.io` CRD to exist
+  - Applies a Secret (`aws-creds`) and AWS `ProviderConfig` (`default`) in namespace `default`
+  - Supports overrides via `--namespace`, `--secret-name`, `--provider-config-name`, `--provider-name`, and `--provider-package`
 
 ## Logging
 
