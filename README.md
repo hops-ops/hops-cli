@@ -161,6 +161,7 @@ cargo run -- local unconfig --repo hops-ops/helm-certmanager
   - Applies `xpkg.crossplane.io/crossplane-contrib/provider-family-aws:v2.4.0`
   - Waits for `providerconfigs.aws.m.upbound.io` CRD to exist
   - Applies a Secret (`aws-creds`) and AWS `ProviderConfig` (`default`) in namespace `default`
+  - `--refresh` updates only the Secret credentials and skips Provider/ProviderConfig apply
   - Supports overrides via `--namespace`, `--secret-name`, `--provider-config-name`, `--provider-name`, and `--provider-package`
 
 ## Logging

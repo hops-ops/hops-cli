@@ -37,6 +37,10 @@ pub struct AwsArgs {
     /// provider-family-aws package reference
     #[arg(long, default_value = DEFAULT_PROVIDER_PACKAGE)]
     pub provider_package: String,
+
+    /// Refresh credentials in the secret only; skips Provider and ProviderConfig apply
+    #[arg(long)]
+    pub refresh: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +58,27 @@ pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
 
     log::info!("Exporting AWS credentials from profile '{}'...", profile);
     let creds = export_credentials(&profile)?;
+    let credentials_ini = build_credentials_ini(&creds);
+
+    if args.refresh {
+        log::info!(
+            "Refreshing secret '{}/{}' with generated credentials...",
+            args.namespace,
+            args.secret_name
+        );
+        kubectl_apply_stdin(&build_secret_yaml(
+            &args.namespace,
+            &args.secret_name,
+            &credentials_ini,
+        ))?;
+        log::info!(
+            "AWS credentials secret refreshed from profile '{}' ({}/{})",
+            profile,
+            args.namespace,
+            args.secret_name
+        );
+        return Ok(());
+    }
 
     log::info!(
         "Applying provider-family-aws package '{}'...",
@@ -71,7 +96,6 @@ pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
         args.namespace,
         args.secret_name
     );
-    let credentials_ini = build_credentials_ini(&creds);
     kubectl_apply_stdin(&build_secret_yaml(
         &args.namespace,
         &args.secret_name,
