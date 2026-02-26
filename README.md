@@ -93,7 +93,13 @@ cargo run -- local start
 cargo run -- local aws --profile <aws-profile>
 
 # 4) Build and load a Crossplane configuration package from an XRD project
-cargo run -- local config /path/to/project
+cargo run -- local config --path /path/to/project
+
+# 5) Build from a GitHub repo (clone + build + push to local registry)
+cargo run -- local config --repo hops-ops/helm-certmanager
+
+# 6) Apply a pinned remote package version directly (no clone/build)
+cargo run -- local config --repo hops-ops/helm-certmanager --version v0.1.0
 ```
 
 ## Commands
@@ -125,11 +131,17 @@ cargo run -- local config /path/to/project
 - `local uninstall`
   - Stops the background `kubefwd` process started by `local start`
   - Prompts for confirmation, then runs `brew uninstall colima`.
-- `local config [PATH]`
+- `local config [--path <PATH>]`
   - Runs `up project build` in `PATH` (defaults to current directory)
   - Loads generated `.uppkg` artifacts from `<PATH>/_output`
   - Pushes package images to local registry (`localhost:30500`)
   - Applies Crossplane `Configuration` resources pointing at `registry.crossplane-system.svc.cluster.local:5000/...`
+- `local config --repo <org/repo>`
+  - Clones `https://github.com/<org>/<repo>` to a temp directory
+  - Runs the same build/load/push/apply flow as `--path`
+- `local config --repo <org/repo> --version <tag>`
+  - Skips clone/build and applies `Configuration` with package `ghcr.io/<org>/<repo>:<tag>`
+  - Uses configuration name `<org>-<repo>` (for example `hops-ops-helm-certmanager`)
 - `local aws [--profile <AWS_PROFILE>]`
   - Exports temporary AWS credentials with `aws configure export-credentials --format process`
   - Uses profile resolution order: `--profile` -> `AWS_PROFILE` -> `AWS_DEFAULT_PROFILE` -> interactive prompt

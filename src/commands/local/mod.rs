@@ -47,10 +47,7 @@ pub enum LocalCommands {
     /// Uninstall Colima
     Uninstall,
     /// Build and load a Crossplane configuration into the local cluster
-    Config {
-        /// Path to the XRD project directory (defaults to current directory)
-        path: Option<String>,
-    },
+    Config(config::ConfigArgs),
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
@@ -63,7 +60,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Stop => stop::run(),
         LocalCommands::Destroy => destroy::run(),
         LocalCommands::Uninstall => uninstall::run(),
-        LocalCommands::Config { path } => config::run(path.as_deref().unwrap_or(".")),
+        LocalCommands::Config(config_args) => config::run(config_args),
     }
 }
 

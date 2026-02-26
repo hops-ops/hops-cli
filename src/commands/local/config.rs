@@ -1,4 +1,5 @@
 use super::{kubectl_apply_stdin, run_cmd, run_cmd_output, sync_registry_hosts_entry};
+use clap::Args;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
@@ -20,6 +21,27 @@ const REGISTRY_PUSH: &str = "localhost:30500";
 /// Cluster-internal address used in Crossplane package references
 const REGISTRY_PULL: &str = "registry.crossplane-system.svc.cluster.local:5000";
 const REGISTRY_HOSTNAME: &str = "registry.crossplane-system.svc.cluster.local";
+
+#[derive(Args, Debug)]
+pub struct ConfigArgs {
+    /// Path to the local XRD project directory (defaults to current directory)
+    #[arg(long, conflicts_with = "repo")]
+    pub path: Option<String>,
+
+    /// GitHub repository in <org>/<repo> format (for example hops-ops/helm-certmanager)
+    #[arg(long, conflicts_with = "path")]
+    pub repo: Option<String>,
+
+    /// Version tag to apply directly from ghcr.io without cloning/building (requires --repo)
+    #[arg(long, requires = "repo")]
+    pub version: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RepoSpec {
+    org: String,
+    repo: String,
+}
 
 #[derive(Clone, Debug)]
 struct LoadedImage {
@@ -54,7 +76,93 @@ struct DockerImageConfigSection {
     labels: Option<HashMap<String, String>>,
 }
 
-pub fn run(path: &str) -> Result<(), Box<dyn Error>> {
+pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
+    match (args.repo.as_deref(), args.version.as_deref()) {
+        (Some(repo), Some(version)) => apply_repo_version(repo, version),
+        (Some(repo), None) => run_repo_clone(repo),
+        (None, _) => run_local_path(args.path.as_deref().unwrap_or(".")),
+    }
+}
+
+fn run_repo_clone(repo: &str) -> Result<(), Box<dyn Error>> {
+    let spec = parse_repo_spec(repo)?;
+    let clone_dir = std::env::temp_dir().join(format!(
+        "hops-cli-config-repo-{}-{}-{}",
+        sanitize_name_component(&spec.org),
+        sanitize_name_component(&spec.repo),
+        unique_suffix()
+    ));
+    let clone_path = clone_dir.to_string_lossy().to_string();
+    let clone_url = format!("https://github.com/{}/{}", spec.org, spec.repo);
+
+    log::info!("Cloning {}...", clone_url);
+    run_cmd("git", &["clone", &clone_url, &clone_path])?;
+
+    let result = run_local_path(&clone_path);
+    let _ = fs::remove_dir_all(&clone_dir);
+    result
+}
+
+fn apply_repo_version(repo: &str, version: &str) -> Result<(), Box<dyn Error>> {
+    let spec = parse_repo_spec(repo)?;
+    let version = version.trim();
+    if version.is_empty() {
+        return Err("`--version` cannot be empty".into());
+    }
+
+    let package_ref = format!("ghcr.io/{}/{}:{}", spec.org, spec.repo, version);
+    let config_name = format!(
+        "{}-{}",
+        sanitize_name_component(&spec.org),
+        sanitize_name_component(&spec.repo)
+    );
+    apply_configuration(&config_name, &package_ref, false)
+}
+
+fn parse_repo_spec(repo: &str) -> Result<RepoSpec, Box<dyn Error>> {
+    let trimmed = repo.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("`--repo` cannot be empty".into());
+    }
+
+    let no_prefix = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+        .or_else(|| trimmed.strip_prefix("github.com/"))
+        .unwrap_or(trimmed);
+    let no_suffix = no_prefix.strip_suffix(".git").unwrap_or(no_prefix);
+
+    let parts: Vec<&str> = no_suffix.split('/').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(format!("invalid --repo '{}': expected <org>/<repo>", repo).into());
+    }
+
+    Ok(RepoSpec {
+        org: parts[0].to_string(),
+        repo: parts[1].to_string(),
+    })
+}
+
+fn sanitize_name_component(input: &str) -> String {
+    let mut out = input
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+
+    out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "xrd".to_string()
+    } else {
+        out
+    }
+}
+
+fn run_local_path(path: &str) -> Result<(), Box<dyn Error>> {
     let dir = Path::new(path);
     if !dir.is_dir() {
         return Err(format!("{} is not a directory", path).into());
@@ -219,20 +327,46 @@ spec:
     for pull_ref in &config_pull_refs {
         let (img_path, _) = split_ref(pull_ref);
         let name = img_path.rsplit('/').next().unwrap_or(img_path);
-        log::info!("Applying Configuration '{}'...", name);
-        kubectl_apply_stdin(&format!(
-            "apiVersion: pkg.crossplane.io/v1
+        apply_configuration(name, pull_ref, false)?;
+    }
+
+    Ok(())
+}
+
+fn apply_configuration(
+    name: &str,
+    package_ref: &str,
+    skip_dependency_resolution: bool,
+) -> Result<(), Box<dyn Error>> {
+    log::info!("Applying Configuration '{}'...", name);
+    kubectl_apply_stdin(&build_configuration_yaml(
+        name,
+        package_ref,
+        skip_dependency_resolution,
+    ))?;
+    Ok(())
+}
+
+fn build_configuration_yaml(
+    name: &str,
+    package_ref: &str,
+    skip_dependency_resolution: bool,
+) -> String {
+    let mut yaml = format!(
+        "apiVersion: pkg.crossplane.io/v1
 kind: Configuration
 metadata:
   name: {name}
 spec:
-  package: {pull_ref}
-  packagePullPolicy: Always
-"
-        ))?;
+  package: {package_ref}
+  packagePullPolicy: Always\n"
+    );
+
+    if skip_dependency_resolution {
+        yaml.push_str("  skipDependencyResolution: true\n");
     }
 
-    Ok(())
+    yaml
 }
 
 /// Ensure the in-cluster registry is deployed and available.
@@ -672,5 +806,42 @@ spec:
         assert!(changed);
         assert!(patched.contains("version: sha256:new"));
         assert!(patched.contains("version: '>=v0.6.0'"));
+    }
+
+    #[test]
+    fn parse_repo_spec_accepts_slug_and_github_url() {
+        let slug = parse_repo_spec("hops-ops/helm-certmanager").unwrap();
+        assert_eq!(slug.org, "hops-ops");
+        assert_eq!(slug.repo, "helm-certmanager");
+
+        let url = parse_repo_spec("https://github.com/hops-ops/helm-certmanager.git").unwrap();
+        assert_eq!(url.org, "hops-ops");
+        assert_eq!(url.repo, "helm-certmanager");
+    }
+
+    #[test]
+    fn parse_repo_spec_rejects_invalid_values() {
+        assert!(parse_repo_spec("").is_err());
+        assert!(parse_repo_spec("hops-ops").is_err());
+        assert!(parse_repo_spec("hops-ops/helm-certmanager/extra").is_err());
+    }
+
+    #[test]
+    fn sanitize_name_component_normalizes_for_k8s_names() {
+        assert_eq!(sanitize_name_component("Hops_Ops"), "hops-ops");
+        assert_eq!(
+            sanitize_name_component("helm.certmanager"),
+            "helm-certmanager"
+        );
+        assert_eq!(sanitize_name_component("---"), "xrd");
+    }
+
+    #[test]
+    fn build_configuration_yaml_controls_dependency_resolution_flag() {
+        let with_skip = build_configuration_yaml("cfg", "ghcr.io/hops-ops/x:v1", true);
+        assert!(with_skip.contains("skipDependencyResolution: true"));
+
+        let without_skip = build_configuration_yaml("cfg", "ghcr.io/hops-ops/x:v1", false);
+        assert!(!without_skip.contains("skipDependencyResolution: true"));
     }
 }

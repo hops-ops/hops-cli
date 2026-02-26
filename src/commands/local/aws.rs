@@ -52,10 +52,7 @@ struct AwsExportCredentials {
 pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
     let profile = resolve_profile(args.profile.as_deref())?;
 
-    log::info!(
-        "Exporting AWS credentials from profile '{}'...",
-        profile
-    );
+    log::info!("Exporting AWS credentials from profile '{}'...", profile);
     let creds = export_credentials(&profile)?;
 
     log::info!(
