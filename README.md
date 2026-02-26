@@ -100,6 +100,9 @@ cargo run -- local config --repo hops-ops/helm-certmanager
 
 # 6) Apply a pinned remote package version directly (no clone/build)
 cargo run -- local config --repo hops-ops/helm-certmanager --version v0.1.0
+
+# 7) Remove a configuration and prune orphaned package dependencies
+cargo run -- local unconfig --repo hops-ops/helm-certmanager
 ```
 
 ## Commands
@@ -142,6 +145,15 @@ cargo run -- local config --repo hops-ops/helm-certmanager --version v0.1.0
 - `local config --repo <org/repo> --version <tag>`
   - Skips clone/build and applies `Configuration` with package `ghcr.io/<org>/<repo>:<tag>`
   - Uses configuration name `<org>-<repo>` (for example `hops-ops-helm-certmanager`)
+- `local unconfig --name <configuration-name>`
+  - Deletes the target `Configuration`
+  - Waits for package lock reconciliation
+  - Prunes orphaned `Configuration`/`Function`/`Provider` packages and revisions no longer present in lock
+  - Prunes orphaned `ImageConfig` rewrites for removed render functions
+- `local unconfig --repo <org/repo>`
+  - Targets configuration name `<org>-<repo>`
+- `local unconfig --path <PATH>`
+  - Derives target configuration names from `<PATH>/_output/*.uppkg` image tags
 - `local aws [--profile <AWS_PROFILE>]`
   - Exports temporary AWS credentials with `aws configure export-credentials --format process`
   - Uses profile resolution order: `--profile` -> `AWS_PROFILE` -> `AWS_DEFAULT_PROFILE` -> interactive prompt

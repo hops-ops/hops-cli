@@ -6,6 +6,7 @@ mod kubefwd;
 mod reset;
 mod start;
 mod stop;
+mod unconfig;
 mod uninstall;
 
 use clap::{Args, Subcommand};
@@ -48,6 +49,8 @@ pub enum LocalCommands {
     Uninstall,
     /// Build and load a Crossplane configuration into the local cluster
     Config(config::ConfigArgs),
+    /// Remove a Crossplane configuration and prune orphaned package dependencies
+    Unconfig(unconfig::UnconfigArgs),
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
@@ -61,6 +64,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Destroy => destroy::run(),
         LocalCommands::Uninstall => uninstall::run(),
         LocalCommands::Config(config_args) => config::run(config_args),
+        LocalCommands::Unconfig(unconfig_args) => unconfig::run(unconfig_args),
     }
 }
 
