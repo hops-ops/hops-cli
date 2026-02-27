@@ -100,6 +100,12 @@ pub fn run(args: &UnconfigArgs) -> Result<(), Box<dyn Error>> {
         return Err("no target configurations resolved".into());
     }
 
+    let hinted_sources = if let Some(path) = args.path.as_deref() {
+        resolve_sources_from_path(path)?
+    } else {
+        HashSet::new()
+    };
+
     log::info!(
         "Preparing to remove configurations: {}",
         config_names.join(", ")
@@ -116,10 +122,6 @@ pub fn run(args: &UnconfigArgs) -> Result<(), Box<dyn Error>> {
 
     let removed_sources: HashSet<SourceKey> =
         pre_sources.difference(&post_sources).cloned().collect();
-    if removed_sources.is_empty() {
-        log::info!("No orphaned package sources detected after removing configurations");
-        return Ok(());
-    }
 
     let mut removed_render_sources = HashSet::new();
     for source in &removed_sources {
@@ -128,14 +130,38 @@ pub fn run(args: &UnconfigArgs) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    prune_packages_for_removed_sources(&removed_sources)?;
+    if removed_sources.is_empty() {
+        log::info!(
+            "No orphaned package sources detected from lock diff after removing configurations"
+        );
+    } else {
+        prune_packages_for_removed_sources(&removed_sources)?;
+    }
+
+    let mut hinted_resource_prunes = 0usize;
+    if !hinted_sources.is_empty() {
+        hinted_resource_prunes = prune_packages_for_source_hints(&hinted_sources)?;
+        if hinted_resource_prunes > 0 {
+            log::info!(
+                "Pruned {} package resources matching sources derived from --path artifacts",
+                hinted_resource_prunes
+            );
+        }
+        for source in &hinted_sources {
+            if source.contains("_render") {
+                removed_render_sources.insert(source.clone());
+            }
+        }
+    }
+
     if !removed_render_sources.is_empty() {
         prune_image_configs_for_sources(&removed_render_sources)?;
     }
 
     log::info!(
-        "Removed configurations and pruned {} orphaned package source(s)",
-        removed_sources.len()
+        "Removed configurations; lock-diff orphaned sources: {}, path-source package resources pruned: {}",
+        removed_sources.len(),
+        hinted_resource_prunes
     );
     Ok(())
 }
@@ -288,6 +314,21 @@ fn prune_packages_for_removed_sources(
     )?;
 
     Ok(())
+}
+
+fn prune_packages_for_source_hints(sources: &HashSet<String>) -> Result<usize, Box<dyn Error>> {
+    if sources.is_empty() {
+        return Ok(0);
+    }
+
+    let mut deleted = 0usize;
+    deleted += delete_resource_by_source("configuration.pkg.crossplane.io", sources)?;
+    deleted += delete_resource_by_source("configurationrevision.pkg.crossplane.io", sources)?;
+    deleted += delete_resource_by_source("function.pkg.crossplane.io", sources)?;
+    deleted += delete_resource_by_source("functionrevision.pkg.crossplane.io", sources)?;
+    deleted += delete_resource_by_source("provider.pkg.crossplane.io", sources)?;
+    deleted += delete_resource_by_source("providerrevision.pkg.crossplane.io", sources)?;
+    Ok(deleted)
 }
 
 fn prune_resource_group(
@@ -489,6 +530,30 @@ fn resolve_names_from_path(path: &str) -> Result<Vec<String>, Box<dyn Error>> {
     Ok(names)
 }
 
+fn resolve_sources_from_path(path: &str) -> Result<HashSet<String>, Box<dyn Error>> {
+    let dir = Path::new(path);
+    if !dir.is_dir() {
+        return Err(format!("{} is not a directory", path).into());
+    }
+
+    let output_dir = dir.join("_output");
+    let mut sources = HashSet::new();
+    for entry in fs::read_dir(&output_dir)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path.extension().map(|e| e == "uppkg").unwrap_or(false) {
+            for source in sources_from_uppkg_manifest(&path)? {
+                sources.insert(source);
+            }
+        }
+    }
+
+    Ok(sources)
+}
+
 fn names_from_uppkg_manifest(uppkg_path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     let manifest_bytes = read_entry_from_tar(uppkg_path, "manifest.json")?;
     let entries: Vec<DockerSaveManifestEntry> = serde_json::from_slice(&manifest_bytes)?;
@@ -512,6 +577,28 @@ fn names_from_uppkg_manifest(uppkg_path: &Path) -> Result<Vec<String>, Box<dyn E
     let mut names: Vec<String> = names.into_iter().collect();
     names.sort();
     Ok(names)
+}
+
+fn sources_from_uppkg_manifest(uppkg_path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let manifest_bytes = read_entry_from_tar(uppkg_path, "manifest.json")?;
+    let entries: Vec<DockerSaveManifestEntry> = serde_json::from_slice(&manifest_bytes)?;
+
+    let mut sources = HashSet::new();
+    for entry in entries {
+        let Some(tags) = entry.repo_tags else {
+            continue;
+        };
+        for tag in tags {
+            let source = package_source(&tag);
+            if !source.is_empty() {
+                sources.insert(source);
+            }
+        }
+    }
+
+    let mut sources: Vec<String> = sources.into_iter().collect();
+    sources.sort();
+    Ok(sources)
 }
 
 fn read_entry_from_tar(tar_path: &Path, entry_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {

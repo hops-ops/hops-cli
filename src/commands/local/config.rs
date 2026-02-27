@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tar::Archive;
 
 const REGISTRY_YAML: &str = include_str!("../../../bootstrap/registry/registry.yaml");
@@ -35,6 +35,10 @@ pub struct ConfigArgs {
     /// Version tag to apply directly from ghcr.io without cloning/building (requires --repo)
     #[arg(long, requires = "repo")]
     pub version: Option<String>,
+
+    /// Force reload from source by recreating ConfigurationRevision(s) before apply (path/repo only)
+    #[arg(long, conflicts_with = "version")]
+    pub reload: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -76,15 +80,65 @@ struct DockerImageConfigSection {
     labels: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct KubeList<T> {
+    items: Vec<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OwnerReference {
+    kind: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RevisionMetadata {
+    name: String,
+    #[serde(rename = "ownerReferences")]
+    owner_references: Option<Vec<OwnerReference>>,
+    labels: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigurationRevisionResource {
+    metadata: RevisionMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageMetadataName {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageSpec {
+    #[serde(rename = "package")]
+    package_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageResource {
+    metadata: PackageMetadataName,
+    spec: Option<PackageSpec>,
+}
+
 pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
+    validate_reload_args(args)?;
+
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => apply_repo_version(repo, version),
-        (Some(repo), None) => run_repo_clone(repo),
-        (None, _) => run_local_path(args.path.as_deref().unwrap_or(".")),
+        (Some(repo), None) => run_repo_clone(repo, args.reload),
+        (None, _) => run_local_path(args.path.as_deref().unwrap_or("."), args.reload),
     }
 }
 
-fn run_repo_clone(repo: &str) -> Result<(), Box<dyn Error>> {
+fn validate_reload_args(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
+    if args.reload && args.version.is_some() {
+        return Err("`--reload` can only be used with source builds (`--path` or `--repo` without `--version`)".into());
+    }
+    Ok(())
+}
+
+fn run_repo_clone(repo: &str, reload: bool) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
     let clone_dir = std::env::temp_dir().join(format!(
         "hops-cli-config-repo-{}-{}-{}",
@@ -98,7 +152,7 @@ fn run_repo_clone(repo: &str) -> Result<(), Box<dyn Error>> {
     log::info!("Cloning {}...", clone_url);
     run_cmd("git", &["clone", &clone_url, &clone_path])?;
 
-    let result = run_local_path(&clone_path);
+    let result = run_local_path(&clone_path, reload);
     let _ = fs::remove_dir_all(&clone_dir);
     result
 }
@@ -116,7 +170,7 @@ fn apply_repo_version(repo: &str, version: &str) -> Result<(), Box<dyn Error>> {
         sanitize_name_component(&spec.org),
         sanitize_name_component(&spec.repo)
     );
-    apply_configuration(&config_name, &package_ref, false)
+    apply_configuration(&config_name, &package_ref, false, false)
 }
 
 fn parse_repo_spec(repo: &str) -> Result<RepoSpec, Box<dyn Error>> {
@@ -162,7 +216,7 @@ fn sanitize_name_component(input: &str) -> String {
     }
 }
 
-fn run_local_path(path: &str) -> Result<(), Box<dyn Error>> {
+fn run_local_path(path: &str, reload: bool) -> Result<(), Box<dyn Error>> {
     let dir = Path::new(path);
     if !dir.is_dir() {
         return Err(format!("{} is not a directory", path).into());
@@ -228,6 +282,32 @@ fn run_local_path(path: &str) -> Result<(), Box<dyn Error>> {
     // De-duplicate images that can appear multiple times across loaded tarballs.
     let mut seen = HashSet::new();
     loaded.retain(|img| seen.insert(img.source.clone()));
+
+    if reload {
+        let function_sources: HashSet<String> = loaded
+            .iter()
+            .filter(|img| !is_configuration_image(&img.source))
+            .map(|img| package_source(&img.source))
+            .collect();
+
+        if !function_sources.is_empty() {
+            let removed_functions = delete_package_resources_by_source(
+                "function.pkg.crossplane.io",
+                &function_sources,
+            )?;
+            let removed_function_revisions = delete_package_resources_by_source(
+                "functionrevision.pkg.crossplane.io",
+                &function_sources,
+            )?;
+            if removed_functions > 0 || removed_function_revisions > 0 {
+                log::info!(
+                    "Reload requested; deleted {} Function package(s) and {} FunctionRevision(s) from matching sources before re-apply",
+                    removed_functions,
+                    removed_function_revisions
+                );
+            }
+        }
+    }
 
     let arch = docker_arch().to_string();
     let mut render_rewrites: HashMap<String, RenderRewrite> = HashMap::new();
@@ -327,7 +407,7 @@ spec:
     for pull_ref in &config_pull_refs {
         let (img_path, _) = split_ref(pull_ref);
         let name = img_path.rsplit('/').next().unwrap_or(img_path);
-        apply_configuration(name, pull_ref, false)?;
+        apply_configuration(name, pull_ref, false, reload)?;
     }
 
     Ok(())
@@ -337,7 +417,12 @@ fn apply_configuration(
     name: &str,
     package_ref: &str,
     skip_dependency_resolution: bool,
+    reload: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if reload {
+        force_reload_configuration_revisions(name)?;
+    }
+
     log::info!("Applying Configuration '{}'...", name);
     kubectl_apply_stdin(&build_configuration_yaml(
         name,
@@ -345,6 +430,145 @@ fn apply_configuration(
         skip_dependency_resolution,
     ))?;
     Ok(())
+}
+
+fn force_reload_configuration_revisions(name: &str) -> Result<(), Box<dyn Error>> {
+    let revisions = list_configuration_revisions_for(name)?;
+    if revisions.is_empty() {
+        return Ok(());
+    }
+
+    log::info!(
+        "Reload requested; deleting {} ConfigurationRevision(s) for '{}' before re-applying...",
+        revisions.len(),
+        name
+    );
+    for rev in &revisions {
+        run_cmd(
+            "kubectl",
+            &[
+                "delete",
+                "configurationrevision.pkg.crossplane.io",
+                rev,
+                "--ignore-not-found",
+            ],
+        )?;
+    }
+
+    for _ in 0..60 {
+        let remaining = list_configuration_revisions_for(name)?;
+        if !remaining.is_empty() {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        return Ok(());
+    }
+
+    Err(format!(
+        "Timed out waiting for ConfigurationRevision deletion for '{}' before reload",
+        name
+    )
+    .into())
+}
+
+fn list_configuration_revisions_for(config_name: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let raw = run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "configurationrevision.pkg.crossplane.io",
+            "-o",
+            "json",
+        ],
+    )?;
+    let list: KubeList<ConfigurationRevisionResource> = serde_json::from_str(&raw)?;
+
+    let mut revisions = Vec::new();
+    for item in list.items {
+        if revision_belongs_to_configuration(&item.metadata, config_name) {
+            revisions.push(item.metadata.name);
+        }
+    }
+
+    Ok(revisions)
+}
+
+fn revision_belongs_to_configuration(metadata: &RevisionMetadata, config_name: &str) -> bool {
+    if metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("pkg.crossplane.io/package"))
+        .map(|v| v == config_name)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    metadata
+        .owner_references
+        .as_ref()
+        .map(|owners| {
+            owners.iter().any(|owner| {
+                owner.kind.as_deref() == Some("Configuration")
+                    && owner.name.as_deref() == Some(config_name)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn delete_package_resources_by_source(
+    resource: &str,
+    sources: &HashSet<String>,
+) -> Result<usize, Box<dyn Error>> {
+    if sources.is_empty() {
+        return Ok(0);
+    }
+
+    let raw = run_cmd_output("kubectl", &["get", resource, "-o", "json"])?;
+    let list: KubeList<PackageResource> = serde_json::from_str(&raw)?;
+
+    let mut deleted = 0usize;
+    for item in list.items {
+        let Some(spec) = item.spec else {
+            continue;
+        };
+        let Some(package_ref) = spec.package_ref else {
+            continue;
+        };
+        if !sources.contains(&package_source(&package_ref)) {
+            continue;
+        }
+
+        run_cmd(
+            "kubectl",
+            &[
+                "delete",
+                resource,
+                &item.metadata.name,
+                "--ignore-not-found",
+            ],
+        )?;
+        deleted += 1;
+    }
+
+    Ok(deleted)
+}
+
+fn package_source(package_ref: &str) -> String {
+    let trimmed = package_ref.trim();
+    if let Some((source, _)) = trimmed.split_once('@') {
+        return source.to_string();
+    }
+
+    if let Some(slash_idx) = trimmed.rfind('/') {
+        let suffix = &trimmed[slash_idx + 1..];
+        if let Some(colon_idx) = suffix.rfind(':') {
+            let idx = slash_idx + 1 + colon_idx;
+            return trimmed[..idx].to_string();
+        }
+    }
+
+    trimmed.to_string()
 }
 
 fn build_configuration_yaml(
@@ -843,5 +1067,67 @@ spec:
 
         let without_skip = build_configuration_yaml("cfg", "ghcr.io/hops-ops/x:v1", false);
         assert!(!without_skip.contains("skipDependencyResolution: true"));
+    }
+
+    #[test]
+    fn validate_reload_args_rejects_reload_with_version() {
+        let args = ConfigArgs {
+            path: None,
+            repo: Some("hops-ops/helm-certmanager".to_string()),
+            version: Some("v0.1.0".to_string()),
+            reload: true,
+        };
+        assert!(validate_reload_args(&args).is_err());
+    }
+
+    #[test]
+    fn validate_reload_args_accepts_source_reload() {
+        let args = ConfigArgs {
+            path: Some("/tmp/project".to_string()),
+            repo: None,
+            version: None,
+            reload: true,
+        };
+        assert!(validate_reload_args(&args).is_ok());
+    }
+
+    #[test]
+    fn revision_belongs_to_configuration_by_label() {
+        let metadata = RevisionMetadata {
+            name: "cfg-abc".to_string(),
+            owner_references: None,
+            labels: Some(HashMap::from([(
+                "pkg.crossplane.io/package".to_string(),
+                "cfg".to_string(),
+            )])),
+        };
+        assert!(revision_belongs_to_configuration(&metadata, "cfg"));
+        assert!(!revision_belongs_to_configuration(&metadata, "other"));
+    }
+
+    #[test]
+    fn revision_belongs_to_configuration_by_owner_reference() {
+        let metadata = RevisionMetadata {
+            name: "cfg-def".to_string(),
+            owner_references: Some(vec![OwnerReference {
+                kind: Some("Configuration".to_string()),
+                name: Some("cfg".to_string()),
+            }]),
+            labels: None,
+        };
+        assert!(revision_belongs_to_configuration(&metadata, "cfg"));
+        assert!(!revision_belongs_to_configuration(&metadata, "other"));
+    }
+
+    #[test]
+    fn package_source_strips_tag_and_digest() {
+        assert_eq!(
+            package_source("ghcr.io/hops-ops/helm-airflow_render:arm64"),
+            "ghcr.io/hops-ops/helm-airflow_render"
+        );
+        assert_eq!(
+            package_source("ghcr.io/hops-ops/helm-airflow_render@sha256:abc123"),
+            "ghcr.io/hops-ops/helm-airflow_render"
+        );
     }
 }
