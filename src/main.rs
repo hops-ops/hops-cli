@@ -14,6 +14,8 @@ struct Args {
 enum Commands {
     /// Manage the local development environment
     Local(commands::local::LocalArgs),
+    /// Manage Crossplane configuration project helpers
+    Config(commands::config::ConfigArgs),
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -26,6 +28,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     match &args.command {
         Some(Commands::Local(local_args)) => {
             commands::local::run(local_args)?;
+        }
+        Some(Commands::Config(config_args)) => {
+            commands::config::run(config_args)?;
         }
         None => {
             log::info!("No command specified, use --help for usage information");

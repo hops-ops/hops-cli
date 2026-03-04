@@ -71,6 +71,7 @@ cargo build --features vendored
 hops --help
 hops local --help
 hops local kubefwd --help
+hops config --help
 ```
 
 From source without installing:
@@ -78,6 +79,7 @@ From source without installing:
 ```bash
 cargo run -- --help
 cargo run -- local --help
+cargo run -- config --help
 ```
 
 ## Quick Start
@@ -106,6 +108,9 @@ cargo run -- local config --repo hops-ops/helm-certmanager --version v0.1.0
 
 # 8) Remove a configuration and prune orphaned package dependencies
 cargo run -- local unconfig --repo hops-ops/helm-certmanager
+
+# 9) Generate apis/*/configuration.yaml from upbound.yaml for validation
+cargo run -- config generate --path /path/to/project
 ```
 
 ## Commands
@@ -173,6 +178,10 @@ cargo run -- local unconfig --repo hops-ops/helm-certmanager
   - Applies a Secret (`aws-creds`) and AWS `ProviderConfig` (`default`) in namespace `default`
   - `--refresh` updates only the Secret credentials and skips Provider/ProviderConfig apply
   - Supports overrides via `--namespace`, `--secret-name`, `--provider-config-name`, `--provider-name`, and `--provider-package`
+- `config generate [--path <PATH>] [--api-path <APIS_PATH>]`
+  - Reads `<PATH>/upbound.yaml` and writes `<APIS_PATH>/configuration.yaml`
+  - Auto-detects `--api-path` via `apis/*/definition.yaml` when omitted
+  - Ensures `apis/**/configuration.yaml` is present in `<PATH>/.gitignore` (unless `--no-gitignore-update`)
 
 ## Logging
 
