@@ -95,7 +95,7 @@ cargo run -- local aws --profile <aws-profile>
 # 4) Build and load a Crossplane configuration package from an XRD project
 cargo run -- local config --path /path/to/project
 
-# 5) Build from a GitHub repo (clone + build + push to local registry)
+# 5) Build from a GitHub repo (cached clone + build + push to local registry)
 cargo run -- local config --repo hops-ops/helm-certmanager
 
 # 6) Force reload from source (deletes existing ConfigurationRevision(s) first)
@@ -118,7 +118,7 @@ cargo run -- local unconfig --repo hops-ops/helm-certmanager
 - `local start`
   - Runs `colima start --kubernetes --cpu 8 --memory 16 --disk 60`
   - Installs Crossplane from `crossplane-stable/crossplane`
-  - Applies manifests from `bootstrap/` for runtime config, providers, provider configs, and registry
+  - Applies manifests from `bootstrap/` for runtime config, providers, provider configs, and registry (embedded in the binary at build time)
   - Configures Docker in Colima for insecure pulls from `registry.crossplane-system.svc.cluster.local:5000`
   - Adds host mapping in Colima VM for the registry service DNS name
   - Starts `kubefwd services -A --resync-interval 30s` in the background (log: `~/.hops/local/kubefwd.log`)
@@ -143,7 +143,8 @@ cargo run -- local unconfig --repo hops-ops/helm-certmanager
   - Pushes package images to local registry (`localhost:30500`)
   - Applies Crossplane `Configuration` resources pointing at `registry.crossplane-system.svc.cluster.local:5000/...`
 - `local config --repo <org/repo> [--reload]`
-  - Clones `https://github.com/<org>/<repo>` to a temp directory
+  - Uses local repo cache at `~/.hops/local/repo-cache/<org>/<repo>`
+  - Clones on first use, then fetches/pulls on subsequent runs
   - Runs the same build/load/push/apply flow as `--path`
 - `--reload`
   - Forces source-based config (`--path` or `--repo` without `--version`) to delete existing `ConfigurationRevision` resources and matching `Function`/`FunctionRevision` package resources from the same sources, then re-apply the `Configuration`
@@ -159,6 +160,7 @@ cargo run -- local unconfig --repo hops-ops/helm-certmanager
   - Prunes orphaned `ImageConfig` rewrites for removed render functions
 - `local unconfig --repo <org/repo>`
   - Targets configuration name `<org>-<repo>`
+  - If cached repo exists at `~/.hops/local/repo-cache/<org>/<repo>`, derives source hints from it for additional package pruning
 - `local unconfig --path <PATH>`
   - Derives target configuration names from `<PATH>/_output/*.uppkg` image tags
   - Also derives package sources from those artifacts and prunes matching package resources (including Functions) if they remain

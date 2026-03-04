@@ -18,7 +18,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const KUBEFWD_STATE_DIR: &str = ".hops/local";
+const LOCAL_STATE_DIR: &str = ".hops/local";
+const REPO_CACHE_DIR: &str = "repo-cache";
 const KUBEFWD_PID_FILE: &str = "kubefwd.pid";
 const KUBEFWD_LOG_FILE: &str = "kubefwd.log";
 const KUBEFWD_RESYNC_INTERVAL: &str = "30s";
@@ -252,9 +253,17 @@ pub fn stop_kubefwd() -> Result<(), Box<dyn Error>> {
 }
 
 fn kubefwd_state_dir() -> Result<PathBuf, Box<dyn Error>> {
+    local_state_dir()
+}
+
+pub fn repo_cache_path(org: &str, repo: &str) -> Result<PathBuf, Box<dyn Error>> {
+    Ok(local_state_dir()?.join(REPO_CACHE_DIR).join(org).join(repo))
+}
+
+fn local_state_dir() -> Result<PathBuf, Box<dyn Error>> {
     let home = std::env::var("HOME")
-        .map_err(|_| "HOME is not set; unable to determine kubefwd state directory")?;
-    Ok(Path::new(&home).join(KUBEFWD_STATE_DIR))
+        .map_err(|_| "HOME is not set; unable to determine local state directory")?;
+    Ok(Path::new(&home).join(LOCAL_STATE_DIR))
 }
 
 fn command_exists(program: &str) -> bool {

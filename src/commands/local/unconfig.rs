@@ -1,4 +1,4 @@
-use super::{run_cmd, run_cmd_output};
+use super::{repo_cache_path, run_cmd, run_cmd_output};
 use clap::Args;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -100,11 +100,7 @@ pub fn run(args: &UnconfigArgs) -> Result<(), Box<dyn Error>> {
         return Err("no target configurations resolved".into());
     }
 
-    let hinted_sources = if let Some(path) = args.path.as_deref() {
-        resolve_sources_from_path(path)?
-    } else {
-        HashSet::new()
-    };
+    let hinted_sources = resolve_hinted_sources(args)?;
 
     log::info!(
         "Preparing to remove configurations: {}",
@@ -143,7 +139,7 @@ pub fn run(args: &UnconfigArgs) -> Result<(), Box<dyn Error>> {
         hinted_resource_prunes = prune_packages_for_source_hints(&hinted_sources)?;
         if hinted_resource_prunes > 0 {
             log::info!(
-                "Pruned {} package resources matching sources derived from --path artifacts",
+                "Pruned {} package resources matching source hints derived from local artifacts",
                 hinted_resource_prunes
             );
         }
@@ -159,7 +155,7 @@ pub fn run(args: &UnconfigArgs) -> Result<(), Box<dyn Error>> {
     }
 
     log::info!(
-        "Removed configurations; lock-diff orphaned sources: {}, path-source package resources pruned: {}",
+        "Removed configurations; lock-diff orphaned sources: {}, source-hint package resources pruned: {}",
         removed_sources.len(),
         hinted_resource_prunes
     );
@@ -190,6 +186,33 @@ fn resolve_configuration_names(args: &UnconfigArgs) -> Result<Vec<String>, Box<d
     }
 
     Err("pass one of `--name`, `--repo`, or `--path`".into())
+}
+
+fn resolve_hinted_sources(args: &UnconfigArgs) -> Result<HashSet<String>, Box<dyn Error>> {
+    if let Some(path) = args.path.as_deref() {
+        return resolve_sources_from_path(path);
+    }
+
+    if let Some(repo) = args.repo.as_deref() {
+        return resolve_sources_from_cached_repo(repo);
+    }
+
+    Ok(HashSet::new())
+}
+
+fn resolve_sources_from_cached_repo(repo: &str) -> Result<HashSet<String>, Box<dyn Error>> {
+    let spec = parse_repo_spec(repo)?;
+    let cache_path = repo_cache_path(&spec.org, &spec.repo)?;
+    if !cache_path.exists() {
+        log::info!(
+            "No cached repo found at {} for --repo {}; skipping source-hint pruning",
+            cache_path.display(),
+            repo
+        );
+        return Ok(HashSet::new());
+    }
+
+    resolve_sources_from_path(&cache_path.to_string_lossy())
 }
 
 fn delete_configurations(names: &[String]) -> Result<(), Box<dyn Error>> {

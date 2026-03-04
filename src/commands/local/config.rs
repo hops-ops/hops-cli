@@ -1,4 +1,6 @@
-use super::{kubectl_apply_stdin, run_cmd, run_cmd_output, sync_registry_hosts_entry};
+use super::{
+    kubectl_apply_stdin, repo_cache_path, run_cmd, run_cmd_output, sync_registry_hosts_entry,
+};
 use clap::Args;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
@@ -140,21 +142,64 @@ fn validate_reload_args(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
 
 fn run_repo_clone(repo: &str, reload: bool) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
-    let clone_dir = std::env::temp_dir().join(format!(
-        "hops-cli-config-repo-{}-{}-{}",
-        sanitize_name_component(&spec.org),
-        sanitize_name_component(&spec.repo),
-        unique_suffix()
-    ));
-    let clone_path = clone_dir.to_string_lossy().to_string();
+    let cache_path = ensure_cached_repo_checkout(&spec)?;
+    run_local_path(&cache_path.to_string_lossy(), reload)
+}
+
+fn ensure_cached_repo_checkout(spec: &RepoSpec) -> Result<PathBuf, Box<dyn Error>> {
+    let cache_path = repo_cache_path(&spec.org, &spec.repo)?;
     let clone_url = format!("https://github.com/{}/{}", spec.org, spec.repo);
 
-    log::info!("Cloning {}...", clone_url);
-    run_cmd("git", &["clone", &clone_url, &clone_path])?;
+    if cache_path.join(".git").is_dir() {
+        log::info!("Updating cached repo at {}...", cache_path.display());
+        if let Err(err) = refresh_cached_repo(&cache_path) {
+            log::warn!(
+                "Failed to update cached repo at {}: {}. Re-cloning...",
+                cache_path.display(),
+                err
+            );
+            fs::remove_dir_all(&cache_path)?;
+            clone_repo_into_cache(&clone_url, &cache_path)?;
+        }
+        return Ok(cache_path);
+    }
 
-    let result = run_local_path(&clone_path, reload);
-    let _ = fs::remove_dir_all(&clone_dir);
-    result
+    if cache_path.exists() {
+        log::warn!(
+            "Removing non-git cache directory at {} before cloning...",
+            cache_path.display()
+        );
+        fs::remove_dir_all(&cache_path)?;
+    }
+
+    clone_repo_into_cache(&clone_url, &cache_path)?;
+    Ok(cache_path)
+}
+
+fn clone_repo_into_cache(clone_url: &str, cache_path: &Path) -> Result<(), Box<dyn Error>> {
+    let parent = cache_path
+        .parent()
+        .ok_or("repo cache path has no parent directory")?;
+    fs::create_dir_all(parent)?;
+
+    let cache_path_str = cache_path.to_string_lossy().to_string();
+    log::info!(
+        "Cloning {} into local cache at {}...",
+        clone_url,
+        cache_path.display()
+    );
+    run_cmd("git", &["clone", clone_url, &cache_path_str])?;
+    Ok(())
+}
+
+fn refresh_cached_repo(cache_path: &Path) -> Result<(), Box<dyn Error>> {
+    let cache_path_str = cache_path.to_string_lossy().to_string();
+    run_cmd(
+        "git",
+        &["-C", &cache_path_str, "fetch", "--prune", "origin"],
+    )?;
+    run_cmd("git", &["-C", &cache_path_str, "pull", "--ff-only"])?;
+    Ok(())
 }
 
 fn apply_repo_version(repo: &str, version: &str) -> Result<(), Box<dyn Error>> {
