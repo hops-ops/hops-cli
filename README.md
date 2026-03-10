@@ -94,22 +94,25 @@ cargo run -- local start
 # 3) Configure AWS provider-family + ProviderConfig from your AWS profile
 cargo run -- local aws --profile <aws-profile>
 
-# 4) Build and load a Crossplane configuration package from an XRD project
+# 4) Configure GitHub provider + ProviderConfig from your gh auth login
+cargo run -- local github --owner <org-or-user>
+
+# 5) Build and load a Crossplane configuration package from an XRD project
 cargo run -- local config --path /path/to/project
 
-# 5) Build from a GitHub repo (cached clone + build + push to local registry)
+# 6) Build from a GitHub repo (cached clone + build + push to local registry)
 cargo run -- local config --repo hops-ops/helm-certmanager
 
-# 6) Force reload from source (deletes existing ConfigurationRevision(s) first)
+# 7) Force reload from source (deletes existing ConfigurationRevision(s) first)
 cargo run -- local config --repo hops-ops/helm-certmanager --reload
 
-# 7) Apply a pinned remote package version directly (no clone/build)
+# 8) Apply a pinned remote package version directly (no clone/build)
 cargo run -- local config --repo hops-ops/helm-certmanager --version v0.1.0
 
-# 8) Remove a configuration and prune orphaned package dependencies
+# 9) Remove a configuration and prune orphaned package dependencies
 cargo run -- local unconfig --repo hops-ops/helm-certmanager
 
-# 9) Generate apis/*/configuration.yaml from upbound.yaml for validation
+# 10) Generate apis/*/configuration.yaml from upbound.yaml for validation
 cargo run -- config generate --path /path/to/project
 ```
 
@@ -176,6 +179,15 @@ cargo run -- config generate --path /path/to/project
   - Applies `xpkg.crossplane.io/crossplane-contrib/provider-family-aws:v2.4.0`
   - Waits for `providerconfigs.aws.m.upbound.io` CRD to exist
   - Applies a Secret (`aws-creds`) and AWS `ProviderConfig` (`default`) in namespace `default`
+  - `--refresh` updates only the Secret credentials and skips Provider/ProviderConfig apply
+  - Supports overrides via `--namespace`, `--secret-name`, `--provider-config-name`, `--provider-name`, and `--provider-package`
+- `local github [--owner <ORG_OR_USER>]`
+  - Exports your current GitHub CLI token with `gh auth token`
+  - Uses owner resolution order: `--owner` -> `GH_OWNER` -> `GITHUB_OWNER` -> interactive prompt with your authenticated `gh` login as the default
+  - If GitHub CLI is not authenticated, runs `gh auth login` and retries once
+  - Applies `xpkg.crossplane.io/crossplane-contrib/provider-upjet-github:v0.19.0`
+  - Waits for `providerconfigs.github.m.upbound.io` CRD to exist
+  - Applies a Secret (`github-creds`) and GitHub `ProviderConfig` (`default`) in namespace `default`
   - `--refresh` updates only the Secret credentials and skips Provider/ProviderConfig apply
   - Supports overrides via `--namespace`, `--secret-name`, `--provider-config-name`, `--provider-name`, and `--provider-package`
 - `config generate [--path <PATH>] [--api-path <APIS_PATH>]`

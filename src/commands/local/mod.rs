@@ -1,6 +1,7 @@
 mod aws;
 mod config;
 mod destroy;
+mod github;
 mod install;
 mod kubefwd;
 mod reset;
@@ -40,6 +41,8 @@ pub enum LocalCommands {
     Start,
     /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
     Aws(aws::AwsArgs),
+    /// Configure crossplane-contrib provider-upjet-github and GitHub ProviderConfig
+    Github(github::GithubArgs),
     /// Manage background kubefwd forwarding
     Kubefwd(kubefwd::KubefwdArgs),
     /// Stop the local cluster
@@ -60,6 +63,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Reset => reset::run(),
         LocalCommands::Start => start::run(),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
+        LocalCommands::Github(github_args) => github::run(github_args),
         LocalCommands::Kubefwd(kubefwd_args) => kubefwd::run(kubefwd_args),
         LocalCommands::Stop => stop::run(),
         LocalCommands::Destroy => destroy::run(),
