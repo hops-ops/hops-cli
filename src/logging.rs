@@ -24,7 +24,7 @@ pub fn init_logging() -> Result<(), fern::InitError> {
             };
             out.finish(format_args!("{} {}", level, message))
         })
-        .chain(std::io::stdout())
+        .chain(std::io::stderr())
         .apply()?;
     Ok(())
 }
