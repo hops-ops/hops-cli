@@ -106,11 +106,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     //     inside the VM so the kubelet can resolve it.
     sync_registry_hosts_entry("crossplane-system", "registry", REGISTRY_HOSTNAME)?;
 
-    // 13. Start kubefwd in the background for local service access.
-    if let Err(err) = super::kubefwd::start() {
-        log::warn!("kubefwd was not started automatically: {}", err);
-    }
-
     log::info!("Local environment is ready");
     Ok(())
 }

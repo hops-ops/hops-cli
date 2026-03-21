@@ -128,11 +128,8 @@ fn resolve_owner(
     let env_owner = std::env::var("GH_OWNER").ok();
     let env_github_owner = std::env::var("GITHUB_OWNER").ok();
 
-    if let Some(owner) = select_owner(
-        cli_owner,
-        env_owner.as_deref(),
-        env_github_owner.as_deref(),
-    ) {
+    if let Some(owner) = select_owner(cli_owner, env_owner.as_deref(), env_github_owner.as_deref())
+    {
         return Ok(owner);
     }
 
@@ -167,7 +164,10 @@ fn prompt_for_owner(default_owner: Option<&str>) -> Result<String, Box<dyn Error
         );
     }
 
-    let prompt = match default_owner.map(str::trim).filter(|owner| !owner.is_empty()) {
+    let prompt = match default_owner
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
+    {
         Some(default) => format!("GitHub owner is not set. Enter GitHub owner [{default}]: "),
         None => "GitHub owner is not set. Enter GitHub owner: ".to_string(),
     };
@@ -183,7 +183,10 @@ fn prompt_for_owner(default_owner: Option<&str>) -> Result<String, Box<dyn Error
         return Ok(owner.to_string());
     }
 
-    if let Some(default) = default_owner.map(str::trim).filter(|owner| !owner.is_empty()) {
+    if let Some(default) = default_owner
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
+    {
         return Ok(default.to_string());
     }
 
@@ -363,7 +366,9 @@ mod tests {
         assert!(gh_login_required(
             "authentication failed; please run gh auth login"
         ));
-        assert!(!gh_login_required("gh exited with exit status: 1: unknown api endpoint"));
+        assert!(!gh_login_required(
+            "gh exited with exit status: 1: unknown api endpoint"
+        ));
     }
 
     #[test]
