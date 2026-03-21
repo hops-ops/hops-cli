@@ -3,7 +3,6 @@ mod config;
 mod destroy;
 mod github;
 mod install;
-mod kubefwd;
 mod reset;
 mod start;
 mod stop;
@@ -12,18 +11,12 @@ mod uninstall;
 
 use clap::{Args, Subcommand};
 use std::error::Error;
-use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
 
 const LOCAL_STATE_DIR: &str = ".hops/local";
 const REPO_CACHE_DIR: &str = "repo-cache";
-const KUBEFWD_PID_FILE: &str = "kubefwd.pid";
-const KUBEFWD_LOG_FILE: &str = "kubefwd.log";
-const KUBEFWD_RESYNC_INTERVAL: &str = "30s";
 
 #[derive(Args, Debug)]
 pub struct LocalArgs {
@@ -43,8 +36,6 @@ pub enum LocalCommands {
     Aws(aws::AwsArgs),
     /// Configure crossplane-contrib provider-upjet-github and GitHub ProviderConfig
     Github(github::GithubArgs),
-    /// Manage background kubefwd forwarding
-    Kubefwd(kubefwd::KubefwdArgs),
     /// Stop the local cluster
     Stop,
     /// Destroy the local cluster VM
@@ -64,7 +55,6 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Start => start::run(),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Github(github_args) => github::run(github_args),
-        LocalCommands::Kubefwd(kubefwd_args) => kubefwd::run(kubefwd_args),
         LocalCommands::Stop => stop::run(),
         LocalCommands::Destroy => destroy::run(),
         LocalCommands::Uninstall => uninstall::run(),
@@ -101,165 +91,6 @@ pub fn run_cmd_output(program: &str, args: &[&str]) -> Result<String, Box<dyn Er
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Start kubefwd in the background to forward all services in the current cluster.
-pub fn start_kubefwd() -> Result<(), Box<dyn Error>> {
-    if !command_exists("kubefwd") {
-        return Err(
-            "kubefwd is not installed or not in PATH (install it, e.g. `brew install kubefwd`)"
-                .into(),
-        );
-    }
-
-    let state_dir = kubefwd_state_dir()?;
-    fs::create_dir_all(&state_dir)?;
-    let pid_path = state_dir.join(KUBEFWD_PID_FILE);
-    let log_path = state_dir.join(KUBEFWD_LOG_FILE);
-
-    if let Some(pid) = read_pid_file(&pid_path) {
-        if process_is_running(pid) {
-            if process_is_kubefwd(pid) {
-                log::info!(
-                    "kubefwd is already running (pid {}), skipping start (log: {})",
-                    pid,
-                    log_path.display()
-                );
-                return Ok(());
-            }
-
-            log::warn!(
-                "Ignoring stale kubefwd PID file: pid {} is running but is not kubefwd",
-                pid
-            );
-        }
-        let _ = fs::remove_file(&pid_path);
-    }
-
-    // kubefwd typically needs sudo for hosts-file updates and privileged ports.
-    run_cmd("sudo", &["-v"])?;
-
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let log_file_err = log_file.try_clone()?;
-
-    let mut child = Command::new("sudo")
-        .args([
-            "-n",
-            "kubefwd",
-            "services",
-            "-A",
-            "--resync-interval",
-            KUBEFWD_RESYNC_INTERVAL,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_err))
-        .spawn()?;
-
-    let pid = child.id();
-    fs::write(&pid_path, format!("{pid}\n"))?;
-
-    // Fail fast if the process exits immediately (e.g. bad kube context).
-    thread::sleep(Duration::from_millis(500));
-    if let Some(status) = child.try_wait()? {
-        let _ = fs::remove_file(&pid_path);
-        return Err(format!(
-            "kubefwd exited immediately with {} (check {})",
-            status,
-            log_path.display()
-        )
-        .into());
-    }
-
-    log::info!(
-        "kubefwd started in background (pid {}, log: {})",
-        pid,
-        log_path.display()
-    );
-    Ok(())
-}
-
-/// Stop kubefwd previously started by this CLI.
-pub fn stop_kubefwd() -> Result<(), Box<dyn Error>> {
-    let pid_path = kubefwd_state_dir()?.join(KUBEFWD_PID_FILE);
-    if !pid_path.exists() {
-        return Ok(());
-    }
-
-    let pid = match read_pid_file(&pid_path) {
-        Some(pid) => pid,
-        None => {
-            let _ = fs::remove_file(&pid_path);
-            return Ok(());
-        }
-    };
-
-    if !process_is_running(pid) {
-        let _ = fs::remove_file(&pid_path);
-        return Ok(());
-    }
-    if !process_is_kubefwd(pid) {
-        log::warn!(
-            "Refusing to stop pid {} from kubefwd PID file because it is not a kubefwd process",
-            pid
-        );
-        let _ = fs::remove_file(&pid_path);
-        return Ok(());
-    }
-
-    let pid_str = pid.to_string();
-    log::info!("Stopping kubefwd (pid {})...", pid);
-
-    let stopped = Command::new("kill")
-        .arg(&pid_str)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-        || Command::new("sudo")
-            .args(["kill", &pid_str])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-    if !stopped {
-        return Err(format!("failed to stop kubefwd process {}", pid).into());
-    }
-
-    for _ in 0..20 {
-        if !process_is_running(pid) {
-            let _ = fs::remove_file(&pid_path);
-            log::info!("kubefwd stopped");
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-
-    let forced = Command::new("sudo")
-        .args(["kill", "-9", &pid_str])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if !forced || process_is_running(pid) {
-        return Err(format!("kubefwd process {} did not terminate", pid).into());
-    }
-
-    let _ = fs::remove_file(&pid_path);
-    log::info!("kubefwd stopped");
-    Ok(())
-}
-
-fn kubefwd_state_dir() -> Result<PathBuf, Box<dyn Error>> {
-    local_state_dir()
-}
-
 pub fn repo_cache_path(org: &str, repo: &str) -> Result<PathBuf, Box<dyn Error>> {
     Ok(local_state_dir()?.join(REPO_CACHE_DIR).join(org).join(repo))
 }
@@ -276,34 +107,6 @@ fn command_exists(program: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-fn read_pid_file(path: &Path) -> Option<u32> {
-    let contents = fs::read_to_string(path).ok()?;
-    contents.trim().parse::<u32>().ok()
-}
-
-fn process_is_running(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn process_is_kubefwd(pid: u32) -> bool {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output();
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-
-    let cmd = String::from_utf8_lossy(&output.stdout);
-    cmd.contains("kubefwd")
 }
 
 /// Ensure Colima's /etc/hosts maps a service hostname to the current ClusterIP.

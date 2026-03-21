@@ -6,7 +6,7 @@
 
 This tool manages a local Kubernetes stack and package workflow for Crossplane:
 
-- Installs and manages Colima and kubefwd
+- Installs and manages Colima
 - Starts a local k8s cluster with Crossplane installed via Helm
 - Installs the Kubernetes and Helm Crossplane providers
 - Deploys an in-cluster OCI registry (`crossplane-system/registry`)
@@ -48,10 +48,9 @@ See "Releases" for available versions and changenotes.
 - `kubectl`
 - `helm`
 - `up` (Upbound CLI, used by `up project build`)
-- `kubefwd` (used by `local start` / `local kubefwd start` for service forwarding)
 - `aws` CLI v2 (used by `local aws` to export profile credentials)
 
-Note: `hops-cli local install` installs `colima` and `kubefwd` through Homebrew.
+Note: `hops-cli local install` installs `colima` through Homebrew.
 
 ## Build
 
@@ -70,7 +69,6 @@ cargo build --features vendored
 ```bash
 hops --help
 hops local --help
-hops local kubefwd --help
 hops config --help
 ```
 
@@ -85,7 +83,7 @@ cargo run -- config --help
 ## Quick Start
 
 ```bash
-# 1) Install Colima + kubefwd (via Homebrew)
+# 1) Install Colima (via Homebrew)
 cargo run -- local install
 
 # 2) Start local k8s + Crossplane + providers + local registry
@@ -119,9 +117,8 @@ cargo run -- config generate --path /path/to/project
 ## Commands
 
 - `local install`
-  - Runs `brew install colima kubefwd`.
+  - Runs `brew install colima`.
 - `local reset`
-  - Stops the background `kubefwd` process started by `local start`
   - Runs `colima kubernetes reset`.
 - `local start`
   - Runs `colima start --kubernetes --cpu 8 --memory 16 --disk 60`
@@ -129,21 +126,11 @@ cargo run -- config generate --path /path/to/project
   - Applies manifests from `bootstrap/` for runtime config, providers, provider configs, and registry (embedded in the binary at build time)
   - Configures Docker in Colima for insecure pulls from `registry.crossplane-system.svc.cluster.local:5000`
   - Adds host mapping in Colima VM for the registry service DNS name
-  - Starts `kubefwd services -A --resync-interval 30s` in the background (log: `~/.hops/local/kubefwd.log`)
-- `local kubefwd start`
-  - Starts background `kubefwd` forwarding for all namespaces with a forced resync every 30s.
-- `local kubefwd stop`
-  - Stops the background `kubefwd` process managed by this CLI.
-- `local kubefwd refresh`
-  - Restarts background `kubefwd` immediately (stop + start).
 - `local stop`
-  - Stops the background `kubefwd` process started by `local start`
   - Runs `colima stop`.
 - `local destroy`
-  - Stops the background `kubefwd` process started by `local start`
   - Runs `colima delete --force`.
 - `local uninstall`
-  - Stops the background `kubefwd` process started by `local start`
   - Prompts for confirmation, then runs `brew uninstall colima`.
 - `local config [--path <PATH>] [--reload]`
   - Runs `up project build` in `PATH` (defaults to current directory)
