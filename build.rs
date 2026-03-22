@@ -27,12 +27,10 @@ struct ResourceRef {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-    let xrs_root = manifest_dir
-        .parent()
-        .ok_or("cli manifest dir has no parent")?
-        .join("xrs");
+    let xrs_root = xrs_root(&manifest_dir)?;
 
     println!("cargo:rerun-if-changed={}", xrs_root.display());
+    println!("cargo:rerun-if-env-changed=HOPS_XRS_DIR");
 
     let specs = discover_reclaim_specs(&xrs_root)?;
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
@@ -40,6 +38,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(output_path, serde_json::to_vec_pretty(&specs)?)?;
 
     Ok(())
+}
+
+fn xrs_root(manifest_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(path) = env::var_os("HOPS_XRS_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+
+    Ok(manifest_dir.join("xrs"))
 }
 
 fn discover_reclaim_specs(xrs_root: &Path) -> Result<Vec<ReclaimSpec>, Box<dyn Error>> {

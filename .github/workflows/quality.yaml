@@ -29,21 +29,8 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Configure GitHub Auth for Meta
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
-
       - name: Fetch XR Meta Repo
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          cd "$GITHUB_WORKSPACE/.."
-          meta git clone https://github.com/hops-ops/hops.git
-          ln -s "$GITHUB_WORKSPACE/../hops/xrs" "$GITHUB_WORKSPACE/../xrs"
-
-      - name: Link XR Metadata Source
-        run: test -d "$GITHUB_WORKSPACE/../xrs"
+        run: meta git clone https://github.com/hops-ops/hops-xrs.git xrs
 
       - name: Cache Cargo
         uses: actions/cache@v5
