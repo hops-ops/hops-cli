@@ -29,6 +29,11 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Configure GitHub Auth for Meta
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+
       - name: Fetch XR Meta Repo
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
