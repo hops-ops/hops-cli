@@ -109,8 +109,6 @@ struct ReclaimSpec {
     plural: String,
     group: String,
     project_slug: String,
-    import_example_yaml: Option<String>,
-    reclaim_fields: Vec<String>,
     composed_resources: Vec<ResourceRef>,
     live_resolver: Option<String>,
 }
@@ -142,7 +140,7 @@ struct ManagedResourcePatch {
 #[derive(Debug, Clone, Copy)]
 enum ManifestSource {
     Cluster,
-    EmbeddedExample,
+    Generated,
 }
 
 pub fn run(args: &XrArgs) -> Result<(), Box<dyn Error>> {
@@ -158,9 +156,8 @@ fn run_observe(args: &ObserveArgs) -> Result<(), Box<dyn Error>> {
     let spec = match_spec(&specs, &args.kind)?;
 
     let mut manifest = render_manifest(spec, &args.name, &args.namespace)?;
-    sanitize_manifest_defaults(spec, &mut manifest, ManifestSource::EmbeddedExample);
+    sanitize_manifest_defaults(spec, &mut manifest, ManifestSource::Generated);
     let live_notes = apply_live_aws(spec, &mut manifest, &args.name, &args.aws_region)?;
-    clear_reclaim_fields(spec, &mut manifest);
     set_observe_only_management(&mut manifest);
 
     emit_report(
@@ -168,7 +165,7 @@ fn run_observe(args: &ObserveArgs) -> Result<(), Box<dyn Error>> {
         &manifest,
         &live_notes,
         &["generated bootstrap observe-only manifest".to_string()],
-        ManifestSource::EmbeddedExample,
+        ManifestSource::Generated,
         args.output.as_deref(),
         false,
         "observe manifest",
@@ -181,7 +178,6 @@ fn run_manage(args: &ManageXrArgs) -> Result<(), Box<dyn Error>> {
     let (mut manifest, source, cluster_notes) = load_existing_cluster_manifest(spec, &args.name, &args.namespace)?;
     strip_manage_only_fields(&mut manifest);
     let live_notes = apply_observed_cluster(spec, &mut manifest, &args.name, &args.namespace)?;
-    clear_reclaim_fields(spec, &mut manifest);
     prune_empty_maps(&mut manifest);
     set_adopt_management(&mut manifest);
     validate_manage_manifest(spec, &manifest)?;
@@ -299,17 +295,12 @@ fn render_manifest(
     object_name: &str,
     namespace: &str,
 ) -> Result<Value, Box<dyn Error>> {
-    let mut doc = match &spec.import_example_yaml {
-        Some(yaml) => serde_yaml::from_str::<Value>(yaml)?,
-        None => {
-            let mut root = Mapping::new();
-            root.insert(vs("apiVersion"), vs(&spec.api_version));
-            root.insert(vs("kind"), vs(&spec.kind));
-            root.insert(vs("metadata"), Value::Mapping(Mapping::new()));
-            root.insert(vs("spec"), Value::Mapping(Mapping::new()));
-            Value::Mapping(root)
-        }
-    };
+    let mut root = Mapping::new();
+    root.insert(vs("apiVersion"), vs(&spec.api_version));
+    root.insert(vs("kind"), vs(&spec.kind));
+    root.insert(vs("metadata"), Value::Mapping(Mapping::new()));
+    root.insert(vs("spec"), Value::Mapping(Mapping::new()));
+    let mut doc = Value::Mapping(root);
 
     let root = doc
         .as_mapping_mut()
@@ -364,12 +355,6 @@ fn sanitize_manifest_defaults(spec: &ReclaimSpec, manifest: &mut Value, source: 
     }
 }
 
-fn clear_reclaim_fields(spec: &ReclaimSpec, manifest: &mut Value) {
-    for path in &spec.reclaim_fields {
-        remove_path(manifest, path);
-    }
-}
-
 fn prune_empty_maps(value: &mut Value) -> bool {
     match value {
         Value::Mapping(map) => {
@@ -391,43 +376,6 @@ fn prune_empty_maps(value: &mut Value) -> bool {
         }
         _ => false,
     }
-}
-
-fn remove_path(value: &mut Value, path: &str) {
-    let mut parts = path.split('.').collect::<Vec<_>>();
-    remove_path_parts(value, &mut parts);
-}
-
-fn remove_path_parts(value: &mut Value, parts: &mut Vec<&str>) {
-    if parts.is_empty() {
-        return;
-    }
-    let key = parts.remove(0);
-
-    if let Some(array_key) = key.strip_suffix("[]") {
-        if let Some(next) = get_child_mut(value, array_key).and_then(Value::as_sequence_mut) {
-            for item in next {
-                let mut remaining = parts.clone();
-                remove_path_parts(item, &mut remaining);
-            }
-        }
-        return;
-    }
-
-    if parts.is_empty() {
-        if let Some(map) = value.as_mapping_mut() {
-            map.remove(vs(key));
-        }
-        return;
-    }
-
-    if let Some(child) = get_child_mut(value, key) {
-        remove_path_parts(child, parts);
-    }
-}
-
-fn get_child_mut<'a>(value: &'a mut Value, key: &str) -> Option<&'a mut Value> {
-    value.as_mapping_mut()?.get_mut(vs(key))
 }
 
 fn set_observe_only_management(manifest: &mut Value) {
@@ -1527,7 +1475,7 @@ fn log_report(report: &ReclaimReport, live_aws: bool) {
         "base source: {}",
         match report.source {
             ManifestSource::Cluster => "cluster XR",
-            ManifestSource::EmbeddedExample => "embedded reclaim scaffold",
+            ManifestSource::Generated => "generated reclaim scaffold",
         }
     );
 
@@ -1537,24 +1485,10 @@ fn log_report(report: &ReclaimReport, live_aws: bool) {
         log::debug!("live resolver: none");
     }
 
-    match &report.spec.import_example_yaml {
-        Some(_) => log::debug!("import example: embedded"),
-        None => log::debug!("import example: none embedded"),
-    }
-
     if !report.cluster_notes.is_empty() {
         log::debug!("cluster discovery:");
         for note in &report.cluster_notes {
             log::debug!("- {note}");
-        }
-    }
-
-    if report.spec.reclaim_fields.is_empty() {
-        log::debug!("reclaim fields: none discovered");
-    } else {
-        log::debug!("reclaim fields:");
-        for field in &report.spec.reclaim_fields {
-            log::debug!("- {field}");
         }
     }
 
@@ -1605,36 +1539,37 @@ fn vs(value: &str) -> Value {
 mod tests {
     use super::*;
 
-    #[test]
-    fn embedded_metadata_contains_network() {
-        let specs = load_specs().expect("embedded specs");
-        let spec = match_spec(&specs, "network").expect("network spec");
-        assert_eq!(spec.kind, "Network");
-        assert_eq!(spec.live_resolver.as_deref(), Some("aws-network-by-tag"));
-        assert!(spec.reclaim_fields.contains(&"spec.vpc.externalName".to_string()));
+    fn test_spec(kind: &str) -> ReclaimSpec {
+        ReclaimSpec {
+            api_version: "aws.hops.ops.com.ai/v1alpha1".to_string(),
+            kind: kind.to_string(),
+            plural: kind.to_ascii_lowercase(),
+            group: "aws.hops.ops.com.ai".to_string(),
+            project_slug: "test-project".to_string(),
+            composed_resources: Vec::new(),
+            live_resolver: None,
+        }
     }
 
     #[test]
-    fn render_manifest_uses_embedded_example() {
-        let specs = load_specs().expect("embedded specs");
-        let spec = match_spec(&specs, "actions-connector").expect("actions connector spec");
-        let manifest = render_manifest(spec, "imported", "hops").expect("manifest");
+    fn render_manifest_builds_basic_scaffold() {
+        let spec = test_spec("ActionsConnector");
+        let manifest = render_manifest(&spec, "imported", "hops").expect("manifest");
         let yaml = serde_yaml::to_string(&manifest).expect("yaml");
         assert!(yaml.contains("kind: ActionsConnector"));
         assert!(yaml.contains("name: imported"));
         assert!(yaml.contains("namespace: hops"));
+        assert!(yaml.contains("spec: {}"));
     }
 
     #[test]
-    fn sanitize_autoekscluster_removes_example_provider_values() {
-        let specs = load_specs().expect("embedded specs");
-        let spec = match_spec(&specs, "autoekscluster").expect("autoeks spec");
-        let mut manifest = render_manifest(spec, "pat-local", "default").expect("manifest");
-        sanitize_manifest_defaults(spec, &mut manifest, ManifestSource::EmbeddedExample);
+    fn sanitize_autoekscluster_sets_default_provider_config() {
+        let spec = test_spec("AutoEKSCluster");
+        let mut manifest = render_manifest(&spec, "pat-local", "default").expect("manifest");
+        sanitize_manifest_defaults(&spec, &mut manifest, ManifestSource::Generated);
         let yaml = serde_yaml::to_string(&manifest).expect("yaml");
         assert!(yaml.contains("name: default"));
-        assert!(!yaml.contains("aws-production"));
-        assert!(!yaml.contains("environment: production"));
+        assert!(yaml.contains("kind: ProviderConfig"));
     }
 
     #[test]
@@ -1669,7 +1604,15 @@ status:
 
     #[test]
     fn match_spec_normalizes_hyphenated_names() {
-        let specs = load_specs().expect("embedded specs");
+        let specs = vec![ReclaimSpec {
+            api_version: "aws.hops.ops.com.ai/v1alpha1".to_string(),
+            kind: "AutoEKSCluster".to_string(),
+            plural: "autoeksclusters".to_string(),
+            group: "aws.hops.ops.com.ai".to_string(),
+            project_slug: "auto-eks-cluster".to_string(),
+            composed_resources: Vec::new(),
+            live_resolver: Some("aws-autoekscluster".to_string()),
+        }];
         let spec = match_spec(&specs, "autoekscluster").expect("auto eks cluster spec");
         assert_eq!(spec.kind, "AutoEKSCluster");
         assert_eq!(spec.live_resolver.as_deref(), Some("aws-autoekscluster"));

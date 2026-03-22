@@ -13,8 +13,6 @@ struct ReclaimSpec {
     plural: String,
     group: String,
     project_slug: String,
-    import_example_yaml: Option<String>,
-    reclaim_fields: Vec<String>,
     composed_resources: Vec<ResourceRef>,
     live_resolver: Option<String>,
 }
@@ -96,8 +94,6 @@ fn discover_reclaim_specs(xrs_root: &Path) -> Result<Vec<ReclaimSpec>, Box<dyn E
             plural,
             group,
             project_slug: project_slug.clone(),
-            import_example_yaml: find_import_example_yaml(project_root, &kind)?,
-            reclaim_fields: collect_reclaim_fields(&value),
             composed_resources: collect_composed_resources(project_root, &kind)?,
             live_resolver: live_resolver_for(&project_slug, &kind),
         });
@@ -107,87 +103,6 @@ fn discover_reclaim_specs(xrs_root: &Path) -> Result<Vec<ReclaimSpec>, Box<dyn E
 
     specs.sort_by(|a, b| a.kind.cmp(&b.kind));
     Ok(specs)
-}
-
-fn find_import_example_yaml(project_root: &Path, kind: &str) -> Result<Option<String>, Box<dyn Error>> {
-    let examples_root = project_root.join("examples");
-    if !examples_root.is_dir() {
-        return Ok(None);
-    }
-
-    let mut matches = Vec::new();
-    visit_dirs(&examples_root, &mut |path| {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            return Ok(());
-        };
-        if !name.contains("import") || path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
-            return Ok(());
-        }
-        let value = load_yaml(path)?;
-        if yaml_kind_matches(&value, kind) {
-            matches.push(fs::read_to_string(path)?);
-        }
-        Ok(())
-    })?;
-
-    matches.sort();
-    Ok(matches.into_iter().next())
-}
-
-fn collect_reclaim_fields(definition: &Value) -> Vec<String> {
-    let mut fields = BTreeSet::new();
-    let Some(root) = definition.as_mapping() else {
-        return Vec::new();
-    };
-    let Some(spec) = get_mapping(root, "spec") else {
-        return Vec::new();
-    };
-    let schema = spec
-        .get(vs("versions"))
-        .and_then(Value::as_sequence)
-        .and_then(|versions| versions.first())
-        .and_then(Value::as_mapping)
-        .and_then(|version| get_mapping(version, "schema"))
-        .and_then(|schema| get_mapping(schema, "openAPIV3Schema"));
-
-    if let Some(schema) = schema {
-        walk_schema(schema, "", &mut fields);
-    }
-
-    fields.into_iter().collect()
-}
-
-fn walk_schema(schema: &Mapping, path: &str, fields: &mut BTreeSet<String>) {
-    if let Some(properties) = schema.get(vs("properties")).and_then(Value::as_mapping) {
-        for (key, value) in properties {
-            let Some(key) = key.as_str() else {
-                continue;
-            };
-            let next = if path.is_empty() {
-                key.to_string()
-            } else {
-                format!("{path}.{key}")
-            };
-            if matches!(
-                key,
-                "externalName" | "externalNames" | "associationExternalNames" | "eipExternalNames" | "cidrExternalName"
-            ) {
-                fields.insert(next.clone());
-            }
-            if let Some(mapping) = value.as_mapping() {
-                walk_schema(mapping, &next, fields);
-            }
-        }
-    }
-
-    if let Some(items) = schema.get(vs("items")).and_then(Value::as_mapping) {
-        let next = if path.is_empty() {
-            "[]".to_string()
-        } else {
-            format!("{path}[]")
-        };
-        walk_schema(items, &next, fields);
-    }
 }
 
 fn collect_composed_resources(project_root: &Path, xr_kind: &str) -> Result<Vec<ResourceRef>, Box<dyn Error>> {
@@ -246,15 +161,6 @@ fn parse_resource_refs(content: &str) -> Vec<ResourceRef> {
 
 fn is_literal_yaml_scalar(value: &str) -> bool {
     !value.is_empty() && !value.contains("{{") && !value.contains("{%") && !value.contains('$')
-}
-
-fn yaml_kind_matches(value: &Value, kind: &str) -> bool {
-    value
-        .as_mapping()
-        .and_then(|m| m.get(vs("kind")))
-        .and_then(Value::as_str)
-        .map(|value| value == kind)
-        .unwrap_or(false)
 }
 
 fn live_resolver_for(project_slug: &str, kind: &str) -> Option<String> {
