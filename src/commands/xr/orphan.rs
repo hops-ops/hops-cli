@@ -1,9 +1,7 @@
-use crate::commands::local::kubectl_apply_stdin;
-use crate::commands::xr::helpers::discovery::{
-    load_existing_cluster_manifest, render_managed_resource_patches,
-};
+use crate::commands::local::kubectl_patch_merge;
+use crate::commands::xr::helpers::discovery::load_existing_cluster_manifest;
 use crate::commands::xr::helpers::manifest::{load_specs, match_spec, vs};
-use crate::commands::xr::helpers::types::{ManagedResourcePatch, OrphanArgs};
+use crate::commands::xr::helpers::types::OrphanArgs;
 use serde_yaml::Value;
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -18,32 +16,29 @@ pub(crate) fn run(args: &OrphanArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
 
-    let patches = vec![ManagedResourcePatch {
-        api_version: spec.api_version.clone(),
-        kind: spec.kind.clone(),
-        namespace: args.namespace.clone(),
-        name: args.name.clone(),
-        external_name: None,
-        management_policies: Some(management_policies),
-    }];
-
-    let patch_yaml = render_managed_resource_patches(&patches)?;
+    let patch_json = serde_json::json!({
+        "spec": {
+            "managementPolicies": management_policies
+        }
+    });
+    let patch_json = serde_json::to_string_pretty(&patch_json)?;
+    let resource = format!("{}.{}", spec.plural, spec.group);
 
     if let Some(output) = &args.output {
-        fs::write(output, &patch_yaml)?;
-        log::info!("XR orphaning patch written to {output}");
+        fs::write(output, &patch_json)?;
+        log::info!("XR orphaning merge patch written to {output}");
     }
 
     if args.apply {
-        kubectl_apply_stdin(&patch_yaml)?;
-        log::info!("applied XR orphaning patch to the cluster");
+        kubectl_patch_merge(&resource, &args.name, &args.namespace, &patch_json)?;
+        log::info!("applied XR orphaning merge patch to the cluster");
     } else if args.output.is_none() {
-        print!("{patch_yaml}");
+        println!("{patch_json}");
     }
 
     if !args.apply {
         log::debug!(
-            "rendered XR orphaning patch; pipe the output to kubectl apply if you want to apply it"
+            "rendered XR orphaning merge patch; apply it with kubectl patch --type merge -p"
         );
     }
 

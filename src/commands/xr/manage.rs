@@ -1,10 +1,8 @@
-use crate::commands::local::kubectl_apply_stdin;
-use crate::commands::xr::helpers::discovery::{
-    load_existing_cluster_manifest, render_managed_resource_patches,
-};
+use crate::commands::local::kubectl_patch_merge;
+use crate::commands::xr::helpers::discovery::load_existing_cluster_manifest;
 use crate::commands::xr::helpers::manifest::load_specs;
 use crate::commands::xr::helpers::manifest::match_spec;
-use crate::commands::xr::helpers::types::{ManageXrArgs, ManagedResourcePatch};
+use crate::commands::xr::helpers::types::ManageXrArgs;
 use serde_yaml::Value;
 use std::error::Error;
 use std::fs;
@@ -19,31 +17,28 @@ pub(crate) fn run(args: &ManageXrArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let patch_yaml = render_managed_resource_patches(&[ManagedResourcePatch {
-        api_version: spec.api_version.clone(),
-        kind: spec.kind.clone(),
-        namespace: args.namespace.clone(),
-        name: args.name.clone(),
-        external_name: None,
-        management_policies: Some(vec!["*".to_string()]),
-    }])?;
+    let patch_json = serde_json::json!({
+        "spec": {
+            "managementPolicies": ["*"]
+        }
+    });
+    let patch_json = serde_json::to_string_pretty(&patch_json)?;
+    let resource = format!("{}.{}", spec.plural, spec.group);
 
     if let Some(output) = &args.output {
-        fs::write(output, &patch_yaml)?;
-        log::info!("managed XR patch written to {output}");
+        fs::write(output, &patch_json)?;
+        log::info!("managed XR merge patch written to {output}");
     }
 
     if args.apply {
-        kubectl_apply_stdin(&patch_yaml)?;
-        log::info!("applied managed XR patch to the cluster");
+        kubectl_patch_merge(&resource, &args.name, &args.namespace, &patch_json)?;
+        log::info!("applied managed XR merge patch to the cluster");
     } else if args.output.is_none() {
-        print!("{patch_yaml}");
+        println!("{patch_json}");
     }
 
     if !args.apply {
-        log::debug!(
-            "rendered managed XR patch; pipe the output to kubectl apply if you want to apply it"
-        );
+        log::debug!("rendered managed XR merge patch; apply it with kubectl patch --type merge -p");
     }
 
     Ok(())

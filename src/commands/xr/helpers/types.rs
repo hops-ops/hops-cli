@@ -14,8 +14,6 @@ pub struct XrArgs {
 pub enum XrCommand {
     /// Generate an observe-only XR manifest for an existing resource
     Observe(ObserveArgs),
-    /// Reconcile additional non-identity XR spec fields from live backing systems
-    Reconcile(ReconcileArgs),
     /// Generate the final managed XR manifest from an observed/adopted XR
     Manage(ManageXrArgs),
     /// Patch an observe XR with import identities so it can attach to existing resources
@@ -64,33 +62,6 @@ pub struct ManageXrArgs {
     /// Namespace of the existing XR
     #[arg(long, default_value = "default")]
     pub namespace: String,
-
-    /// Also write the resulting object to a file
-    #[arg(long)]
-    pub output: Option<String>,
-
-    /// Apply the generated manifest to the cluster
-    #[arg(long)]
-    pub apply: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct ReconcileArgs {
-    /// XR kind, plural, or project slug (for example: Network, networks, network)
-    #[arg(long)]
-    pub kind: String,
-
-    /// Kubernetes object name and AWS lookup selector
-    #[arg(long)]
-    pub name: String,
-
-    /// Namespace of the existing XR
-    #[arg(long, default_value = "default")]
-    pub namespace: String,
-
-    /// AWS region used for live AWS discovery
-    #[arg(long)]
-    pub aws_region: String,
 
     /// Also write the resulting object to a file
     #[arg(long)]

@@ -196,3 +196,18 @@ pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+/// Apply a JSON merge patch with `kubectl patch --type merge`.
+pub fn kubectl_patch_merge(
+    resource: &str,
+    name: &str,
+    namespace: &str,
+    patch_json: &str,
+) -> Result<(), Box<dyn Error>> {
+    run_cmd(
+        "kubectl",
+        &[
+            "patch", resource, name, "-n", namespace, "--type", "merge", "-p", patch_json,
+        ],
+    )
+}
