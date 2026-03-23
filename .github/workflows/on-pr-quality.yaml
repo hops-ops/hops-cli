@@ -7,5 +7,6 @@ on:
 
 jobs:
   quality:
-    uses: ./.github/workflows/quality.yaml
-    secrets: inherit
+    uses: unbounded-tech/workflows-rust/.github/workflows/quality.yaml@v2.2.2
+    with:
+      cargo_incremental: true

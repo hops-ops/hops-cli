@@ -2,60 +2,14 @@ name: On Version Tagged, Build and Publish Rust Binaries
 on:
   push:
     tags:
-      - "v*.*.*"
+    - "v*.*.*"
 
 permissions:
   contents: write
 
 jobs:
   build-and-release:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Create GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.GH_APP_ID }}
-          private-key: ${{ secrets.GH_APP_KEY }}
-          owner: hops-ops
-
-      - name: Checkout CLI
-        uses: actions/checkout@v6
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-
-      - name: Setup mise
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Fetch XR Meta Repo
-        run: meta git clone https://github.com/hops-ops/hops-xrs.git xrs
-
-      - name: Cache Cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build Release Binary
-        run: cargo build --release --features vendored --verbose
-
-      - name: Package Release Artifact
-        run: |
-          mkdir -p dist
-          cp "target/release/${{ github.event.repository.name }}" "dist/${{ github.event.repository.name }}-linux-amd64"
-
-      - name: Publish GitHub Release Assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/${{ github.event.repository.name }}-linux-amd64
+    uses: unbounded-tech/workflows-rust/.github/workflows/release.yaml@v2.2.2
+    with:
+      binary_name: ${{ github.event.repository.name }}
+      build_args: "--release --features vendored"
