@@ -1,7 +1,6 @@
 use crate::commands::local::kubectl_patch_merge;
 use crate::commands::xr::helpers::discovery::load_existing_cluster_manifest;
-use crate::commands::xr::helpers::manifest::load_specs;
-use crate::commands::xr::helpers::manifest::match_spec;
+use crate::commands::xr::helpers::manifest::{load_specs, match_spec, vs};
 use crate::commands::xr::helpers::types::ManageXrArgs;
 use serde_yaml::Value;
 use std::error::Error;
@@ -47,9 +46,9 @@ pub(crate) fn run(args: &ManageXrArgs) -> Result<(), Box<dyn Error>> {
 fn xr_is_fully_managed(manifest: &Value) -> bool {
     manifest
         .as_mapping()
-        .and_then(|root| root.get(Value::String("spec".to_string())))
+        .and_then(|root| root.get(vs("spec")))
         .and_then(Value::as_mapping)
-        .and_then(|spec| spec.get(Value::String("managementPolicies".to_string())))
+        .and_then(|spec| spec.get(vs("managementPolicies")))
         .and_then(Value::as_sequence)
         .map(|policies| {
             policies

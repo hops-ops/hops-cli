@@ -230,62 +230,6 @@ fn is_observe_only(item: &JsonValue) -> bool {
     values == ["LateInitialize", "Observe"]
 }
 
-#[cfg(test)]
-pub(crate) fn orphan_management_policies(item: &JsonValue) -> Option<Vec<String>> {
-    let current =
-        get_json_path(item, &["spec", "managementPolicies"]).and_then(JsonValue::as_array);
-
-    let mut policies = match current {
-        Some(values) => {
-            let items = values
-                .iter()
-                .filter_map(JsonValue::as_str)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-
-            if items.iter().any(|value| value == "*") {
-                vec![
-                    "Create".to_string(),
-                    "Observe".to_string(),
-                    "Update".to_string(),
-                    "LateInitialize".to_string(),
-                ]
-            } else {
-                items
-                    .into_iter()
-                    .filter(|value| value != "Delete")
-                    .collect::<Vec<_>>()
-            }
-        }
-        None => vec![
-            "Create".to_string(),
-            "Observe".to_string(),
-            "Update".to_string(),
-            "LateInitialize".to_string(),
-        ],
-    };
-
-    policies.sort_unstable();
-    policies.dedup();
-
-    let current_normalized = current.map(|values| {
-        let mut items = values
-            .iter()
-            .filter_map(JsonValue::as_str)
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        items.sort_unstable();
-        items.dedup();
-        items
-    });
-
-    if current_normalized.as_ref() == Some(&policies) {
-        None
-    } else {
-        Some(policies)
-    }
-}
-
 fn get_json_path<'a>(value: &'a JsonValue, path: &[&str]) -> Option<&'a JsonValue> {
     let mut current = value;
     for segment in path {

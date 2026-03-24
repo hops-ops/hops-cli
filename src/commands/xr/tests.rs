@@ -1,12 +1,10 @@
-use super::helpers::discovery::{
-    has_tag, orphan_management_policies, role_name_from_arn, tag_value,
-};
+use super::helpers::discovery::{has_tag, role_name_from_arn, tag_value};
 use super::helpers::manifest::{
     match_spec, render_manifest, sanitize_manifest_defaults, strip_external_name_fields,
     strip_runtime_k8s_fields,
 };
 use super::helpers::types::{ManifestSource, ReclaimSpec, NETWORK_TAG_KEY};
-use super::orphan::orphan_xr_management_policies;
+use super::orphan::{canonical_orphan_management_policies, orphan_xr_management_policies};
 use serde_json::Value as JsonValue;
 use serde_yaml::Value;
 
@@ -130,35 +128,44 @@ fn parses_role_name_from_arn() {
 
 #[test]
 fn orphan_management_policies_replaces_wildcard_without_delete() {
-    let item: JsonValue =
-        serde_json::from_str(r#"{"spec":{"managementPolicies":["*"]}}"#).expect("json");
-
     assert_eq!(
-        orphan_management_policies(&item),
-        Some(vec![
+        canonical_orphan_management_policies(Some(vec!["*".to_string()])),
+        vec![
             "Create".to_string(),
             "LateInitialize".to_string(),
             "Observe".to_string(),
             "Update".to_string(),
-        ])
+        ]
     );
 }
 
 #[test]
 fn orphan_management_policies_removes_delete_and_skips_when_already_orphaned() {
-    let item: JsonValue =
-        serde_json::from_str(r#"{"spec":{"managementPolicies":["Create","Delete","Observe"]}}"#)
-            .expect("json");
     assert_eq!(
-        orphan_management_policies(&item),
-        Some(vec!["Create".to_string(), "Observe".to_string(),])
+        canonical_orphan_management_policies(Some(vec![
+            "Create".to_string(),
+            "Delete".to_string(),
+            "Observe".to_string(),
+        ])),
+        vec!["Create".to_string(), "Observe".to_string(),]
     );
 
-    let already: JsonValue = serde_json::from_str(
-        r#"{"spec":{"managementPolicies":["Create","Observe","Update","LateInitialize"]}}"#,
+    let manifest: Value = serde_yaml::from_str(
+        r#"
+apiVersion: aws.hops.ops.com.ai/v1alpha1
+kind: AutoEKSCluster
+metadata:
+  name: pat-local
+spec:
+  managementPolicies:
+    - Create
+    - Observe
+    - Update
+    - LateInitialize
+"#,
     )
-    .expect("json");
-    assert_eq!(orphan_management_policies(&already), None);
+    .expect("yaml");
+    assert_eq!(orphan_xr_management_policies(&manifest), None);
 }
 
 #[test]
@@ -180,9 +187,9 @@ spec:
         orphan_xr_management_policies(&manifest),
         Some(vec![
             "Create".to_string(),
+            "LateInitialize".to_string(),
             "Observe".to_string(),
             "Update".to_string(),
-            "LateInitialize".to_string(),
         ])
     );
 }

@@ -8,8 +8,9 @@ use crate::commands::xr::helpers::types::{ManifestSource, ObserveArgs, ReclaimSp
 use serde_json::Value as JsonValue;
 use serde_yaml::Value;
 use std::error::Error;
-use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 
 pub(crate) fn run(args: &ObserveArgs) -> Result<(), Box<dyn Error>> {
     let specs = load_specs()?;
@@ -68,14 +69,15 @@ fn observe_autoekscluster_workload_state(
     }
 
     let kubeconfig = generate_eks_kubeconfig(xr_name, aws_region)?;
+    let kubeconfig_path = kubeconfig.to_string_lossy().to_string();
     let result = observe_autoekscluster_from_cluster(
         manifest,
         xr_name,
-        &kubeconfig,
+        &kubeconfig_path,
         wants_nodeclass,
         wants_nodepool,
     );
-    let _ = fs::remove_file(&kubeconfig);
+    fs::remove_file(&kubeconfig)?;
     result
 }
 
@@ -86,18 +88,18 @@ fn observe_autoekscluster_from_cluster(
     wants_nodeclass: bool,
     wants_nodepool: bool,
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    let nodeclasses = kubectl_json(
-        kubeconfig,
-        &["get", "nodeclasses.eks.amazonaws.com", "-o", "json"],
-    )?;
     let nodeclass = if wants_nodeclass {
+        let nodeclasses = kubectl_json(
+            kubeconfig,
+            &["get", "nodeclasses.eks.amazonaws.com", "-o", "json"],
+        )?;
         select_nodeclass(&nodeclasses, "AutoEKSCluster", xr_name)?
     } else {
         None
     };
 
-    let nodepools = kubectl_json(kubeconfig, &["get", "nodepools.karpenter.sh", "-o", "json"])?;
     let nodepool = if wants_nodepool {
+        let nodepools = kubectl_json(kubeconfig, &["get", "nodepools.karpenter.sh", "-o", "json"])?;
         select_nodepool(&nodepools, nodeclass.as_ref().and_then(json_name))?
     } else {
         None
@@ -194,7 +196,10 @@ fn has_composed_resource(spec: &ReclaimSpec, api_version: &str, kind: &str) -> b
         .any(|resource| resource.api_version == api_version && resource.kind == kind)
 }
 
-fn generate_eks_kubeconfig(cluster_name: &str, aws_region: &str) -> Result<String, Box<dyn Error>> {
+fn generate_eks_kubeconfig(
+    cluster_name: &str,
+    aws_region: &str,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
     let kubeconfig = run_cmd_output(
         "aws",
         &[
@@ -208,11 +213,28 @@ fn generate_eks_kubeconfig(cluster_name: &str, aws_region: &str) -> Result<Strin
         ],
     )?;
 
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let path =
-        std::env::temp_dir().join(format!("hops-xr-observe-{cluster_name}-{nonce}.kubeconfig"));
-    fs::write(&path, kubeconfig)?;
-    Ok(path.to_string_lossy().to_string())
+    let mut attempt = 0u32;
+    loop {
+        let path = std::env::temp_dir().join(format!(
+            "hops-xr-observe-{cluster_name}-{}-{attempt}.kubeconfig",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(kubeconfig.as_bytes())?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 fn kubectl_json(kubeconfig: &str, args: &[&str]) -> Result<JsonValue, Box<dyn Error>> {
@@ -305,7 +327,7 @@ fn select_nodepool(
     match matching.len() {
         1 => Ok(Some(matching[0].clone())),
         0 => {
-            if items.len() == 1 {
+            if nodeclass_name.is_none() && items.len() == 1 {
                 Ok(Some(items[0].clone()))
             } else {
                 Ok(None)
@@ -459,5 +481,17 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("target")
         );
+    }
+
+    #[test]
+    fn select_nodepool_does_not_fall_back_when_requested_nodeclass_is_missing() {
+        let root = json!({
+            "items": [
+                {"metadata":{"name":"only"},"spec":{"template":{"spec":{"nodeClassRef":{"name":"other"}}}}}
+            ]
+        });
+
+        let selected = select_nodepool(&root, Some("nodeclass-a")).expect("select");
+        assert!(selected.is_none());
     }
 }

@@ -12,7 +12,7 @@ pub(crate) fn enrich_spec_with_runtime_discovery(spec: &ReclaimSpec) -> ReclaimS
     match discover_composed_resources(spec) {
         Ok(resources) => enriched.composed_resources = resources,
         Err(err) => {
-            log::debug!(
+            log::warn!(
                 "failed to discover composed resources for {} {}: {}",
                 spec.api_version,
                 spec.kind,

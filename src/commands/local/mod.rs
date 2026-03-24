@@ -65,18 +65,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
 
 /// Run an external command with inherited stdio. Fails on non-zero exit.
 pub fn run_cmd(program: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
-    log::debug!("Running: {} {}", program, args.join(" "));
-    let status = Command::new(program)
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
-
-    if !status.success() {
-        return Err(format!("{} exited with {}", program, status).into());
-    }
-    Ok(())
+    run_cmd_with_logged_args(program, args, args)
 }
 
 /// Run an external command and capture stdout.
@@ -89,6 +78,25 @@ pub fn run_cmd_output(program: &str, args: &[&str]) -> Result<String, Box<dyn Er
         return Err(format!("{} exited with {}: {}", program, output.status, stderr).into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn run_cmd_with_logged_args(
+    program: &str,
+    args: &[&str],
+    logged_args: &[&str],
+) -> Result<(), Box<dyn Error>> {
+    log::debug!("Running: {} {}", program, logged_args.join(" "));
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("{} exited with {}", program, status).into());
+    }
+    Ok(())
 }
 
 pub fn repo_cache_path(org: &str, repo: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -204,10 +212,19 @@ pub fn kubectl_patch_merge(
     namespace: &str,
     patch_json: &str,
 ) -> Result<(), Box<dyn Error>> {
-    run_cmd(
-        "kubectl",
-        &[
-            "patch", resource, name, "-n", namespace, "--type", "merge", "-p", patch_json,
-        ],
-    )
+    let args = [
+        "patch", resource, name, "-n", namespace, "--type", "merge", "-p", patch_json,
+    ];
+    let logged_args = [
+        "patch",
+        resource,
+        name,
+        "-n",
+        namespace,
+        "--type",
+        "merge",
+        "-p",
+        "<REDACTED>",
+    ];
+    run_cmd_with_logged_args("kubectl", &args, &logged_args)
 }

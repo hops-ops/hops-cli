@@ -43,8 +43,6 @@ pub(crate) fn render_manifest(
     namespace: &str,
 ) -> Result<Value, Box<dyn Error>> {
     let mut root = Mapping::new();
-    root.insert(vs("apiVersion"), vs(&spec.api_version));
-    root.insert(vs("kind"), vs(&spec.kind));
     root.insert(vs("metadata"), Value::Mapping(Mapping::new()));
     root.insert(vs("spec"), Value::Mapping(Mapping::new()));
     let mut doc = Value::Mapping(root);

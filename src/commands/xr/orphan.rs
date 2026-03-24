@@ -3,7 +3,6 @@ use crate::commands::xr::helpers::discovery::load_existing_cluster_manifest;
 use crate::commands::xr::helpers::manifest::{load_specs, match_spec, vs};
 use crate::commands::xr::helpers::types::OrphanArgs;
 use serde_yaml::Value;
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
 
@@ -53,38 +52,13 @@ pub(crate) fn orphan_xr_management_policies(manifest: &Value) -> Option<Vec<Stri
         .and_then(|spec| spec.get(vs("managementPolicies")))
         .and_then(Value::as_sequence);
 
-    let mut policies = match current {
-        Some(values) => {
-            let items = values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-
-            if items.iter().any(|value| value == "*") {
-                vec![
-                    "Create".to_string(),
-                    "Observe".to_string(),
-                    "Update".to_string(),
-                    "LateInitialize".to_string(),
-                ]
-            } else {
-                items
-                    .into_iter()
-                    .filter(|value| value != "Delete")
-                    .collect::<Vec<_>>()
-            }
-        }
-        None => vec![
-            "Create".to_string(),
-            "Observe".to_string(),
-            "Update".to_string(),
-            "LateInitialize".to_string(),
-        ],
-    };
-
-    let mut deduped = BTreeSet::new();
-    policies.retain(|policy| deduped.insert(policy.clone()));
+    let policies = canonical_orphan_management_policies(current.map(|values| {
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    }));
 
     let current_normalized = current.map(|values| {
         let mut items = values
@@ -97,12 +71,34 @@ pub(crate) fn orphan_xr_management_policies(manifest: &Value) -> Option<Vec<Stri
         items
     });
 
-    let mut normalized_policies = policies.clone();
-    normalized_policies.sort_unstable();
-
-    if current_normalized.as_ref() == Some(&normalized_policies) {
+    if current_normalized.as_ref() == Some(&policies) {
         None
     } else {
         Some(policies)
     }
+}
+
+pub(crate) fn canonical_orphan_management_policies(current: Option<Vec<String>>) -> Vec<String> {
+    let mut policies = match current {
+        Some(values) if values.iter().any(|value| value == "*") => vec![
+            "Create".to_string(),
+            "Observe".to_string(),
+            "Update".to_string(),
+            "LateInitialize".to_string(),
+        ],
+        Some(values) => values
+            .into_iter()
+            .filter(|value| value != "Delete")
+            .collect::<Vec<_>>(),
+        None => vec![
+            "Create".to_string(),
+            "Observe".to_string(),
+            "Update".to_string(),
+            "LateInitialize".to_string(),
+        ],
+    };
+
+    policies.sort_unstable();
+    policies.dedup();
+    policies
 }
