@@ -147,7 +147,7 @@ pub(crate) struct ReclaimReport {
 pub(crate) struct ManagedResourcePatch {
     pub api_version: String,
     pub kind: String,
-    pub namespace: String,
+    pub namespace: Option<String>,
     pub name: String,
     pub external_name: Option<String>,
     pub management_policies: Option<Vec<String>>,

@@ -77,8 +77,20 @@ fn observe_autoekscluster_workload_state(
         wants_nodeclass,
         wants_nodepool,
     );
-    fs::remove_file(&kubeconfig)?;
-    result
+    match fs::remove_file(&kubeconfig) {
+        Ok(()) => result,
+        Err(err) => match result {
+            Ok(_) => Err(err.into()),
+            Err(observe_err) => {
+                log::warn!(
+                    "failed to remove temporary kubeconfig {}: {}",
+                    kubeconfig_path,
+                    err
+                );
+                Err(observe_err)
+            }
+        },
+    }
 }
 
 fn observe_autoekscluster_from_cluster(

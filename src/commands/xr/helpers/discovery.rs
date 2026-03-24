@@ -64,7 +64,11 @@ pub(crate) fn render_managed_resource_patches(
     for patch in patches {
         let mut metadata = Mapping::new();
         metadata.insert(vs("name"), vs(&patch.name));
-        metadata.insert(vs("namespace"), vs(&patch.namespace));
+        if let Some(namespace) = &patch.namespace {
+            if !namespace.is_empty() {
+                metadata.insert(vs("namespace"), vs(namespace));
+            }
+        }
 
         let mut root = Mapping::new();
         root.insert(vs("apiVersion"), vs(&patch.api_version));
@@ -145,7 +149,7 @@ fn build_autoekscluster_adoption_patches(
             .get("metadata")
             .and_then(|m| m.get("namespace"))
             .and_then(JsonValue::as_str)
-            .unwrap_or("default");
+            .map(ToString::to_string);
         let api_version = item
             .get("apiVersion")
             .and_then(JsonValue::as_str)
@@ -154,7 +158,7 @@ fn build_autoekscluster_adoption_patches(
         let mut patch = ManagedResourcePatch {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
-            namespace: namespace.to_string(),
+            namespace,
             name: name.to_string(),
             external_name: None,
             management_policies: None,
