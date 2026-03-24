@@ -16,6 +16,8 @@ enum Commands {
     Local(commands::local::LocalArgs),
     /// Manage Crossplane configuration project helpers
     Config(commands::config::ConfigArgs),
+    /// Manage live XR observe/manage/adopt workflows
+    Xr(commands::xr::XrArgs),
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -31,6 +33,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(Commands::Config(config_args)) => {
             commands::config::run(config_args)?;
+        }
+        Some(Commands::Xr(xr_args)) => {
+            commands::xr::run(xr_args)?;
         }
         None => {
             log::info!("No command specified, use --help for usage information");

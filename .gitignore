@@ -22,3 +22,4 @@ Cargo.lock  # Optional: include this if you’re building a binary, exclude for 
 Thumbs.db
 
 .cache/
+xrs/
