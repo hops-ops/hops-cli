@@ -1,4 +1,5 @@
-mod generate_configuration;
+mod install;
+mod uninstall;
 
 use clap::{Args, Subcommand};
 use std::error::Error;
@@ -11,12 +12,15 @@ pub struct ConfigArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommands {
-    /// Generate api metadata configuration.yaml from upbound.yaml
-    Generate(generate_configuration::GenerateArgs),
+    /// Build and load a Crossplane configuration into the local cluster
+    Install(install::ConfigArgs),
+    /// Remove a Crossplane configuration and prune orphaned package dependencies
+    Uninstall(uninstall::UnconfigArgs),
 }
 
 pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
     match &args.command {
-        ConfigCommands::Generate(generate_args) => generate_configuration::run(generate_args),
+        ConfigCommands::Install(install_args) => install::run(install_args),
+        ConfigCommands::Uninstall(uninstall_args) => uninstall::run(uninstall_args),
     }
 }

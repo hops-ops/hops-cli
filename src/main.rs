@@ -14,8 +14,10 @@ struct Args {
 enum Commands {
     /// Manage the local development environment
     Local(commands::local::LocalArgs),
-    /// Manage Crossplane configuration project helpers
+    /// Manage Crossplane configuration packages in the connected cluster
     Config(commands::config::ConfigArgs),
+    /// Manage validation helpers for Crossplane projects
+    Validate(commands::validate::ValidateArgs),
     /// Manage live XR observe/manage/adopt workflows
     Xr(commands::xr::XrArgs),
 }
@@ -33,6 +35,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(Commands::Config(config_args)) => {
             commands::config::run(config_args)?;
+        }
+        Some(Commands::Validate(validate_args)) => {
+            commands::validate::run(validate_args)?;
         }
         Some(Commands::Xr(xr_args)) => {
             commands::xr::run(xr_args)?;
