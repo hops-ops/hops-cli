@@ -93,6 +93,10 @@ pub struct AdoptArgs {
     /// Apply the generated patches to the cluster
     #[arg(long)]
     pub apply: bool,
+
+    /// Re-run adoption after applying until no new managed-resource patches are needed
+    #[arg(long)]
+    pub recursive: bool,
 }
 
 #[derive(Args, Debug)]

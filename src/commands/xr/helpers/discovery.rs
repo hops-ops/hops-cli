@@ -123,7 +123,7 @@ fn build_autoekscluster_adoption_patches(
             "managed",
             "-A",
             "-l",
-            &format!("crossplane.io/composite={xr_name}"),
+            &format!("hops.ops.com.ai/autoekscluster={xr_name}"),
             "-o",
             "json",
         ],
@@ -164,34 +164,7 @@ fn build_autoekscluster_adoption_patches(
             management_policies: None,
         };
 
-        if external_name_annotation(item).is_none() && kind == "RolePolicyAttachment" {
-            let role = get_json_path(item, &["spec", "forProvider", "role"])
-                .and_then(JsonValue::as_str)
-                .or_else(|| {
-                    get_json_path(item, &["spec", "forProvider", "roleRef", "name"])
-                        .and_then(JsonValue::as_str)
-                })
-                .ok_or("RolePolicyAttachment missing role identity")?;
-            let policy_arn = get_json_path(item, &["spec", "forProvider", "policyArn"])
-                .and_then(JsonValue::as_str)
-                .ok_or("RolePolicyAttachment missing policyArn")?;
-            patch.external_name = Some(format!("{role}/{policy_arn}"));
-        }
-
-        if kind == "Object"
-            && matches!(
-                composition_resource_name(item),
-                Some("k8s-provider-config") | Some("helm-provider-config")
-            )
-            && is_observe_only(item)
-        {
-            patch.management_policies = Some(vec![
-                "Create".to_string(),
-                "Observe".to_string(),
-                "Update".to_string(),
-                "LateInitialize".to_string(),
-            ]);
-        }
+        populate_autoekscluster_adoption_patch(item, &mut patch)?;
 
         if patch.external_name.is_some() || patch.management_policies.is_some() {
             patches.push(patch);
@@ -199,6 +172,50 @@ fn build_autoekscluster_adoption_patches(
     }
 
     Ok(patches)
+}
+
+fn populate_autoekscluster_adoption_patch(
+    item: &JsonValue,
+    patch: &mut ManagedResourcePatch,
+) -> Result<(), Box<dyn Error>> {
+    if external_name_annotation(item).is_none() {
+        match patch.kind.as_str() {
+            "RolePolicyAttachment" => {
+                let role = get_json_path(item, &["spec", "forProvider", "role"])
+                    .and_then(JsonValue::as_str)
+                    .or_else(|| {
+                        get_json_path(item, &["spec", "forProvider", "roleRef", "name"])
+                            .and_then(JsonValue::as_str)
+                    })
+                    .ok_or("RolePolicyAttachment missing role identity")?;
+                let policy_arn = get_json_path(item, &["spec", "forProvider", "policyArn"])
+                    .and_then(JsonValue::as_str)
+                    .ok_or("RolePolicyAttachment missing policyArn")?;
+                patch.external_name = Some(format!("{role}/{policy_arn}"));
+            }
+            "Key" => {
+                patch.external_name = kms_key_external_name(item)?;
+            }
+            _ => {}
+        }
+    }
+
+    if patch.kind == "Object"
+        && matches!(
+            composition_resource_name(item),
+            Some("k8s-provider-config") | Some("helm-provider-config")
+        )
+        && is_observe_only(item)
+    {
+        patch.management_policies = Some(vec![
+            "Create".to_string(),
+            "Observe".to_string(),
+            "Update".to_string(),
+            "LateInitialize".to_string(),
+        ]);
+    }
+
+    Ok(())
 }
 
 fn composition_resource_name<'a>(item: &'a JsonValue) -> Option<&'a str> {
@@ -217,6 +234,56 @@ fn external_name_annotation<'a>(item: &'a JsonValue) -> Option<&'a str> {
         .and_then(|m| m.get("annotations"))
         .and_then(|ann| ann.get("crossplane.io/external-name"))
         .and_then(JsonValue::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+pub(crate) fn kms_key_external_name(item: &JsonValue) -> Result<Option<String>, Box<dyn Error>> {
+    if let Some(key_id) = get_json_path(item, &["status", "atProvider", "keyId"])
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(Some(key_id.to_string()));
+    }
+
+    if let Some(key_id) = get_json_path(item, &["status", "atProvider", "arn"])
+        .and_then(JsonValue::as_str)
+        .and_then(kms_key_id_from_arn)
+    {
+        return Ok(Some(key_id));
+    }
+
+    let Some(name) = get_json_path(item, &["metadata", "name"]).and_then(JsonValue::as_str) else {
+        return Ok(None);
+    };
+    let Some(region) = get_json_path(item, &["spec", "forProvider", "region"])
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    match aws_json(&[
+        "kms",
+        "describe-key",
+        "--key-id",
+        &format!("alias/{name}"),
+        "--region",
+        region,
+    ]) {
+        Ok(value) => Ok(value
+            .get("KeyMetadata")
+            .and_then(|metadata| metadata.get("KeyId"))
+            .and_then(JsonValue::as_str)
+            .map(ToString::to_string)),
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("NotFoundException") || msg.contains("NotFound") {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 fn is_observe_only(item: &JsonValue) -> bool {

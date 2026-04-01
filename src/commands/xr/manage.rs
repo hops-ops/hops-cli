@@ -1,6 +1,9 @@
 use crate::commands::local::kubectl_patch_merge;
 use crate::commands::xr::helpers::discovery::load_existing_cluster_manifest;
-use crate::commands::xr::helpers::manifest::{load_specs, match_spec, vs};
+use crate::commands::xr::helpers::manifest::{
+    ensure_mapping, load_specs, match_spec, prune_manifest_to_crd_spec, sanitize_authored_manifest,
+    vs,
+};
 use crate::commands::xr::helpers::types::ManageXrArgs;
 use serde_yaml::Value;
 use std::error::Error;
@@ -9,7 +12,7 @@ use std::fs;
 pub(crate) fn run(args: &ManageXrArgs) -> Result<(), Box<dyn Error>> {
     let specs = load_specs()?;
     let spec = match_spec(&specs, &args.kind)?;
-    let (manifest, _, _) = load_existing_cluster_manifest(&spec, &args.name, &args.namespace)?;
+    let (mut manifest, _, _) = load_existing_cluster_manifest(&spec, &args.name, &args.namespace)?;
 
     if xr_is_fully_managed(&manifest) {
         log::info!("XR already has full top-level managementPolicies");
@@ -23,23 +26,39 @@ pub(crate) fn run(args: &ManageXrArgs) -> Result<(), Box<dyn Error>> {
     });
     let patch_json = serde_json::to_string_pretty(&patch_json)?;
     let resource = format!("{}.{}", spec.plural, spec.group);
+    set_management_policies(&mut manifest, vec![vs("*")])?;
+    sanitize_authored_manifest(&mut manifest);
+    prune_manifest_to_crd_spec(&spec, &mut manifest)?;
+    let rendered_manifest = serde_yaml::to_string(&manifest)?;
 
     if let Some(output) = &args.output {
-        fs::write(output, &patch_json)?;
-        log::info!("managed XR merge patch written to {output}");
+        fs::write(output, &rendered_manifest)?;
+        log::info!("managed XR manifest written to {output}");
     }
 
     if args.apply {
         kubectl_patch_merge(&resource, &args.name, &args.namespace, &patch_json)?;
         log::info!("applied managed XR merge patch to the cluster");
     } else if args.output.is_none() {
-        println!("{patch_json}");
+        print!("{rendered_manifest}");
     }
 
     if !args.apply {
         log::debug!("rendered managed XR merge patch; apply it with kubectl patch --type merge -p");
     }
 
+    Ok(())
+}
+
+fn set_management_policies(
+    manifest: &mut Value,
+    policies: Vec<Value>,
+) -> Result<(), Box<dyn Error>> {
+    let root = manifest
+        .as_mapping_mut()
+        .ok_or("manifest root must be a mapping")?;
+    let spec = ensure_mapping(root, "spec");
+    spec.insert(vs("managementPolicies"), Value::Sequence(policies));
     Ok(())
 }
 

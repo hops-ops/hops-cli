@@ -1,10 +1,11 @@
-use super::helpers::discovery::{has_tag, role_name_from_arn, tag_value};
+use super::helpers::discovery::{has_tag, kms_key_external_name, role_name_from_arn, tag_value};
 use super::helpers::manifest::{
-    match_spec, render_manifest, sanitize_manifest_defaults, strip_external_name_fields,
-    strip_runtime_k8s_fields,
+    match_spec, prune_value_to_openapi_schema, render_manifest, sanitize_authored_manifest,
+    sanitize_manifest_defaults, strip_external_name_fields, strip_runtime_k8s_fields,
 };
-use super::helpers::types::{ManifestSource, ReclaimSpec, NETWORK_TAG_KEY};
+use super::helpers::types::{AdoptArgs, ManifestSource, ReclaimSpec, NETWORK_TAG_KEY};
 use super::orphan::{canonical_orphan_management_policies, orphan_xr_management_policies};
+use clap::Parser;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value;
 
@@ -59,6 +60,79 @@ status:
     let yaml = serde_yaml::to_string(&manifest).expect("yaml");
     assert!(!yaml.contains("resourceVersion"));
     assert!(!yaml.contains("status:"));
+}
+
+#[test]
+fn sanitize_authored_manifest_removes_runtime_crossplane_fields() {
+    let mut manifest: Value = serde_yaml::from_str(
+        r#"
+apiVersion: aws.hops.ops.com.ai/v1alpha1
+kind: AutoEKSCluster
+metadata:
+  name: pat-local
+  namespace: default
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: "{}"
+  finalizers:
+    - composite.apiextensions.crossplane.io
+  labels:
+    crossplane.io/composite: pat-local
+spec:
+  crossplane:
+    resourceRefs:
+      - name: managed-a
+  managementPolicies:
+    - "*"
+"#,
+    )
+    .expect("yaml");
+
+    sanitize_authored_manifest(&mut manifest);
+    let yaml = serde_yaml::to_string(&manifest).expect("yaml");
+    assert!(!yaml.contains("last-applied-configuration"));
+    assert!(!yaml.contains("finalizers:"));
+    assert!(!yaml.contains("crossplane.io/composite"));
+    assert!(!yaml.contains("resourceRefs"));
+}
+
+#[test]
+fn prune_value_to_openapi_schema_removes_undefined_fields() {
+    let mut value: Value = serde_yaml::from_str(
+        r#"
+accountId: "123"
+crossplane:
+  resourceRefs:
+    - name: managed-a
+nodeConfig:
+  enabled: true
+  extraField: nope
+"#,
+    )
+    .expect("yaml");
+    let schema: JsonValue = serde_json::from_str(
+        r#"
+{
+  "type": "object",
+  "properties": {
+    "accountId": { "type": "string" },
+    "nodeConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    }
+  }
+}
+"#,
+    )
+    .expect("json");
+
+    prune_value_to_openapi_schema(&mut value, &schema);
+    let yaml = serde_yaml::to_string(&value).expect("yaml");
+    assert!(yaml.contains("accountId: '123'"));
+    assert!(yaml.contains("enabled: true"));
+    assert!(!yaml.contains("crossplane:"));
+    assert!(!yaml.contains("extraField"));
 }
 
 #[test]
@@ -192,4 +266,74 @@ spec:
             "Update".to_string(),
         ])
     );
+}
+
+#[test]
+fn kms_key_external_name_prefers_key_id() {
+    let item: JsonValue = serde_json::from_str(
+        r#"
+{
+  "status": {
+    "atProvider": {
+      "keyId": "2f7bebfa-cdc1-436f-8fe7-2256fd73b794",
+      "arn": "arn:aws:kms:us-east-2:123456789012:key/ignored"
+    }
+  }
+}
+"#,
+    )
+    .expect("json");
+
+    assert_eq!(
+        kms_key_external_name(&item)
+            .expect("kms key external name")
+            .as_deref(),
+        Some("2f7bebfa-cdc1-436f-8fe7-2256fd73b794")
+    );
+}
+
+#[test]
+fn kms_key_external_name_falls_back_to_arn() {
+    let item: JsonValue = serde_json::from_str(
+        r#"
+{
+  "status": {
+    "atProvider": {
+      "arn": "arn:aws:kms:us-east-2:123456789012:key/2f7bebfa-cdc1-436f-8fe7-2256fd73b794"
+    }
+  }
+}
+"#,
+    )
+    .expect("json");
+
+    assert_eq!(
+        kms_key_external_name(&item)
+            .expect("kms key external name")
+            .as_deref(),
+        Some("2f7bebfa-cdc1-436f-8fe7-2256fd73b794")
+    );
+}
+
+#[test]
+fn adopt_args_accept_recursive_flag() {
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        adopt: AdoptArgs,
+    }
+
+    let cli = Cli::try_parse_from([
+        "test",
+        "--kind",
+        "AutoEKSCluster",
+        "--name",
+        "pat-local",
+        "--recursive",
+        "--apply",
+    ])
+    .expect("parse");
+
+    assert!(cli.adopt.recursive);
+    assert!(cli.adopt.apply);
 }

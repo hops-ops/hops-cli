@@ -106,6 +106,133 @@ pub(crate) fn strip_runtime_k8s_fields(value: &mut Value) {
     metadata.remove(vs("uid"));
 }
 
+pub(crate) fn sanitize_authored_manifest(value: &mut Value) {
+    strip_runtime_k8s_fields(value);
+
+    let Some(root) = value.as_mapping_mut() else {
+        return;
+    };
+
+    let metadata = ensure_mapping(root, "metadata");
+    metadata.remove(vs("finalizers"));
+    metadata.remove(vs("ownerReferences"));
+
+    if let Some(annotations) = metadata
+        .get_mut(vs("annotations"))
+        .and_then(Value::as_mapping_mut)
+    {
+        annotations.remove(vs("kubectl.kubernetes.io/last-applied-configuration"));
+        if annotations.is_empty() {
+            metadata.remove(vs("annotations"));
+        }
+    }
+
+    if let Some(labels) = metadata
+        .get_mut(vs("labels"))
+        .and_then(Value::as_mapping_mut)
+    {
+        labels.remove(vs("crossplane.io/composite"));
+        if labels.is_empty() {
+            metadata.remove(vs("labels"));
+        }
+    }
+
+    let spec = ensure_mapping(root, "spec");
+    spec.remove(vs("crossplane"));
+}
+
+pub(crate) fn prune_manifest_to_crd_spec(
+    spec: &ReclaimSpec,
+    manifest: &mut Value,
+) -> Result<(), Box<dyn Error>> {
+    let crd_name = format!("{}.{}", spec.plural, spec.group);
+    let crd_json = run_cmd_output("kubectl", &["get", "crd", &crd_name, "-o", "json"])?;
+    let root: JsonValue = serde_json::from_str(&crd_json)?;
+    let version_name = spec.api_version.split('/').nth(1).unwrap_or_default();
+
+    let schema = root
+        .get("spec")
+        .and_then(|spec| spec.get("versions"))
+        .and_then(JsonValue::as_array)
+        .and_then(|versions| {
+            versions
+                .iter()
+                .find(|version| {
+                    version.get("name").and_then(JsonValue::as_str) == Some(version_name)
+                })
+                .or_else(|| versions.first())
+        })
+        .and_then(|version| version.get("schema"))
+        .and_then(|schema| schema.get("openAPIV3Schema"))
+        .and_then(|schema| schema.get("properties"))
+        .and_then(|properties| properties.get("spec"))
+        .ok_or_else(|| format!("CRD schema for {} is missing spec properties", crd_name))?;
+
+    let Some(root) = manifest.as_mapping_mut() else {
+        return Ok(());
+    };
+    if let Some(spec_value) = root.get_mut(vs("spec")) {
+        prune_value_to_openapi_schema(spec_value, schema);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn prune_value_to_openapi_schema(value: &mut Value, schema: &JsonValue) {
+    if schema
+        .get("x-kubernetes-preserve-unknown-fields")
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+    {
+        return;
+    }
+
+    match value {
+        Value::Mapping(map) => {
+            let properties = schema.get("properties").and_then(JsonValue::as_object);
+            let additional = schema.get("additionalProperties");
+            let keys = map.keys().cloned().collect::<Vec<_>>();
+
+            for key in keys {
+                let Some(key_name) = key.as_str() else {
+                    map.remove(&key);
+                    continue;
+                };
+
+                if let Some(child_schema) = properties.and_then(|props| props.get(key_name)) {
+                    if let Some(child) = map.get_mut(&key) {
+                        prune_value_to_openapi_schema(child, child_schema);
+                    }
+                    continue;
+                }
+
+                match additional {
+                    Some(JsonValue::Bool(true)) => {}
+                    Some(JsonValue::Object(_)) => {
+                        if let Some(child) = map.get_mut(&key) {
+                            prune_value_to_openapi_schema(
+                                child,
+                                additional.expect("matched above"),
+                            );
+                        }
+                    }
+                    _ => {
+                        map.remove(&key);
+                    }
+                }
+            }
+        }
+        Value::Sequence(items) => {
+            if let Some(item_schema) = schema.get("items") {
+                for item in items {
+                    prune_value_to_openapi_schema(item, item_schema);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn strip_external_name_fields(value: &mut Value) {
     match value {
         Value::Mapping(map) => {
