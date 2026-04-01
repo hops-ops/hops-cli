@@ -1,4 +1,4 @@
-use super::{
+use crate::commands::local::{
     kubectl_apply_stdin, repo_cache_path, run_cmd, run_cmd_output, sync_registry_hosts_entry,
 };
 use clap::Args;
