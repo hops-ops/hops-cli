@@ -41,6 +41,10 @@ pub struct ConfigArgs {
     /// Force reload from source by recreating ConfigurationRevision(s) before apply (path/repo only)
     #[arg(long, conflicts_with = "version")]
     pub reload: bool,
+
+    /// Set spec.skipDependencyResolution=true on the generated Configuration
+    #[arg(long)]
+    pub skip_dependency_resolution: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -127,9 +131,15 @@ pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
     validate_reload_args(args)?;
 
     match (args.repo.as_deref(), args.version.as_deref()) {
-        (Some(repo), Some(version)) => apply_repo_version(repo, version),
-        (Some(repo), None) => run_repo_clone(repo, args.reload),
-        (None, _) => run_local_path(args.path.as_deref().unwrap_or("."), args.reload),
+        (Some(repo), Some(version)) => {
+            apply_repo_version(repo, version, args.skip_dependency_resolution)
+        }
+        (Some(repo), None) => run_repo_clone(repo, args.reload, args.skip_dependency_resolution),
+        (None, _) => run_local_path(
+            args.path.as_deref().unwrap_or("."),
+            args.reload,
+            args.skip_dependency_resolution,
+        ),
     }
 }
 
@@ -140,10 +150,18 @@ fn validate_reload_args(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_repo_clone(repo: &str, reload: bool) -> Result<(), Box<dyn Error>> {
+fn run_repo_clone(
+    repo: &str,
+    reload: bool,
+    skip_dependency_resolution: bool,
+) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
     let cache_path = ensure_cached_repo_checkout(&spec)?;
-    run_local_path(&cache_path.to_string_lossy(), reload)
+    run_local_path(
+        &cache_path.to_string_lossy(),
+        reload,
+        skip_dependency_resolution,
+    )
 }
 
 fn ensure_cached_repo_checkout(spec: &RepoSpec) -> Result<PathBuf, Box<dyn Error>> {
@@ -202,7 +220,11 @@ fn refresh_cached_repo(cache_path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn apply_repo_version(repo: &str, version: &str) -> Result<(), Box<dyn Error>> {
+fn apply_repo_version(
+    repo: &str,
+    version: &str,
+    skip_dependency_resolution: bool,
+) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
     let version = version.trim();
     if version.is_empty() {
@@ -215,7 +237,12 @@ fn apply_repo_version(repo: &str, version: &str) -> Result<(), Box<dyn Error>> {
         sanitize_name_component(&spec.org),
         sanitize_name_component(&spec.repo)
     );
-    apply_configuration(&config_name, &package_ref, false, false)
+    apply_configuration(
+        &config_name,
+        &package_ref,
+        skip_dependency_resolution,
+        false,
+    )
 }
 
 fn parse_repo_spec(repo: &str) -> Result<RepoSpec, Box<dyn Error>> {
@@ -261,7 +288,11 @@ fn sanitize_name_component(input: &str) -> String {
     }
 }
 
-fn run_local_path(path: &str, reload: bool) -> Result<(), Box<dyn Error>> {
+fn run_local_path(
+    path: &str,
+    reload: bool,
+    skip_dependency_resolution: bool,
+) -> Result<(), Box<dyn Error>> {
     let dir = Path::new(path);
     if !dir.is_dir() {
         return Err(format!("{} is not a directory", path).into());
@@ -452,7 +483,7 @@ spec:
     for pull_ref in &config_pull_refs {
         let (img_path, _) = split_ref(pull_ref);
         let name = img_path.rsplit('/').next().unwrap_or(img_path);
-        apply_configuration(name, pull_ref, false, reload)?;
+        apply_configuration(name, pull_ref, skip_dependency_resolution, reload)?;
     }
 
     Ok(())
@@ -1121,6 +1152,7 @@ spec:
             repo: Some("hops-ops/helm-certmanager".to_string()),
             version: Some("v0.1.0".to_string()),
             reload: true,
+            skip_dependency_resolution: false,
         };
         assert!(validate_reload_args(&args).is_err());
     }
@@ -1132,6 +1164,7 @@ spec:
             repo: None,
             version: None,
             reload: true,
+            skip_dependency_resolution: false,
         };
         assert!(validate_reload_args(&args).is_ok());
     }
