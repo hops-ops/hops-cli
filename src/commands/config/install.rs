@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Read, Write};
+use std::io::{self, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -127,6 +127,18 @@ struct PackageResource {
     spec: Option<PackageSpec>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RepoInstallTarget {
+    SourceBuild,
+    PublishedVersion(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepoInstallChoice {
+    SourceBuild,
+    PublishedVersion,
+}
+
 pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
     validate_reload_args(args)?;
 
@@ -134,7 +146,7 @@ pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
         (Some(repo), Some(version)) => {
             apply_repo_version(repo, version, args.skip_dependency_resolution)
         }
-        (Some(repo), None) => run_repo_clone(repo, args.reload, args.skip_dependency_resolution),
+        (Some(repo), None) => run_repo_install(repo, args.reload, args.skip_dependency_resolution),
         (None, _) => run_local_path(
             args.path.as_deref().unwrap_or("."),
             args.reload,
@@ -150,17 +162,178 @@ fn validate_reload_args(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_repo_clone(
+fn run_repo_install(
     repo: &str,
     reload: bool,
     skip_dependency_resolution: bool,
 ) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
+    match resolve_repo_install_target(&spec, reload)? {
+        RepoInstallTarget::SourceBuild => run_repo_clone(&spec, reload, skip_dependency_resolution),
+        RepoInstallTarget::PublishedVersion(version) => {
+            apply_repo_version_spec(&spec, &version, skip_dependency_resolution)
+        }
+    }
+}
+
+fn run_repo_clone(
+    spec: &RepoSpec,
+    reload: bool,
+    skip_dependency_resolution: bool,
+) -> Result<(), Box<dyn Error>> {
     let cache_path = ensure_cached_repo_checkout(&spec)?;
     run_local_path(
         &cache_path.to_string_lossy(),
         reload,
         skip_dependency_resolution,
+    )
+}
+
+fn resolve_repo_install_target(
+    spec: &RepoSpec,
+    reload: bool,
+) -> Result<RepoInstallTarget, Box<dyn Error>> {
+    if reload || !interactive_stdio_available() {
+        return Ok(RepoInstallTarget::SourceBuild);
+    }
+
+    match prompt_for_repo_install_choice(spec)? {
+        RepoInstallChoice::SourceBuild => Ok(RepoInstallTarget::SourceBuild),
+        RepoInstallChoice::PublishedVersion => {
+            let suggested = latest_published_version(spec).ok().flatten();
+            let version = prompt_for_published_version(spec, suggested.as_deref())?;
+            Ok(RepoInstallTarget::PublishedVersion(version))
+        }
+    }
+}
+
+fn interactive_stdio_available() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn prompt_for_repo_install_choice(spec: &RepoSpec) -> Result<RepoInstallChoice, Box<dyn Error>> {
+    let repo_slug = format!("{}/{}", spec.org, spec.repo);
+
+    loop {
+        print!("Install {repo_slug} from source or use a published version? [published/source]: ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        match parse_repo_install_choice(&input) {
+            Ok(choice) => return Ok(choice),
+            Err(message) => {
+                eprintln!("{message}");
+            }
+        }
+    }
+}
+
+fn prompt_for_published_version(
+    spec: &RepoSpec,
+    default_version: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
+    let repo_slug = format!("{}/{}", spec.org, spec.repo);
+
+    loop {
+        let prompt = match default_version {
+            Some(default) => format!(
+                "Enter published version/tag for {repo_slug} [{default}] (for example `pr-<gitsha>`): "
+            ),
+            None => format!(
+                "Enter published version/tag for {repo_slug} (for example `v0.11.0` or `pr-<gitsha>`): "
+            ),
+        };
+        print!("{prompt}");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        match resolve_published_version_input(&input, default_version) {
+            Some(version) => return Ok(version),
+            None => {
+                eprintln!(
+                    "Published version cannot be empty. Enter a tag like `v0.11.0` or `pr-<gitsha>`."
+                );
+            }
+        }
+    }
+}
+
+fn parse_repo_install_choice(input: &str) -> Result<RepoInstallChoice, String> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" | "published" | "publish" | "published version" | "version" | "release" | "p" => {
+            Ok(RepoInstallChoice::PublishedVersion)
+        }
+        "source" | "build" | "clone" | "source build" | "s" => Ok(RepoInstallChoice::SourceBuild),
+        _ => Err("Enter `published` or `source`.".to_string()),
+    }
+}
+
+fn resolve_published_version_input(input: &str, default_version: Option<&str>) -> Option<String> {
+    let trimmed = input.trim();
+    if !trimmed.is_empty() {
+        return Some(trimmed.to_string());
+    }
+
+    default_version
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)
+}
+
+fn latest_published_version(spec: &RepoSpec) -> Result<Option<String>, Box<dyn Error>> {
+    let repo_url = format!("https://github.com/{}/{}", spec.org, spec.repo);
+    let output = run_cmd_output(
+        "git",
+        &[
+            "ls-remote",
+            "--sort=-version:refname",
+            "--refs",
+            "--tags",
+            &repo_url,
+        ],
+    )?;
+
+    for line in output.lines() {
+        let Some((_, ref_name)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(tag) = ref_name.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        let version = tag.trim();
+        if !version.is_empty() {
+            return Ok(Some(version.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn apply_repo_version_spec(
+    spec: &RepoSpec,
+    version: &str,
+    skip_dependency_resolution: bool,
+) -> Result<(), Box<dyn Error>> {
+    let version = version.trim();
+    if version.is_empty() {
+        return Err("`--version` cannot be empty".into());
+    }
+
+    let package_ref = format!("ghcr.io/{}/{}:{}", spec.org, spec.repo, version);
+    let config_name = format!(
+        "{}-{}",
+        sanitize_name_component(&spec.org),
+        sanitize_name_component(&spec.repo)
+    );
+    apply_configuration(
+        &config_name,
+        &package_ref,
+        skip_dependency_resolution,
+        false,
     )
 }
 
@@ -226,23 +399,7 @@ fn apply_repo_version(
     skip_dependency_resolution: bool,
 ) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
-    let version = version.trim();
-    if version.is_empty() {
-        return Err("`--version` cannot be empty".into());
-    }
-
-    let package_ref = format!("ghcr.io/{}/{}:{}", spec.org, spec.repo, version);
-    let config_name = format!(
-        "{}-{}",
-        sanitize_name_component(&spec.org),
-        sanitize_name_component(&spec.repo)
-    );
-    apply_configuration(
-        &config_name,
-        &package_ref,
-        skip_dependency_resolution,
-        false,
-    )
+    apply_repo_version_spec(&spec, version, skip_dependency_resolution)
 }
 
 fn parse_repo_spec(repo: &str) -> Result<RepoSpec, Box<dyn Error>> {
@@ -1124,6 +1281,52 @@ spec:
         assert!(parse_repo_spec("").is_err());
         assert!(parse_repo_spec("hops-ops").is_err());
         assert!(parse_repo_spec("hops-ops/helm-certmanager/extra").is_err());
+    }
+
+    #[test]
+    fn parse_repo_install_choice_accepts_expected_inputs() {
+        assert_eq!(
+            parse_repo_install_choice("published").unwrap(),
+            RepoInstallChoice::PublishedVersion
+        );
+        assert_eq!(
+            parse_repo_install_choice("release").unwrap(),
+            RepoInstallChoice::PublishedVersion
+        );
+        assert_eq!(
+            parse_repo_install_choice("").unwrap(),
+            RepoInstallChoice::PublishedVersion
+        );
+        assert_eq!(
+            parse_repo_install_choice("source").unwrap(),
+            RepoInstallChoice::SourceBuild
+        );
+        assert_eq!(
+            parse_repo_install_choice("clone").unwrap(),
+            RepoInstallChoice::SourceBuild
+        );
+    }
+
+    #[test]
+    fn parse_repo_install_choice_rejects_unknown_input() {
+        assert!(parse_repo_install_choice("banana").is_err());
+    }
+
+    #[test]
+    fn resolve_published_version_input_prefers_explicit_value() {
+        assert_eq!(
+            resolve_published_version_input("pr-123abc", Some("v0.11.0")).as_deref(),
+            Some("pr-123abc")
+        );
+    }
+
+    #[test]
+    fn resolve_published_version_input_uses_default_for_blank_input() {
+        assert_eq!(
+            resolve_published_version_input("   ", Some("v0.11.0")).as_deref(),
+            Some("v0.11.0")
+        );
+        assert_eq!(resolve_published_version_input("", None), None);
     }
 
     #[test]

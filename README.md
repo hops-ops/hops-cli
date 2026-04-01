@@ -147,6 +147,40 @@ How it works:
 - Applies a GitHub `ProviderConfig` named `default` unless `--refresh` is used.
 - Supports overrides for namespace, Secret name, ProviderConfig name, provider name, and provider package.
 
+## Quick Start
+
+```bash
+# Build and load a Crossplane configuration package from an Upbound-format XRD project
+hops config install --path /path/to/project
+
+# Install from a GitHub repo; interactive TTY runs ask whether to build from source
+# or use a published version (non-interactive runs default to source build)
+hops config install --repo hops-ops/helm-certmanager
+
+# Force reload from source (deletes existing ConfigurationRevision(s) first)
+hops config install --repo hops-ops/helm-certmanager --reload
+
+# Apply a pinned remote package version directly (no clone/build)
+hops config install --repo hops-ops/helm-certmanager --version v0.1.0
+
+# Remove a configuration and prune orphaned package dependencies
+hops config uninstall --repo hops-ops/helm-certmanager
+
+# Generate apis/*/configuration.yaml from upbound.yaml for validation
+hops validate generate-configuration --path /path/to/project
+
+# Observe an existing XR into a manifest
+hops xr observe --kind AutoEKSCluster --name pat-local --namespace default --aws-region us-east-2
+
+# Render adoption patches for managed resources under an existing XR
+hops xr adopt --kind AutoEKSCluster --name pat-local --namespace default
+
+# Convert an observed/adopted XR into a managed manifest
+hops xr manage --kind AutoEKSCluster --name pat-local --namespace default
+
+# Render patches that remove Delete from management policies
+hops xr orphan --kind AutoEKSCluster --name pat-local --namespace default
+```
 ## Config packages
 
 `config install` and `config uninstall` operate on the currently connected Kubernetes cluster.
@@ -165,7 +199,8 @@ hops config install
 # Build from an explicit local Upbound-format XRD project path
 hops config install --path /path/to/project
 
-# Build from a cached GitHub repo checkout containing an Upbound-format XRD project
+# Install from a GitHub repo; interactive TTY runs ask whether to build from source
+# or use a published version
 hops config install --repo hops-ops/aws-auto-eks-cluster
 
 # Force a source reload before re-applying
@@ -195,6 +230,8 @@ Notes:
 
 - `--reload` only applies to source installs: `--path` or `--repo` without `--version`.
 - `--skip-dependency-resolution` sets `spec.skipDependencyResolution=true` on the generated `Configuration`.
+- `config install --repo ...` now prompts in interactive terminals to choose between cloning/building from source or applying a published package version. Published-version prompts suggest the latest discovered tag by default and still accept arbitrary tags such as `pr-<gitsha>`.
+- Non-interactive `config install --repo ...` keeps the previous default behavior and builds from source.
 - `config install --repo ... --version ...` skips clone/build and applies the remote package directly.
 - `config uninstall --repo ...` derives the configuration name as `<org>-<repo>`.
 
@@ -225,10 +262,13 @@ Notes:
   - Applies Crossplane `Configuration` resources pointing at `registry.crossplane-system.svc.cluster.local:5000/...`
   - Supports `--skip-dependency-resolution`
 - `config install --repo <org/repo> [--reload]`
-  - Source-build mode intended for a local control plane because it depends on the local registry flow
-  - Uses local repo cache at `~/.hops/local/repo-cache/<org>/<repo>`
-  - Clones on first use, then fetches/pulls on subsequent runs
-  - Runs the same build/load/push/apply flow as `--path`
+  - Interactive terminals prompt for install mode: source build or published version
+  - Published-version installs suggest the latest discovered tag by default and accept custom tags such as `pr-<gitsha>`
+  - Non-interactive runs and `--reload` continue to use the source-build flow
+  - Source-build mode is intended for a local control plane because it depends on the local registry flow
+  - Source builds use local repo cache at `~/.hops/local/repo-cache/<org>/<repo>`
+  - Source builds clone on first use, then fetch/pull on subsequent runs
+  - Source builds run the same build/load/push/apply flow as `--path`
 - `--reload`
   - Forces source-based config install (`--path` or `--repo` without `--version`) to delete existing `ConfigurationRevision` resources and matching `Function`/`FunctionRevision` package resources from the same sources, then re-apply the `Configuration`
   - Useful when re-running a config and you want Crossplane to re-create the current revision from source
