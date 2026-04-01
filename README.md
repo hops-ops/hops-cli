@@ -80,61 +80,149 @@ hops validate --help
 hops xr --help
 ```
 
-From source without installing:
+## Create a Local Control Plane
 
 ```bash
-cargo run -- --help
-cargo run -- local --help
-cargo run -- config --help
-cargo run -- validate --help
-cargo run -- xr --help
+# 1) Install Colima (via Homebrew)
+hops local install
+
+# 2) Start local k8s + Crossplane + providers + local registry
+hops local start
+
+# 3) Configure AWS provider-family + ProviderConfig from your AWS profile
+hops local aws --profile <aws-profile>
+
+# 4) Configure GitHub provider + ProviderConfig from your gh auth login
+hops local github --owner <org-or-user>
+
+# 5) Install a Crossplane configuration package from an Upbound-format XRD project
+hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
 ```
+
+### Local provider setup and auth
+
+`hops local aws` and `hops local github` install the provider package and bootstrap auth into a local control plane. The exception is `--refresh`, which updates credentials only.
+
+#### AWS auth
+
+`hops local aws` installs the AWS provider package and uses your AWS CLI configuration to generate credentials for it.
+
+```bash
+# Use an explicit AWS profile
+hops local aws --profile hops
+
+# Refresh only the Secret credentials without re-applying the Provider or ProviderConfig
+hops local aws --profile hops --refresh
+```
+
+How it works:
+
+- Resolves the profile in this order: `--profile`, `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, then interactive prompt.
+- Runs `aws configure export-credentials --format process`.
+- If the selected profile needs AWS SSO login, it runs `aws sso login --profile <profile>` and retries once.
+- Applies the AWS provider package unless `--refresh` is used.
+- Writes the generated credentials into a Kubernetes Secret, defaulting to `default/aws-creds`.
+- Applies an AWS `ProviderConfig` named `default` unless `--refresh` is used.
+- Supports overrides for namespace, Secret name, ProviderConfig name, provider name, and provider package.
+
+#### GitHub auth
+
+`hops local github` installs the GitHub provider package and uses your GitHub CLI login to generate credentials for it.
+
+```bash
+# Use an explicit owner
+hops local github --owner hops-ops
+
+# Refresh only the Secret credentials without re-applying the Provider or ProviderConfig
+hops local github --owner hops-ops --refresh
+```
+
+How it works:
+
+- Resolves the owner in this order: `--owner`, `GH_OWNER`, `GITHUB_OWNER`, then interactive prompt.
+- Uses your current `gh auth token`.
+- If `gh` is not authenticated, it runs `gh auth login` and retries once.
+- Applies the GitHub provider package unless `--refresh` is used.
+- Writes the generated credentials into a Kubernetes Secret, defaulting to `default/github-creds`.
+- Applies a GitHub `ProviderConfig` named `default` unless `--refresh` is used.
+- Supports overrides for namespace, Secret name, ProviderConfig name, provider name, and provider package.
 
 ## Quick Start
 
 ```bash
-# 1) Install Colima (via Homebrew)
-cargo run -- local install
+# Build and load a Crossplane configuration package from an Upbound-format XRD project
+hops config install --path /path/to/project
 
-# 2) Start local k8s + Crossplane + providers + local registry
-cargo run -- local start
+# Build from a GitHub repo containing an Upbound-format XRD project
+hops config install --repo hops-ops/helm-certmanager
 
-# 3) Configure AWS provider-family + ProviderConfig from your AWS profile
-cargo run -- local aws --profile <aws-profile>
+# Force reload from source (deletes existing ConfigurationRevision(s) first)
+hops config install --repo hops-ops/helm-certmanager --reload
 
-# 4) Configure GitHub provider + ProviderConfig from your gh auth login
-cargo run -- local github --owner <org-or-user>
+# Apply a pinned remote package version directly (no clone/build)
+hops config install --repo hops-ops/helm-certmanager --version v0.1.0
 
-# 5) Build and load a Crossplane configuration package from an XRD project
-cargo run -- config install --path /path/to/project
+# Remove a configuration and prune orphaned package dependencies
+hops config uninstall --repo hops-ops/helm-certmanager
 
-# 6) Build from a GitHub repo (cached clone + build + push to local registry)
-cargo run -- config install --repo hops-ops/helm-certmanager
+# Generate apis/*/configuration.yaml from upbound.yaml for validation
+hops validate generate-configuration --path /path/to/project
 
-# 7) Force reload from source (deletes existing ConfigurationRevision(s) first)
-cargo run -- config install --repo hops-ops/helm-certmanager --reload
+# Observe an existing XR into a manifest
+hops xr observe --kind AutoEKSCluster --name pat-local --namespace default --aws-region us-east-2
 
-# 8) Apply a pinned remote package version directly (no clone/build)
-cargo run -- config install --repo hops-ops/helm-certmanager --version v0.1.0
+# Render adoption patches for managed resources under an existing XR
+hops xr adopt --kind AutoEKSCluster --name pat-local --namespace default
 
-# 9) Remove a configuration and prune orphaned package dependencies
-cargo run -- config uninstall --repo hops-ops/helm-certmanager
+# Convert an observed/adopted XR into a managed manifest
+hops xr manage --kind AutoEKSCluster --name pat-local --namespace default
 
-# 10) Generate apis/*/configuration.yaml from upbound.yaml for validation
-cargo run -- validate generate-configuration --path /path/to/project
-
-# 11) Observe an existing XR into a manifest
-cargo run -- xr observe --kind AutoEKSCluster --name pat-local --namespace default --aws-region us-east-2
-
-# 12) Render adoption patches for managed resources under an existing XR
-cargo run -- xr adopt --kind AutoEKSCluster --name pat-local --namespace default
-
-# 13) Convert an observed/adopted XR into a managed manifest
-cargo run -- xr manage --kind AutoEKSCluster --name pat-local --namespace default
-
-# 14) Render patches that remove Delete from management policies
-cargo run -- xr orphan --kind AutoEKSCluster --name pat-local --namespace default
+# Render patches that remove Delete from management policies
+hops xr orphan --kind AutoEKSCluster --name pat-local --namespace default
 ```
+
+## Config packages
+
+`config install` and `config uninstall` operate on the currently connected Kubernetes cluster.
+`config install` expects an Upbound-format XRD project when building from source via `--path` or `--repo`.
+
+Common install flows:
+
+```bash
+# Build from the current directory when it is an Upbound-format XRD project
+hops config install
+
+# Build from an explicit local Upbound-format XRD project path
+hops config install --path /path/to/project
+
+# Build from a cached GitHub repo checkout containing an Upbound-format XRD project
+hops config install --repo hops-ops/helm-certmanager
+
+# Force a source reload before re-applying
+hops config install --repo hops-ops/helm-certmanager --reload
+
+# Apply a pinned remote package directly from ghcr.io
+hops config install --repo hops-ops/helm-certmanager --version v0.1.0
+```
+
+Common uninstall flows:
+
+```bash
+# Remove by explicit configuration name
+hops config uninstall --name hops-ops-helm-certmanager
+
+# Remove by repo slug
+hops config uninstall --repo hops-ops/helm-certmanager
+
+# Remove configurations derived from local build artifacts
+hops config uninstall --path /path/to/project
+```
+
+Notes:
+
+- `--reload` only applies to source installs: `--path` or `--repo` without `--version`.
+- `config install --repo ... --version ...` skips clone/build and applies the remote package directly.
+- `config uninstall --repo ...` derives the configuration name as `<org>-<repo>`.
 
 ## Commands
 
@@ -253,7 +341,7 @@ Notes:
 Set `LOG_LEVEL` to control output (default: `info`):
 
 ```bash
-LOG_LEVEL=debug cargo run -- local start
+LOG_LEVEL=debug hops local start
 ```
 
 ## Development

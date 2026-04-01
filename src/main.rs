@@ -12,7 +12,7 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Manage the local development environment
+    /// Manage the local control plane environment
     Local(commands::local::LocalArgs),
     /// Manage Crossplane configuration packages in the connected cluster
     Config(commands::config::ConfigArgs),
