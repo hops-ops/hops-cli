@@ -1,4 +1,4 @@
-use super::{aws_clients, collect_local_secret_names, configured_tags, repo_name, SECRET_DIR};
+use super::{aws_clients, collect_local_secret_names, configured_tags, SECRET_DIR};
 use clap::Args;
 use dialoguer::Confirm;
 use rusoto_secretsmanager::{
@@ -6,6 +6,7 @@ use rusoto_secretsmanager::{
     PutSecretValueRequest, SecretsManager, SecretsManagerClient, Tag, TagResourceRequest,
 };
 use rusoto_sts::{GetCallerIdentityRequest, Sts};
+use serde_json;
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
@@ -52,10 +53,7 @@ pub fn run(args: &SyncArgs) -> Result<(), Box<dyn Error>> {
         args.tags.clone()
     };
 
-    let repo = repo_name()?;
-    final_tags.push(("hops".to_string(), "true".to_string()));
-    final_tags.push(("hops-secrets-repo".to_string(), repo.clone()));
-    final_tags.push(("hops.ops.com.ai/cli".to_string(), "true".to_string()));
+    final_tags.push(("hops.ops.com.ai/managed".to_string(), "true".to_string()));
     final_tags.sort();
     final_tags.dedup();
 
@@ -76,7 +74,7 @@ pub fn run(args: &SyncArgs) -> Result<(), Box<dyn Error>> {
 
     if args.cleanup {
         let local_names = collect_local_secret_names(Path::new(SECRET_DIR));
-        delete_missing_secrets(&runtime, &client, &repo, &local_names, args.yes);
+        delete_missing_secrets(&runtime, &client, &local_names, args.yes);
     }
 
     log::info!("Sync complete - {} secrets processed", synced);
@@ -102,18 +100,92 @@ fn process_path(
             }
         };
 
+        let mut subdirs = Vec::new();
+        let mut json_files = Vec::new();
+        let mut env_files = Vec::new();
+
         for entry in entries.flatten() {
-            process_path(
+            let p = entry.path();
+            if p.is_dir() {
+                subdirs.push(p);
+            } else if p.is_file() {
+                if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                    json_files.push(p);
+                } else {
+                    env_files.push(p);
+                }
+            }
+        }
+
+        for dir in subdirs {
+            process_path(runtime, client, tags, &dir, synced, local_synced, yes, tags_only);
+        }
+
+        for file in &json_files {
+            let secret_string = match fs::read_to_string(file) {
+                Ok(contents) => contents,
+                Err(err) => {
+                    log::error!("Failed reading {}: {}", file.display(), err);
+                    continue;
+                }
+            };
+            let Some(secret_name) = derive_secret_name(file) else {
+                log::warn!("Could not derive secret name for {}", file.display());
+                continue;
+            };
+            sync_secret(
                 runtime,
                 client,
                 tags,
-                &entry.path(),
+                &secret_name,
+                &secret_string,
+                &file.display().to_string(),
                 synced,
                 local_synced,
                 yes,
                 tags_only,
             );
         }
+
+        if !env_files.is_empty() {
+            let mut map = serde_json::Map::new();
+            for file in &env_files {
+                let key = file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("value")
+                    .to_string();
+                match fs::read_to_string(file) {
+                    Ok(contents) => {
+                        map.insert(key, serde_json::Value::String(contents.trim().to_string()));
+                    }
+                    Err(err) => {
+                        log::error!("Failed reading {}: {}", file.display(), err);
+                    }
+                }
+            }
+
+            if !map.is_empty() {
+                let secret_string = serde_json::Value::Object(map).to_string();
+                let Some(secret_name) = derive_secret_name(path) else {
+                    log::warn!("Could not derive secret name for {}", path.display());
+                    return;
+                };
+                sync_secret(
+                    runtime,
+                    client,
+                    tags,
+                    &secret_name,
+                    &secret_string,
+                    &path.display().to_string(),
+                    synced,
+                    local_synced,
+                    yes,
+                    tags_only,
+                );
+            }
+        }
+
         return;
     }
 
@@ -121,18 +193,56 @@ fn process_path(
         return;
     }
 
-    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-        log::info!("Skipping non-JSON secret file {}", path.display());
-        return;
-    }
-
+    let secret_string = match fs::read_to_string(path) {
+        Ok(contents) => {
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                contents
+            } else {
+                let key = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("value");
+                serde_json::json!({ key: contents.trim() }).to_string()
+            }
+        }
+        Err(err) => {
+            log::error!("Failed reading {}: {}", path.display(), err);
+            return;
+        }
+    };
     let Some(secret_name) = derive_secret_name(path) else {
         log::warn!("Could not derive secret name for {}", path.display());
         return;
     };
-    local_synced.push(secret_name.clone());
+    sync_secret(
+        runtime,
+        client,
+        tags,
+        &secret_name,
+        &secret_string,
+        &path.display().to_string(),
+        synced,
+        local_synced,
+        yes,
+        tags_only,
+    );
+}
 
-    let exists = remote_secret_exists(runtime, client, &secret_name);
+fn sync_secret(
+    runtime: &tokio::runtime::Runtime,
+    client: &SecretsManagerClient,
+    tags: &[(String, String)],
+    secret_name: &str,
+    secret_string: &str,
+    source_label: &str,
+    synced: &mut usize,
+    local_synced: &mut Vec<String>,
+    yes: bool,
+    tags_only: bool,
+) {
+    local_synced.push(secret_name.to_string());
+
+    let exists = remote_secret_exists(runtime, client, secret_name);
     if tags_only {
         if !exists {
             log::info!(
@@ -141,34 +251,26 @@ fn process_path(
             );
             return;
         }
-        if !check_tags_need_update(runtime, client, &secret_name, tags) {
+        if !check_tags_need_update(runtime, client, secret_name, tags) {
             log::info!("Secret {} tags already up to date", secret_name);
             return;
         }
         if !yes && !confirm(&format!("Update tags for secret '{}'?", secret_name), true) {
             return;
         }
-        apply_tags(runtime, client, &secret_name, tags);
+        apply_tags(runtime, client, secret_name, tags);
         *synced += 1;
         return;
     }
 
-    let secret_string = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(err) => {
-            log::error!("Failed reading {}: {}", path.display(), err);
-            return;
-        }
-    };
-
     let value_unchanged = if exists {
-        get_remote_secret_string(runtime, client, &secret_name)
+        get_remote_secret_string(runtime, client, secret_name)
             .map(|value| value == secret_string)
             .unwrap_or(false)
     } else {
         false
     };
-    let tags_need_update = exists && check_tags_need_update(runtime, client, &secret_name, tags);
+    let tags_need_update = exists && check_tags_need_update(runtime, client, secret_name, tags);
 
     if value_unchanged && !tags_need_update {
         log::info!("Secret {} unchanged; skipping", secret_name);
@@ -184,12 +286,7 @@ fn process_path(
     };
     if !yes
         && !confirm(
-            &format!(
-                "{} secret '{}' from file '{}'?",
-                action,
-                secret_name,
-                path.display()
-            ),
+            &format!("{} secret '{}' from '{}'?", action, secret_name, source_label),
             true,
         )
     {
@@ -199,8 +296,8 @@ fn process_path(
     let client_request_token = Uuid::new_v4().to_string();
     if !exists {
         let request = CreateSecretRequest {
-            name: secret_name.clone(),
-            secret_string: Some(secret_string),
+            name: secret_name.to_string(),
+            secret_string: Some(secret_string.to_string()),
             client_request_token: Some(client_request_token),
             ..Default::default()
         };
@@ -210,8 +307,8 @@ fn process_path(
         }
     } else if !value_unchanged {
         let request = PutSecretValueRequest {
-            secret_id: secret_name.clone(),
-            secret_string: Some(secret_string),
+            secret_id: secret_name.to_string(),
+            secret_string: Some(secret_string.to_string()),
             client_request_token: Some(client_request_token),
             ..Default::default()
         };
@@ -221,20 +318,20 @@ fn process_path(
         }
     }
 
-    apply_tags(runtime, client, &secret_name, tags);
+    apply_tags(runtime, client, secret_name, tags);
     *synced += 1;
 }
 
 fn derive_secret_name(path: &Path) -> Option<String> {
     let mut secret_path = path.to_string_lossy().to_string();
     secret_path = secret_path.trim_end_matches(".json").to_string();
-    if let Some(stripped) = secret_path.strip_prefix("./secret/") {
+    if let Some(stripped) = secret_path.strip_prefix("./secrets/") {
         return Some(stripped.to_string());
     }
-    if let Some(stripped) = secret_path.strip_prefix("secret/") {
+    if let Some(stripped) = secret_path.strip_prefix("secrets/") {
         return Some(stripped.to_string());
     }
-    if let Some(stripped) = secret_path.strip_prefix("secret\\") {
+    if let Some(stripped) = secret_path.strip_prefix("secrets\\") {
         return Some(stripped.replace('\\', "/"));
     }
     Some(secret_path)
@@ -342,7 +439,6 @@ fn apply_tags(
 fn delete_missing_secrets(
     runtime: &tokio::runtime::Runtime,
     client: &SecretsManagerClient,
-    repo_name: &str,
     local_secrets: &[String],
     yes: bool,
 ) {
@@ -354,7 +450,7 @@ fn delete_missing_secrets(
             next_token: next_token.clone(),
             filters: Some(vec![Filter {
                 key: Some("tag-key".to_string()),
-                values: Some(vec!["hops-secrets-repo".to_string()]),
+                values: Some(vec!["hops.ops.com.ai/managed".to_string()]),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -370,11 +466,7 @@ fn delete_missing_secrets(
             let Some(secret_name) = secret.name else {
                 continue;
             };
-            let belongs_to_repo = secret.tags.unwrap_or_default().iter().any(|tag| {
-                tag.key.as_deref() == Some("hops-secrets-repo")
-                    && tag.value.as_deref() == Some(repo_name)
-            });
-            if !belongs_to_repo || local_set.contains(&secret_name) {
+            if local_set.contains(&secret_name) {
                 continue;
             }
 
@@ -459,10 +551,18 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn derive_secret_name_from_repo_secret_path() {
+    fn derive_secret_name_from_json_path() {
         assert_eq!(
-            derive_secret_name(Path::new("secret/devops/example.json")).as_deref(),
-            Some("devops/example")
+            derive_secret_name(Path::new("secrets/examples/example.json")).as_deref(),
+            Some("examples/example")
+        );
+    }
+
+    #[test]
+    fn derive_secret_name_from_env_dir() {
+        assert_eq!(
+            derive_secret_name(Path::new("secrets/github")).as_deref(),
+            Some("github")
         );
     }
 }

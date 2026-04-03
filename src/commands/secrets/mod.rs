@@ -17,8 +17,8 @@ use std::process::Command;
 
 const CONFIG_FILE: &str = ".hops.yaml";
 const SOPS_FILE: &str = ".sops.yaml";
-const SECRET_DIR: &str = "secret";
-const ENCRYPTED_SECRET_DIR: &str = "secret-encrypted";
+const SECRET_DIR: &str = "secrets";
+const ENCRYPTED_SECRET_DIR: &str = "secrets-encrypted";
 
 #[derive(Args, Debug)]
 pub struct SecretsArgs {
@@ -28,11 +28,11 @@ pub struct SecretsArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum SecretsCommands {
-    /// Initialize repo secrets configuration
+    /// Initialize repo secrets configuration (gitignore, tags, SOPS KMS key)
     Init(init::InitArgs),
-    /// Encrypt files from secret/ into secret-encrypted/ using sops
+    /// Encrypt files from secrets/ into secrets-encrypted/ using sops
     Encrypt(encrypt::EncryptArgs),
-    /// Decrypt files from secret-encrypted/ into secret/ using sops
+    /// Decrypt files from secrets-encrypted/ into secrets/ using sops
     Decrypt(decrypt::DecryptArgs),
     /// List local and remote secrets
     List,
@@ -123,22 +123,6 @@ fn configured_tags() -> Result<Vec<(String, String)>, Box<dyn Error>> {
     Ok(tags)
 }
 
-fn repo_name() -> Result<String, Box<dyn Error>> {
-    let url = run_command_output_string("git", &["config", "--get", "remote.origin.url"])?
-        .trim()
-        .to_string();
-    if url.is_empty() {
-        return Err("Could not determine repository name from git remote.origin.url".into());
-    }
-    let repo = if url.contains(':') {
-        url.split(':').next_back()
-    } else {
-        url.split('/').next_back()
-    }
-    .ok_or("Failed parsing git remote.origin.url")?;
-    Ok(repo.trim_end_matches(".git").to_string())
-}
-
 fn selected_aws_profile() -> Option<String> {
     [
         std::env::var("AWS_PROFILE").ok(),
@@ -226,6 +210,26 @@ fn aws_clients() -> Result<
     ))
 }
 
+fn kms_client() -> Result<rusoto_kms::KmsClient, Box<dyn Error>> {
+    if let Some(profile) = selected_aws_profile() {
+        require_command("aws")?;
+        let credentials = export_aws_credentials(&profile)?;
+        let provider = StaticProvider::new(
+            credentials.access_key_id,
+            credentials.secret_access_key,
+            credentials.session_token,
+            None,
+        );
+        return Ok(rusoto_kms::KmsClient::new_with(
+            HttpClient::new()?,
+            provider,
+            Region::default(),
+        ));
+    }
+
+    Ok(rusoto_kms::KmsClient::new(Region::default()))
+}
+
 fn collect_local_secret_names(root: &Path) -> Vec<String> {
     if !root.exists() {
         return Vec::new();
@@ -254,8 +258,27 @@ fn walk_local_secret_names(root: &Path, current: &Path, results: &mut Vec<String
                 return;
             }
         };
+
+        let mut has_env_files = false;
         for entry in entries.flatten() {
-            walk_local_secret_names(root, &entry.path(), results);
+            let p = entry.path();
+            if p.is_dir() {
+                walk_local_secret_names(root, &p, results);
+            } else if p.is_file() {
+                if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Some(name) = derive_secret_name(root, &p) {
+                        results.push(name);
+                    }
+                } else {
+                    has_env_files = true;
+                }
+            }
+        }
+
+        if has_env_files {
+            if let Some(name) = derive_secret_name(root, current) {
+                results.push(name);
+            }
         }
         return;
     }
@@ -266,10 +289,6 @@ fn walk_local_secret_names(root: &Path, current: &Path, results: &mut Vec<String
 }
 
 fn derive_secret_name(root: &Path, file_path: &Path) -> Option<String> {
-    if file_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-        return None;
-    }
-
     let relative = file_path.strip_prefix(root).ok()?;
     let mut components: Vec<String> = relative
         .components()
@@ -277,10 +296,9 @@ fn derive_secret_name(root: &Path, file_path: &Path) -> Option<String> {
         .collect();
 
     let last = components.last_mut()?;
-    if !last.ends_with(".json") {
-        return None;
+    if let Some(stripped) = last.strip_suffix(".json") {
+        *last = stripped.to_string();
     }
-    last.truncate(last.len().saturating_sub(5));
     Some(components.join("/"))
 }
 
@@ -379,15 +397,6 @@ fn sort_value(value: &mut Value) {
     }
 }
 
-fn ensure_parent_dir(path: &Path) -> Result<(), Box<dyn Error>> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    Ok(())
-}
-
 fn default_secret_paths() -> (PathBuf, PathBuf) {
     (
         PathBuf::from(SECRET_DIR),
@@ -403,8 +412,14 @@ mod tests {
 
     #[test]
     fn derive_secret_name_trims_root_and_json() {
-        let name = derive_secret_name(Path::new("secret"), Path::new("secret/devops/example.json"));
-        assert_eq!(name.as_deref(), Some("devops/example"));
+        let name = derive_secret_name(Path::new("secrets"), Path::new("secrets/examples/example.json"));
+        assert_eq!(name.as_deref(), Some("examples/example"));
+    }
+
+    #[test]
+    fn derive_secret_name_env_dir() {
+        let name = derive_secret_name(Path::new("secrets"), Path::new("secrets/github"));
+        assert_eq!(name.as_deref(), Some("github"));
     }
 
     #[test]

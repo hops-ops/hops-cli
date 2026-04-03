@@ -6,11 +6,11 @@ use std::path::PathBuf;
 #[derive(Args, Debug)]
 pub struct EncryptArgs {
     /// Source directory containing plaintext secrets
-    #[arg(long, default_value = "secret")]
+    #[arg(long, default_value = "secrets")]
     pub source: PathBuf,
 
     /// Destination directory for encrypted secrets
-    #[arg(long, default_value = "secret-encrypted")]
+    #[arg(long, default_value = "secrets-encrypted")]
     pub destination: PathBuf,
 
     /// Overwrite destination files if they already exist

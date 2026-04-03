@@ -1,4 +1,4 @@
-use super::{aws_clients, collect_local_secret_names, configured_tags, repo_name, SECRET_DIR};
+use super::{aws_clients, collect_local_secret_names, configured_tags, SECRET_DIR};
 use rusoto_secretsmanager::{ListSecretsRequest, SecretsManager, SecretsManagerClient};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
@@ -7,12 +7,9 @@ use std::path::Path;
 pub fn run() -> Result<(), Box<dyn Error>> {
     let local_names = collect_local_secret_names(Path::new(SECRET_DIR));
     let local_lookup: HashSet<String> = local_names.iter().cloned().collect();
-    let repo = repo_name()?;
 
     let mut expected_tags = configured_tags()?;
-    expected_tags.push(("hops".to_string(), "true".to_string()));
-    expected_tags.push(("hops-secrets-repo".to_string(), repo.clone()));
-    expected_tags.push(("hops.ops.com.ai/cli".to_string(), "true".to_string()));
+    expected_tags.push(("hops.ops.com.ai/managed".to_string(), "true".to_string()));
     expected_tags.sort();
     expected_tags.dedup();
 
@@ -22,8 +19,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let mut remote_by_name = HashMap::new();
     for secret in remote_secrets {
-        if secret.repo_tag.as_deref() == Some(repo.as_str()) || local_lookup.contains(&secret.name)
-        {
+        if secret.managed || local_lookup.contains(&secret.name) {
             remote_by_name.insert(secret.name.clone(), secret);
         }
     }
@@ -36,7 +32,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         names.insert(name.clone());
     }
 
-    println!("Repo secrets for {}", repo);
+    println!("Managed secrets");
     println!(
         "{:<40} {:<8} {:<8} {:<24} Status",
         "Name", "Local", "Remote", "KMS Key"
@@ -81,7 +77,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 struct RemoteSecret {
     name: String,
     tags: Vec<(String, String)>,
-    repo_tag: Option<String>,
+    managed: bool,
     kms_key_id: Option<String>,
 }
 
@@ -105,11 +101,11 @@ fn fetch_remote_secrets(
                 };
 
                 let mut tags = Vec::new();
-                let mut repo_tag = None;
+                let mut managed = false;
                 for tag in entry.tags.unwrap_or_default() {
                     if let (Some(key), Some(value)) = (tag.key, tag.value) {
-                        if key == "hops-secrets-repo" {
-                            repo_tag = Some(value.clone());
+                        if key == "hops.ops.com.ai/managed" {
+                            managed = true;
                         }
                         tags.push((key, value));
                     }
@@ -118,7 +114,7 @@ fn fetch_remote_secrets(
                 results.push(RemoteSecret {
                     name,
                     tags,
-                    repo_tag,
+                    managed,
                     kms_key_id: entry.kms_key_id,
                 });
             }
