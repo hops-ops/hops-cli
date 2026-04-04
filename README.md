@@ -76,9 +76,113 @@ cargo build --features vendored
 hops --help
 hops local --help
 hops config --help
+hops secrets --help
 hops validate --help
 hops xr --help
 ```
+
+## Command Areas
+
+`hops-cli` is organized into a few command groups:
+
+- `local`
+  - Manage a local Colima-based control plane, install providers, and bootstrap AWS or GitHub provider auth.
+- `config`
+  - Build, install, reload, and uninstall Crossplane configuration packages against the connected cluster.
+- `secrets`
+  - Initialize secrets config, encrypt and decrypt local secrets, and sync repo-managed secrets to AWS Secrets Manager or GitHub repository secrets.
+- `validate`
+  - Generate configuration manifests from Upbound-format XRD projects for validation workflows.
+- `xr`
+  - Observe existing XR-backed infrastructure and render adoption, management, or orphaning manifests.
+
+## Secrets
+
+`hops secrets init` sets up local secrets directories, `.sops.yaml`, and `.hops.yaml` so plaintext secrets can be encrypted locally and synced to AWS Secrets Manager or GitHub repository secrets.
+
+Typical layout:
+
+```text
+secrets/
+  aws/
+  github/
+    _shared/
+secrets-encrypted/
+  aws/
+  github/
+```
+
+Typical config:
+
+```yaml
+secrets:
+  plaintext_dir: secrets
+  encrypted_dir: secrets-encrypted
+  aws:
+    path: aws
+    region: us-east-2
+    tags:
+      hops.ops.com.ai/secret: "true"
+  github:
+    owner: hops-ops
+    path: github
+    shared_secrets:
+      path: _shared
+      repos:
+        - repo-a
+        - repo-b
+```
+
+Encrypt and decrypt operate from the configured roots:
+
+```bash
+hops secrets encrypt
+hops secrets decrypt
+```
+
+AWS sync reads from `<plaintext_dir>/<aws.path>`:
+
+```bash
+hops secrets sync aws
+```
+
+AWS rules:
+
+- A `.json` file becomes one AWS Secrets Manager secret with the JSON object stored as-is.
+- A directory containing plain files rolls up into one AWS secret. Each filename becomes a key in the JSON object.
+- A `.env` file is parsed into key/value pairs and stored as one JSON secret.
+- A directory containing a `.env` file merges those parsed key/value pairs into that directory's rolled-up JSON secret.
+- Secret names are derived from the path relative to the AWS root.
+- `--cleanup` only works when syncing the full configured AWS root.
+- `hops.ops.com.ai/secret=true` is always applied to repo-managed AWS secrets.
+
+Examples:
+
+- `secrets/aws/app.json` -> AWS secret `app`
+- `secrets/aws/github/token` and `secrets/aws/github/owner` -> AWS secret `github`
+- `secrets/aws/slack/.env` with `WEBHOOK_URL=...` -> AWS secret `slack`
+
+GitHub sync reads from `<plaintext_dir>/<github.path>`:
+
+```bash
+hops secrets sync github
+```
+
+GitHub rules:
+
+- Each GitHub secret remains a separate GitHub secret. There is no AWS-style roll-up into a single JSON secret.
+- A raw file becomes one GitHub secret.
+- A `.json` file becomes multiple GitHub secrets, one per top-level key.
+- Repo-specific secrets come from repo-named paths like `secrets/github/repo-a/...` or `secrets/github/repo-a.json`.
+- Shared GitHub secrets come from `secrets/github/_shared/...` and fan out to the repos listed in `secrets.github.shared_secrets.repos` or passed with `--repo`.
+- If a shared secret and a repo-specific secret have the same final name, the repo-specific value wins for that repo.
+- GitHub secret names are normalized by the CLI to a stable format before syncing.
+
+Examples:
+
+- `secrets/github/repo-a/NPM_TOKEN` -> GitHub secret `NPM_TOKEN` in `repo-a`
+- `secrets/github/repo-a/actions.json` with `{"SLACK_WEBHOOK":"..."}` -> GitHub secret `SLACK_WEBHOOK` in `repo-a`
+- `secrets/github/_shared/ORG_TOKEN` -> synced to every configured shared target repo
 
 ## Create a Local Control Plane
 
@@ -147,40 +251,6 @@ How it works:
 - Applies a GitHub `ProviderConfig` named `default` unless `--refresh` is used.
 - Supports overrides for namespace, Secret name, ProviderConfig name, provider name, and provider package.
 
-## Quick Start
-
-```bash
-# Build and load a Crossplane configuration package from an Upbound-format XRD project
-hops config install --path /path/to/project
-
-# Install from a GitHub repo; interactive TTY runs ask whether to build from source
-# or use a published version (non-interactive runs default to source build)
-hops config install --repo hops-ops/helm-certmanager
-
-# Force reload from source (deletes existing ConfigurationRevision(s) first)
-hops config install --repo hops-ops/helm-certmanager --reload
-
-# Apply a pinned remote package version directly (no clone/build)
-hops config install --repo hops-ops/helm-certmanager --version v0.1.0
-
-# Remove a configuration and prune orphaned package dependencies
-hops config uninstall --repo hops-ops/helm-certmanager
-
-# Generate apis/*/configuration.yaml from upbound.yaml for validation
-hops validate generate-configuration --path /path/to/project
-
-# Observe an existing XR into a manifest
-hops xr observe --kind AutoEKSCluster --name pat-local --namespace default --aws-region us-east-2
-
-# Render adoption patches for managed resources under an existing XR
-hops xr adopt --kind AutoEKSCluster --name pat-local --namespace default
-
-# Convert an observed/adopted XR into a managed manifest
-hops xr manage --kind AutoEKSCluster --name pat-local --namespace default
-
-# Render patches that remove Delete from management policies
-hops xr orphan --kind AutoEKSCluster --name pat-local --namespace default
-```
 ## Config packages
 
 `config install` and `config uninstall` operate on the currently connected Kubernetes cluster.
