@@ -329,6 +329,37 @@ fn apply_repo_version_spec(
         sanitize_name_component(&spec.org),
         sanitize_name_component(&spec.repo)
     );
+
+    // Delete any existing render Function so Crossplane re-resolves with the
+    // correct digest for this version (avoids conflicts when switching between
+    // local and published builds).
+    let render_source = format!("ghcr.io/{}/{}_render", spec.org, spec.repo);
+    let sources: HashSet<String> = [render_source.clone()].into_iter().collect();
+    let removed = delete_package_resources_by_source("function.pkg.crossplane.io", &sources)?;
+    if removed > 0 {
+        log::info!("Deleted {} stale Function package(s) before version install", removed);
+    }
+
+    // Delete any local-registry ImageConfig rewrite left over from a previous
+    // `config install --path` so Crossplane pulls from ghcr.io.
+    let ic_name = image_config_name(&render_source);
+    let ic_check = Command::new("kubectl")
+        .args(["get", "imageconfig.pkg.crossplane.io", &ic_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if ic_check.map(|s| s.success()).unwrap_or(false) {
+        run_cmd(
+            "kubectl",
+            &["delete", "imageconfig.pkg.crossplane.io", &ic_name],
+        )?;
+        log::info!("Deleted local ImageConfig rewrite '{}'", ic_name);
+    }
+
+    // Delete stale inactive ConfigurationRevisions pointing at the local
+    // registry so they don't block dependency resolution for the published version.
+    delete_local_registry_config_revisions(&config_name)?;
+
     apply_configuration(
         &config_name,
         &package_ref,
@@ -516,7 +547,12 @@ fn run_local_path(
     let mut seen = HashSet::new();
     loaded.retain(|img| seen.insert(img.source.clone()));
 
-    if reload {
+    // Always delete existing Function packages whose source matches the render
+    // images we are about to push. Without this, Crossplane's dependency
+    // resolution keeps the old Function with a stale digest from the published
+    // version, causing ImagePullBackOff when the local registry has a different
+    // digest. With --reload we also delete ConfigurationRevisions.
+    {
         let function_sources: HashSet<String> = loaded
             .iter()
             .filter(|img| !is_configuration_image(&img.source))
@@ -534,7 +570,7 @@ fn run_local_path(
             )?;
             if removed_functions > 0 || removed_function_revisions > 0 {
                 log::info!(
-                    "Reload requested; deleted {} Function package(s) and {} FunctionRevision(s) from matching sources before re-apply",
+                    "Deleted {} Function package(s) and {} FunctionRevision(s) from matching sources before re-apply",
                     removed_functions,
                     removed_function_revisions
                 );
@@ -639,8 +675,9 @@ spec:
     // dependencies (skipDependencyResolution is intentionally not set).
     for pull_ref in &config_pull_refs {
         let (img_path, _) = split_ref(pull_ref);
-        let name = img_path.rsplit('/').next().unwrap_or(img_path);
-        apply_configuration(name, pull_ref, skip_dependency_resolution, reload)?;
+        let path = strip_registry(img_path);
+        let name = path.replace('/', "-");
+        apply_configuration(&name, pull_ref, skip_dependency_resolution, reload)?;
     }
 
     Ok(())
@@ -1051,15 +1088,53 @@ fn build_patched_configuration_image(
         unique_suffix()
     ));
     fs::create_dir_all(&build_dir)?;
-    fs::write(build_dir.join("package.yaml"), package_yaml)?;
+
+    // Extract the source image's filesystem via docker create + export,
+    // avoiding multi-stage FROM which breaks when Docker's snapshot cache
+    // is stale for images loaded via `docker load`.
+    let container_name = format!("hops-extract-{}", unique_suffix());
+    let create_out = Command::new("docker")
+        .args(["create", "--name", &container_name, source_image, "true"])
+        .output()?;
+    if !create_out.status.success() {
+        return Err(format!(
+            "docker create failed: {}",
+            String::from_utf8_lossy(&create_out.stderr)
+        )
+        .into());
+    }
+
+    let content_dir = build_dir.join("content");
+    fs::create_dir_all(&content_dir)?;
+
+    let export_status = Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "docker export {} | tar -xf - -C {}",
+                container_name,
+                content_dir.to_string_lossy()
+            ),
+        ])
+        .status()?;
+
+    // Always remove the temp container.
+    let _ = Command::new("docker")
+        .args(["rm", "-f", &container_name])
+        .output();
+
+    if !export_status.success() {
+        let _ = fs::remove_dir_all(&build_dir);
+        return Err("docker export failed".into());
+    }
+
+    // Replace package.yaml with the patched version.
+    fs::write(content_dir.join("package.yaml"), package_yaml)?;
+
+    // Build from scratch using the extracted + patched content.
     fs::write(
         build_dir.join("Dockerfile"),
-        format!(
-            "FROM {source_image} AS src\n\
-             FROM scratch\n\
-             COPY --from=src / /\n\
-             COPY package.yaml /package.yaml\n"
-        ),
+        "FROM scratch\nCOPY content/ /\n",
     )?;
 
     let target_tag = format!(
@@ -1216,6 +1291,47 @@ fn docker_build_from(src: &str, tag: &str) -> Result<(), Box<dyn Error>> {
     let status = child.wait()?;
     if !status.success() {
         return Err(format!("docker build exited with {}", status).into());
+    }
+    Ok(())
+}
+
+/// Delete inactive ConfigurationRevisions whose package points at the local
+/// registry. These are left over from `config install --path` and can block
+/// dependency resolution when switching to a published version.
+fn delete_local_registry_config_revisions(config_name: &str) -> Result<(), Box<dyn Error>> {
+    let output = run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "configurationrevision.pkg.crossplane.io",
+            "-o",
+            "jsonpath={range .items[*]}{.metadata.name}|{.spec.package}|{.spec.desiredState}\\n{end}",
+        ],
+    )?;
+
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let rev_name = parts[0].trim();
+        let package = parts[1].trim();
+        let state = parts[2].trim();
+
+        if !rev_name.starts_with(config_name) {
+            continue;
+        }
+        if package.contains(REGISTRY_PULL) && state == "Inactive" {
+            run_cmd(
+                "kubectl",
+                &[
+                    "delete",
+                    "configurationrevision.pkg.crossplane.io",
+                    rev_name,
+                ],
+            )?;
+            log::info!("Deleted stale local ConfigurationRevision '{}'", rev_name);
+        }
     }
     Ok(())
 }
