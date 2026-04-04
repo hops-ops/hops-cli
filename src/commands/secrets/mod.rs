@@ -455,13 +455,6 @@ fn process_tree(
 
     let relative = current.strip_prefix(source_root)?;
     let destination = dest_root.join(relative);
-    if destination.exists() && !force {
-        return Err(format!(
-            "Destination file already exists: {} (rerun with --force to overwrite)",
-            destination.display()
-        )
-        .into());
-    }
 
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
