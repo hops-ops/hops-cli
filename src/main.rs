@@ -14,6 +14,8 @@ struct Args {
 enum Commands {
     /// Manage the local control plane environment
     Local(commands::local::LocalArgs),
+    /// Manage repo secrets with SOPS and AWS Secrets Manager
+    Secrets(commands::secrets::SecretsArgs),
     /// Manage Crossplane configuration packages in the connected cluster
     Config(commands::config::ConfigArgs),
     /// Manage validation helpers for Crossplane projects
@@ -32,6 +34,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     match &args.command {
         Some(Commands::Local(local_args)) => {
             commands::local::run(local_args)?;
+        }
+        Some(Commands::Secrets(secrets_args)) => {
+            commands::secrets::run(secrets_args)?;
         }
         Some(Commands::Config(config_args)) => {
             commands::config::run(config_args)?;
