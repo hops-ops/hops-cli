@@ -1,20 +1,25 @@
-use super::{aws_clients, collect_local_secret_names, configured_tags, SECRET_DIR};
+use super::{
+    aws_clients, collect_local_secret_names, configured_aws_settings, configured_secret_paths,
+};
 use rusoto_secretsmanager::{ListSecretsRequest, SecretsManager, SecretsManagerClient};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::path::Path;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
-    let local_names = collect_local_secret_names(Path::new(SECRET_DIR));
+    let (plaintext_dir, _) = configured_secret_paths()?;
+    let aws_settings = configured_aws_settings()?;
+    let aws_root = plaintext_dir.join(&aws_settings.path);
+    let local_names = collect_local_secret_names(Path::new(&aws_root));
     let local_lookup: HashSet<String> = local_names.iter().cloned().collect();
 
-    let mut expected_tags = configured_tags()?;
-    expected_tags.push(("hops.ops.com.ai/managed".to_string(), "true".to_string()));
+    let mut expected_tags = aws_settings.tags.into_iter().collect::<Vec<_>>();
+    expected_tags.push(("hops.ops.com.ai/secret".to_string(), "true".to_string()));
     expected_tags.sort();
     expected_tags.dedup();
 
     let runtime = tokio::runtime::Runtime::new()?;
-    let (client, _) = aws_clients()?;
+    let (client, _) = aws_clients(&aws_settings.region)?;
     let remote_secrets = fetch_remote_secrets(&runtime, &client)?;
 
     let mut remote_by_name = HashMap::new();
@@ -104,7 +109,7 @@ fn fetch_remote_secrets(
                 let mut managed = false;
                 for tag in entry.tags.unwrap_or_default() {
                     if let (Some(key), Some(value)) = (tag.key, tag.value) {
-                        if key == "hops.ops.com.ai/managed" {
+                        if key == "hops.ops.com.ai/secret" {
                             managed = true;
                         }
                         tags.push((key, value));

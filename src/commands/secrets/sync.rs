@@ -1,21 +1,39 @@
-use super::{aws_clients, collect_local_secret_names, configured_tags, SECRET_DIR};
-use clap::Args;
+use super::{
+    aws_clients, collect_local_secret_names, configured_aws_settings, configured_github_settings,
+    configured_secret_paths, derive_secret_name, require_command, run_command_output_string,
+};
+use clap::{Args, Subcommand};
 use dialoguer::Confirm;
 use rusoto_secretsmanager::{
     CreateSecretRequest, DeleteSecretRequest, Filter, GetSecretValueRequest, ListSecretsRequest,
     PutSecretValueRequest, SecretsManager, SecretsManagerClient, Tag, TagResourceRequest,
 };
 use rusoto_sts::{GetCallerIdentityRequest, Sts};
-use serde_json;
+use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use uuid::Uuid;
 
 #[derive(Args, Debug)]
 pub struct SyncArgs {
+    #[command(subcommand)]
+    pub target: SyncTarget,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SyncTarget {
+    /// Sync secrets to AWS Secrets Manager
+    Aws(AwsSyncArgs),
+    /// Sync secrets to GitHub repository secrets
+    Github(GithubSyncArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AwsSyncArgs {
     /// Secret path to sync, either a directory or a single file
     #[arg(long)]
     pub secret_path: Option<String>,
@@ -37,23 +55,52 @@ pub struct SyncArgs {
     pub tags_only: bool,
 }
 
-pub fn run(args: &SyncArgs) -> Result<(), Box<dyn Error>> {
-    let runtime = tokio::runtime::Runtime::new()?;
-    let (client, sts_client) = aws_clients()?;
+#[derive(Args, Debug)]
+pub struct GithubSyncArgs {
+    /// Secret path to sync. Defaults to <plaintext_dir>/<github.path>
+    #[arg(long)]
+    pub secret_path: Option<String>,
 
+    /// Override configured repositories. Repeat to target multiple repos.
+    #[arg(long = "repo")]
+    pub repos: Vec<String>,
+
+    /// Override configured GitHub owner or organization
+    #[arg(long)]
+    pub owner: Option<String>,
+
+    /// Skip confirmation prompts
+    #[arg(short, long)]
+    pub yes: bool,
+}
+
+pub fn run(args: &SyncArgs) -> Result<(), Box<dyn Error>> {
+    match &args.target {
+        SyncTarget::Aws(aws_args) => run_aws(aws_args),
+        SyncTarget::Github(github_args) => run_github(github_args),
+    }
+}
+
+fn run_aws(args: &AwsSyncArgs) -> Result<(), Box<dyn Error>> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let aws_settings = configured_aws_settings()?;
+    let (plaintext_dir, _) = configured_secret_paths()?;
+    let default_source = plaintext_dir.join(&aws_settings.path);
     let secret_source = args
         .secret_path
         .clone()
-        .unwrap_or_else(|| SECRET_DIR.to_string());
+        .map(PathBuf::from)
+        .unwrap_or(default_source);
     fs::metadata(&secret_source)?;
 
+    let (client, sts_client) = aws_clients(&aws_settings.region)?;
+
     let mut final_tags = if args.tags.is_empty() {
-        configured_tags()?
+        aws_settings.tags.into_iter().collect::<Vec<_>>()
     } else {
         args.tags.clone()
     };
-
-    final_tags.push(("hops.ops.com.ai/managed".to_string(), "true".to_string()));
+    final_tags.push(("hops.ops.com.ai/secret".to_string(), "true".to_string()));
     final_tags.sort();
     final_tags.dedup();
 
@@ -61,11 +108,12 @@ pub fn run(args: &SyncArgs) -> Result<(), Box<dyn Error>> {
 
     let mut synced = 0usize;
     let mut local_synced = Vec::new();
-    process_path(
+    process_aws_path(
         &runtime,
         &client,
         &final_tags,
-        Path::new(&secret_source),
+        &secret_source,
+        &secret_source,
         &mut synced,
         &mut local_synced,
         args.yes,
@@ -73,18 +121,19 @@ pub fn run(args: &SyncArgs) -> Result<(), Box<dyn Error>> {
     );
 
     if args.cleanup {
-        let local_names = collect_local_secret_names(Path::new(SECRET_DIR));
+        let local_names = collect_local_secret_names(&secret_source);
         delete_missing_secrets(&runtime, &client, &local_names, args.yes);
     }
 
-    log::info!("Sync complete - {} secrets processed", synced);
+    log::info!("AWS sync complete - {} secrets processed", synced);
     Ok(())
 }
 
-fn process_path(
+fn process_aws_path(
     runtime: &tokio::runtime::Runtime,
     client: &SecretsManagerClient,
     tags: &[(String, String)],
+    root: &Path,
     path: &Path,
     synced: &mut usize,
     local_synced: &mut Vec<String>,
@@ -118,7 +167,17 @@ fn process_path(
         }
 
         for dir in subdirs {
-            process_path(runtime, client, tags, &dir, synced, local_synced, yes, tags_only);
+            process_aws_path(
+                runtime,
+                client,
+                tags,
+                root,
+                &dir,
+                synced,
+                local_synced,
+                yes,
+                tags_only,
+            );
         }
 
         for file in &json_files {
@@ -129,11 +188,11 @@ fn process_path(
                     continue;
                 }
             };
-            let Some(secret_name) = derive_secret_name(file) else {
+            let Some(secret_name) = derive_secret_name(root, file) else {
                 log::warn!("Could not derive secret name for {}", file.display());
                 continue;
             };
-            sync_secret(
+            sync_aws_secret(
                 runtime,
                 client,
                 tags,
@@ -157,7 +216,7 @@ fn process_path(
                     .to_string();
                 match fs::read_to_string(file) {
                     Ok(contents) => {
-                        map.insert(key, serde_json::Value::String(contents.trim().to_string()));
+                        map.insert(key, JsonValue::String(contents.trim().to_string()));
                     }
                     Err(err) => {
                         log::error!("Failed reading {}: {}", file.display(), err);
@@ -166,12 +225,12 @@ fn process_path(
             }
 
             if !map.is_empty() {
-                let secret_string = serde_json::Value::Object(map).to_string();
-                let Some(secret_name) = derive_secret_name(path) else {
+                let secret_string = JsonValue::Object(map).to_string();
+                let Some(secret_name) = derive_secret_name(root, path) else {
                     log::warn!("Could not derive secret name for {}", path.display());
                     return;
                 };
-                sync_secret(
+                sync_aws_secret(
                     runtime,
                     client,
                     tags,
@@ -198,10 +257,7 @@ fn process_path(
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 contents
             } else {
-                let key = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("value");
+                let key = path.file_name().and_then(|n| n.to_str()).unwrap_or("value");
                 serde_json::json!({ key: contents.trim() }).to_string()
             }
         }
@@ -210,11 +266,11 @@ fn process_path(
             return;
         }
     };
-    let Some(secret_name) = derive_secret_name(path) else {
+    let Some(secret_name) = derive_secret_name(root, path) else {
         log::warn!("Could not derive secret name for {}", path.display());
         return;
     };
-    sync_secret(
+    sync_aws_secret(
         runtime,
         client,
         tags,
@@ -228,7 +284,7 @@ fn process_path(
     );
 }
 
-fn sync_secret(
+fn sync_aws_secret(
     runtime: &tokio::runtime::Runtime,
     client: &SecretsManagerClient,
     tags: &[(String, String)],
@@ -286,7 +342,10 @@ fn sync_secret(
     };
     if !yes
         && !confirm(
-            &format!("{} secret '{}' from '{}'?", action, secret_name, source_label),
+            &format!(
+                "{} secret '{}' from '{}'?",
+                action, secret_name, source_label
+            ),
             true,
         )
     {
@@ -322,19 +381,318 @@ fn sync_secret(
     *synced += 1;
 }
 
-fn derive_secret_name(path: &Path) -> Option<String> {
-    let mut secret_path = path.to_string_lossy().to_string();
-    secret_path = secret_path.trim_end_matches(".json").to_string();
-    if let Some(stripped) = secret_path.strip_prefix("./secrets/") {
-        return Some(stripped.to_string());
+fn run_github(args: &GithubSyncArgs) -> Result<(), Box<dyn Error>> {
+    require_command("gh")?;
+    ensure_gh_auth()?;
+
+    let github_settings = configured_github_settings()?;
+    let (plaintext_dir, _) = configured_secret_paths()?;
+    let default_source = plaintext_dir.join(&github_settings.path);
+    let source_root = args
+        .secret_path
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or(default_source);
+    fs::metadata(&source_root)?;
+
+    let owner = resolve_github_owner(args.owner.as_deref(), github_settings.owner.as_deref())?;
+    let repos = resolve_github_repos(&source_root, &github_settings, &args.repos)?;
+    if repos.is_empty() {
+        return Err("No GitHub repos configured. Add secrets.github.shared_secrets.repos, pass --repo, or create repo directories under the GitHub secrets path.".into());
     }
-    if let Some(stripped) = secret_path.strip_prefix("secrets/") {
-        return Some(stripped.to_string());
+
+    let shared_root = source_root.join(&github_settings.shared_path);
+    let shared_secrets = collect_github_target_secrets(&shared_root)?;
+
+    let mut synced = 0usize;
+    for repo in repos {
+        sync_github_repo(
+            &owner,
+            &repo,
+            &source_root,
+            &shared_root,
+            &shared_secrets,
+            args.yes,
+            &mut synced,
+        )?;
     }
-    if let Some(stripped) = secret_path.strip_prefix("secrets\\") {
-        return Some(stripped.replace('\\', "/"));
+
+    log::info!("GitHub sync complete - {} secrets processed", synced);
+    Ok(())
+}
+
+fn ensure_gh_auth() -> Result<(), Box<dyn Error>> {
+    let token = run_command_output_string("gh", &["auth", "token"]).map_err(|err| {
+        format!(
+            "failed to read GitHub auth token: {}\nRun `gh auth login` first.",
+            err
+        )
+    })?;
+    if token.trim().is_empty() {
+        return Err("`gh auth token` returned an empty token. Run `gh auth login`.".into());
     }
-    Some(secret_path)
+    Ok(())
+}
+
+fn resolve_github_owner(
+    cli_owner: Option<&str>,
+    configured_owner: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
+    let env_owner = env::var("GH_OWNER").ok();
+    let env_github_owner = env::var("GITHUB_OWNER").ok();
+    let owner = [
+        cli_owner,
+        configured_owner,
+        env_owner.as_deref(),
+        env_github_owner.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .map(str::to_string);
+
+    match owner {
+        Some(owner) => Ok(owner),
+        None => Err("GitHub owner is not configured. Set secrets.github.owner, pass --owner, or set GH_OWNER/GITHUB_OWNER.".into()),
+    }
+}
+
+fn resolve_github_repos(
+    source_root: &Path,
+    settings: &super::GithubSecretsRuntimeConfig,
+    cli_repos: &[String],
+) -> Result<Vec<String>, Box<dyn Error>> {
+    if !cli_repos.is_empty() {
+        return Ok(cli_repos.to_vec());
+    }
+    if !settings.shared_repos.is_empty() {
+        return Ok(settings.shared_repos.clone());
+    }
+
+    let mut repos = Vec::new();
+    for entry in fs::read_dir(source_root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+                if name == settings.shared_path {
+                    continue;
+                }
+                repos.push(name.to_string());
+            }
+        } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+                if stem == settings.shared_path {
+                    continue;
+                }
+                repos.push(stem.to_string());
+            }
+        }
+    }
+    repos.sort();
+    repos.dedup();
+    Ok(repos)
+}
+
+fn sync_github_repo(
+    owner: &str,
+    repo: &str,
+    source_root: &Path,
+    shared_root: &Path,
+    shared_secrets: &[(String, String, String)],
+    yes: bool,
+    synced: &mut usize,
+) -> Result<(), Box<dyn Error>> {
+    let repo_dir = source_root.join(repo);
+    let repo_file = source_root.join(format!("{repo}.json"));
+    let mut merged = std::collections::BTreeMap::<String, (String, String)>::new();
+
+    for (secret_name, secret_value, source_label) in shared_secrets {
+        merged.insert(
+            secret_name.clone(),
+            (secret_value.clone(), source_label.clone()),
+        );
+    }
+
+    if repo_dir.is_dir() {
+        for (secret_name, secret_value, source_label) in collect_github_target_secrets(&repo_dir)? {
+            merged.insert(secret_name, (secret_value, source_label));
+        }
+    } else if repo_file.is_file() {
+        for (secret_name, secret_value, source_label) in collect_github_target_secrets(&repo_file)?
+        {
+            merged.insert(secret_name, (secret_value, source_label));
+        }
+    } else if shared_root.exists() && !shared_secrets.is_empty() {
+        log::info!(
+            "Applying only shared GitHub secrets to '{}/{}' (no repo-specific secrets found).",
+            owner,
+            repo
+        );
+    } else {
+        log::warn!(
+            "No secret source found for GitHub repo '{}'. Expected '{}' or '{}'.",
+            repo,
+            repo_dir.display(),
+            repo_file.display()
+        );
+    }
+
+    for (secret_name, (secret_value, source_label)) in merged {
+        set_github_secret(owner, repo, &secret_name, &secret_value, &source_label, yes)?;
+        *synced += 1;
+    }
+    Ok(())
+}
+
+fn collect_github_target_secrets(
+    target: &Path,
+) -> Result<Vec<(String, String, String)>, Box<dyn Error>> {
+    if !target.exists() {
+        return Ok(Vec::new());
+    }
+    if target.is_file() {
+        return collect_github_file_secrets(target, target);
+    }
+
+    let mut out = Vec::new();
+    collect_github_dir_secrets(target, target, &mut out)?;
+    Ok(out)
+}
+
+fn collect_github_dir_secrets(
+    root: &Path,
+    current: &Path,
+    out: &mut Vec<(String, String, String)>,
+) -> Result<(), Box<dyn Error>> {
+    for entry in fs::read_dir(current)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_github_dir_secrets(root, &path, out)?;
+        } else if path.is_file() {
+            out.extend(collect_github_file_secrets(root, &path)?);
+        }
+    }
+    Ok(())
+}
+
+fn collect_github_file_secrets(
+    root: &Path,
+    path: &Path,
+) -> Result<Vec<(String, String, String)>, Box<dyn Error>> {
+    if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        let contents = fs::read_to_string(path)?;
+        let secrets = parse_github_secret_map(&contents, path)?;
+        return Ok(secrets
+            .into_iter()
+            .map(|(name, value)| (name, value, path.display().to_string()))
+            .collect());
+    }
+
+    let secret_name = github_secret_name(root, path)?;
+    let secret_value = fs::read_to_string(path)?.trim().to_string();
+    Ok(vec![(
+        secret_name,
+        secret_value,
+        path.display().to_string(),
+    )])
+}
+
+fn parse_github_secret_map(
+    contents: &str,
+    path: &Path,
+) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+    let value: JsonValue = serde_json::from_str(contents)
+        .map_err(|err| format!("Failed parsing JSON in {}: {}", path.display(), err))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("GitHub secret JSON must be an object: {}", path.display()))?;
+
+    let mut secrets = Vec::new();
+    for (key, value) in object {
+        let secret_name = normalize_github_secret_name(key);
+        let secret_value = value
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| value.to_string());
+        secrets.push((secret_name, secret_value));
+    }
+    Ok(secrets)
+}
+
+fn github_secret_name(repo_root: &Path, path: &Path) -> Result<String, Box<dyn Error>> {
+    let relative = path.strip_prefix(repo_root)?;
+    let raw = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("__");
+    Ok(normalize_github_secret_name(raw.trim_end_matches(".json")))
+}
+
+fn normalize_github_secret_name(value: &str) -> String {
+    let mut out = String::new();
+    let mut prev_underscore = false;
+    for ch in value.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_uppercase()
+        } else {
+            '_'
+        };
+        if mapped == '_' {
+            if !prev_underscore {
+                out.push(mapped);
+            }
+            prev_underscore = true;
+        } else {
+            out.push(mapped);
+            prev_underscore = false;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn set_github_secret(
+    owner: &str,
+    repo: &str,
+    secret_name: &str,
+    secret_value: &str,
+    source_label: &str,
+    yes: bool,
+) -> Result<(), Box<dyn Error>> {
+    if !yes
+        && !confirm(
+            &format!(
+                "Set GitHub secret '{}' in '{}/{}' from '{}'?",
+                secret_name, owner, repo, source_label
+            ),
+            true,
+        )
+    {
+        return Ok(());
+    }
+
+    let status = Command::new("gh")
+        .args([
+            "secret",
+            "set",
+            secret_name,
+            "--repo",
+            &format!("{}/{}", owner, repo),
+            "--body",
+            secret_value,
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("gh secret set exited with {}", status).into());
+    }
+    log::info!(
+        "Set GitHub secret '{}' in '{}/{}'",
+        secret_name,
+        owner,
+        repo
+    );
+    Ok(())
 }
 
 fn remote_secret_exists(
@@ -450,7 +808,7 @@ fn delete_missing_secrets(
             next_token: next_token.clone(),
             filters: Some(vec![Filter {
                 key: Some("tag-key".to_string()),
-                values: Some(vec!["hops.ops.com.ai/managed".to_string()]),
+                values: Some(vec!["hops.ops.com.ai/secret".to_string()]),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -547,13 +905,19 @@ fn parse_key_value(value: &str) -> Result<(String, String), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::derive_secret_name;
+    use crate::commands::secrets::derive_secret_name;
     use std::path::Path;
+
+    use super::normalize_github_secret_name;
 
     #[test]
     fn derive_secret_name_from_json_path() {
         assert_eq!(
-            derive_secret_name(Path::new("secrets/examples/example.json")).as_deref(),
+            derive_secret_name(
+                Path::new("secrets"),
+                Path::new("secrets/examples/example.json")
+            )
+            .as_deref(),
             Some("examples/example")
         );
     }
@@ -561,8 +925,21 @@ mod tests {
     #[test]
     fn derive_secret_name_from_env_dir() {
         assert_eq!(
-            derive_secret_name(Path::new("secrets/github")).as_deref(),
+            derive_secret_name(Path::new("secrets"), Path::new("secrets/github")).as_deref(),
             Some("github")
+        );
+    }
+
+    #[test]
+    fn normalize_github_secret_name_uppercases_and_flattens() {
+        assert_eq!(normalize_github_secret_name("token"), "TOKEN");
+        assert_eq!(
+            normalize_github_secret_name("actions/npm-token"),
+            "ACTIONS_NPM_TOKEN"
+        );
+        assert_eq!(
+            normalize_github_secret_name("app__prod.database-url"),
+            "APP_PROD_DATABASE_URL"
         );
     }
 }

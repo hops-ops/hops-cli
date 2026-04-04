@@ -19,7 +19,7 @@ pub struct EncryptArgs {
 }
 
 pub fn run(args: &EncryptArgs) -> Result<(), Box<dyn Error>> {
-    let (default_source, default_destination) = default_secret_paths();
+    let (default_source, default_destination) = default_secret_paths()?;
     let source = if args.source.as_os_str().is_empty() {
         default_source
     } else {

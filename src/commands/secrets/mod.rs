@@ -19,6 +19,10 @@ const CONFIG_FILE: &str = ".hops.yaml";
 const SOPS_FILE: &str = ".sops.yaml";
 const SECRET_DIR: &str = "secrets";
 const ENCRYPTED_SECRET_DIR: &str = "secrets-encrypted";
+const DEFAULT_AWS_REGION: &str = "us-east-1";
+const DEFAULT_AWS_SECRET_SUBDIR: &str = "aws";
+const DEFAULT_GITHUB_SECRET_SUBDIR: &str = "github";
+const DEFAULT_GITHUB_SHARED_SUBDIR: &str = "_shared";
 
 #[derive(Args, Debug)]
 pub struct SecretsArgs {
@@ -48,7 +52,33 @@ struct RepoConfig {
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct SecretsConfig {
+    #[serde(default)]
+    aws: AwsSecretsConfig,
+    encrypted_dir: Option<String>,
+    #[serde(default)]
+    github: GithubSecretsConfig,
+    plaintext_dir: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct AwsSecretsConfig {
+    path: Option<String>,
+    region: Option<String>,
     tags: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct GithubSecretsConfig {
+    owner: Option<String>,
+    path: Option<String>,
+    #[serde(default)]
+    shared_secrets: GithubSharedSecretsConfig,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct GithubSharedSecretsConfig {
+    path: Option<String>,
+    repos: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,15 +142,78 @@ fn save_config(config: &RepoConfig) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn configured_tags() -> Result<Vec<(String, String)>, Box<dyn Error>> {
+fn configured_aws_settings() -> Result<AwsSecretsRuntimeConfig, Box<dyn Error>> {
     let config = load_config()?;
     let tags = config
         .secrets
+        .aws
         .tags
         .unwrap_or_default()
         .into_iter()
-        .collect::<Vec<_>>();
-    Ok(tags)
+        .collect::<HashMap<_, _>>();
+    let path = config
+        .secrets
+        .aws
+        .path
+        .unwrap_or_else(|| DEFAULT_AWS_SECRET_SUBDIR.to_string());
+    let region = config
+        .secrets
+        .aws
+        .region
+        .unwrap_or_else(|| DEFAULT_AWS_REGION.to_string());
+    Ok(AwsSecretsRuntimeConfig { path, region, tags })
+}
+
+fn configured_github_settings() -> Result<GithubSecretsRuntimeConfig, Box<dyn Error>> {
+    let config = load_config()?;
+    Ok(GithubSecretsRuntimeConfig {
+        owner: config.secrets.github.owner,
+        path: config
+            .secrets
+            .github
+            .path
+            .unwrap_or_else(|| DEFAULT_GITHUB_SECRET_SUBDIR.to_string()),
+        shared_path: config
+            .secrets
+            .github
+            .shared_secrets
+            .path
+            .unwrap_or_else(|| DEFAULT_GITHUB_SHARED_SUBDIR.to_string()),
+        shared_repos: config
+            .secrets
+            .github
+            .shared_secrets
+            .repos
+            .unwrap_or_default(),
+    })
+}
+
+fn configured_secret_paths() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let config = load_config()?;
+    let plaintext = config
+        .secrets
+        .plaintext_dir
+        .unwrap_or_else(|| SECRET_DIR.to_string());
+    let encrypted = config
+        .secrets
+        .encrypted_dir
+        .unwrap_or_else(|| ENCRYPTED_SECRET_DIR.to_string());
+    Ok((PathBuf::from(plaintext), PathBuf::from(encrypted)))
+}
+
+#[derive(Debug, Clone)]
+struct AwsSecretsRuntimeConfig {
+    path: String,
+    region: String,
+    tags: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct GithubSecretsRuntimeConfig {
+    owner: Option<String>,
+    path: String,
+    shared_path: String,
+    shared_repos: Vec<String>,
 }
 
 fn selected_aws_profile() -> Option<String> {
@@ -177,13 +270,18 @@ fn export_aws_credentials(profile: &str) -> Result<AwsExportCredentials, Box<dyn
     Ok(credentials)
 }
 
-fn aws_clients() -> Result<
+fn aws_clients(
+    region: &str,
+) -> Result<
     (
         rusoto_secretsmanager::SecretsManagerClient,
         rusoto_sts::StsClient,
     ),
     Box<dyn Error>,
 > {
+    let region = region
+        .parse::<Region>()
+        .map_err(|_| format!("unsupported AWS region '{}'", region))?;
     if let Some(profile) = selected_aws_profile() {
         require_command("aws")?;
         let credentials = export_aws_credentials(&profile)?;
@@ -197,37 +295,16 @@ fn aws_clients() -> Result<
         let secrets_client = rusoto_secretsmanager::SecretsManagerClient::new_with(
             HttpClient::new()?,
             provider.clone(),
-            Region::default(),
+            region.clone(),
         );
-        let sts_client =
-            rusoto_sts::StsClient::new_with(HttpClient::new()?, provider, Region::default());
+        let sts_client = rusoto_sts::StsClient::new_with(HttpClient::new()?, provider, region);
         return Ok((secrets_client, sts_client));
     }
 
     Ok((
-        rusoto_secretsmanager::SecretsManagerClient::new(Region::default()),
-        rusoto_sts::StsClient::new(Region::default()),
+        rusoto_secretsmanager::SecretsManagerClient::new(region.clone()),
+        rusoto_sts::StsClient::new(region),
     ))
-}
-
-fn kms_client() -> Result<rusoto_kms::KmsClient, Box<dyn Error>> {
-    if let Some(profile) = selected_aws_profile() {
-        require_command("aws")?;
-        let credentials = export_aws_credentials(&profile)?;
-        let provider = StaticProvider::new(
-            credentials.access_key_id,
-            credentials.secret_access_key,
-            credentials.session_token,
-            None,
-        );
-        return Ok(rusoto_kms::KmsClient::new_with(
-            HttpClient::new()?,
-            provider,
-            Region::default(),
-        ));
-    }
-
-    Ok(rusoto_kms::KmsClient::new(Region::default()))
 }
 
 fn collect_local_secret_names(root: &Path) -> Vec<String> {
@@ -397,11 +474,8 @@ fn sort_value(value: &mut Value) {
     }
 }
 
-fn default_secret_paths() -> (PathBuf, PathBuf) {
-    (
-        PathBuf::from(SECRET_DIR),
-        PathBuf::from(ENCRYPTED_SECRET_DIR),
-    )
+fn default_secret_paths() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    configured_secret_paths()
 }
 
 #[cfg(test)]
@@ -412,7 +486,10 @@ mod tests {
 
     #[test]
     fn derive_secret_name_trims_root_and_json() {
-        let name = derive_secret_name(Path::new("secrets"), Path::new("secrets/examples/example.json"));
+        let name = derive_secret_name(
+            Path::new("secrets"),
+            Path::new("secrets/examples/example.json"),
+        );
         assert_eq!(name.as_deref(), Some("examples/example"));
     }
 
