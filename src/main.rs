@@ -22,6 +22,8 @@ enum Commands {
     Validate(commands::validate::ValidateArgs),
     /// Manage live XR observe/manage/adopt workflows
     Xr(commands::xr::XrArgs),
+    /// Install AI agent skills and configuration (Claude Code, Codex)
+    Ai(commands::ai::AiArgs),
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -46,6 +48,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(Commands::Xr(xr_args)) => {
             commands::xr::run(xr_args)?;
+        }
+        Some(Commands::Ai(ai_args)) => {
+            commands::ai::run(ai_args)?;
         }
         None => {
             log::info!("No command specified, use --help for usage information");
