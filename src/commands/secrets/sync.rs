@@ -10,12 +10,13 @@ use rusoto_secretsmanager::{
 };
 use rusoto_sts::{GetCallerIdentityRequest, Sts};
 use serde_json::Value as JsonValue;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use uuid::Uuid;
 
 #[derive(Args, Debug)]
@@ -86,6 +87,7 @@ fn run_aws(args: &AwsSyncArgs) -> Result<(), Box<dyn Error>> {
     let aws_settings = configured_aws_settings()?;
     let (plaintext_dir, _) = configured_secret_paths()?;
     let default_source = plaintext_dir.join(&aws_settings.path);
+    let naming_root = default_source.clone();
     let secret_source = args
         .secret_path
         .clone()
@@ -93,40 +95,75 @@ fn run_aws(args: &AwsSyncArgs) -> Result<(), Box<dyn Error>> {
         .unwrap_or(default_source);
     fs::metadata(&secret_source)?;
 
+    if args.cleanup
+        && normalized_absolute_path(&secret_source)? != normalized_absolute_path(&naming_root)?
+    {
+        return Err(
+            "--cleanup can only be used when syncing the full configured AWS secrets root".into(),
+        );
+    }
+
     let (client, sts_client) = aws_clients(&aws_settings.region)?;
 
-    let mut final_tags = if args.tags.is_empty() {
-        aws_settings.tags.into_iter().collect::<Vec<_>>()
+    let mut final_tags_map = if args.tags.is_empty() {
+        aws_settings.tags
     } else {
-        args.tags.clone()
+        let mut tags = HashMap::new();
+        for (key, value) in &args.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+        tags
     };
-    final_tags.push(("hops.ops.com.ai/secret".to_string(), "true".to_string()));
+    final_tags_map.insert("hops.ops.com.ai/secret".to_string(), "true".to_string());
+    let mut final_tags = final_tags_map.into_iter().collect::<Vec<_>>();
     final_tags.sort();
-    final_tags.dedup();
 
     confirm_target_account(&runtime, &sts_client, args.yes)?;
 
     let mut synced = 0usize;
-    let mut local_synced = Vec::new();
     process_aws_path(
         &runtime,
         &client,
         &final_tags,
-        &secret_source,
+        &naming_root,
         &secret_source,
         &mut synced,
-        &mut local_synced,
         args.yes,
         args.tags_only,
     );
 
     if args.cleanup {
-        let local_names = collect_local_secret_names(&secret_source);
+        let local_names = collect_local_secret_names(&naming_root);
         delete_missing_secrets(&runtime, &client, &local_names, args.yes);
     }
 
     log::info!("AWS sync complete - {} secrets processed", synced);
     Ok(())
+}
+
+fn normalized_absolute_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    if path.exists() {
+        return Ok(path.canonicalize()?);
+    }
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+
+    Ok(normalized)
 }
 
 fn process_aws_path(
@@ -136,7 +173,6 @@ fn process_aws_path(
     root: &Path,
     path: &Path,
     synced: &mut usize,
-    local_synced: &mut Vec<String>,
     yes: bool,
     tags_only: bool,
 ) {
@@ -167,17 +203,7 @@ fn process_aws_path(
         }
 
         for dir in subdirs {
-            process_aws_path(
-                runtime,
-                client,
-                tags,
-                root,
-                &dir,
-                synced,
-                local_synced,
-                yes,
-                tags_only,
-            );
+            process_aws_path(runtime, client, tags, root, &dir, synced, yes, tags_only);
         }
 
         for file in &json_files {
@@ -200,7 +226,6 @@ fn process_aws_path(
                 &secret_string,
                 &file.display().to_string(),
                 synced,
-                local_synced,
                 yes,
                 tags_only,
             );
@@ -209,14 +234,27 @@ fn process_aws_path(
         if !env_files.is_empty() {
             let mut map = serde_json::Map::new();
             for file in &env_files {
-                let key = file
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("value")
-                    .to_string();
                 match fs::read_to_string(file) {
                     Ok(contents) => {
-                        map.insert(key, JsonValue::String(contents.trim().to_string()));
+                        if is_dotenv_file(file) {
+                            match parse_dotenv_secret_map(&contents) {
+                                Ok(values) => map.extend(values),
+                                Err(err) => {
+                                    log::error!(
+                                        "Failed parsing dotenv file {}: {}",
+                                        file.display(),
+                                        err
+                                    );
+                                }
+                            }
+                        } else {
+                            let key = file
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("value")
+                                .to_string();
+                            map.insert(key, JsonValue::String(contents.trim().to_string()));
+                        }
                     }
                     Err(err) => {
                         log::error!("Failed reading {}: {}", file.display(), err);
@@ -238,7 +276,6 @@ fn process_aws_path(
                     &secret_string,
                     &path.display().to_string(),
                     synced,
-                    local_synced,
                     yes,
                     tags_only,
                 );
@@ -256,6 +293,14 @@ fn process_aws_path(
         Ok(contents) => {
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 contents
+            } else if is_dotenv_file(path) {
+                match parse_dotenv_secret_map(&contents) {
+                    Ok(values) => JsonValue::Object(values).to_string(),
+                    Err(err) => {
+                        log::error!("Failed parsing dotenv file {}: {}", path.display(), err);
+                        return;
+                    }
+                }
             } else {
                 let key = path.file_name().and_then(|n| n.to_str()).unwrap_or("value");
                 serde_json::json!({ key: contents.trim() }).to_string()
@@ -278,7 +323,6 @@ fn process_aws_path(
         &secret_string,
         &path.display().to_string(),
         synced,
-        local_synced,
         yes,
         tags_only,
     );
@@ -292,12 +336,9 @@ fn sync_aws_secret(
     secret_string: &str,
     source_label: &str,
     synced: &mut usize,
-    local_synced: &mut Vec<String>,
     yes: bool,
     tags_only: bool,
 ) {
-    local_synced.push(secret_name.to_string());
-
     let exists = remote_secret_exists(runtime, client, secret_name);
     if tags_only {
         if !exists {
@@ -314,7 +355,10 @@ fn sync_aws_secret(
         if !yes && !confirm(&format!("Update tags for secret '{}'?", secret_name), true) {
             return;
         }
-        apply_tags(runtime, client, secret_name, tags);
+        if let Err(err) = apply_tags(runtime, client, secret_name, tags) {
+            log::error!("Failed applying tags to {}: {}", secret_name, err);
+            return;
+        }
         *synced += 1;
         return;
     }
@@ -358,6 +402,14 @@ fn sync_aws_secret(
             name: secret_name.to_string(),
             secret_string: Some(secret_string.to_string()),
             client_request_token: Some(client_request_token),
+            tags: Some(
+                tags.iter()
+                    .map(|(key, value)| Tag {
+                        key: Some(key.clone()),
+                        value: Some(value.clone()),
+                    })
+                    .collect(),
+            ),
             ..Default::default()
         };
         if let Err(err) = runtime.block_on(client.create_secret(request)) {
@@ -377,7 +429,10 @@ fn sync_aws_secret(
         }
     }
 
-    apply_tags(runtime, client, secret_name, tags);
+    if let Err(err) = apply_tags(runtime, client, secret_name, tags) {
+        log::error!("Failed applying tags to {}: {}", secret_name, err);
+        return;
+    }
     *synced += 1;
 }
 
@@ -652,6 +707,50 @@ fn normalize_github_secret_name(value: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
+fn is_dotenv_file(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some(".env")
+}
+
+fn parse_dotenv_secret_map(contents: &str) -> Result<serde_json::Map<String, JsonValue>, String> {
+    let mut map = serde_json::Map::new();
+
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let line = line
+            .strip_prefix("export ")
+            .map(str::trim_start)
+            .unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("invalid dotenv entry on line {}", index + 1));
+        };
+
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(format!("empty dotenv key on line {}", index + 1));
+        }
+
+        let value = strip_matching_quotes(value.trim());
+        map.insert(key.to_string(), JsonValue::String(value.to_string()));
+    }
+
+    Ok(map)
+}
+
+fn strip_matching_quotes(value: &str) -> &str {
+    if value.len() >= 2 {
+        let quoted = (value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\''));
+        if quoted {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
 fn set_github_secret(
     owner: &str,
     repo: &str,
@@ -672,17 +771,22 @@ fn set_github_secret(
         return Ok(());
     }
 
-    let status = Command::new("gh")
+    let mut child = Command::new("gh")
         .args([
             "secret",
             "set",
             secret_name,
             "--repo",
             &format!("{}/{}", owner, repo),
-            "--body",
-            secret_value,
         ])
-        .status()?;
+        .stdin(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(secret_value.as_bytes())?;
+    } else {
+        return Err("failed to open stdin for `gh secret set`".into());
+    }
+    let status = child.wait()?;
     if !status.success() {
         return Err(format!("gh secret set exited with {}", status).into());
     }
@@ -777,7 +881,7 @@ fn apply_tags(
     client: &SecretsManagerClient,
     secret_name: &str,
     tags: &[(String, String)],
-) {
+) -> Result<(), Box<dyn Error>> {
     let request = TagResourceRequest {
         secret_id: secret_name.to_string(),
         tags: tags
@@ -789,9 +893,8 @@ fn apply_tags(
             .collect(),
     };
 
-    if let Err(err) = runtime.block_on(client.tag_resource(request)) {
-        log::warn!("Failed applying tags to {}: {}", secret_name, err);
-    }
+    runtime.block_on(client.tag_resource(request))?;
+    Ok(())
 }
 
 fn delete_missing_secrets(
@@ -821,6 +924,9 @@ fn delete_missing_secrets(
         };
 
         for secret in response.secret_list.unwrap_or_default() {
+            if !has_managed_secret_tag(secret.tags.as_ref()) {
+                continue;
+            }
             let Some(secret_name) = secret.name else {
                 continue;
             };
@@ -859,6 +965,12 @@ fn delete_missing_secrets(
     }
 }
 
+fn has_managed_secret_tag(tags: Option<&Vec<rusoto_secretsmanager::Tag>>) -> bool {
+    tags.into_iter().flatten().any(|tag| {
+        tag.key.as_deref() == Some("hops.ops.com.ai/secret") && tag.value.as_deref() == Some("true")
+    })
+}
+
 fn confirm_target_account(
     runtime: &tokio::runtime::Runtime,
     client: &rusoto_sts::StsClient,
@@ -867,11 +979,12 @@ fn confirm_target_account(
     let profile = env::var("AWS_PROFILE")
         .or_else(|_| env::var("AWS_DEFAULT_PROFILE"))
         .unwrap_or_else(|_| "default".to_string());
-    let account = runtime
+    let response = runtime
         .block_on(client.get_caller_identity(GetCallerIdentityRequest::default()))
-        .ok()
-        .and_then(|response| response.account)
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_err(|err| format!("Failed to determine AWS account: {}", err))?;
+    let account = response
+        .account
+        .ok_or("AWS account ID not available from STS GetCallerIdentity")?;
 
     if yes
         || confirm(
@@ -906,9 +1019,10 @@ fn parse_key_value(value: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use crate::commands::secrets::derive_secret_name;
+    use serde_json::{json, Value as JsonValue};
     use std::path::Path;
 
-    use super::normalize_github_secret_name;
+    use super::{normalize_github_secret_name, parse_dotenv_secret_map};
 
     #[test]
     fn derive_secret_name_from_json_path() {
@@ -941,5 +1055,20 @@ mod tests {
             normalize_github_secret_name("app__prod.database-url"),
             "APP_PROD_DATABASE_URL"
         );
+    }
+
+    #[test]
+    fn parse_dotenv_secret_map_reads_key_values() {
+        let parsed = parse_dotenv_secret_map("FOO=bar\nBAZ=qux\n").unwrap();
+        assert_eq!(
+            JsonValue::Object(parsed),
+            json!({"FOO": "bar", "BAZ": "qux"})
+        );
+    }
+
+    #[test]
+    fn parse_dotenv_secret_map_skips_comments_and_export() {
+        let parsed = parse_dotenv_secret_map("# comment\nexport FOO=\"bar\"\n\n").unwrap();
+        assert_eq!(JsonValue::Object(parsed), json!({"FOO": "bar"}));
     }
 }

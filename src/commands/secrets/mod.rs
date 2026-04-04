@@ -391,8 +391,47 @@ fn mirror_tree_with_sops(
         return Err(format!("Source path does not exist: {}", source_root.display()).into());
     }
 
-    fs::create_dir_all(dest_root)?;
-    process_tree(source_root, source_root, dest_root, sops_mode, force)
+    let source_root = normalized_path(source_root)?;
+    let dest_root = normalized_path(dest_root)?;
+    if source_root == dest_root
+        || dest_root.starts_with(&source_root)
+        || source_root.starts_with(&dest_root)
+    {
+        return Err(format!(
+            "Source and destination paths must not overlap: {} and {}",
+            source_root.display(),
+            dest_root.display()
+        )
+        .into());
+    }
+
+    fs::create_dir_all(&dest_root)?;
+    process_tree(&source_root, &source_root, &dest_root, sops_mode, force)
+}
+
+fn normalized_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    if path.exists() {
+        return Ok(path.canonicalize()?);
+    }
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+
+    Ok(normalized)
 }
 
 fn process_tree(

@@ -79,6 +79,22 @@ pub fn run(args: &InitArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn configure_kms(args: &InitArgs) -> Result<(), Box<dyn Error>> {
+    if let Some(existing_kms) = existing_sops_kms_key()? {
+        return Err(format!(
+            "{} already exists and references this KMS key: {}. Continue using the existing file, or delete it before creating a new SOPS key configuration.",
+            SOPS_FILE, existing_kms
+        )
+        .into());
+    }
+
+    if Path::new(SOPS_FILE).exists() {
+        return Err(format!(
+            "{} already exists. Continue using the existing file, or delete it before creating a new SOPS key configuration.",
+            SOPS_FILE
+        )
+        .into());
+    }
+
     if let Some(arn) = args.kms_arn.as_ref() {
         write_sops_file(arn)?;
         return Ok(());
@@ -87,17 +103,6 @@ fn configure_kms(args: &InitArgs) -> Result<(), Box<dyn Error>> {
     if args.create_kms {
         create_control_plane_kms_key(args)?;
         return Ok(());
-    }
-
-    if let Some(existing_kms) = existing_sops_kms_key()? {
-        log::info!(
-            "{} already exists and references this KMS key: {}",
-            SOPS_FILE,
-            existing_kms
-        );
-        if prompt_yes_no("Continue using the existing SOPS KMS key?", true)? {
-            return Ok(());
-        }
     }
 
     let arn = select_kms_configuration()?;
@@ -146,8 +151,11 @@ fn prompt_for_kms_arn() -> Result<String, Box<dyn Error>> {
 fn write_sops_file(kms_arn: &str) -> Result<(), Box<dyn Error>> {
     let path = Path::new(SOPS_FILE);
     if path.exists() {
-        log::warn!("{} already exists; leaving it unchanged", path.display());
-        return Ok(());
+        return Err(format!(
+            "{} already exists. Continue using the existing file, or delete it before creating a new SOPS key configuration.",
+            path.display()
+        )
+        .into());
     }
 
     let contents = format!("creation_rules:\n  - kms: \"{}\"\n", kms_arn);
@@ -213,7 +221,6 @@ fn update_gitignore() -> Result<(), Box<dyn Error>> {
 fn ensure_secret_tags(args: &InitArgs) -> Result<(), Box<dyn Error>> {
     let mut config = load_config()?;
     let mut tags = config.secrets.aws.tags.clone().unwrap_or_else(HashMap::new);
-    tags.insert("hops.ops.com.ai/secret".to_string(), "true".to_string());
 
     for (key, value) in &args.tags {
         tags.insert(key.clone(), value.clone());
@@ -242,6 +249,7 @@ fn ensure_secret_tags(args: &InitArgs) -> Result<(), Box<dyn Error>> {
         );
     }
 
+    tags.insert("hops.ops.com.ai/secret".to_string(), "true".to_string());
     config.secrets.aws.tags = Some(tags);
     save_config(&config)?;
     log::info!("Saved default secret tags to {}", CONFIG_FILE);
@@ -487,10 +495,10 @@ fn wait_for_kms_key_ready(
     namespace: &str,
     wait_seconds: u64,
 ) -> Result<JsonValue, Box<dyn Error>> {
-    let attempts = std::cmp::max(1, wait_seconds / 5);
+    let attempts = std::cmp::max(1, (wait_seconds + 4) / 5);
     let mut last_summary = None;
 
-    for _ in 0..attempts {
+    for i in 0..attempts {
         let raw = run_cmd_output(
             "kubectl",
             &["get", KMS_KEY_RESOURCE, name, "-n", namespace, "-o", "json"],
@@ -510,7 +518,9 @@ fn wait_for_kms_key_ready(
         }
 
         last_summary = condition_summary(&item);
-        thread::sleep(Duration::from_secs(5));
+        if i + 1 < attempts {
+            thread::sleep(Duration::from_secs(5));
+        }
     }
 
     let suffix = last_summary
