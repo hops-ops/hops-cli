@@ -173,6 +173,7 @@ GitHub rules:
 - Each GitHub secret remains a separate GitHub secret. There is no AWS-style roll-up into a single JSON secret.
 - A raw file becomes one GitHub secret.
 - A `.json` file becomes multiple GitHub secrets, one per top-level key.
+- A `.env` file becomes multiple GitHub secrets, one per `KEY=value` entry.
 - Repo-specific secrets come from repo-named paths like `secrets/github/repo-a/...` or `secrets/github/repo-a.json`.
 - Shared GitHub secrets come from `secrets/github/_shared/...` and fan out to the repos listed in `secrets.github.shared_secrets.repos` or passed with `--repo`.
 - If a shared secret and a repo-specific secret have the same final name, the repo-specific value wins for that repo.
@@ -182,6 +183,7 @@ Examples:
 
 - `secrets/github/repo-a/NPM_TOKEN` -> GitHub secret `NPM_TOKEN` in `repo-a`
 - `secrets/github/repo-a/actions.json` with `{"SLACK_WEBHOOK":"..."}` -> GitHub secret `SLACK_WEBHOOK` in `repo-a`
+- `secrets/github/repo-a/.env` with `NPM_TOKEN=...` -> GitHub secret `NPM_TOKEN` in `repo-a`
 - `secrets/github/_shared/ORG_TOKEN` -> synced to every configured shared target repo
 
 ## Create a Local Control Plane

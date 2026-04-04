@@ -635,9 +635,16 @@ fn collect_github_file_secrets(
     root: &Path,
     path: &Path,
 ) -> Result<Vec<(String, String, String)>, Box<dyn Error>> {
+    let contents = fs::read_to_string(path)?;
     if path.extension().and_then(|value| value.to_str()) == Some("json") {
-        let contents = fs::read_to_string(path)?;
         let secrets = parse_github_secret_map(&contents, path)?;
+        return Ok(secrets
+            .into_iter()
+            .map(|(name, value)| (name, value, path.display().to_string()))
+            .collect());
+    }
+    if is_dotenv_file(path) {
+        let secrets = parse_github_dotenv_secret_map(&contents, path)?;
         return Ok(secrets
             .into_iter()
             .map(|(name, value)| (name, value, path.display().to_string()))
@@ -645,7 +652,7 @@ fn collect_github_file_secrets(
     }
 
     let secret_name = github_secret_name(root, path)?;
-    let secret_value = fs::read_to_string(path)?.trim().to_string();
+    let secret_value = contents.trim().to_string();
     Ok(vec![(
         secret_name,
         secret_value,
@@ -666,6 +673,25 @@ fn parse_github_secret_map(
     let mut secrets = Vec::new();
     for (key, value) in object {
         let secret_name = normalize_github_secret_name(key);
+        let secret_value = value
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| value.to_string());
+        secrets.push((secret_name, secret_value));
+    }
+    Ok(secrets)
+}
+
+fn parse_github_dotenv_secret_map(
+    contents: &str,
+    path: &Path,
+) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+    let values = parse_dotenv_secret_map(contents)
+        .map_err(|err| format!("Failed parsing dotenv file {}: {}", path.display(), err))?;
+
+    let mut secrets = Vec::new();
+    for (key, value) in values {
+        let secret_name = normalize_github_secret_name(&key);
         let secret_value = value
             .as_str()
             .map(ToString::to_string)
@@ -1022,7 +1048,9 @@ mod tests {
     use serde_json::{json, Value as JsonValue};
     use std::path::Path;
 
-    use super::{normalize_github_secret_name, parse_dotenv_secret_map};
+    use super::{
+        normalize_github_secret_name, parse_dotenv_secret_map, parse_github_dotenv_secret_map,
+    };
 
     #[test]
     fn derive_secret_name_from_json_path() {
@@ -1070,5 +1098,18 @@ mod tests {
     fn parse_dotenv_secret_map_skips_comments_and_export() {
         let parsed = parse_dotenv_secret_map("# comment\nexport FOO=\"bar\"\n\n").unwrap();
         assert_eq!(JsonValue::Object(parsed), json!({"FOO": "bar"}));
+    }
+
+    #[test]
+    fn parse_github_dotenv_secret_map_expands_to_individual_secrets() {
+        let parsed =
+            parse_github_dotenv_secret_map("foo=bar\napp-token=baz\n", Path::new(".env")).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("APP_TOKEN".to_string(), "baz".to_string()),
+                ("FOO".to_string(), "bar".to_string())
+            ]
+        );
     }
 }
