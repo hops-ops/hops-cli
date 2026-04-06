@@ -8,6 +8,8 @@ const REF_CONFIG_INSTALL: &str = include_str!("../../../skills/claude/references
 const REF_XR_WORKFLOW: &str = include_str!("../../../skills/claude/references/xr-workflow.md");
 const REF_SECRETS: &str = include_str!("../../../skills/claude/references/secrets.md");
 const REF_LOCAL_SETUP: &str = include_str!("../../../skills/claude/references/local-setup.md");
+const REF_STACKS_AND_XRS: &str = include_str!("../../../skills/claude/references/stacks-and-xrs.md");
+const REF_DEBUGGING: &str = include_str!("../../../skills/claude/references/debugging.md");
 
 #[derive(Args, Debug)]
 pub struct ClaudeArgs {
@@ -31,6 +33,14 @@ pub fn run(args: &ClaudeArgs) -> Result<(), Box<dyn Error>> {
         (
             ".claude/skills/hops/references/local-setup.md",
             REF_LOCAL_SETUP,
+        ),
+        (
+            ".claude/skills/hops/references/stacks-and-xrs.md",
+            REF_STACKS_AND_XRS,
+        ),
+        (
+            ".claude/skills/hops/references/debugging.md",
+            REF_DEBUGGING,
         ),
     ];
 

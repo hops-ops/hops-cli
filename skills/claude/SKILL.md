@@ -29,6 +29,8 @@ For detailed reference on each area, see the bundled references:
 - [XR observe → adopt → manage workflow](references/xr-workflow.md)
 - [Secrets management](references/secrets.md)
 - [Local control plane setup](references/local-setup.md)
+- [Available stacks and XRs](references/stacks-and-xrs.md)
+- [Debugging with kubectl](references/debugging.md)
 
 ## Crossplane Conventions
 
