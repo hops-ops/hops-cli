@@ -677,6 +677,13 @@ spec:
         let (img_path, _) = split_ref(pull_ref);
         let path = strip_registry(img_path);
         let name = path.replace('/', "-");
+
+        // Delete inactive ConfigurationRevisions pointing at the remote registry.
+        // When switching from a published version to a local build, the old
+        // inactive revision's Function dependency has a stale digest that
+        // conflicts with the locally-pushed render image.
+        delete_remote_registry_config_revisions(&name)?;
+
         apply_configuration(&name, pull_ref, skip_dependency_resolution, reload)?;
     }
 
@@ -1305,7 +1312,7 @@ fn delete_local_registry_config_revisions(config_name: &str) -> Result<(), Box<d
             "get",
             "configurationrevision.pkg.crossplane.io",
             "-o",
-            "jsonpath={range .items[*]}{.metadata.name}|{.spec.package}|{.spec.desiredState}\\n{end}",
+            "jsonpath={range .items[*]}{.metadata.name}|{.spec.image}|{.spec.desiredState}\\n{end}",
         ],
     )?;
 
@@ -1331,6 +1338,50 @@ fn delete_local_registry_config_revisions(config_name: &str) -> Result<(), Box<d
                 ],
             )?;
             log::info!("Deleted stale local ConfigurationRevision '{}'", rev_name);
+        }
+    }
+    Ok(())
+}
+
+/// Delete inactive ConfigurationRevisions pointing at the remote registry
+/// (ghcr.io). When switching from a published version to a local build,
+/// these old revisions have stale Function digests that conflict.
+fn delete_remote_registry_config_revisions(config_name: &str) -> Result<(), Box<dyn Error>> {
+    let output = run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "configurationrevision.pkg.crossplane.io",
+            "-o",
+            "jsonpath={range .items[*]}{.metadata.name}|{.spec.image}|{.spec.desiredState}\\n{end}",
+        ],
+    )?;
+
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let rev_name = parts[0].trim();
+        let package = parts[1].trim();
+        let state = parts[2].trim();
+
+        if !rev_name.starts_with(config_name) {
+            continue;
+        }
+        if !package.contains(REGISTRY_PULL) && state == "Inactive" {
+            run_cmd(
+                "kubectl",
+                &[
+                    "delete",
+                    "configurationrevision.pkg.crossplane.io",
+                    rev_name,
+                ],
+            )?;
+            log::info!(
+                "Deleted stale remote ConfigurationRevision '{}'",
+                rev_name
+            );
         }
     }
     Ok(())
