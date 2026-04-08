@@ -4,6 +4,7 @@ use crate::commands::local::{
 use clap::Args;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -337,7 +338,10 @@ fn apply_repo_version_spec(
     let sources: HashSet<String> = [render_source.clone()].into_iter().collect();
     let removed = delete_package_resources_by_source("function.pkg.crossplane.io", &sources)?;
     if removed > 0 {
-        log::info!("Deleted {} stale Function package(s) before version install", removed);
+        log::info!(
+            "Deleted {} stale Function package(s) before version install",
+            removed
+        );
     }
 
     // Delete any local-registry ImageConfig rewrite left over from a previous
@@ -547,36 +551,11 @@ fn run_local_path(
     let mut seen = HashSet::new();
     loaded.retain(|img| seen.insert(img.source.clone()));
 
-    // Always delete existing Function packages whose source matches the render
-    // images we are about to push. Without this, Crossplane's dependency
-    // resolution keeps the old Function with a stale digest from the published
-    // version, causing ImagePullBackOff when the local registry has a different
-    // digest. With --reload we also delete ConfigurationRevisions.
-    {
-        let function_sources: HashSet<String> = loaded
-            .iter()
-            .filter(|img| !is_configuration_image(&img.source))
-            .map(|img| package_source(&img.source))
-            .collect();
-
-        if !function_sources.is_empty() {
-            let removed_functions = delete_package_resources_by_source(
-                "function.pkg.crossplane.io",
-                &function_sources,
-            )?;
-            let removed_function_revisions = delete_package_resources_by_source(
-                "functionrevision.pkg.crossplane.io",
-                &function_sources,
-            )?;
-            if removed_functions > 0 || removed_function_revisions > 0 {
-                log::info!(
-                    "Deleted {} Function package(s) and {} FunctionRevision(s) from matching sources before re-apply",
-                    removed_functions,
-                    removed_function_revisions
-                );
-            }
-        }
-    }
+    let function_sources: HashSet<String> = loaded
+        .iter()
+        .filter(|img| !is_configuration_image(&img.source))
+        .map(|img| package_source(&img.source))
+        .collect();
 
     let arch = docker_arch().to_string();
     let mut render_rewrites: HashMap<String, RenderRewrite> = HashMap::new();
@@ -650,8 +629,14 @@ spec:
             continue;
         }
 
-        let push_ref = rewrite_registry(&img.source, REGISTRY_PUSH);
-        let pull_ref = rewrite_registry(&img.source, REGISTRY_PULL);
+        let dev_tag = dev_tag_for_uppkg(&img.uppkg_path)?;
+        let push_ref = rewrite_registry_with_tag(&img.source, REGISTRY_PUSH, &dev_tag);
+        let pull_ref = rewrite_registry_with_tag(&img.source, REGISTRY_PULL, &dev_tag);
+        log::info!(
+            "Using local build version '{}' for {}...",
+            dev_tag,
+            img.source
+        );
         config_pull_refs.push(pull_ref.clone());
 
         let mut source_to_push = img.source.clone();
@@ -677,6 +662,8 @@ spec:
         let (img_path, _) = split_ref(pull_ref);
         let path = strip_registry(img_path);
         let name = path.replace('/', "-");
+        let existing_package_ref = current_configuration_package_ref(&name)?;
+        log_existing_install_replacement(&name, existing_package_ref.as_deref(), pull_ref);
 
         // Delete inactive ConfigurationRevisions pointing at the remote registry.
         // When switching from a published version to a local build, the old
@@ -685,6 +672,25 @@ spec:
         delete_remote_registry_config_revisions(&name)?;
 
         apply_configuration(&name, pull_ref, skip_dependency_resolution, reload)?;
+    }
+
+    // Delete existing Function packages only after the new Configuration has
+    // been applied. This ensures Crossplane sees the new desired package
+    // revision before we force render function recreation.
+    if !function_sources.is_empty() {
+        let removed_functions =
+            delete_package_resources_by_source("function.pkg.crossplane.io", &function_sources)?;
+        let removed_function_revisions = delete_package_resources_by_source(
+            "functionrevision.pkg.crossplane.io",
+            &function_sources,
+        )?;
+        if removed_functions > 0 || removed_function_revisions > 0 {
+            log::info!(
+                "Deleted {} Function package(s) and {} FunctionRevision(s) from matching sources after re-apply",
+                removed_functions,
+                removed_function_revisions
+            );
+        }
     }
 
     Ok(())
@@ -846,6 +852,69 @@ fn package_source(package_ref: &str) -> String {
     }
 
     trimmed.to_string()
+}
+
+fn package_tag(package_ref: &str) -> Option<&str> {
+    if let Some((_, digest)) = package_ref.rsplit_once('@') {
+        return Some(digest);
+    }
+
+    package_ref.rsplit_once(':').map(|(_, tag)| tag)
+}
+
+fn current_configuration_package_ref(name: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let output = Command::new("kubectl")
+        .args(["get", "configuration.pkg.crossplane.io", name, "-o", "json"])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("NotFound") {
+            return Ok(None);
+        }
+        return Err(format!("kubectl get configuration '{}' failed: {}", name, stderr).into());
+    }
+
+    let resource: PackageResource = serde_json::from_slice(&output.stdout)?;
+    Ok(resource.spec.and_then(|spec| spec.package_ref))
+}
+
+fn log_existing_install_replacement(
+    name: &str,
+    existing_package_ref: Option<&str>,
+    new_package_ref: &str,
+) {
+    let Some(existing_package_ref) = existing_package_ref else {
+        return;
+    };
+
+    let new_tag = package_tag(new_package_ref).unwrap_or(new_package_ref);
+    let existing_tag = package_tag(existing_package_ref).unwrap_or(existing_package_ref);
+
+    if existing_tag == new_tag {
+        log::info!(
+            "Found existing installation '{}' already using local build version '{}'...",
+            name,
+            new_tag
+        );
+        return;
+    }
+
+    if existing_tag.starts_with("dev-") {
+        log::info!(
+            "Found existing installation '{}' using local build version '{}'; replacing with '{}'...",
+            name,
+            existing_tag,
+            new_tag
+        );
+    } else {
+        log::info!(
+            "Found existing installation '{}' using package '{}'; replacing with local build version '{}'...",
+            name,
+            existing_package_ref,
+            new_tag
+        );
+    }
 }
 
 fn build_configuration_yaml(
@@ -1254,6 +1323,12 @@ fn rewrite_registry(image: &str, registry: &str) -> String {
     format!("{}/{}:{}", registry, path, tag)
 }
 
+fn rewrite_registry_with_tag(image: &str, registry: &str, tag: &str) -> String {
+    let (path_with_reg, _) = split_ref(image);
+    let path = strip_registry(path_with_reg);
+    format!("{}/{}:{}", registry, path, tag)
+}
+
 /// Strip the registry prefix from an image path.
 fn strip_registry(path: &str) -> &str {
     if let Some(pos) = path.find('/') {
@@ -1268,6 +1343,23 @@ fn strip_registry(path: &str) -> &str {
 /// Split "path:tag" into ("path", "tag").
 fn split_ref(image: &str) -> (&str, &str) {
     image.rsplit_once(':').unwrap_or((image, "latest"))
+}
+
+fn dev_tag_for_uppkg(uppkg_path: &Path) -> Result<String, Box<dyn Error>> {
+    let mut file = fs::File::open(uppkg_path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+
+    let hex = format!("{:x}", hasher.finalize());
+    Ok(format!("dev-{}", &hex[..12]))
 }
 
 /// Map Rust arch constant to Docker platform architecture name.
@@ -1378,10 +1470,7 @@ fn delete_remote_registry_config_revisions(config_name: &str) -> Result<(), Box<
                     rev_name,
                 ],
             )?;
-            log::info!(
-                "Deleted stale remote ConfigurationRevision '{}'",
-                rev_name
-            );
+            log::info!("Deleted stale remote ConfigurationRevision '{}'", rev_name);
         }
     }
     Ok(())
@@ -1576,6 +1665,20 @@ spec:
         assert_eq!(
             package_source("ghcr.io/hops-ops/helm-airflow_render@sha256:abc123"),
             "ghcr.io/hops-ops/helm-airflow_render"
+        );
+    }
+
+    #[test]
+    fn package_tag_extracts_tag_or_digest() {
+        assert_eq!(
+            package_tag(
+                "registry.crossplane-system.svc.cluster.local:5000/hops-ops/test:dev-123456789abc"
+            ),
+            Some("dev-123456789abc")
+        );
+        assert_eq!(
+            package_tag("ghcr.io/hops-ops/test@sha256:abcdef"),
+            Some("sha256:abcdef")
         );
     }
 }

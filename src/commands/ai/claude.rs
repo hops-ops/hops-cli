@@ -4,11 +4,13 @@ use std::fs;
 use std::path::Path;
 
 const SKILL_MD: &str = include_str!("../../../skills/claude/SKILL.md");
-const REF_CONFIG_INSTALL: &str = include_str!("../../../skills/claude/references/config-install.md");
+const REF_CONFIG_INSTALL: &str =
+    include_str!("../../../skills/claude/references/config-install.md");
 const REF_XR_WORKFLOW: &str = include_str!("../../../skills/claude/references/xr-workflow.md");
 const REF_SECRETS: &str = include_str!("../../../skills/claude/references/secrets.md");
 const REF_LOCAL_SETUP: &str = include_str!("../../../skills/claude/references/local-setup.md");
-const REF_STACKS_AND_XRS: &str = include_str!("../../../skills/claude/references/stacks-and-xrs.md");
+const REF_STACKS_AND_XRS: &str =
+    include_str!("../../../skills/claude/references/stacks-and-xrs.md");
 const REF_DEBUGGING: &str = include_str!("../../../skills/claude/references/debugging.md");
 
 #[derive(Args, Debug)]
@@ -38,10 +40,7 @@ pub fn run(args: &ClaudeArgs) -> Result<(), Box<dyn Error>> {
             ".claude/skills/hops/references/stacks-and-xrs.md",
             REF_STACKS_AND_XRS,
         ),
-        (
-            ".claude/skills/hops/references/debugging.md",
-            REF_DEBUGGING,
-        ),
+        (".claude/skills/hops/references/debugging.md", REF_DEBUGGING),
     ];
 
     let mut wrote = 0usize;
