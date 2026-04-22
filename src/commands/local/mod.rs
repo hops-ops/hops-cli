@@ -16,6 +16,33 @@ use std::process::{Command, Stdio};
 const LOCAL_STATE_DIR: &str = ".hops/local";
 const REPO_CACHE_DIR: &str = "repo-cache";
 
+/// Env var checked by kubectl helpers to inject `--context <name>`.
+pub const HOPS_KUBE_CONTEXT_ENV: &str = "HOPS_KUBE_CONTEXT";
+
+/// Build the kubectl args prefix. Returns `["--context", ctx]` when the env var
+/// is set, or an empty vec otherwise.
+fn kubectl_context_args() -> Vec<String> {
+    match std::env::var(HOPS_KUBE_CONTEXT_ENV) {
+        Ok(ctx) if !ctx.is_empty() => vec!["--context".to_string(), ctx],
+        _ => vec![],
+    }
+}
+
+/// Prepend `--context` to a kubectl arg slice when configured.
+fn with_kube_context(args: &[&str]) -> Vec<String> {
+    let mut out = kubectl_context_args();
+    out.extend(args.iter().map(|s| s.to_string()));
+    out
+}
+
+/// Build a `Command` for kubectl with `--context` injected when configured.
+pub fn kubectl_command(args: &[&str]) -> Command {
+    let full = with_kube_context(args);
+    let mut cmd = Command::new("kubectl");
+    cmd.args(&full);
+    cmd
+}
+
 #[derive(Args, Debug)]
 pub struct LocalArgs {
     #[command(subcommand)]
@@ -56,15 +83,32 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
 }
 
 /// Run an external command with inherited stdio. Fails on non-zero exit.
+/// For kubectl commands, automatically injects `--context` when configured.
 pub fn run_cmd(program: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
+    if program == "kubectl" {
+        let full = with_kube_context(args);
+        let refs: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
+        return run_cmd_with_logged_args(program, &refs, &refs);
+    }
     run_cmd_with_logged_args(program, args, args)
 }
 
 /// Run an external command and capture stdout.
+/// For kubectl commands, automatically injects `--context` when configured.
 pub fn run_cmd_output(program: &str, args: &[&str]) -> Result<String, Box<dyn Error>> {
+    if program == "kubectl" {
+        let full = with_kube_context(args);
+        log::debug!("Running: {} {}", program, full.join(" "));
+        let output = Command::new(program).args(&full).output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("{} exited with {}: {}", program, output.status, stderr).into());
+        }
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+
     log::debug!("Running: {} {}", program, args.join(" "));
     let output = Command::new(program).args(args).output()?;
-
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("{} exited with {}: {}", program, output.status, stderr).into());
@@ -178,9 +222,11 @@ pub fn sync_registry_hosts_entry(
 }
 
 /// Pipe a YAML string into `kubectl apply -f -`.
+/// Automatically injects `--context` when configured.
 pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
+    let full = with_kube_context(&["apply", "-f", "-"]);
     let mut child = Command::new("kubectl")
-        .args(["apply", "-f", "-"])
+        .args(&full)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -198,25 +244,22 @@ pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
 }
 
 /// Apply a JSON merge patch with `kubectl patch --type merge`.
+/// Automatically injects `--context` when configured.
 pub fn kubectl_patch_merge(
     resource: &str,
     name: &str,
     namespace: &str,
     patch_json: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let args = [
+    let base_args = [
         "patch", resource, name, "-n", namespace, "--type", "merge", "-p", patch_json,
     ];
-    let logged_args = [
-        "patch",
-        resource,
-        name,
-        "-n",
-        namespace,
-        "--type",
-        "merge",
-        "-p",
-        "<REDACTED>",
+    let base_logged = [
+        "patch", resource, name, "-n", namespace, "--type", "merge", "-p", "<REDACTED>",
     ];
-    run_cmd_with_logged_args("kubectl", &args, &logged_args)
+    let full_args = with_kube_context(&base_args);
+    let full_logged = with_kube_context(&base_logged);
+    let args_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+    let logged_refs: Vec<&str> = full_logged.iter().map(|s| s.as_str()).collect();
+    run_cmd_with_logged_args("kubectl", &args_refs, &logged_refs)
 }

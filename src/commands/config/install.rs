@@ -1,8 +1,10 @@
 use crate::commands::local::{
-    kubectl_apply_stdin, repo_cache_path, run_cmd, run_cmd_output, sync_registry_hosts_entry,
+    kubectl_apply_stdin, kubectl_command, repo_cache_path, run_cmd, run_cmd_output,
+    sync_registry_hosts_entry, HOPS_KUBE_CONTEXT_ENV,
 };
 use clap::Args;
 use flate2::read::GzDecoder;
+use notify::{RecursiveMode, Watcher};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
@@ -13,7 +15,8 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tar::Archive;
 
 const REGISTRY_YAML: &str = include_str!("../../../bootstrap/registry/registry.yaml");
@@ -46,6 +49,18 @@ pub struct ConfigArgs {
     /// Set spec.skipDependencyResolution=true on the generated Configuration
     #[arg(long)]
     pub skip_dependency_resolution: bool,
+
+    /// Kubernetes context to use for all kubectl commands (e.g. "colima")
+    #[arg(long)]
+    pub context: Option<String>,
+
+    /// Watch the project directory for changes and re-run install automatically
+    #[arg(long, conflicts_with = "repo")]
+    pub watch: bool,
+
+    /// Debounce interval for --watch in seconds (default: 30)
+    #[arg(long, requires = "watch", default_value = "30")]
+    pub debounce: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -143,16 +158,110 @@ enum RepoInstallChoice {
 pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
     validate_reload_args(args)?;
 
+    if let Some(ctx) = &args.context {
+        std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx);
+    }
+
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => {
             apply_repo_version(repo, version, args.skip_dependency_resolution)
         }
         (Some(repo), None) => run_repo_install(repo, args.reload, args.skip_dependency_resolution),
-        (None, _) => run_local_path(
-            args.path.as_deref().unwrap_or("."),
-            args.reload,
-            args.skip_dependency_resolution,
-        ),
+        (None, _) => {
+            let path = args.path.as_deref().unwrap_or(".");
+            run_local_path(path, args.reload, args.skip_dependency_resolution)?;
+
+            if args.watch {
+                run_watch(path, args.reload, args.skip_dependency_resolution, args.debounce)?;
+            }
+
+            Ok(())
+        }
+    }
+}
+
+fn should_ignore_path(path: &Path) -> bool {
+    path.components().any(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        s == "_output" || s == ".git" || s == "node_modules" || s == ".cache"
+    })
+}
+
+fn run_watch(
+    path: &str,
+    reload: bool,
+    skip_dependency_resolution: bool,
+    debounce_secs: u64,
+) -> Result<(), Box<dyn Error>> {
+    let dir = Path::new(path).canonicalize()?;
+    let debounce = Duration::from_secs(debounce_secs);
+
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            let dominated_by_ignored = event.paths.iter().all(|p| should_ignore_path(p));
+            if !dominated_by_ignored {
+                let _ = tx.send(());
+            }
+        }
+    })?;
+    watcher.watch(&dir, RecursiveMode::Recursive)?;
+
+    log::info!(
+        "Watching {} for changes (debounce {}s, Ctrl+C to stop)...",
+        dir.display(),
+        debounce_secs,
+    );
+
+    loop {
+        // Block until the first filesystem event arrives.
+        rx.recv().map_err(|_| "watcher channel closed")?;
+
+        // Debounce: wait until no new events arrive for the full debounce window.
+        wait_for_quiet(&rx, debounce)?;
+
+        log::info!("──────────────────────────────────────────────");
+        log::info!("Change detected, rebuilding...");
+
+        match run_local_path(path, reload, skip_dependency_resolution) {
+            Ok(()) => log::info!("Rebuild succeeded."),
+            Err(e) => log::error!("Rebuild failed: {}", e),
+        }
+
+        // Drain everything that arrived during the build, then wait for
+        // a full quiet window before accepting new triggers. This prevents
+        // the build's own filesystem side-effects from cascading.
+        drain_pending(&rx);
+        wait_for_quiet(&rx, debounce)?;
+        // Drain once more — if events trickled in at the tail of the quiet
+        // window they'd immediately trigger the next recv() at the top.
+        drain_pending(&rx);
+
+        log::info!(
+            "Watching for changes (debounce {}s, Ctrl+C to stop)...",
+            debounce_secs,
+        );
+    }
+}
+
+fn drain_pending(rx: &mpsc::Receiver<()>) {
+    while rx.try_recv().is_ok() {}
+}
+
+fn wait_for_quiet(rx: &mpsc::Receiver<()>, debounce: Duration) -> Result<(), Box<dyn Error>> {
+    let mut deadline = Instant::now() + debounce;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(()) => deadline = Instant::now() + debounce,
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("watcher channel closed".into());
+            }
+        }
     }
 }
 
@@ -347,8 +456,7 @@ fn apply_repo_version_spec(
     // Delete any local-registry ImageConfig rewrite left over from a previous
     // `config install --path` so Crossplane pulls from ghcr.io.
     let ic_name = image_config_name(&render_source);
-    let ic_check = Command::new("kubectl")
-        .args(["get", "imageconfig.pkg.crossplane.io", &ic_name])
+    let ic_check = kubectl_command(&["get", "imageconfig.pkg.crossplane.io", &ic_name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -863,8 +971,7 @@ fn package_tag(package_ref: &str) -> Option<&str> {
 }
 
 fn current_configuration_package_ref(name: &str) -> Result<Option<String>, Box<dyn Error>> {
-    let output = Command::new("kubectl")
-        .args(["get", "configuration.pkg.crossplane.io", name, "-o", "json"])
+    let output = kubectl_command(&["get", "configuration.pkg.crossplane.io", name, "-o", "json"])
         .output()?;
 
     if !output.status.success() {
