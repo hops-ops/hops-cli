@@ -42,10 +42,6 @@ pub struct ConfigArgs {
     #[arg(long, requires = "repo")]
     pub version: Option<String>,
 
-    /// Force reload from source by recreating ConfigurationRevision(s) before apply (path/repo only)
-    #[arg(long, conflicts_with = "version")]
-    pub reload: bool,
-
     /// Set spec.skipDependencyResolution=true on the generated Configuration
     #[arg(long)]
     pub skip_dependency_resolution: bool,
@@ -108,25 +104,6 @@ struct KubeList<T> {
 }
 
 #[derive(Debug, Deserialize)]
-struct OwnerReference {
-    kind: Option<String>,
-    name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RevisionMetadata {
-    name: String,
-    #[serde(rename = "ownerReferences")]
-    owner_references: Option<Vec<OwnerReference>>,
-    labels: Option<HashMap<String, String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConfigurationRevisionResource {
-    metadata: RevisionMetadata,
-}
-
-#[derive(Debug, Deserialize)]
 struct PackageMetadataName {
     name: String,
 }
@@ -156,8 +133,6 @@ enum RepoInstallChoice {
 }
 
 pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
-    validate_reload_args(args)?;
-
     if let Some(ctx) = &args.context {
         std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx);
     }
@@ -166,13 +141,13 @@ pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
         (Some(repo), Some(version)) => {
             apply_repo_version(repo, version, args.skip_dependency_resolution)
         }
-        (Some(repo), None) => run_repo_install(repo, args.reload, args.skip_dependency_resolution),
+        (Some(repo), None) => run_repo_install(repo, args.skip_dependency_resolution),
         (None, _) => {
             let path = args.path.as_deref().unwrap_or(".");
-            run_local_path(path, args.reload, args.skip_dependency_resolution)?;
+            run_local_path(path, args.skip_dependency_resolution)?;
 
             if args.watch {
-                run_watch(path, args.reload, args.skip_dependency_resolution, args.debounce)?;
+                run_watch(path, args.skip_dependency_resolution, args.debounce)?;
             }
 
             Ok(())
@@ -189,7 +164,6 @@ fn should_ignore_path(path: &Path) -> bool {
 
 fn run_watch(
     path: &str,
-    reload: bool,
     skip_dependency_resolution: bool,
     debounce_secs: u64,
 ) -> Result<(), Box<dyn Error>> {
@@ -232,7 +206,7 @@ fn run_watch(
         log::info!("──────────────────────────────────────────────");
         log::info!("Change detected, rebuilding...");
 
-        match run_local_path(path, reload, skip_dependency_resolution) {
+        match run_local_path(path, skip_dependency_resolution) {
             Ok(()) => log::info!("Rebuild succeeded."),
             Err(e) => log::error!("Rebuild failed: {}", e),
         }
@@ -261,21 +235,13 @@ fn wait_for_quiet(rx: &mpsc::Receiver<()>, debounce: Duration) -> Result<(), Box
     }
 }
 
-fn validate_reload_args(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
-    if args.reload && args.version.is_some() {
-        return Err("`--reload` can only be used with source builds (`--path` or `--repo` without `--version`)".into());
-    }
-    Ok(())
-}
-
 fn run_repo_install(
     repo: &str,
-    reload: bool,
     skip_dependency_resolution: bool,
 ) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
-    match resolve_repo_install_target(&spec, reload)? {
-        RepoInstallTarget::SourceBuild => run_repo_clone(&spec, reload, skip_dependency_resolution),
+    match resolve_repo_install_target(&spec)? {
+        RepoInstallTarget::SourceBuild => run_repo_clone(&spec, skip_dependency_resolution),
         RepoInstallTarget::PublishedVersion(version) => {
             apply_repo_version_spec(&spec, &version, skip_dependency_resolution)
         }
@@ -284,22 +250,14 @@ fn run_repo_install(
 
 fn run_repo_clone(
     spec: &RepoSpec,
-    reload: bool,
     skip_dependency_resolution: bool,
 ) -> Result<(), Box<dyn Error>> {
     let cache_path = ensure_cached_repo_checkout(&spec)?;
-    run_local_path(
-        &cache_path.to_string_lossy(),
-        reload,
-        skip_dependency_resolution,
-    )
+    run_local_path(&cache_path.to_string_lossy(), skip_dependency_resolution)
 }
 
-fn resolve_repo_install_target(
-    spec: &RepoSpec,
-    reload: bool,
-) -> Result<RepoInstallTarget, Box<dyn Error>> {
-    if reload || !interactive_stdio_available() {
+fn resolve_repo_install_target(spec: &RepoSpec) -> Result<RepoInstallTarget, Box<dyn Error>> {
+    if !interactive_stdio_available() {
         return Ok(RepoInstallTarget::SourceBuild);
     }
 
@@ -468,12 +426,7 @@ fn apply_repo_version_spec(
     // registry so they don't block dependency resolution for the published version.
     delete_local_registry_config_revisions(&config_name)?;
 
-    apply_configuration(
-        &config_name,
-        &package_ref,
-        skip_dependency_resolution,
-        false,
-    )
+    apply_configuration(&config_name, &package_ref, skip_dependency_resolution)
 }
 
 fn ensure_cached_repo_checkout(spec: &RepoSpec) -> Result<PathBuf, Box<dyn Error>> {
@@ -586,7 +539,6 @@ fn sanitize_name_component(input: &str) -> String {
 
 fn run_local_path(
     path: &str,
-    reload: bool,
     skip_dependency_resolution: bool,
 ) -> Result<(), Box<dyn Error>> {
     let dir = Path::new(path);
@@ -775,7 +727,7 @@ spec:
         // conflicts with the locally-pushed render image.
         delete_remote_registry_config_revisions(&name)?;
 
-        apply_configuration(&name, pull_ref, skip_dependency_resolution, reload)?;
+        apply_configuration(&name, pull_ref, skip_dependency_resolution)?;
     }
 
     // Delete existing Function packages only after the new Configuration has
@@ -804,12 +756,7 @@ fn apply_configuration(
     name: &str,
     package_ref: &str,
     skip_dependency_resolution: bool,
-    reload: bool,
 ) -> Result<(), Box<dyn Error>> {
-    if reload {
-        force_reload_configuration_revisions(name)?;
-    }
-
     log::info!("Applying Configuration '{}'...", name);
     kubectl_apply_stdin(&build_configuration_yaml(
         name,
@@ -817,90 +764,6 @@ fn apply_configuration(
         skip_dependency_resolution,
     ))?;
     Ok(())
-}
-
-fn force_reload_configuration_revisions(name: &str) -> Result<(), Box<dyn Error>> {
-    let revisions = list_configuration_revisions_for(name)?;
-    if revisions.is_empty() {
-        return Ok(());
-    }
-
-    log::info!(
-        "Reload requested; deleting {} ConfigurationRevision(s) for '{}' before re-applying...",
-        revisions.len(),
-        name
-    );
-    for rev in &revisions {
-        run_cmd(
-            "kubectl",
-            &[
-                "delete",
-                "configurationrevision.pkg.crossplane.io",
-                rev,
-                "--ignore-not-found",
-            ],
-        )?;
-    }
-
-    for _ in 0..60 {
-        let remaining = list_configuration_revisions_for(name)?;
-        if !remaining.is_empty() {
-            std::thread::sleep(Duration::from_secs(2));
-            continue;
-        }
-        return Ok(());
-    }
-
-    Err(format!(
-        "Timed out waiting for ConfigurationRevision deletion for '{}' before reload",
-        name
-    )
-    .into())
-}
-
-fn list_configuration_revisions_for(config_name: &str) -> Result<Vec<String>, Box<dyn Error>> {
-    let raw = run_cmd_output(
-        "kubectl",
-        &[
-            "get",
-            "configurationrevision.pkg.crossplane.io",
-            "-o",
-            "json",
-        ],
-    )?;
-    let list: KubeList<ConfigurationRevisionResource> = serde_json::from_str(&raw)?;
-
-    let mut revisions = Vec::new();
-    for item in list.items {
-        if revision_belongs_to_configuration(&item.metadata, config_name) {
-            revisions.push(item.metadata.name);
-        }
-    }
-
-    Ok(revisions)
-}
-
-fn revision_belongs_to_configuration(metadata: &RevisionMetadata, config_name: &str) -> bool {
-    if metadata
-        .labels
-        .as_ref()
-        .and_then(|labels| labels.get("pkg.crossplane.io/package"))
-        .map(|v| v == config_name)
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    metadata
-        .owner_references
-        .as_ref()
-        .map(|owners| {
-            owners.iter().any(|owner| {
-                owner.kind.as_deref() == Some("Configuration")
-                    && owner.name.as_deref() == Some(config_name)
-            })
-        })
-        .unwrap_or(false)
 }
 
 fn delete_package_resources_by_source(
@@ -1705,64 +1568,6 @@ spec:
 
         let without_skip = build_configuration_yaml("cfg", "ghcr.io/hops-ops/x:v1", false);
         assert!(!without_skip.contains("skipDependencyResolution: true"));
-    }
-
-    #[test]
-    fn validate_reload_args_rejects_reload_with_version() {
-        let args = ConfigArgs {
-            path: None,
-            repo: Some("hops-ops/helm-certmanager".to_string()),
-            version: Some("v0.1.0".to_string()),
-            reload: true,
-            skip_dependency_resolution: false,
-            context: None,
-            watch: false,
-            debounce: 15,
-        };
-        assert!(validate_reload_args(&args).is_err());
-    }
-
-    #[test]
-    fn validate_reload_args_accepts_source_reload() {
-        let args = ConfigArgs {
-            path: Some("/tmp/project".to_string()),
-            repo: None,
-            version: None,
-            reload: true,
-            skip_dependency_resolution: false,
-            context: None,
-            watch: false,
-            debounce: 15,
-        };
-        assert!(validate_reload_args(&args).is_ok());
-    }
-
-    #[test]
-    fn revision_belongs_to_configuration_by_label() {
-        let metadata = RevisionMetadata {
-            name: "cfg-abc".to_string(),
-            owner_references: None,
-            labels: Some(HashMap::from([(
-                "pkg.crossplane.io/package".to_string(),
-                "cfg".to_string(),
-            )])),
-        };
-        assert!(revision_belongs_to_configuration(&metadata, "cfg"));
-        assert!(!revision_belongs_to_configuration(&metadata, "other"));
-    }
-
-    #[test]
-    fn revision_belongs_to_configuration_by_owner_reference() {
-        let metadata = RevisionMetadata {
-            name: "cfg-def".to_string(),
-            owner_references: Some(vec![OwnerReference {
-                kind: Some("Configuration".to_string()),
-                name: Some("cfg".to_string()),
-            }]),
-            labels: None,
-        };
-        assert!(revision_belongs_to_configuration(&metadata, "cfg"));
-        assert!(!revision_belongs_to_configuration(&metadata, "other"));
     }
 
     #[test]

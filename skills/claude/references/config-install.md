@@ -16,9 +16,20 @@ hops config install --path /path/to/project
 
 # Build from GitHub repo (interactive: choose source or published)
 hops config install --repo hops-ops/aws-auto-eks-cluster
+```
 
-# Force source reload
-hops config install --repo hops-ops/aws-auto-eks-cluster --reload
+### Iterating on local changes
+
+Each source build is tagged with a unique `dev-<sha256>` derived from the `.uppkg`
+content, so the Configuration's `spec.package` changes on every build. To pick up
+edits, re-run the same install command — Crossplane sees the new package ref and
+creates a fresh ConfigurationRevision. **No flag is needed to force a rebuild**:
+just run `hops config install --path <dir>` again.
+
+For an even tighter loop, use `--watch` to re-run install automatically on save:
+
+```bash
+hops config install --path /path/to/project --watch
 ```
 
 **What happens:**
@@ -78,8 +89,10 @@ Functions, Providers) and ImageConfig rewrites.
 
 | Flag | Applies to | Purpose |
 |------|-----------|---------|
-| `--reload` | Source builds only | Delete ConfigurationRevisions and Functions before re-applying |
-| `--skip-dependency-resolution` | All modes | Set `spec.skipDependencyResolution=true` |
 | `--path` | Source build | Path to local XRD project |
 | `--repo` | Both modes | GitHub `<org>/<repo>` |
 | `--version` | Remote mode | Version tag (e.g. `v0.11.0`) |
+| `--watch` | Source build | Re-run install on filesystem changes |
+| `--debounce` | Used with `--watch` | Quiet interval in seconds before rebuild (default 15) |
+| `--skip-dependency-resolution` | All modes | Set `spec.skipDependencyResolution=true` |
+| `--context` | All modes | Kubernetes context (e.g. `colima`) |
