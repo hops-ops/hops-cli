@@ -58,8 +58,8 @@ pub struct ConfigArgs {
     #[arg(long, conflicts_with = "repo")]
     pub watch: bool,
 
-    /// Debounce interval for --watch in seconds (default: 30)
-    #[arg(long, requires = "watch", default_value = "30")]
+    /// Debounce interval for --watch in seconds (default: 15)
+    #[arg(long, requires = "watch", default_value = "15")]
     pub debounce: u64,
 }
 
@@ -198,11 +198,20 @@ fn run_watch(
 
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
-            let dominated_by_ignored = event.paths.iter().all(|p| should_ignore_path(p));
-            if !dominated_by_ignored {
-                let _ = tx.send(());
+        match res {
+            Ok(event) => {
+                let dominated_by_ignored = event.paths.iter().all(|p| should_ignore_path(p));
+                log::debug!(
+                    "watch event: kind={:?} paths={:?} filtered={}",
+                    event.kind,
+                    event.paths,
+                    dominated_by_ignored,
+                );
+                if !dominated_by_ignored {
+                    let _ = tx.send(());
+                }
             }
+            Err(e) => log::debug!("watch error: {:?}", e),
         }
     })?;
     watcher.watch(&dir, RecursiveMode::Recursive)?;
@@ -228,24 +237,11 @@ fn run_watch(
             Err(e) => log::error!("Rebuild failed: {}", e),
         }
 
-        // Drain everything that arrived during the build, then wait for
-        // a full quiet window before accepting new triggers. This prevents
-        // the build's own filesystem side-effects from cascading.
-        drain_pending(&rx);
-        wait_for_quiet(&rx, debounce)?;
-        // Drain once more — if events trickled in at the tail of the quiet
-        // window they'd immediately trigger the next recv() at the top.
-        drain_pending(&rx);
-
         log::info!(
             "Watching for changes (debounce {}s, Ctrl+C to stop)...",
             debounce_secs,
         );
     }
-}
-
-fn drain_pending(rx: &mpsc::Receiver<()>) {
-    while rx.try_recv().is_ok() {}
 }
 
 fn wait_for_quiet(rx: &mpsc::Receiver<()>, debounce: Duration) -> Result<(), Box<dyn Error>> {
@@ -1719,6 +1715,9 @@ spec:
             version: Some("v0.1.0".to_string()),
             reload: true,
             skip_dependency_resolution: false,
+            context: None,
+            watch: false,
+            debounce: 15,
         };
         assert!(validate_reload_args(&args).is_err());
     }
@@ -1731,6 +1730,9 @@ spec:
             version: None,
             reload: true,
             skip_dependency_resolution: false,
+            context: None,
+            watch: false,
+            debounce: 15,
         };
         assert!(validate_reload_args(&args).is_ok());
     }
