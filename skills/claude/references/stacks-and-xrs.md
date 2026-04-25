@@ -6,7 +6,7 @@ These compose multiple resources for a specific platform concern. Group: `aws.ho
 
 | Kind | Package | Description |
 |------|---------|-------------|
-| `BaseStack` | `aws-base-stack` | AWS Load Balancer Controller with Pod Identity |
+| `LBCStack` | `aws-lbc-stack` | AWS Load Balancer Controller with Pod Identity |
 | `CrossplaneStack` | `aws-crossplane-stack` | Crossplane + AWS/K8s/Helm/GitHub providers with toggles |
 | `DNSStack` | `aws-dns-stack` | ExternalDNS, CertManager, ClusterIssuer for DNS/TLS |
 | `ObserveStack` | `aws-observe-stack` | Full observability: KPS, Loki, Tempo, k8s-monitoring, Grafana Operator, VPA, Goldilocks. Optional dedicated NodePool |
