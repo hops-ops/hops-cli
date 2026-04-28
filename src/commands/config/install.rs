@@ -627,26 +627,25 @@ fn run_local_path(
         let push_ref = rewrite_registry(&img.source, REGISTRY_PUSH);
         let (img_path, tag) = split_ref(&img.source);
 
-        if img_path.ends_with("_render") {
-            log::info!("Rebuilding {} (fix OCI config)...", push_ref);
-            docker_build_from(&img.source, &push_ref)?;
+        // All non-configuration images are Crossplane Function packages (the
+        // configuration filter ran above). Single-function repos historically
+        // produced one image named <repo>_render; multi-function repos produce
+        // <repo>_<funcname> per function. Both need the OCI-config rebuild +
+        // digest capture + ImageConfig rewrite treatment.
+        log::info!("Rebuilding {} (fix OCI config)...", push_ref);
+        docker_build_from(&img.source, &push_ref)?;
 
-            if tag == arch {
-                let digest = docker_push_and_get_digest(&push_ref)?;
-                let target_prefix = format!("{}/{}", REGISTRY_PULL, strip_registry(img_path));
-                render_rewrites.insert(
-                    img_path.to_string(),
-                    RenderRewrite {
-                        digest,
-                        target_prefix,
-                    },
-                );
-            } else {
-                log::info!("Pushing {}...", push_ref);
-                run_cmd("docker", &["push", &push_ref])?;
-            }
+        if tag == arch {
+            let digest = docker_push_and_get_digest(&push_ref)?;
+            let target_prefix = format!("{}/{}", REGISTRY_PULL, strip_registry(img_path));
+            render_rewrites.insert(
+                img_path.to_string(),
+                RenderRewrite {
+                    digest,
+                    target_prefix,
+                },
+            );
         } else {
-            run_cmd("docker", &["tag", &img.source, &push_ref])?;
             log::info!("Pushing {}...", push_ref);
             run_cmd("docker", &["push", &push_ref])?;
         }
