@@ -18,6 +18,7 @@ control planes, configuration packages, secrets, and live infrastructure adoptio
 | `hops local` | Local Colima-based control plane setup |
 | `hops config` | Build, install, and uninstall Crossplane configuration packages |
 | `hops secrets` | SOPS encrypt/decrypt, sync to AWS Secrets Manager or GitHub |
+| `hops vars` | Declarative non-secret config (e.g. GitHub Actions repo variables) |
 | `hops xr` | Observe/adopt/manage/orphan existing infrastructure |
 | `hops validate` | Generate configuration manifests for validation |
 
@@ -28,6 +29,7 @@ For detailed reference on each area, see the bundled references:
 - [Config install modes and local/published switching](references/config-install.md)
 - [XR observe → adopt → manage workflow](references/xr-workflow.md)
 - [Secrets management](references/secrets.md)
+- [Vars management (declarative GH Actions variables)](references/vars.md)
 - [Local control plane setup](references/local-setup.md)
 - [Available stacks and XRs](references/stacks-and-xrs.md)
 - [Debugging with kubectl](references/debugging.md)

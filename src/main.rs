@@ -16,6 +16,8 @@ enum Commands {
     Local(commands::local::LocalArgs),
     /// Manage repo secrets with SOPS and AWS Secrets Manager
     Secrets(commands::secrets::SecretsArgs),
+    /// Manage non-secret config (e.g. GitHub Actions repo variables) declaratively
+    Vars(commands::vars::VarsArgs),
     /// Manage Crossplane configuration packages in the connected cluster
     Config(commands::config::ConfigArgs),
     /// Manage validation helpers for Crossplane projects
@@ -39,6 +41,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(Commands::Secrets(secrets_args)) => {
             commands::secrets::run(secrets_args)?;
+        }
+        Some(Commands::Vars(vars_args)) => {
+            commands::vars::run(vars_args)?;
         }
         Some(Commands::Config(config_args)) => {
             commands::config::run(config_args)?;
