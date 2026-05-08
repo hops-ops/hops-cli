@@ -2,6 +2,7 @@ mod aws;
 mod destroy;
 mod github;
 mod install;
+pub mod package_install;
 mod reset;
 mod start;
 mod stop;

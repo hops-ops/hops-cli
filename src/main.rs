@@ -20,6 +20,8 @@ enum Commands {
     Vars(commands::vars::VarsArgs),
     /// Manage Crossplane configuration packages in the connected cluster
     Config(commands::config::ConfigArgs),
+    /// Manage Crossplane provider packages in the connected cluster
+    Provider(commands::provider::ProviderArgs),
     /// Manage validation helpers for Crossplane projects
     Validate(commands::validate::ValidateArgs),
     /// Manage live XR observe/manage/adopt workflows
@@ -47,6 +49,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(Commands::Config(config_args)) => {
             commands::config::run(config_args)?;
+        }
+        Some(Commands::Provider(provider_args)) => {
+            commands::provider::run(provider_args)?;
         }
         Some(Commands::Validate(validate_args)) => {
             commands::validate::run(validate_args)?;
