@@ -12,14 +12,13 @@
 //! freshly-generated value. The CLI never touches Kubernetes — applying
 //! the AuthStack manifest stays a separate, declarative step.
 
+use crate::commands::secrets;
 use clap::Args;
-use rusoto_core::{HttpClient, Region};
-use rusoto_credential::ChainProvider;
+use rusoto_core::RusotoError;
 use rusoto_secretsmanager::{
     CreateSecretRequest, GetSecretValueError, GetSecretValueRequest, PutSecretValueRequest,
     SecretsManager, SecretsManagerClient, Tag,
 };
-use rusoto_core::RusotoError;
 use std::env;
 use std::error::Error;
 use tokio::runtime::Runtime;
@@ -56,24 +55,22 @@ pub fn run(args: &BootstrapArgs) -> Result<(), Box<dyn Error>> {
         .clone()
         .unwrap_or_else(|| format!("{}/zitadel", args.cluster));
 
-    let region: Region = args
+    let region = args
         .region
         .clone()
         .or_else(|| env::var("AWS_REGION").ok())
-        .unwrap_or_else(|| DEFAULT_REGION.to_string())
-        .parse()?;
+        .unwrap_or_else(|| DEFAULT_REGION.to_string());
 
     let runtime = Runtime::new()?;
-    let client = SecretsManagerClient::new_with(
-        HttpClient::new()?,
-        ChainProvider::new(),
-        region.clone(),
-    );
+    // Reuse the AWS credential helpers from `hops secrets` so this command
+    // resolves SSO profiles the same way (AWS_PROFILE → aws configure
+    // export-credentials → StaticProvider).
+    let (client, _sts) = secrets::aws_clients(&region)?;
 
     let masterkey_path = format!("{}/masterkey", prefix);
     let admin_pwd_path = format!("{}/admin-password", prefix);
 
-    log::info!("Bootstrapping AuthStack durable secrets in region {:?}", region.name());
+    log::info!("Bootstrapping AuthStack durable secrets in region {}", region);
     log::info!("  masterkey  → {}", masterkey_path);
     log::info!("  admin-pwd  → {}", admin_pwd_path);
 
@@ -91,7 +88,7 @@ pub fn run(args: &BootstrapArgs) -> Result<(), Box<dyn Error>> {
         &client,
         &admin_pwd_path,
         "password",
-        &generate_32_char_random(),
+        &generate_complex_password(),
         args.cluster.as_str(),
         args.force,
     )?;
@@ -130,6 +127,9 @@ fn upsert_json_secret(
             runtime.block_on(client.put_secret_value(PutSecretValueRequest {
                 secret_id: path.to_string(),
                 secret_string: Some(json),
+                // AWS SM requires a UUID-shaped idempotency token on
+                // PutSecretValue as well as CreateSecret.
+                client_request_token: Some(Uuid::new_v4().to_string()),
                 ..Default::default()
             }))?;
         }
@@ -138,6 +138,9 @@ fn upsert_json_secret(
             runtime.block_on(client.create_secret(CreateSecretRequest {
                 name: path.to_string(),
                 secret_string: Some(json),
+                // ClientRequestToken makes CreateSecret idempotent; AWS
+                // requires a UUID-shaped value.
+                client_request_token: Some(Uuid::new_v4().to_string()),
                 tags: Some(vec![
                     Tag {
                         key: Some("hops.ops.com.ai/secret".to_string()),
@@ -162,11 +165,43 @@ fn upsert_json_secret(
 }
 
 /// Returns 32 hex characters of cryptographic randomness (~122 bits of
-/// entropy from a v4 UUID). The AuthStack values are user-facing strings
-/// (Zitadel reads them as text) so hex is fine — no need for full
-/// 256-bit base64.
+/// entropy from a v4 UUID). Used for values Zitadel treats as opaque
+/// text — masterkey, etc.
 fn generate_32_char_random() -> String {
     Uuid::new_v4().simple().to_string()
+}
+
+/// Returns a 32-char password that satisfies Zitadel's default password
+/// complexity policy (HasUppercase + HasLowercase + HasNumber +
+/// HasSymbol). We start from a v4 UUID's hex form (which gives digits
+/// and lowercase letters), then deterministically force one uppercase
+/// letter and one symbol so all four character classes are present.
+fn generate_complex_password() -> String {
+    let mut out: Vec<char> = Uuid::new_v4().simple().to_string().chars().collect();
+
+    // Position 0 becomes the forced symbol. Find an ASCII letter from
+    // position 1 onward and uppercase it. (We skip position 0 so we don't
+    // promote a letter that's about to be overwritten by the symbol.)
+    // If somehow no letter exists in positions 1.. (all-digit 32-hex
+    // rolls are ~6e-8 probability) seed position 1 directly.
+    let letter_idx = out
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, c)| c.is_ascii_alphabetic())
+        .map(|(i, _)| i);
+    if let Some(idx) = letter_idx {
+        out[idx] = out[idx].to_ascii_uppercase();
+    } else {
+        out[1] = 'A';
+    }
+
+    // Force a symbol at position 0. Hex chars don't include symbols, so
+    // this is the only way to satisfy HasSymbol without giving up the
+    // randomness of the rest of the string.
+    out[0] = '!';
+
+    out.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -184,5 +219,34 @@ mod tests {
     fn generate_32_char_random_is_random() {
         // Two consecutive calls should never collide.
         assert_ne!(generate_32_char_random(), generate_32_char_random());
+    }
+
+    #[test]
+    fn generate_complex_password_satisfies_zitadel_default_policy() {
+        // Zitadel default: HasUppercase + HasLowercase + HasNumber + HasSymbol.
+        for _ in 0..200 {
+            let pwd = generate_complex_password();
+            assert_eq!(pwd.len(), 32);
+            assert!(
+                pwd.chars().any(|c| c.is_ascii_uppercase()),
+                "no uppercase: {}",
+                pwd
+            );
+            assert!(
+                pwd.chars().any(|c| c.is_ascii_lowercase()),
+                "no lowercase: {}",
+                pwd
+            );
+            assert!(
+                pwd.chars().any(|c| c.is_ascii_digit()),
+                "no digit: {}",
+                pwd
+            );
+            assert!(
+                pwd.chars().any(|c| !c.is_ascii_alphanumeric()),
+                "no symbol: {}",
+                pwd
+            );
+        }
     }
 }

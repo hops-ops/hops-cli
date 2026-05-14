@@ -270,7 +270,7 @@ fn export_aws_credentials(profile: &str) -> Result<AwsExportCredentials, Box<dyn
     Ok(credentials)
 }
 
-fn aws_clients(
+pub(crate) fn aws_clients(
     region: &str,
 ) -> Result<
     (
