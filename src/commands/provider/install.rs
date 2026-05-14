@@ -1,5 +1,5 @@
 use crate::commands::local::package_install::{
-    docker_arch, ensure_cached_repo_checkout, ensure_registry, parse_repo_spec,
+    docker_arch, ensure_cached_repo_checkout_at, ensure_registry, parse_repo_spec,
     resolve_repo_install_target, run_watch, sanitize_name_component, RepoInstallTarget, RepoSpec,
     REGISTRY_HOSTNAME, REGISTRY_PULL, REGISTRY_PUSH,
 };
@@ -42,6 +42,13 @@ pub struct ProviderInstallArgs {
     #[arg(long, conflicts_with = "version")]
     pub version_prefix: Option<String>,
 
+    /// Git branch to check out when cloning a source build from `--repo`.
+    /// Useful for installing a fork's WIP branch (e.g. `--repo
+    /// jonasz-lasut/provider-helm --branch helm-v4`). Ignored when `--path`
+    /// or `--repo + --version` is used.
+    #[arg(long, requires = "repo", conflicts_with = "version")]
+    pub branch: Option<String>,
+
     /// Kubernetes context to use for all kubectl commands (e.g. "colima")
     #[arg(long)]
     pub context: Option<String>,
@@ -78,6 +85,7 @@ pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
             repo,
             args.skip_dependency_resolution,
             args.version_prefix.as_deref(),
+            args.branch.as_deref(),
         ),
         (None, _) => {
             let path = args.path.as_deref().unwrap_or(".");
@@ -102,11 +110,12 @@ fn run_repo_install(
     repo: &str,
     skip_dependency_resolution: bool,
     version_prefix: Option<&str>,
+    branch: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
     match resolve_repo_install_target(&spec)? {
         RepoInstallTarget::SourceBuild => {
-            let cache_path = ensure_cached_repo_checkout(&spec)?;
+            let cache_path = ensure_cached_repo_checkout_at(&spec, branch)?;
             run_local_path(
                 &cache_path.to_string_lossy(),
                 skip_dependency_resolution,
@@ -150,7 +159,21 @@ fn apply_repo_version_spec(
         provider_name,
         package_ref
     );
-    apply_provider_resources(&provider_name, &package_ref, None, skip_dependency_resolution)
+    let providers_json = run_cmd_output(
+        "kubectl",
+        &["get", "providers.pkg.crossplane.io", "-o", "json"],
+    )?;
+    let resolved = resolve_provider_target(&provider_name, &providers_json, REGISTRY_PULL)?;
+    // Published install pulls directly from ghcr.io — no ImageConfig rewrite,
+    // no local registry push, no runtime-image override.
+    apply_provider_resources(
+        &provider_name,
+        &resolved,
+        &package_ref,
+        None,
+        None,
+        skip_dependency_resolution,
+    )
 }
 
 fn run_local_path(
@@ -169,6 +192,22 @@ fn run_local_path(
     ensure_registry()?;
     sync_registry_hosts_entry("crossplane-system", "registry", REGISTRY_HOSTNAME)?;
 
+    // Resolve the existing upstream Provider before building so we can:
+    //   1. carry the upstream package URL into the new `spec.package` (Crossplane
+    //      records the URL-without-tag as the Lock Source; deps declared as
+    //      `xpkg.crossplane.io/.../provider-foo` only resolve when the Lock
+    //      Source matches that string exactly — ImageConfig's `rewriteImage`
+    //      only affects fetching, not Lock matching).
+    //   2. derive the upstream major version for the dev tag so the resulting
+    //      `vMAJOR.999.999-dev-<sha>` cleanly satisfies `>=vMAJOR` constraints.
+    let providers_json = run_cmd_output(
+        "kubectl",
+        &["get", "providers.pkg.crossplane.io", "-o", "json"],
+    )?;
+    let resolved = resolve_provider_target(&provider_name, &providers_json, REGISTRY_PULL)?;
+    let upstream_url_prefix = recover_upstream_url_prefix(&resolved, REGISTRY_PULL)?;
+    let upstream_major = parse_major_version(&resolved.existing_package);
+
     ensure_build_submodule(dir)?;
 
     log::info!("Building provider binaries (make build) in {}...", path);
@@ -181,16 +220,19 @@ fn run_local_path(
     let xpkg_path = find_xpkg_for_provider(dir, &provider_name, arch)?;
     log::info!("Located xpkg: {}", xpkg_path.display());
 
-    let dev_tag = dev_tag_for_file(&xpkg_path, version_prefix)?;
+    let local_image_path_for_tag = format!("{}/hops-ops/{}", REGISTRY_PULL, provider_name);
+    let dev_tag = dev_tag_for_file(
+        &xpkg_path,
+        version_prefix,
+        upstream_major,
+        &local_image_path_for_tag,
+    )?;
 
     let push_xpkg_ref = format!(
         "{}/hops-ops/{}:{}",
         REGISTRY_PUSH, provider_name, dev_tag
     );
-    let pull_xpkg_ref = format!(
-        "{}/hops-ops/{}:{}",
-        REGISTRY_PULL, provider_name, dev_tag
-    );
+    let local_pull_xpkg_path = format!("{}/hops-ops/{}", REGISTRY_PULL, provider_name);
     log::info!("Pushing xpkg to {}...", push_xpkg_ref);
     crossplane_xpkg_push(&xpkg_path, &push_xpkg_ref)?;
 
@@ -212,9 +254,15 @@ fn run_local_path(
     log::info!("Pushing {}...", push_runtime_ref);
     run_cmd("docker", &["push", &push_runtime_ref])?;
 
+    // Apply the Provider with the UPSTREAM URL + dev tag in `spec.package` so
+    // Crossplane's dep manager records the upstream URL in the Lock. Fetching
+    // is redirected to the local registry via the paired ImageConfig.
+    let spec_package = format!("{}:{}", upstream_url_prefix, dev_tag);
     apply_provider_resources(
         &provider_name,
-        &pull_xpkg_ref,
+        &resolved,
+        &spec_package,
+        Some((&upstream_url_prefix, &local_pull_xpkg_path)),
         Some(&pull_runtime_ref),
         skip_dependency_resolution,
     )
@@ -364,7 +412,12 @@ fn crossplane_xpkg_push(xpkg_path: &Path, push_ref: &str) -> Result<(), Box<dyn 
     )
 }
 
-fn dev_tag_for_file(path: &Path, version_prefix: Option<&str>) -> Result<String, Box<dyn Error>> {
+fn dev_tag_for_file(
+    path: &Path,
+    version_prefix: Option<&str>,
+    upstream_major: Option<u64>,
+    image_path: &str,
+) -> Result<String, Box<dyn Error>> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
@@ -379,27 +432,298 @@ fn dev_tag_for_file(path: &Path, version_prefix: Option<&str>) -> Result<String,
 
     let hex = format!("{:x}", hasher.finalize());
     let short = &hex[..12];
-    Ok(match version_prefix {
-        Some(prefix) if !prefix.is_empty() => {
-            // A full semver like `v1.2.0` is used verbatim (stable, satisfies
-            // `>=v1` constraints). Anything else gets the `-dev-<sha>` suffix
-            // appended; note such tags are pre-releases per semver and won't
-            // satisfy `>=vMAJOR` constraints — pass a stable semver if you
-            // need that.
-            if is_full_semver(prefix) {
-                prefix.to_string()
-            } else {
-                format!("{}-dev-{}", prefix, short)
-            }
+
+    // Explicit --version-prefix (highest precedence):
+    //   - full semver (vN.N.N) -> used verbatim (stable release pin)
+    //   - bare major (vN)      -> auto-incrementing vN.999.<PATCH> (stable
+    //                             SemVer, satisfies `>=vN`, monotonically
+    //                             newer each push). Falls back to
+    //                             vN.999.999-dev-<sha> if the registry can't
+    //                             be queried.
+    //   - other prefix         -> "<prefix>-dev-<sha>" (legacy behavior; not
+    //                             valid SemVer, but kept for backward compat)
+    if let Some(prefix) = version_prefix.filter(|p| !p.is_empty()) {
+        if is_full_semver(prefix) {
+            return Ok(prefix.to_string());
         }
-        _ => format!("dev-{}", short),
-    })
+        if let Some(major) = parse_bare_major(prefix) {
+            return Ok(next_incrementing_tag(image_path, major, short));
+        }
+        return Ok(format!("{}-dev-{}", prefix, short));
+    }
+
+    // No --version-prefix: derive the major from the upstream Provider's
+    // current tag so the dev tag stays valid SemVer and satisfies the most
+    // common `>=vMAJOR` Configuration dep constraints.
+    if let Some(major) = upstream_major {
+        return Ok(next_incrementing_tag(image_path, major, short));
+    }
+
+    // Last resort: a bare dev tag. Won't satisfy `>=vN` SemVer constraints,
+    // but never has — keep as-is for hands-off ad-hoc builds.
+    Ok(format!("dev-{}", short))
+}
+
+/// Produce a stable, monotonically-increasing tag of the form `vN.999.<P>`
+/// where `<P>` is one greater than the highest existing patch among tags
+/// matching `vN.999.<int>` in the local registry. This keeps tags as valid
+/// (non-prerelease) SemVer so they satisfy `>=vN` constraints in Crossplane's
+/// dep manager (Masterminds/semver excludes prereleases by default).
+///
+/// Falls back to `vN.999.999-dev-<sha>` if the registry can't be reached —
+/// the dev-sha form preserves traceability and is still informative even if
+/// it doesn't satisfy `>=vN` (constraint authors can then add `-0`).
+fn next_incrementing_tag(image_path: &str, major: u64, sha_short: &str) -> String {
+    match next_local_patch_for_major(image_path, major) {
+        Ok(patch) => format!("v{}.999.{}", major, patch),
+        Err(err) => {
+            log::warn!(
+                "Could not enumerate local registry tags for {} to compute next patch ({}); falling back to prerelease tag",
+                image_path,
+                err
+            );
+            format!("v{}.999.999-dev-{}", major, sha_short)
+        }
+    }
+}
+
+/// Query the local registry's tag-list endpoint and return the next available
+/// patch number for `vMAJOR.999.<patch>`. Starts at 1 when no tags match the
+/// pattern. Treats a 404 (image-path-not-yet-pushed) as "start at 1".
+fn next_local_patch_for_major(image_path: &str, major: u64) -> Result<u32, Box<dyn Error>> {
+    // image_path is the cluster-internal path (e.g.
+    // "registry.crossplane-system.svc.cluster.local:5000/hops-ops/provider-helm").
+    // The tags-list endpoint is reachable on the host via the NodePort.
+    let path = image_path
+        .split_once('/')
+        .map(|(_, rest)| rest)
+        .unwrap_or(image_path);
+    let url = format!("http://{}/v2/{}/tags/list", REGISTRY_PUSH, path);
+    let output = Command::new("curl")
+        .args(["-sf", "-o", "-", &url])
+        .output()?;
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        // curl exit 22 → HTTP 4xx (likely 404 because the image hasn't been
+        // pushed yet). Treat as "no tags" so the first push gets patch 1.
+        if code == 22 {
+            return Ok(1);
+        }
+        return Err(format!(
+            "curl exited with code {} fetching {} (stderr: {})",
+            code,
+            url,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    let body = String::from_utf8_lossy(&output.stdout);
+    let parsed: TagsListResponse = serde_json::from_str(&body)
+        .map_err(|e| format!("failed to parse tags-list JSON: {}: body={}", e, body))?;
+
+    let prefix = format!("v{}.999.", major);
+    let max_patch: u32 = parsed
+        .tags
+        .iter()
+        .filter_map(|t| t.strip_prefix(&prefix))
+        .filter_map(|s| s.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    Ok(max_patch + 1)
+}
+
+#[derive(Debug, Deserialize)]
+struct TagsListResponse {
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 fn is_full_semver(s: &str) -> bool {
     let trimmed = s.strip_prefix('v').unwrap_or(s);
     let parts: Vec<&str> = trimmed.splitn(3, '.').collect();
     parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Parse a `vN` (or `N`) bare-major version string, e.g. `v1` -> `Some(1)`.
+fn parse_bare_major(s: &str) -> Option<u64> {
+    let trimmed = s.strip_prefix('v').unwrap_or(s);
+    if trimmed.is_empty() || trimmed.contains('.') || trimmed.contains('-') {
+        return None;
+    }
+    trimmed.parse::<u64>().ok()
+}
+
+/// Extract the major version from a full package reference like
+/// `xpkg.crossplane.io/.../provider-helm:v1.2.0` -> `Some(1)`.
+/// Handles digest-tagged refs (returns None) and tags without `v` prefix.
+fn parse_major_version(package_ref: &str) -> Option<u64> {
+    let (_, tag) = split_package_ref(package_ref)?;
+    if tag.starts_with("sha256:") {
+        return None;
+    }
+    let trimmed = tag.strip_prefix('v').unwrap_or(tag);
+    // Stop at the first non-digit so v1, v1.2.3, v1-dev-abc all yield 1.
+    let major: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    major.parse::<u64>().ok()
+}
+
+/// Split a package reference into `(url_prefix_without_tag, tag)`. Returns
+/// `None` when the reference has no `:` (treat as untagged, no split).
+/// Distinguishes `registry:5000/path:tag` (split at the last `:`) from
+/// `registry:5000/path` (port colon, no tag).
+fn split_package_ref(package_ref: &str) -> Option<(&str, &str)> {
+    let (prefix, suffix) = package_ref.rsplit_once(':')?;
+    // If the suffix contains `/`, the `:` we found is part of a port number
+    // earlier in the URL, not a tag separator. Treat as no tag.
+    if suffix.contains('/') {
+        return None;
+    }
+    Some((prefix, suffix))
+}
+
+/// Find the upstream URL prefix to use as the Provider's `spec.package` URL
+/// (without tag). On the first install the existing Provider's `spec.package`
+/// IS the upstream URL — we just strip the tag. On re-runs the existing
+/// Provider may already have been patched in a previous (broken) install to
+/// point at the local registry; in that case we look up a paired ImageConfig
+/// whose `rewriteImage.prefix` matches and recover the original upstream URL
+/// from its `matchImages.prefix`.
+fn recover_upstream_url_prefix(
+    resolved: &ResolvedProvider,
+    local_registry_host: &str,
+) -> Result<String, Box<dyn Error>> {
+    let (prefix, _tag) = split_package_ref(&resolved.existing_package).ok_or_else(|| {
+        format!(
+            "existing Provider '{}' has no tag in spec.package ({}); cannot \
+             determine the upstream URL prefix",
+            resolved.existing_name, resolved.existing_package
+        )
+    })?;
+
+    if !prefix.contains(local_registry_host) {
+        // Fresh install path — the existing Provider still has the upstream URL.
+        return Ok(prefix.to_string());
+    }
+
+    // Re-run path — look up an ImageConfig that rewrites to this local prefix.
+    let ic_json = run_cmd_output(
+        "kubectl",
+        &["get", "imageconfig.pkg.crossplane.io", "-o", "json"],
+    )?;
+    if let Some(upstream) = find_upstream_for_rewrite(&ic_json, prefix)? {
+        return Ok(upstream);
+    }
+
+    Err(format!(
+        "existing Provider '{}' already points at the local registry ({}) and \
+         no ImageConfig rewrites to this prefix — delete the Provider and \
+         re-apply the upstream manifest, then re-run `hops provider install`.",
+        resolved.existing_name, prefix
+    )
+    .into())
+}
+
+fn find_upstream_for_rewrite(
+    ic_json: &str,
+    local_prefix: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let trimmed = ic_json.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let parsed: ImageConfigList = serde_json::from_str(trimmed)
+        .map_err(|e| format!("failed to parse ImageConfig list JSON: {}", e))?;
+    for ic in parsed.items {
+        let Some(spec) = ic.spec else { continue };
+        let rewrite_prefix = spec
+            .rewrite_image
+            .as_ref()
+            .and_then(|r| r.prefix.as_deref())
+            .unwrap_or_default();
+        if rewrite_prefix.is_empty() || !local_prefix.starts_with(rewrite_prefix) {
+            continue;
+        }
+        for m in &spec.match_images {
+            if let Some(prefix) = m.prefix.as_deref() {
+                return Ok(Some(prefix.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageConfigList {
+    items: Vec<ImageConfigResource>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageConfigResource {
+    spec: Option<ImageConfigSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageConfigSpec {
+    #[serde(rename = "matchImages")]
+    match_images: Vec<ImageConfigMatch>,
+    #[serde(rename = "rewriteImage")]
+    rewrite_image: Option<ImageConfigRewrite>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageConfigMatch {
+    prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageConfigRewrite {
+    prefix: Option<String>,
+}
+
+fn image_config_name_for(upstream_prefix: &str) -> String {
+    // Match the `<host>-<path-with-dashes>` shape used elsewhere for these
+    // rewrite ImageConfigs (see config/install.rs::image_config_name).
+    let mut s = String::with_capacity(upstream_prefix.len() + 16);
+    s.push_str("hops-local-rewrite-");
+    for ch in upstream_prefix.chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => s.push(ch),
+            _ => s.push('-'),
+        }
+    }
+    // Collapse any run of dashes and trim trailing/leading dashes for k8s name
+    // hygiene.
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = false;
+    for ch in s.chars() {
+        if ch == '-' {
+            if !prev_dash {
+                out.push(ch);
+            }
+            prev_dash = true;
+        } else {
+            out.push(ch);
+            prev_dash = false;
+        }
+    }
+    out.trim_matches('-').to_lowercase()
+}
+
+fn build_image_config_yaml(name: &str, match_prefix: &str, rewrite_prefix: &str) -> String {
+    format!(
+        "apiVersion: pkg.crossplane.io/v1beta1
+kind: ImageConfig
+metadata:
+  name: {name}
+spec:
+  matchImages:
+    - type: Prefix
+      prefix: {match_prefix}
+  rewriteImage:
+    prefix: {rewrite_prefix}
+"
+    )
 }
 
 /// Apply a Provider plus its supporting DeploymentRuntimeConfig and
@@ -421,16 +745,12 @@ fn is_full_semver(s: &str) -> bool {
 /// against the existing Provider's name (never against a hypothetical sibling).
 fn apply_provider_resources(
     provider_name: &str,
-    package_ref: &str,
+    resolved: &ResolvedProvider,
+    spec_package: &str,
+    image_config_rewrite: Option<(&str, &str)>,
     runtime_image: Option<&str>,
     skip_dependency_resolution: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let providers_json = run_cmd_output(
-        "kubectl",
-        &["get", "providers.pkg.crossplane.io", "-o", "json"],
-    )?;
-    let resolved = resolve_provider_target(provider_name, &providers_json, REGISTRY_PULL)?;
-
     if resolved.existing_name != provider_name {
         log::info!(
             "Reusing existing Provider '{}' (matches package substring '{}'); patching in place",
@@ -452,6 +772,25 @@ fn apply_provider_resources(
     let sa_name = target_name.clone();
     let crb_name = format!("{}-cluster-admin", target_name);
 
+    // Apply the ImageConfig BEFORE the Provider (for local-build installs) so
+    // Crossplane has the rewrite in place when it next reconciles the Provider
+    // revision. For ghcr.io published-version installs we skip this entirely
+    // since Crossplane pulls upstream directly.
+    if let Some((upstream_url_prefix, local_image_path)) = image_config_rewrite {
+        let ic_name = image_config_name_for(upstream_url_prefix);
+        log::info!(
+            "Applying ImageConfig '{}' ({} -> {})...",
+            ic_name,
+            upstream_url_prefix,
+            local_image_path
+        );
+        kubectl_apply_stdin(&build_image_config_yaml(
+            &ic_name,
+            upstream_url_prefix,
+            local_image_path,
+        ))?;
+    }
+
     log::info!("Applying DeploymentRuntimeConfig '{}'...", drc_name);
     kubectl_apply_stdin(&build_runtime_config_yaml(
         &drc_name,
@@ -465,7 +804,7 @@ fn apply_provider_resources(
     log::info!("Applying Provider '{}'...", target_name);
     kubectl_apply_stdin(&build_provider_yaml(
         &target_name,
-        package_ref,
+        spec_package,
         &drc_name,
         skip_dependency_resolution,
     ))?;
@@ -480,6 +819,11 @@ fn apply_provider_resources(
 struct ResolvedProvider {
     /// Existing Provider's `metadata.name` to patch in place.
     existing_name: String,
+    /// Existing Provider's full `spec.package` (URL + tag/digest). Carries the
+    /// original upstream URL prefix on the first install; carries a local
+    /// registry URL when re-running over a previously patched Provider — we
+    /// recover the upstream URL via an ImageConfig lookup in that case.
+    existing_package: String,
     /// Existing Provider's `spec.runtimeConfigRef.name`, if any. Reusing it
     /// avoids orphaning the DRC the upstream Provider already references; if
     /// `None` we derive `<existing_name>-runtime` rather than fabricating a
@@ -570,6 +914,7 @@ fn resolve_provider_target(
             let entry = pick.into_iter().next().unwrap();
             Ok(ResolvedProvider {
                 existing_name: entry.name,
+                existing_package: entry.package,
                 existing_drc_name: entry.drc_name,
             })
         }

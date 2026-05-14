@@ -339,19 +339,30 @@ pub fn resolve_repo_install_target(spec: &RepoSpec) -> Result<RepoInstallTarget,
 }
 
 pub fn ensure_cached_repo_checkout(spec: &RepoSpec) -> Result<PathBuf, Box<dyn Error>> {
+    ensure_cached_repo_checkout_at(spec, None)
+}
+
+/// Clone or refresh the cached checkout of `spec.org/spec.repo`. When `branch`
+/// is `Some`, the cache is checked out at that branch (initial clone uses
+/// `--branch`; existing checkouts do a `fetch + checkout + reset --hard`).
+/// When `None`, the default branch is used.
+pub fn ensure_cached_repo_checkout_at(
+    spec: &RepoSpec,
+    branch: Option<&str>,
+) -> Result<PathBuf, Box<dyn Error>> {
     let cache_path = repo_cache_path(&spec.org, &spec.repo)?;
     let clone_url = format!("https://github.com/{}/{}", spec.org, spec.repo);
 
     if cache_path.join(".git").is_dir() {
         log::info!("Updating cached repo at {}...", cache_path.display());
-        if let Err(err) = refresh_cached_repo(&cache_path) {
+        if let Err(err) = refresh_cached_repo(&cache_path, branch) {
             log::warn!(
                 "Failed to update cached repo at {}: {}. Re-cloning...",
                 cache_path.display(),
                 err
             );
             fs::remove_dir_all(&cache_path)?;
-            clone_repo_into_cache(&clone_url, &cache_path)?;
+            clone_repo_into_cache(&clone_url, &cache_path, branch)?;
         }
         return Ok(cache_path);
     }
@@ -364,11 +375,15 @@ pub fn ensure_cached_repo_checkout(spec: &RepoSpec) -> Result<PathBuf, Box<dyn E
         fs::remove_dir_all(&cache_path)?;
     }
 
-    clone_repo_into_cache(&clone_url, &cache_path)?;
+    clone_repo_into_cache(&clone_url, &cache_path, branch)?;
     Ok(cache_path)
 }
 
-fn clone_repo_into_cache(clone_url: &str, cache_path: &Path) -> Result<(), Box<dyn Error>> {
+fn clone_repo_into_cache(
+    clone_url: &str,
+    cache_path: &Path,
+    branch: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let parent = cache_path
         .parent()
         .ok_or("repo cache path has no parent directory")?;
@@ -376,21 +391,48 @@ fn clone_repo_into_cache(clone_url: &str, cache_path: &Path) -> Result<(), Box<d
 
     let cache_path_str = cache_path.to_string_lossy().to_string();
     log::info!(
-        "Cloning {} into local cache at {}...",
+        "Cloning {} into local cache at {}{}...",
         clone_url,
-        cache_path.display()
+        cache_path.display(),
+        branch.map(|b| format!(" (branch {})", b)).unwrap_or_default()
     );
-    run_cmd("git", &["clone", clone_url, &cache_path_str])?;
+    let mut args: Vec<&str> = vec!["clone"];
+    if let Some(b) = branch {
+        args.extend_from_slice(&["--branch", b]);
+    }
+    args.extend_from_slice(&[clone_url, &cache_path_str]);
+    run_cmd("git", &args)?;
     Ok(())
 }
 
-fn refresh_cached_repo(cache_path: &Path) -> Result<(), Box<dyn Error>> {
+fn refresh_cached_repo(
+    cache_path: &Path,
+    branch: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let cache_path_str = cache_path.to_string_lossy().to_string();
     run_cmd(
         "git",
         &["-C", &cache_path_str, "fetch", "--prune", "origin"],
     )?;
-    run_cmd("git", &["-C", &cache_path_str, "pull", "--ff-only"])?;
+    if let Some(b) = branch {
+        // For an explicit branch we do a hard reset to the remote tip. The
+        // cache is a non-developer checkout; preserving local divergence isn't
+        // a concern and `pull --ff-only` against a branch we haven't tracked
+        // yet would fail.
+        run_cmd("git", &["-C", &cache_path_str, "checkout", b])?;
+        run_cmd(
+            "git",
+            &[
+                "-C",
+                &cache_path_str,
+                "reset",
+                "--hard",
+                &format!("origin/{}", b),
+            ],
+        )?;
+    } else {
+        run_cmd("git", &["-C", &cache_path_str, "pull", "--ff-only"])?;
+    }
     Ok(())
 }
 
