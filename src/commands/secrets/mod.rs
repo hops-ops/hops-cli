@@ -142,7 +142,7 @@ fn save_config(config: &RepoConfig) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn configured_aws_settings() -> Result<AwsSecretsRuntimeConfig, Box<dyn Error>> {
+pub(crate) fn configured_aws_settings() -> Result<AwsSecretsRuntimeConfig, Box<dyn Error>> {
     let config = load_config()?;
     let tags = config
         .secrets
@@ -188,7 +188,7 @@ fn configured_github_settings() -> Result<GithubSecretsRuntimeConfig, Box<dyn Er
     })
 }
 
-fn configured_secret_paths() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+pub(crate) fn configured_secret_paths() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     let config = load_config()?;
     let plaintext = config
         .secrets
@@ -202,10 +202,11 @@ fn configured_secret_paths() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
 }
 
 #[derive(Debug, Clone)]
-struct AwsSecretsRuntimeConfig {
-    path: String,
-    region: String,
-    tags: HashMap<String, String>,
+pub(crate) struct AwsSecretsRuntimeConfig {
+    pub(crate) path: String,
+    pub(crate) region: String,
+    #[allow(dead_code)]
+    pub(crate) tags: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,7 +271,7 @@ fn export_aws_credentials(profile: &str) -> Result<AwsExportCredentials, Box<dyn
     Ok(credentials)
 }
 
-pub(crate) fn aws_clients(
+fn aws_clients(
     region: &str,
 ) -> Result<
     (

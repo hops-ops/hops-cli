@@ -1,166 +1,85 @@
-//! `hops auth bootstrap <cluster>` — seed the durable AuthStack secrets in
-//! AWS Secrets Manager.
+//! `hops auth bootstrap <cluster>` — generate the durable AuthStack
+//! secret plaintexts into the repo's `secrets/` tree.
 //!
-//! Writes the two values the AuthStack composition's reconciler-pattern
-//! needs to be projected back via ExternalSecret on every install:
+//! Writes two files matching the AuthStack composition's ExternalSecret
+//! contract (AWS SM secret path / JSON property):
 //!
-//!   <prefix>/zitadel/masterkey        { "masterkey": "<32 chars>" }
-//!   <prefix>/zitadel/admin-password   { "password":  "<32 chars>" }
+//!   <plaintext>/<aws>/<cluster>/zitadel/masterkey/masterkey
+//!   <plaintext>/<aws>/<cluster>/zitadel/admin-password/password
 //!
-//! Idempotent: if a path is already present in AWS SM, we skip it (and
-//! say so) unless `--force` is set, in which case we overwrite with a
-//! freshly-generated value. The CLI never touches Kubernetes — applying
-//! the AuthStack manifest stays a separate, declarative step.
+//! The platform's normal secrets pipeline takes it from there:
+//!
+//!   hops secrets encrypt    # SOPS-encrypts into secrets-encrypted/
+//!   hops secrets sync aws   # pushes to AWS Secrets Manager
+//!
+//! Idempotent: existing plaintexts are left alone unless `--force`.
 
 use crate::commands::secrets;
 use clap::Args;
-use rusoto_core::RusotoError;
-use rusoto_secretsmanager::{
-    CreateSecretRequest, GetSecretValueError, GetSecretValueRequest, PutSecretValueRequest,
-    SecretsManager, SecretsManagerClient, Tag,
-};
-use std::env;
 use std::error::Error;
-use tokio::runtime::Runtime;
+use std::fs;
+use std::path::PathBuf;
 use uuid::Uuid;
-
-const DEFAULT_REGION: &str = "us-east-1";
 
 #[derive(Args, Debug)]
 pub struct BootstrapArgs {
-    /// Cluster name. Becomes the leading path segment in AWS SM
-    /// (e.g. `pat-local/zitadel/masterkey`).
+    /// Cluster name. Becomes a path segment under the AWS secrets root
+    /// (e.g. `secrets/aws/pat-local/zitadel/masterkey/masterkey`).
     pub cluster: String,
 
-    /// Override the default `<cluster>/zitadel` AWS SM path prefix.
-    /// Use when the AuthStack manifest's `externalSecrets.*.secretPath`
-    /// values don't start with `<cluster>/zitadel`.
+    /// Override the default `<cluster>/zitadel` path prefix beneath the
+    /// AWS secrets root. Use when the AuthStack manifest's
+    /// `externalSecrets.*.secretPath` values don't start with
+    /// `<cluster>/zitadel`.
     #[arg(long)]
     pub prefix: Option<String>,
 
-    /// AWS region for AWS Secrets Manager. Defaults to AWS_REGION env var,
-    /// falling back to us-east-1.
-    #[arg(long)]
-    pub region: Option<String>,
-
-    /// Overwrite values that already exist in AWS SM. The default is to
-    /// leave existing values alone so re-running `bootstrap` is safe.
+    /// Overwrite plaintexts that already exist. The default is to leave
+    /// existing files alone so re-running `bootstrap` is safe.
     #[arg(long)]
     pub force: bool,
 }
 
 pub fn run(args: &BootstrapArgs) -> Result<(), Box<dyn Error>> {
+    let (plaintext_root, _encrypted_root) = secrets::configured_secret_paths()?;
+    let aws_settings = secrets::configured_aws_settings()?;
     let prefix = args
         .prefix
         .clone()
         .unwrap_or_else(|| format!("{}/zitadel", args.cluster));
 
-    let region = args
-        .region
-        .clone()
-        .or_else(|| env::var("AWS_REGION").ok())
-        .unwrap_or_else(|| DEFAULT_REGION.to_string());
+    let masterkey_path = plaintext_root
+        .join(&aws_settings.path)
+        .join(&prefix)
+        .join("masterkey")
+        .join("masterkey");
+    let admin_pwd_path = plaintext_root
+        .join(&aws_settings.path)
+        .join(&prefix)
+        .join("admin-password")
+        .join("password");
 
-    let runtime = Runtime::new()?;
-    // Reuse the AWS credential helpers from `hops secrets` so this command
-    // resolves SSO profiles the same way (AWS_PROFILE → aws configure
-    // export-credentials → StaticProvider).
-    let (client, _sts) = secrets::aws_clients(&region)?;
+    log::info!("Bootstrapping AuthStack durable secret plaintexts:");
+    write_secret(&masterkey_path, &generate_32_char_random(), args.force)?;
+    write_secret(&admin_pwd_path, &generate_complex_password(), args.force)?;
 
-    let masterkey_path = format!("{}/masterkey", prefix);
-    let admin_pwd_path = format!("{}/admin-password", prefix);
-
-    log::info!("Bootstrapping AuthStack durable secrets in region {}", region);
-    log::info!("  masterkey  → {}", masterkey_path);
-    log::info!("  admin-pwd  → {}", admin_pwd_path);
-
-    upsert_json_secret(
-        &runtime,
-        &client,
-        &masterkey_path,
-        "masterkey",
-        &generate_32_char_random(),
-        args.cluster.as_str(),
-        args.force,
-    )?;
-    upsert_json_secret(
-        &runtime,
-        &client,
-        &admin_pwd_path,
-        "password",
-        &generate_complex_password(),
-        args.cluster.as_str(),
-        args.force,
-    )?;
-
-    log::info!("Bootstrap complete. Next: kubectl apply -f local/ (or your GitOps equivalent).");
+    log::info!("Next:");
+    log::info!("  hops secrets encrypt   # SOPS-encrypts into secrets-encrypted/");
+    log::info!("  hops secrets sync aws  # pushes to AWS Secrets Manager");
     Ok(())
 }
 
-/// Idempotent put: create if missing, otherwise leave alone (or
-/// overwrite if `force`). The value is wrapped as `{ <key>: <random> }`
-/// to match what the AuthStack composition's ExternalSecrets read via
-/// their `remoteRef.property` selectors.
-fn upsert_json_secret(
-    runtime: &Runtime,
-    client: &SecretsManagerClient,
-    path: &str,
-    json_key: &str,
-    value: &str,
-    cluster: &str,
-    force: bool,
-) -> Result<(), Box<dyn Error>> {
-    let json = serde_json::json!({ json_key: value }).to_string();
-
-    let existing = runtime.block_on(client.get_secret_value(GetSecretValueRequest {
-        secret_id: path.to_string(),
-        ..Default::default()
-    }));
-
-    match existing {
-        Ok(_) if !force => {
-            log::info!("  skip   {}: already present (use --force to overwrite)", path);
-            return Ok(());
-        }
-        Ok(_) => {
-            log::info!("  update {}: overwriting per --force", path);
-            runtime.block_on(client.put_secret_value(PutSecretValueRequest {
-                secret_id: path.to_string(),
-                secret_string: Some(json),
-                // AWS SM requires a UUID-shaped idempotency token on
-                // PutSecretValue as well as CreateSecret.
-                client_request_token: Some(Uuid::new_v4().to_string()),
-                ..Default::default()
-            }))?;
-        }
-        Err(RusotoError::Service(GetSecretValueError::ResourceNotFound(_))) => {
-            log::info!("  create {}", path);
-            runtime.block_on(client.create_secret(CreateSecretRequest {
-                name: path.to_string(),
-                secret_string: Some(json),
-                // ClientRequestToken makes CreateSecret idempotent; AWS
-                // requires a UUID-shaped value.
-                client_request_token: Some(Uuid::new_v4().to_string()),
-                tags: Some(vec![
-                    Tag {
-                        key: Some("hops.ops.com.ai/secret".to_string()),
-                        value: Some("true".to_string()),
-                    },
-                    Tag {
-                        key: Some("hops.ops.com.ai/cluster".to_string()),
-                        value: Some(cluster.to_string()),
-                    },
-                    Tag {
-                        key: Some("hops.ops.com.ai/authstack".to_string()),
-                        value: Some("bootstrap".to_string()),
-                    },
-                ]),
-                ..Default::default()
-            }))?;
-        }
-        Err(err) => return Err(err.into()),
+fn write_secret(path: &PathBuf, value: &str, force: bool) -> Result<(), Box<dyn Error>> {
+    if path.exists() && !force {
+        log::info!("  skip   {}: already present (use --force to overwrite)", path.display());
+        return Ok(());
     }
-
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, value)?;
+    let verb = if force { "update" } else { "create" };
+    log::info!("  {}  {}", verb, path.display());
     Ok(())
 }
 
