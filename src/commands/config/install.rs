@@ -814,9 +814,19 @@ fn build_patched_configuration_image(
         unique_suffix()
     );
 
+    // --provenance=false --sbom=false disable buildx's attestation manifests.
+    // With attestations enabled (modern Docker default), the output is wrapped
+    // in an OCI manifest list containing only the host arch + attestation
+    // entries. Crossplane's package fetcher (go-containerregistry remote.Image
+    // with no platform hint) defaults to linux/amd64 when navigating an index,
+    // so it fails with "no child with platform linux/amd64" against our
+    // arm64-only list. Without attestations, buildx emits a single manifest,
+    // which Crossplane fetches directly without index navigation.
     let status = Command::new("docker")
         .args([
             "build",
+            "--provenance=false",
+            "--sbom=false",
             "-t",
             &target_tag,
             build_dir.to_string_lossy().as_ref(),
@@ -881,8 +891,19 @@ fn dev_tag_for_uppkg(uppkg_path: &Path) -> Result<String, Box<dyn Error>> {
 /// render function images).
 fn docker_build_from(src: &str, tag: &str) -> Result<(), Box<dyn Error>> {
     let dockerfile = format!("FROM {}\n", src);
+    // See note on `--provenance=false --sbom=false` in
+    // `build_patched_configuration_image`: without these, buildx wraps the
+    // output in a single-arch manifest list that Crossplane (which fetches
+    // package layers as linux/amd64 regardless of host) cannot navigate.
     let mut child = Command::new("docker")
-        .args(["build", "-t", tag, "-"])
+        .args([
+            "build",
+            "--provenance=false",
+            "--sbom=false",
+            "-t",
+            tag,
+            "-",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
