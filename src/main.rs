@@ -14,6 +14,8 @@ struct Args {
 enum Commands {
     /// Manage the local control plane environment
     Local(commands::local::LocalArgs),
+    /// Bootstrap durable AuthStack secrets in AWS Secrets Manager
+    Auth(commands::auth::AuthArgs),
     /// Manage repo secrets with SOPS and AWS Secrets Manager
     Secrets(commands::secrets::SecretsArgs),
     /// Manage non-secret config (e.g. GitHub Actions repo variables) declaratively
@@ -40,6 +42,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     match &args.command {
         Some(Commands::Local(local_args)) => {
             commands::local::run(local_args)?;
+        }
+        Some(Commands::Auth(auth_args)) => {
+            commands::auth::run(auth_args)?;
         }
         Some(Commands::Secrets(secrets_args)) => {
             commands::secrets::run(secrets_args)?;
