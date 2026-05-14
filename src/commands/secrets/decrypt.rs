@@ -13,6 +13,13 @@ pub struct DecryptArgs {
     #[arg(long, default_value = "secrets")]
     pub destination: PathBuf,
 
+    /// Scope decryption to a single file or subdirectory within `source`.
+    /// Useful for partial inspection without overwriting all local
+    /// plaintexts. Path may be absolute or relative to cwd; must resolve
+    /// inside `source`.
+    #[arg(long)]
+    pub secret_path: Option<PathBuf>,
+
     /// Overwrite destination files if they already exist
     #[arg(long)]
     pub force: bool,
@@ -31,10 +38,20 @@ pub fn run(args: &DecryptArgs) -> Result<(), Box<dyn Error>> {
         args.destination.clone()
     };
 
-    log::info!(
-        "Decrypting secrets from {} to {}",
-        source.display(),
-        destination.display()
-    );
-    mirror_tree_with_sops(&source, &destination, "decrypt", args.force)
+    let start_path = args.secret_path.as_deref();
+    if let Some(scope) = start_path {
+        log::info!(
+            "Decrypting {} → {} (scope: {})",
+            source.display(),
+            destination.display(),
+            scope.display()
+        );
+    } else {
+        log::info!(
+            "Decrypting {} → {}",
+            source.display(),
+            destination.display()
+        );
+    }
+    mirror_tree_with_sops(&source, &destination, "decrypt", args.force, start_path)
 }

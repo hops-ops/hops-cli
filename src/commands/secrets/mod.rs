@@ -385,6 +385,7 @@ fn mirror_tree_with_sops(
     dest_root: &Path,
     sops_mode: &str,
     force: bool,
+    start_path: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     require_command("sops")?;
 
@@ -406,8 +407,27 @@ fn mirror_tree_with_sops(
         .into());
     }
 
+    let start = match start_path {
+        None => source_root.clone(),
+        Some(p) => {
+            if !p.exists() {
+                return Err(format!("Scope path does not exist: {}", p.display()).into());
+            }
+            let resolved = normalized_path(p)?;
+            if !resolved.starts_with(&source_root) {
+                return Err(format!(
+                    "Scope path {} is not inside source {}",
+                    resolved.display(),
+                    source_root.display()
+                )
+                .into());
+            }
+            resolved
+        }
+    };
+
     fs::create_dir_all(&dest_root)?;
-    process_tree(&source_root, &source_root, &dest_root, sops_mode, force)
+    process_tree(&source_root, &start, &dest_root, sops_mode, force)
 }
 
 fn normalized_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
