@@ -1,16 +1,18 @@
 //! `hops auth bootstrap <cluster>` — generate the durable AuthStack
 //! secret plaintexts into the repo's `secrets/` tree.
 //!
-//! Writes two files matching the AuthStack composition's ExternalSecret
-//! contract (AWS SM secret path / JSON property):
+//! Writes two files under one directory so `hops secrets sync aws`
+//! lands both values as JSON properties under a single AWS SM secret
+//! (matches the AuthStack composition's ExternalSecret contract:
+//! one `secretPath`, two `property:` selectors):
 //!
-//!   <plaintext>/<aws>/<cluster>/zitadel/masterkey/masterkey
-//!   <plaintext>/<aws>/<cluster>/zitadel/admin-password/password
+//!   <plaintext>/<aws>/<cluster>/zitadel/masterkey         (random 32-char hex)
+//!   <plaintext>/<aws>/<cluster>/zitadel/admin-password    (32-char, Zitadel policy)
 //!
-//! The platform's normal secrets pipeline takes it from there:
+//! Pipeline:
 //!
 //!   hops secrets encrypt    # SOPS-encrypts into secrets-encrypted/
-//!   hops secrets sync aws   # pushes to AWS Secrets Manager
+//!   hops secrets sync aws   # → AWS SM <cluster>/zitadel as one JSON blob
 //!
 //! Idempotent: existing plaintexts are left alone unless `--force`.
 
@@ -48,16 +50,9 @@ pub fn run(args: &BootstrapArgs) -> Result<(), Box<dyn Error>> {
         .clone()
         .unwrap_or_else(|| format!("{}/zitadel", args.cluster));
 
-    let masterkey_path = plaintext_root
-        .join(&aws_settings.path)
-        .join(&prefix)
-        .join("masterkey")
-        .join("masterkey");
-    let admin_pwd_path = plaintext_root
-        .join(&aws_settings.path)
-        .join(&prefix)
-        .join("admin-password")
-        .join("password");
+    let secret_dir = plaintext_root.join(&aws_settings.path).join(&prefix);
+    let masterkey_path = secret_dir.join("masterkey");
+    let admin_pwd_path = secret_dir.join("admin-password");
 
     log::info!("Bootstrapping AuthStack durable secret plaintexts:");
     write_secret(&masterkey_path, &generate_32_char_random(), args.force)?;
