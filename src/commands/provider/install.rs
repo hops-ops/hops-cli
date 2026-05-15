@@ -739,10 +739,11 @@ spec:
 /// container image (used for source builds); otherwise the DRC only sets up a
 /// cluster-admin ServiceAccount (used for published versions).
 ///
-/// The DRC and ClusterRoleBinding are also reused-or-named-after the existing
-/// Provider: if the upstream Provider already references a DRC we patch that
-/// DRC; otherwise we derive `<provider>-runtime` / `<provider>-cluster-admin`
-/// against the existing Provider's name (never against a hypothetical sibling).
+/// The DRC and ClusterRoleBinding are always named after the existing Provider
+/// (`<provider>-runtime` / `<provider>-cluster-admin`). We deliberately do NOT
+/// reuse the existing Provider's `runtimeConfigRef.name` — a different Provider
+/// may already reference that DRC, and overwriting a shared DRC with this
+/// provider's image silently corrupts the other provider's pod.
 fn apply_provider_resources(
     provider_name: &str,
     resolved: &ResolvedProvider,
@@ -765,10 +766,18 @@ fn apply_provider_resources(
     }
 
     let target_name = resolved.existing_name.clone();
-    let drc_name = resolved
-        .existing_drc_name
-        .clone()
-        .unwrap_or_else(|| format!("{}-runtime", target_name));
+    let drc_name = format!("{}-runtime", target_name);
+    if let Some(prev) = &resolved.existing_drc_name {
+        if prev != &drc_name {
+            log::warn!(
+                "Provider '{}' previously referenced DRC '{}'; switching to owned DRC '{}'. \
+                 The old DRC is not deleted (it may still be referenced by another Provider).",
+                target_name,
+                prev,
+                drc_name
+            );
+        }
+    }
     let sa_name = target_name.clone();
     let crb_name = format!("{}-cluster-admin", target_name);
 
