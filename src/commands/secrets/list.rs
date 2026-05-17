@@ -22,36 +22,60 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         expected_tags.insert(key, value);
     }
     expected_tags.insert("hops.ops.com.ai/secret".to_string(), "true".to_string());
+    expected_tags.insert("hops.ops.com.ai/managed-by".to_string(), "sync".to_string());
 
     let runtime = tokio::runtime::Runtime::new()?;
     let (client, _) = aws_clients(&aws_settings.region)?;
     let remote_secrets = fetch_remote_secrets(&runtime, &client)?;
 
     let mut remote_by_name = HashMap::new();
+    let mut pushed_rows = Vec::new();
     let mut other_remote_rows = Vec::new();
     for secret in remote_secrets {
-        if secret.managed || local_lookup.contains(&secret.name) {
-            remote_by_name.insert(secret.name.clone(), secret);
-            continue;
+        match producer(&secret) {
+            Producer::Pushsecret => {
+                let kms = secret
+                    .kms_key_id
+                    .clone()
+                    .unwrap_or_else(|| "aws/secretsmanager".to_string());
+                pushed_rows.push(PushedSecretRow {
+                    name: secret.name.clone(),
+                    owner: owner_label(&secret),
+                    cluster: tag_value(&secret, "hops.ops.com.ai/cluster").unwrap_or("-".to_string()),
+                    namespace: tag_value(&secret, "hops.ops.com.ai/namespace")
+                        .unwrap_or("-".to_string()),
+                    kms_key: shorten_kms_key(&kms),
+                    status: "synced".to_string(),
+                });
+            }
+            Producer::Sync => {
+                remote_by_name.insert(secret.name.clone(), secret);
+            }
+            Producer::Other => {
+                if local_lookup.contains(&secret.name) {
+                    remote_by_name.insert(secret.name.clone(), secret);
+                    continue;
+                }
+                let status = if is_crossplane_managed(&secret) {
+                    "managed by crossplane"
+                } else {
+                    "-"
+                };
+                let kms = secret
+                    .kms_key_id
+                    .clone()
+                    .unwrap_or_else(|| "aws/secretsmanager".to_string());
+                other_remote_rows.push(RemoteOnlyRow {
+                    name: secret.name,
+                    tags: format_tags(&secret.tags),
+                    kms_key: shorten_kms_key(&kms),
+                    status: status.to_string(),
+                });
+            }
         }
-
-        let status = if is_crossplane_managed(&secret) {
-            "managed by crossplane"
-        } else {
-            "-"
-        };
-        let kms = secret
-            .kms_key_id
-            .clone()
-            .unwrap_or_else(|| "aws/secretsmanager".to_string());
-        other_remote_rows.push(RemoteOnlyRow {
-            name: secret.name,
-            tags: format_tags(&secret.tags),
-            kms_key: shorten_kms_key(&kms),
-            status: status.to_string(),
-        });
     }
     other_remote_rows.sort_by(|left, right| left.name.cmp(&right.name));
+    pushed_rows.sort_by(|left, right| left.name.cmp(&right.name));
 
     let mut names = BTreeSet::new();
     for name in local_names {
@@ -97,12 +121,160 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     println!("Managed secrets");
     print_secret_rows(&rows);
     println!();
+    println!("Platform-pushed secrets");
+    print_pushed_rows(&pushed_rows);
+    println!();
     println!("Other AWS secrets");
     print_remote_only_rows(&other_remote_rows);
     println!();
     print_github_section()?;
 
     Ok(())
+}
+
+#[derive(Debug)]
+enum Producer {
+    Sync,
+    Pushsecret,
+    Other,
+}
+
+fn tag_value(secret: &RemoteSecret, key: &str) -> Option<String> {
+    secret
+        .tags
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+}
+
+// Producer routing by tag:
+//   - managed-by=sync  → CLI-managed (hops secrets sync). Falls back here for
+//     legacy entries with `hops.ops.com.ai/secret=true` but no managed-by tag.
+//   - managed-by=pushsecret → composed by a Crossplane stack's PushSecret
+//     (e.g. AuthStack publishing the iam-admin PAT).
+//   - everything else → Other.
+fn producer(secret: &RemoteSecret) -> Producer {
+    match tag_value(secret, "hops.ops.com.ai/managed-by").as_deref() {
+        Some("pushsecret") => Producer::Pushsecret,
+        Some("sync") => Producer::Sync,
+        Some(_) => Producer::Other,
+        None => {
+            if secret.managed {
+                Producer::Sync
+            } else {
+                Producer::Other
+            }
+        }
+    }
+}
+
+// Build an `<kind>/<name>` owner label.
+//
+// Prefer the explicit programmatic tags `hops.ops.com.ai/kind` +
+// `hops.ops.com.ai/name`. Fall back to the dynamic
+// `hops.ops.com.ai/<kind.lower>=<xr-name>` label-scan for entries
+// pushed before those tags were added. Returns "-" if neither is
+// present.
+fn owner_label(secret: &RemoteSecret) -> String {
+    if let (Some(kind), Some(name)) = (
+        tag_value(secret, "hops.ops.com.ai/kind"),
+        tag_value(secret, "hops.ops.com.ai/name"),
+    ) {
+        return format!("{kind}/{name}");
+    }
+    let reserved = [
+        "hops.ops.com.ai/secret",
+        "hops.ops.com.ai/managed",
+        "hops.ops.com.ai/managed-by",
+        "hops.ops.com.ai/cluster",
+        "hops.ops.com.ai/namespace",
+        "hops.ops.com.ai/kind",
+        "hops.ops.com.ai/name",
+        "hops.ops.com.ai/apiVersion",
+    ];
+    for (k, v) in &secret.tags {
+        if k.starts_with("hops.ops.com.ai/") && !reserved.contains(&k.as_str()) {
+            if let Some(kind) = k.strip_prefix("hops.ops.com.ai/") {
+                return format!("{kind}/{v}");
+            }
+        }
+    }
+    "-".to_string()
+}
+
+struct PushedSecretRow {
+    name: String,
+    owner: String,
+    cluster: String,
+    namespace: String,
+    kms_key: String,
+    status: String,
+}
+
+fn print_pushed_rows(rows: &[PushedSecretRow]) {
+    if rows.is_empty() {
+        println!("(none)");
+        return;
+    }
+
+    let mut name_width = "Name".len();
+    let mut owner_width = "Owner".len();
+    let mut cluster_width = "Cluster".len();
+    let mut namespace_width = "Namespace".len();
+    let mut kms_key_width = "KMS Key".len();
+    let mut status_width = "Status".len();
+
+    for row in rows {
+        name_width = name_width.max(row.name.len());
+        owner_width = owner_width.max(row.owner.len());
+        cluster_width = cluster_width.max(row.cluster.len());
+        namespace_width = namespace_width.max(row.namespace.len());
+        kms_key_width = kms_key_width.max(row.kms_key.len());
+        status_width = status_width.max(row.status.len());
+    }
+
+    println!(
+        "{:<name_width$}  {:<owner_width$}  {:<cluster_width$}  {:<namespace_width$}  {:<kms_key_width$}  {:<status_width$}",
+        "Name",
+        "Owner",
+        "Cluster",
+        "Namespace",
+        "KMS Key",
+        "Status",
+        name_width = name_width,
+        owner_width = owner_width,
+        cluster_width = cluster_width,
+        namespace_width = namespace_width,
+        kms_key_width = kms_key_width,
+        status_width = status_width,
+    );
+    println!(
+        "{}  {}  {}  {}  {}  {}",
+        "-".repeat(name_width),
+        "-".repeat(owner_width),
+        "-".repeat(cluster_width),
+        "-".repeat(namespace_width),
+        "-".repeat(kms_key_width),
+        "-".repeat(status_width),
+    );
+
+    for row in rows {
+        println!(
+            "{:<name_width$}  {:<owner_width$}  {:<cluster_width$}  {:<namespace_width$}  {:<kms_key_width$}  {:<status_width$}",
+            row.name,
+            row.owner,
+            row.cluster,
+            row.namespace,
+            row.kms_key,
+            row.status,
+            name_width = name_width,
+            owner_width = owner_width,
+            cluster_width = cluster_width,
+            namespace_width = namespace_width,
+            kms_key_width = kms_key_width,
+            status_width = status_width,
+        );
+    }
 }
 
 struct SecretRow {

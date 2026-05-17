@@ -115,6 +115,7 @@ fn run_aws(args: &AwsSyncArgs) -> Result<(), Box<dyn Error>> {
         tags
     };
     final_tags_map.insert("hops.ops.com.ai/secret".to_string(), "true".to_string());
+    final_tags_map.insert("hops.ops.com.ai/managed-by".to_string(), "sync".to_string());
     let mut final_tags = final_tags_map.into_iter().collect::<Vec<_>>();
     final_tags.sort();
 
@@ -991,10 +992,27 @@ fn delete_missing_secrets(
     }
 }
 
+// Only treat as sync-managed when `hops.ops.com.ai/secret=true` AND either
+// `hops.ops.com.ai/managed-by=sync` is set OR the managed-by tag is absent
+// entirely (legacy entries written before we added managed-by). PushSecret-
+// produced entries carry `managed-by=pushsecret` and must NOT be swept up by
+// `sync --cleanup`.
 fn has_managed_secret_tag(tags: Option<&Vec<rusoto_secretsmanager::Tag>>) -> bool {
-    tags.into_iter().flatten().any(|tag| {
+    let tag_slice: &[rusoto_secretsmanager::Tag] = match tags {
+        Some(v) => v.as_slice(),
+        None => return false,
+    };
+    let secret_marker = tag_slice.iter().any(|tag| {
         tag.key.as_deref() == Some("hops.ops.com.ai/secret") && tag.value.as_deref() == Some("true")
-    })
+    });
+    if !secret_marker {
+        return false;
+    }
+    let managed_by = tag_slice
+        .iter()
+        .find(|tag| tag.key.as_deref() == Some("hops.ops.com.ai/managed-by"))
+        .and_then(|tag| tag.value.as_deref());
+    matches!(managed_by, None | Some("sync"))
 }
 
 fn confirm_target_account(
