@@ -31,8 +31,9 @@ pub struct ZitadelArgs {
     #[arg(long)]
     pub insecure: bool,
 
-    /// Kubernetes context containing the AuthStack iam-admin PAT Secret
-    #[arg(long, default_value = "pat-local")]
+    /// Kubernetes context containing the AuthStack iam-admin PAT Secret.
+    /// Required — no platform-name default.
+    #[arg(long)]
     pub source_context: String,
 
     /// Namespace containing the AuthStack iam-admin PAT Secret

@@ -2,6 +2,7 @@ mod aws;
 mod destroy;
 mod github;
 mod install;
+mod listmonk;
 pub mod package_install;
 mod reset;
 mod start;
@@ -65,6 +66,8 @@ pub enum LocalCommands {
     Github(github::GithubArgs),
     /// Configure crossplane-contrib provider-upjet-zitadel and Zitadel ProviderConfig
     Zitadel(zitadel::ZitadelArgs),
+    /// Configure hops-ops/provider-listmonk and Listmonk ProviderConfig
+    Listmonk(listmonk::ListmonkArgs),
     /// Stop the local cluster
     Stop,
     /// Destroy the local cluster VM
@@ -81,6 +84,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Github(github_args) => github::run(github_args),
         LocalCommands::Zitadel(zitadel_args) => zitadel::run(zitadel_args),
+        LocalCommands::Listmonk(listmonk_args) => listmonk::run(listmonk_args),
         LocalCommands::Stop => stop::run(),
         LocalCommands::Destroy => destroy::run(),
         LocalCommands::Uninstall => uninstall::run(),
