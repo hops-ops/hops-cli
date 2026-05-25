@@ -7,6 +7,7 @@ mod reset;
 mod start;
 mod stop;
 mod uninstall;
+mod zitadel;
 
 use clap::{Args, Subcommand};
 use std::error::Error;
@@ -62,6 +63,8 @@ pub enum LocalCommands {
     Aws(aws::AwsArgs),
     /// Configure crossplane-contrib provider-upjet-github and GitHub ProviderConfig
     Github(github::GithubArgs),
+    /// Configure crossplane-contrib provider-upjet-zitadel and Zitadel ProviderConfig
+    Zitadel(zitadel::ZitadelArgs),
     /// Stop the local cluster
     Stop,
     /// Destroy the local cluster VM
@@ -77,6 +80,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Start => start::run(),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Github(github_args) => github::run(github_args),
+        LocalCommands::Zitadel(zitadel_args) => zitadel::run(zitadel_args),
         LocalCommands::Stop => stop::run(),
         LocalCommands::Destroy => destroy::run(),
         LocalCommands::Uninstall => uninstall::run(),
