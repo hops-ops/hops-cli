@@ -201,13 +201,16 @@ hops local aws --profile <aws-profile>
 # 4) Configure GitHub provider + ProviderConfig from your gh auth login
 hops local github --owner <org-or-user>
 
-# 5) Install a Crossplane configuration package from an Upbound-format XRD project
+# 5) Configure Zitadel provider + ProviderConfig from the AuthStack PAT Secret
+hops local zitadel --source-context pat-local --domain auth.ops.com.ai
+
+# 6) Install a Crossplane configuration package from an Upbound-format XRD project
 hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
 ```
 
 ### Local provider setup and auth
 
-`hops local aws` and `hops local github` install the provider package and bootstrap auth into a local control plane. The exception is `--refresh`, which updates credentials only.
+`hops local aws`, `hops local github`, and `hops local zitadel` install the provider package and bootstrap auth into a local control plane. The exception is `--refresh`, which updates credentials only.
 
 #### AWS auth
 
@@ -252,6 +255,29 @@ How it works:
 - Writes the generated credentials into a Kubernetes Secret, defaulting to `default/github-creds`.
 - Applies a GitHub `ProviderConfig` named `default` unless `--refresh` is used.
 - Supports overrides for namespace, Secret name, ProviderConfig name, provider name, and provider package.
+
+#### Zitadel auth
+
+`hops local zitadel` installs the Zitadel provider package and creates a Zitadel `ProviderConfig` for consumer stacks that need to author Zitadel resources from the local control plane.
+
+```bash
+# Read the AuthStack iam-admin PAT from a target cluster and create default/zitadel-credentials + ProviderConfig/default
+hops local zitadel --source-context pat-local --domain auth.ops.com.ai
+
+# Use an explicit token instead of reading the target cluster Secret
+ZITADEL_ACCESS_TOKEN=<pat> hops local zitadel --domain auth.ops.com.ai
+
+# Refresh only the Secret credentials without re-applying the Provider or ProviderConfig
+hops local zitadel --source-context pat-local --domain auth.ops.com.ai --refresh
+```
+
+How it works:
+
+- Resolves the access token in this order: `--access-token`, `ZITADEL_ACCESS_TOKEN`, then the source cluster Secret.
+- Defaults the source Secret to `pat-local/zitadel/iam-admin-pat` key `pat`.
+- Writes the generated credentials JSON into a Kubernetes Secret, defaulting to `default/zitadel-credentials`.
+- Applies a Zitadel `ProviderConfig` named `default` unless `--refresh` is used.
+- Supports overrides for namespace, Secret name, ProviderConfig name, provider name, provider package, source context, source namespace, source Secret, source key, domain, port, and `insecure`.
 
 ## Config packages
 
