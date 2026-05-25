@@ -22,9 +22,10 @@ pub struct ZitadelArgs {
     #[arg(long, default_value = "auth.ops.com.ai")]
     pub domain: String,
 
-    /// Zitadel API port stored in the provider credentials JSON
-    #[arg(long, default_value = "443")]
-    pub port: String,
+    /// Zitadel API port stored in the provider credentials JSON.
+    /// Defaults to an explicit --domain URL port when present, otherwise 443.
+    #[arg(long)]
+    pub port: Option<String>,
 
     /// Set Zitadel provider credentials.insecure=true
     #[arg(long)]
@@ -74,8 +75,9 @@ pub struct ZitadelArgs {
 pub fn run(args: &ZitadelArgs) -> Result<(), Box<dyn Error>> {
     let access_token = resolve_access_token(args)?;
     let domain = normalize_domain(&args.domain)?;
+    let port = effective_port(args.port.as_deref(), domain.port.as_deref());
     let credentials_json =
-        build_credentials_json(&access_token, &domain, &args.port, args.insecure)?;
+        build_credentials_json(&access_token, &domain.host, &port, args.insecure)?;
 
     if args.refresh {
         log::info!(
@@ -131,7 +133,7 @@ pub fn run(args: &ZitadelArgs) -> Result<(), Box<dyn Error>> {
 
     log::info!(
         "Zitadel provider configured for '{}' (ProviderConfig: {}/{})",
-        domain,
+        domain.host,
         args.namespace,
         args.provider_config_name
     );
@@ -220,23 +222,65 @@ fn wait_for_crd(crd: &str) -> Result<(), Box<dyn Error>> {
     Err(format!("Timed out waiting for CRD {}", crd).into())
 }
 
-fn normalize_domain(input: &str) -> Result<String, Box<dyn Error>> {
+#[derive(Debug, PartialEq, Eq)]
+struct Domain {
+    host: String,
+    port: Option<String>,
+}
+
+fn normalize_domain(input: &str) -> Result<Domain, Box<dyn Error>> {
     let trimmed = input.trim().trim_end_matches('/');
     let without_scheme = trimmed
         .strip_prefix("https://")
         .or_else(|| trimmed.strip_prefix("http://"))
         .unwrap_or(trimmed);
     let host_port = without_scheme.split('/').next().unwrap_or("").trim();
-    let host = if host_port.starts_with('[') {
-        host_port
-    } else {
-        host_port.split(':').next().unwrap_or("").trim()
-    };
+    let (host, port) = split_host_port(host_port)?;
 
     if host.is_empty() {
         return Err("Zitadel domain is empty".into());
     }
-    Ok(host.to_string())
+    Ok(Domain {
+        host: host.to_string(),
+        port,
+    })
+}
+
+fn split_host_port(host_port: &str) -> Result<(&str, Option<String>), Box<dyn Error>> {
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let close_idx = rest
+            .find(']')
+            .ok_or("IPv6 domain literal is missing closing ']'")?
+            + 1;
+        let host = &host_port[..=close_idx];
+        let suffix = &host_port[close_idx + 1..];
+        if suffix.is_empty() {
+            return Ok((host, None));
+        }
+        if let Some(port) = suffix.strip_prefix(':') {
+            return Ok((host, non_empty(Some(port)).map(ToString::to_string)));
+        }
+        return Err("unexpected characters after IPv6 domain literal".into());
+    }
+
+    if host_port.matches(':').count() == 1 {
+        let mut parts = host_port.splitn(2, ':');
+        let host = parts.next().unwrap_or("").trim();
+        let port = parts
+            .next()
+            .and_then(|port| non_empty(Some(port)))
+            .map(ToString::to_string);
+        return Ok((host, port));
+    }
+
+    Ok((host_port, None))
+}
+
+fn effective_port(cli_port: Option<&str>, domain_port: Option<&str>) -> String {
+    non_empty(cli_port)
+        .or_else(|| non_empty(domain_port))
+        .unwrap_or("443")
+        .to_string()
 }
 
 fn build_credentials_json(
@@ -292,20 +336,39 @@ mod tests {
     fn normalize_domain_accepts_host_or_url() {
         assert_eq!(
             normalize_domain("auth.ops.com.ai").unwrap(),
-            "auth.ops.com.ai"
+            Domain {
+                host: "auth.ops.com.ai".to_string(),
+                port: None
+            }
         );
         assert_eq!(
             normalize_domain("https://auth.ops.com.ai").unwrap(),
-            "auth.ops.com.ai"
+            Domain {
+                host: "auth.ops.com.ai".to_string(),
+                port: None
+            }
         );
         assert_eq!(
             normalize_domain("https://auth.ops.com.ai/ui/login").unwrap(),
-            "auth.ops.com.ai"
+            Domain {
+                host: "auth.ops.com.ai".to_string(),
+                port: None
+            }
         );
         assert_eq!(
             normalize_domain("https://auth.ops.com.ai:443").unwrap(),
-            "auth.ops.com.ai"
+            Domain {
+                host: "auth.ops.com.ai".to_string(),
+                port: Some("443".to_string())
+            }
         );
+    }
+
+    #[test]
+    fn effective_port_prefers_cli_then_domain_then_default() {
+        assert_eq!(effective_port(Some("9443"), Some("8443")), "9443");
+        assert_eq!(effective_port(None, Some("8443")), "8443");
+        assert_eq!(effective_port(None, None), "443");
     }
 
     #[test]
