@@ -20,6 +20,14 @@ use std::process::{Command, Stdio};
 const LOCAL_STATE_DIR: &str = ".hops/local";
 const REPO_CACHE_DIR: &str = "repo-cache";
 
+/// metadata.labels key recording who manages a resource (k8s recommended label).
+pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
+/// `MANAGED_BY_LABEL` value that `hops provider install` stamps on the Provider,
+/// DeploymentRuntimeConfig, and ClusterRoleBinding it manages — so `hops local
+/// doctor` can tell an intentional custom install (e.g. a forked provider built
+/// from source) apart from accidental drift.
+pub const PROVIDER_INSTALL_MANAGED_BY: &str = "hops-provider-install";
+
 /// Env var checked by kubectl helpers to inject `--context <name>`.
 pub const HOPS_KUBE_CONTEXT_ENV: &str = "HOPS_KUBE_CONTEXT";
 
