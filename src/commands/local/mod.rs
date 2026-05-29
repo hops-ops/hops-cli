@@ -1,5 +1,6 @@
 mod aws;
 mod destroy;
+mod doctor;
 mod github;
 mod install;
 mod listmonk;
@@ -50,6 +51,12 @@ pub fn kubectl_command(args: &[&str]) -> Command {
 pub struct LocalArgs {
     #[command(subcommand)]
     pub command: LocalCommands,
+
+    /// Kubernetes context to use for all kubectl commands (e.g. "colima").
+    /// Global: applies to every `hops local` subcommand and may be given before
+    /// or after the subcommand.
+    #[arg(long, global = true)]
+    pub context: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -60,6 +67,8 @@ pub enum LocalCommands {
     Reset,
     /// Start local k8s cluster with Crossplane and providers
     Start,
+    /// Check what `hops local start` set up and report drift
+    Doctor,
     /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
     Aws(aws::AwsArgs),
     /// Configure crossplane-contrib provider-upjet-github and GitHub ProviderConfig
@@ -77,10 +86,18 @@ pub enum LocalCommands {
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
+    // Plumb --context through the same env channel the kubectl helpers read, so
+    // every subcommand's kubectl calls target the chosen context.
+    if let Some(ctx) = &args.context {
+        if !ctx.is_empty() {
+            std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx);
+        }
+    }
     match &args.command {
         LocalCommands::Install => install::run(),
         LocalCommands::Reset => reset::run(),
         LocalCommands::Start => start::run(),
+        LocalCommands::Doctor => doctor::run(),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Github(github_args) => github::run(github_args),
         LocalCommands::Zitadel(zitadel_args) => zitadel::run(zitadel_args),

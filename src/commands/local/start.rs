@@ -5,7 +5,10 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const DRC: &str = include_str!("../../../bootstrap/drc/local-dev.yaml");
+// Per-provider DRCs — never shared. Each pins its own cluster-admin SA so the
+// providers can never clobber each other's runtime config. See bootstrap/drc/.
+const DRC_K8S: &str = include_str!("../../../bootstrap/drc/kubernetes.yaml");
+const DRC_HELM: &str = include_str!("../../../bootstrap/drc/helm.yaml");
 const PROVIDER_HELM: &str = include_str!("../../../bootstrap/providers/provider-helm.yaml");
 const PROVIDER_K8S: &str = include_str!("../../../bootstrap/providers/provider-kubernetes.yaml");
 const PC_HELM: &str = include_str!("../../../bootstrap/helm/pc.yaml");
@@ -78,9 +81,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     log::info!("Waiting for Crossplane to be ready...");
     wait_for_deployment("crossplane-system", "crossplane")?;
 
-    // 7. Deploy DRC (cluster-admin SA for provider pods)
-    log::info!("Applying DeploymentRuntimeConfig...");
-    kubectl_apply_stdin(DRC)?;
+    // 7. Deploy per-provider DRCs (each pins its own cluster-admin SA)
+    log::info!("Applying DeploymentRuntimeConfigs (per-provider)...");
+    kubectl_apply_stdin(DRC_K8S)?;
+    kubectl_apply_stdin(DRC_HELM)?;
 
     // 8. Install providers
     log::info!("Installing providers...");
