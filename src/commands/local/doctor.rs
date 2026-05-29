@@ -1,4 +1,4 @@
-use super::run_cmd_output;
+use super::{run_cmd_output, MANAGED_BY_LABEL, PROVIDER_INSTALL_MANAGED_BY};
 use std::error::Error;
 
 /// `hops local doctor` — verify what `hops local start` set up on the current
@@ -124,7 +124,35 @@ fn check_provider(d: &mut Doctor, e: &ProviderExpectation) {
         cond_detail("Healthy", &healthy),
     );
 
-    // Drift detector: the Provider must point at its OWN per-provider DRC.
+    // A provider installed via `hops provider install` (e.g. a fork built from
+    // source) is labeled and uses the `<provider>-runtime` convention instead of
+    // the bootstrap `local-dev-<provider>` DRC. Recognize that so it reads as an
+    // intentional custom install, not drift — while still verifying cluster-admin.
+    let custom_install = provider_label(e.provider_name, MANAGED_BY_LABEL).as_deref()
+        == Some(PROVIDER_INSTALL_MANAGED_BY);
+    let (exp_drc, exp_binding, exp_sa) = if custom_install {
+        (
+            format!("{}-runtime", e.provider_name),
+            format!("{}-cluster-admin", e.provider_name),
+            e.provider_name.to_string(),
+        )
+    } else {
+        (e.drc.to_string(), e.binding.to_string(), e.sa.to_string())
+    };
+    d.check(
+        "install mode",
+        true,
+        if custom_install {
+            format!(
+                "custom install via `hops provider install` (package: {})",
+                provider_package(e.provider_name)
+            )
+        } else {
+            "bootstrap (hops local start)".to_string()
+        },
+    );
+
+    // The Provider must point at its expected per-provider DRC.
     let rc = jsonpath(&[
         "get",
         "provider.pkg.crossplane.io",
@@ -133,7 +161,7 @@ fn check_provider(d: &mut Doctor, e: &ProviderExpectation) {
         "jsonpath={.spec.runtimeConfigRef.name}",
     ])
     .unwrap_or_default();
-    let rc_ok = rc == e.drc;
+    let rc_ok = rc == exp_drc;
     d.check(
         "runtimeConfigRef pinned to its own DRC",
         rc_ok,
@@ -143,19 +171,19 @@ fn check_provider(d: &mut Doctor, e: &ProviderExpectation) {
             format!(
                 "runtimeConfigRef is \"{}\" (expected \"{}\") — drifted; provider lacks its cluster-admin ServiceAccount and cannot observe XRs",
                 if rc.is_empty() { "<unset>" } else { &rc },
-                e.drc
+                exp_drc
             )
         },
     );
 
-    let drc_ok = exists(&["get", "deploymentruntimeconfig", e.drc]);
+    let drc_ok = exists(&["get", "deploymentruntimeconfig", exp_drc.as_str()]);
     d.check(
         "DeploymentRuntimeConfig present",
         drc_ok,
         if drc_ok {
             String::new()
         } else {
-            format!("DeploymentRuntimeConfig \"{}\" missing", e.drc)
+            format!("DeploymentRuntimeConfig \"{}\" missing", exp_drc)
         },
     );
 
@@ -163,21 +191,21 @@ fn check_provider(d: &mut Doctor, e: &ProviderExpectation) {
     let role = jsonpath(&[
         "get",
         "clusterrolebinding",
-        e.binding,
+        exp_binding.as_str(),
         "-o",
         "jsonpath={.roleRef.name}",
     ]);
     let subjects = jsonpath(&[
         "get",
         "clusterrolebinding",
-        e.binding,
+        exp_binding.as_str(),
         "-o",
         "jsonpath={.subjects[?(@.kind==\"ServiceAccount\")].name}",
     ]);
     let binding_ok = role.as_deref() == Some("cluster-admin")
         && subjects
             .as_deref()
-            .map(|s| s.split_whitespace().any(|n| n == e.sa))
+            .map(|s| s.split_whitespace().any(|n| n == exp_sa.as_str()))
             .unwrap_or(false);
     d.check(
         "cluster-admin binding -> pinned SA",
@@ -187,7 +215,7 @@ fn check_provider(d: &mut Doctor, e: &ProviderExpectation) {
         } else {
             format!(
                 "ClusterRoleBinding \"{}\" missing or not binding cluster-admin to ServiceAccount \"{}\"",
-                e.binding, e.sa
+                exp_binding, exp_sa
             )
         },
     );
@@ -227,6 +255,34 @@ fn cond_detail(cond: &str, status: &str) -> String {
     } else {
         format!("{}={}", cond, if status.is_empty() { "<none>" } else { status })
     }
+}
+
+/// Read a metadata label off a Provider via `-o json` (robust against the dotted
+/// label key that jsonpath escaping mishandles).
+fn provider_label(provider: &str, key: &str) -> Option<String> {
+    let json = run_cmd_output(
+        "kubectl",
+        &["get", "provider.pkg.crossplane.io", provider, "-o", "json"],
+    )
+    .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    v.get("metadata")?
+        .get("labels")?
+        .get(key)?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// The Provider's spec.package (image ref) — shown for custom installs.
+fn provider_package(provider: &str) -> String {
+    jsonpath(&[
+        "get",
+        "provider.pkg.crossplane.io",
+        provider,
+        "-o",
+        "jsonpath={.spec.package}",
+    ])
+    .unwrap_or_default()
 }
 
 /// True when `kubectl get <args>` finds the resource. Uses `--ignore-not-found`

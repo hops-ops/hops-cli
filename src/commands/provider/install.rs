@@ -5,7 +5,7 @@ use crate::commands::local::package_install::{
 };
 use crate::commands::local::{
     kubectl_apply_stdin, run_cmd, run_cmd_output, sync_registry_hosts_entry,
-    HOPS_KUBE_CONTEXT_ENV,
+    HOPS_KUBE_CONTEXT_ENV, MANAGED_BY_LABEL, PROVIDER_INSTALL_MANAGED_BY,
 };
 use clap::Args;
 use serde::Deserialize;
@@ -1002,6 +1002,8 @@ fn build_provider_yaml(
 kind: Provider
 metadata:
   name: {name}
+  labels:
+    {MANAGED_BY_LABEL}: {PROVIDER_INSTALL_MANAGED_BY}
 spec:
   package: {package_ref}
   packagePullPolicy: Always
@@ -1028,6 +1030,8 @@ fn build_runtime_config_yaml(
 kind: DeploymentRuntimeConfig
 metadata:
   name: {name}
+  labels:
+    {MANAGED_BY_LABEL}: {PROVIDER_INSTALL_MANAGED_BY}
 spec:
   serviceAccountTemplate:
     metadata:
@@ -1056,6 +1060,8 @@ fn build_cluster_role_binding_yaml(name: &str, service_account: &str) -> String 
 kind: ClusterRoleBinding
 metadata:
   name: {name}
+  labels:
+    {MANAGED_BY_LABEL}: {PROVIDER_INSTALL_MANAGED_BY}
 subjects:
 - kind: ServiceAccount
   name: {service_account}
@@ -1084,6 +1090,7 @@ mod tests {
         assert!(yaml.contains("name: provider-helm"));
         assert!(yaml.contains("package: registry.example/provider-helm:dev-abc"));
         assert!(yaml.contains("name: provider-helm-runtime"));
+        assert!(yaml.contains("app.kubernetes.io/managed-by: hops-provider-install"));
         assert!(!yaml.contains("skipDependencyResolution"));
     }
 
@@ -1107,6 +1114,7 @@ mod tests {
         assert!(!without.contains("package-runtime"));
         assert!(!without.contains("deploymentTemplate"));
         assert!(without.contains("serviceAccountTemplate"));
+        assert!(without.contains("app.kubernetes.io/managed-by: hops-provider-install"));
     }
 
     #[test]
@@ -1116,6 +1124,7 @@ mod tests {
         assert!(yaml.contains("name: p-cluster-admin"));
         assert!(yaml.contains("name: p\n  namespace: crossplane-system"));
         assert!(yaml.contains("name: cluster-admin"));
+        assert!(yaml.contains("app.kubernetes.io/managed-by: hops-provider-install"));
     }
 
     const TEST_LOCAL_REGISTRY: &str = "registry.crossplane-system.svc.cluster.local:5000";
