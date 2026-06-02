@@ -79,6 +79,7 @@ hops config --help
 hops secrets --help
 hops validate --help
 hops xr --help
+hops service --help
 ```
 
 ## Command Areas
@@ -95,6 +96,8 @@ hops xr --help
   - Generate configuration manifests from Upbound-format XRD projects for validation workflows.
 - `xr`
   - Observe existing XR-backed infrastructure and render adoption, management, or orphaning manifests.
+- `service`
+  - Scaffold Distributed microservice crates, optional GitOps/Knative/GitHub workflow scaffolds, and inspect/render their project manifests.
 
 ## Secrets
 
