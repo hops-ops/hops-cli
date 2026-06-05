@@ -1,6 +1,9 @@
 use clap::{Args, Subcommand, ValueEnum};
+use distributed_tooling::{
+    generate_service_scaffold, BusTarget, FileMode, GeneratedFile, GithubRepo, GitopsPromoteTarget,
+    PostCreateAction, ServiceScaffoldSpec, ServiceTransport, StoreTarget,
+};
 use serde::Deserialize;
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
@@ -180,17 +183,6 @@ pub enum Bus {
     Nats,
 }
 
-impl Bus {
-    fn kind(self) -> &'static str {
-        match self {
-            Bus::Rabbitmq => "rabbitmq",
-            Bus::Kafka => "kafka",
-            Bus::Psql => "psql",
-            Bus::Nats => "nats",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Store {
     Postgres,
@@ -209,6 +201,48 @@ pub enum SchemaDialect {
     Sqlite,
 }
 
+// Map the CLI's clap enums onto the scaffold-tooling spec enums. These exist so
+// `--help` / value parsing stay owned by the CLI while generation stays owned by
+// `distributed_tooling`.
+impl From<Transport> for ServiceTransport {
+    fn from(transport: Transport) -> Self {
+        match transport {
+            Transport::Http => ServiceTransport::Http,
+            Transport::Knative => ServiceTransport::Knative,
+        }
+    }
+}
+
+impl From<Store> for StoreTarget {
+    fn from(store: Store) -> Self {
+        match store {
+            Store::Postgres => StoreTarget::Postgres,
+            Store::Sqlite => StoreTarget::Sqlite,
+            Store::InMemory => StoreTarget::InMemory,
+        }
+    }
+}
+
+impl From<Bus> for BusTarget {
+    fn from(bus: Bus) -> Self {
+        match bus {
+            Bus::Rabbitmq => BusTarget::Rabbitmq,
+            Bus::Kafka => BusTarget::Kafka,
+            Bus::Psql => BusTarget::Psql,
+            Bus::Nats => BusTarget::Nats,
+        }
+    }
+}
+
+impl From<GitopsPromote> for GitopsPromoteTarget {
+    fn from(promote: GitopsPromote) -> Self {
+        match promote {
+            GitopsPromote::Argo => GitopsPromoteTarget::Argo,
+            GitopsPromote::Flux => GitopsPromoteTarget::Flux,
+        }
+    }
+}
+
 pub fn run(args: &ServiceArgs) -> Result<(), Box<dyn Error>> {
     match &args.command {
         ServiceCommands::Scaffold(scaffold) => run_scaffold(scaffold),
@@ -219,7 +253,6 @@ pub fn run(args: &ServiceArgs) -> Result<(), Box<dyn Error>> {
 
 fn run_scaffold(args: &ScaffoldArgs) -> Result<(), Box<dyn Error>> {
     validate_scaffold_kind(args.framework, args.kind.as_deref())?;
-    let include_read_models = args.read_models;
     let transport = if args.http && args.knative {
         return Err("--http and --knative cannot be used together".into());
     } else if args.http {
@@ -229,73 +262,57 @@ fn run_scaffold(args: &ScaffoldArgs) -> Result<(), Box<dyn Error>> {
     } else {
         args.transport
     };
-    let names = ScaffoldNames::new(&args.name)?;
-    let models = model_scaffolds(&args.model)?;
-    let read_models = if include_read_models {
-        if models.is_empty() {
-            vec![ModelScaffold::new(&names.package_name)?]
-        } else {
-            models.clone()
-        }
-    } else {
-        Vec::new()
-    };
-    let mut module_idents = BTreeSet::new();
-    let commands = message_handlers_with_modules(
-        if args.command.is_empty() {
-            vec![default_command_name(&names, &models)]
-        } else {
-            args.command.clone()
-        },
-        "command",
-        &mut module_idents,
-    )?;
-    let events = message_handlers_with_modules(args.event.clone(), "event", &mut module_idents)?;
+
     let github = parse_optional_github_repo(args.github.as_deref(), "--github")?;
     let github_preview =
         parse_optional_github_repo(args.github_preview.as_deref(), "--github-preview")?;
     let github_promote =
         parse_optional_github_repo(args.github_promote.as_deref(), "--github-promote")?;
+
+    // The default output directory uses the normalized package name, so derive it
+    // (and fail fast on an invalid name) before creating any directory.
+    let package_name = distributed_tooling::package_name(&args.name)?;
     let output_dir = args
         .path
         .clone()
-        .unwrap_or_else(|| PathBuf::from(&names.package_name));
+        .unwrap_or_else(|| PathBuf::from(&package_name));
     let output_dir = absolute_path(&output_dir)?;
     ensure_output_dir(&output_dir, args.force)?;
 
     let distributed_path = resolve_distributed_path(args.distributed_path.as_deref(), &output_dir)?;
-    let distributed_dependency_path = relative_path(&output_dir, &distributed_path);
-    let scaffold = Scaffold {
-        names,
-        output_dir,
+    let distributed_dependency_path = path_for_toml(&relative_path(&output_dir, &distributed_path));
+
+    let spec = ServiceScaffoldSpec {
+        name: args.name.clone(),
+        transport: transport.into(),
+        store: args.store.into(),
+        bus: args.bus.map(Into::into),
+        models: args.model.clone(),
+        read_models: args.read_models,
+        commands: args.command.clone(),
+        events: args.event.clone(),
         distributed_dependency_path,
-        transport,
-        store: args.store,
-        bus: args.bus,
-        include_read_models,
-        gitops: args.gitops
-            || args.gitops_promote.is_some()
-            || github.is_some()
-            || github_preview.is_some()
-            || github_promote.is_some(),
-        gitops_promote: args.gitops_promote,
+        gitops: args.gitops,
+        gitops_promote: args.gitops_promote.map(Into::into),
         github,
         github_preview,
         github_promote,
-        models,
-        read_models,
-        commands,
-        events,
     };
 
-    scaffold.write()?;
-    if let Some(repo) = &scaffold.github {
-        ensure_github_repo(repo)?;
+    let project = generate_service_scaffold(spec)?;
+    for file in &project.files {
+        write_generated_file(&output_dir, file)?;
     }
-    println!(
-        "Scaffolded Distributed service at {}",
-        scaffold.output_dir.display()
-    );
+    for warning in &project.warnings {
+        eprintln!("warning: {warning}");
+    }
+    for action in &project.post_create_actions {
+        match action {
+            PostCreateAction::EnsureGithubRepository { repo } => ensure_github_repo(repo)?,
+        }
+    }
+
+    println!("Scaffolded Distributed service at {}", output_dir.display());
     Ok(())
 }
 
@@ -384,6 +401,81 @@ fn ensure_output_dir(path: &Path, force: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Write one generated file under `output_dir`, creating parent directories and
+/// honoring the optional executable mode hint.
+fn write_generated_file(output_dir: &Path, file: &GeneratedFile) -> Result<(), Box<dyn Error>> {
+    let path = output_dir.join(&file.path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, &file.contents)?;
+    if file.mode == Some(FileMode::Executable) {
+        set_executable(&path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(perms.mode() | 0o111);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+fn parse_optional_github_repo(
+    raw: Option<&str>,
+    flag: &str,
+) -> Result<Option<GithubRepo>, Box<dyn Error>> {
+    raw.map(|value| {
+        GithubRepo::parse(value)
+            .map_err(|err| -> Box<dyn Error> { format!("{flag}: {err}").into() })
+    })
+    .transpose()
+}
+
+fn ensure_github_repo(repo: &GithubRepo) -> Result<(), Box<dyn Error>> {
+    let slug = repo.slug();
+    let view_output = Command::new("gh")
+        .args(["repo", "view", &slug, "--json", "nameWithOwner"])
+        .output();
+
+    match view_output {
+        Ok(output) if output.status.success() => {
+            println!("GitHub repository {slug} already exists");
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(
+                "GitHub CLI (`gh`) is not installed or not in PATH. Install it before using --github."
+                    .into(),
+            );
+        }
+        Err(err) => return Err(Box::new(err)),
+    }
+
+    let output = Command::new("gh")
+        .args(github_repo_create_args(&slug))
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh repo create failed: {stderr}").into());
+    }
+    println!("Created GitHub repository {slug}");
+    Ok(())
+}
+
+fn github_repo_create_args(slug: &str) -> Vec<&str> {
+    vec!["repo", "create", slug, "--private"]
+}
+
 fn validate_manifest_json(envelope: &serde_json::Value) -> Result<(), Box<dyn Error>> {
     let Some(schema_version) = envelope
         .get("schema_version")
@@ -401,1457 +493,6 @@ fn validate_manifest_json(envelope: &serde_json::Value) -> Result<(), Box<dyn Er
         return Err("manifest JSON is missing project".into());
     }
     Ok(())
-}
-
-struct Scaffold {
-    names: ScaffoldNames,
-    output_dir: PathBuf,
-    distributed_dependency_path: PathBuf,
-    transport: Transport,
-    store: Store,
-    bus: Option<Bus>,
-    include_read_models: bool,
-    gitops: bool,
-    gitops_promote: Option<GitopsPromote>,
-    github: Option<GithubRepo>,
-    github_preview: Option<GithubRepo>,
-    github_promote: Option<GithubRepo>,
-    models: Vec<ModelScaffold>,
-    read_models: Vec<ModelScaffold>,
-    commands: Vec<MessageHandler>,
-    events: Vec<MessageHandler>,
-}
-
-impl Scaffold {
-    fn write(&self) -> Result<(), Box<dyn Error>> {
-        self.write_file("Cargo.toml", self.cargo_toml())?;
-        self.write_file("src/lib.rs", self.lib_rs())?;
-        self.write_file("src/main.rs", self.main_rs())?;
-        self.write_file("src/manifest.rs", self.manifest_rs())?;
-        self.write_file("src/service.rs", self.service_rs())?;
-        if !self.models.is_empty() {
-            self.write_file("src/models/mod.rs", self.models_mod_rs())?;
-            for model in &self.models {
-                self.write_file(
-                    &format!("src/models/{}.rs", model.module_ident),
-                    self.model_rs(model),
-                )?;
-            }
-        }
-        self.write_file("src/handlers/mod.rs", self.handlers_mod_rs())?;
-        for command in &self.commands {
-            self.write_file(
-                &format!("src/handlers/{}.rs", command.module_ident),
-                self.command_handler_rs(command),
-            )?;
-        }
-        for event in &self.events {
-            self.write_file(
-                &format!("src/handlers/{}.rs", event.module_ident),
-                self.event_handler_rs(event),
-            )?;
-        }
-        if self.include_read_models {
-            self.write_file("src/read_models/mod.rs", self.read_models_mod_rs())?;
-        }
-        if self.gitops {
-            self.write_gitops_deploy()?;
-        }
-        if let Some(promote) = self.gitops_promote {
-            self.write_gitops_promote(promote)?;
-        }
-        if self.github.is_some() {
-            self.write_github_release_workflows()?;
-        }
-        if self.github_preview.is_some() {
-            self.write_github_preview_workflow()?;
-            self.write_github_promotion_chart(".gitops/preview/helm")?;
-        }
-        if self.github_promote.is_some() {
-            self.write_github_promote_workflow()?;
-            self.write_github_promotion_chart(".gitops/promote/helm")?;
-        }
-        Ok(())
-    }
-
-    fn write_file(&self, relative: &str, contents: String) -> Result<(), Box<dyn Error>> {
-        let path = self.output_dir.join(relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, contents)?;
-        Ok(())
-    }
-
-    fn cargo_toml(&self) -> String {
-        let distributed_path = toml_string(&path_for_toml(&self.distributed_dependency_path));
-        let features = self
-            .distributed_features()
-            .into_iter()
-            .map(toml_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let axum = if self.transport == Transport::Knative {
-            "axum = \"0.7\"\n"
-        } else {
-            ""
-        };
-
-        format!(
-            r#"[package]
-name = {package_name}
-version = "0.1.0"
-edition = "2021"
-
-[workspace]
-
-[dependencies]
-distributed = {{ path = {distributed_path}, features = [{features}] }}
-{axum}serde = {{ version = "1", features = ["derive"] }}
-serde_json = "1"
-tokio = {{ version = "1", features = ["macros", "net", "rt-multi-thread"] }}
-"#,
-            package_name = toml_string(&self.names.package_name),
-            axum = axum,
-        )
-    }
-
-    fn distributed_features(&self) -> Vec<&'static str> {
-        let mut features = Vec::new();
-        match self.transport {
-            Transport::Http => features.push("http"),
-            Transport::Knative => features.push("http"),
-        }
-        match self.store {
-            Store::Postgres => features.push("postgres"),
-            Store::Sqlite => features.push("sqlite"),
-            Store::InMemory => {}
-        }
-        features
-    }
-
-    fn lib_rs(&self) -> String {
-        let models = if !self.models.is_empty() {
-            "pub mod models;\n"
-        } else {
-            ""
-        };
-        let read_models = if self.include_read_models {
-            "pub mod read_models;\n"
-        } else {
-            ""
-        };
-        format!(
-            r#"pub mod handlers;
-pub mod manifest;
-{models}{read_models}pub mod service;
-
-pub use manifest::distributed_manifest;
-"#
-        )
-    }
-
-    fn main_rs(&self) -> String {
-        match self.transport {
-            Transport::Http => format!(
-                r#"#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {{
-    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
-    let service = {crate_ident}::service::in_memory();
-    distributed::microsvc::serve(service, &addr).await?;
-    Ok(())
-}}
-"#,
-                crate_ident = self.names.crate_ident,
-            ),
-            Transport::Knative => format!(
-                r#"#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {{
-    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
-    let service = {crate_ident}::service::in_memory();
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let app = distributed::microsvc::cloud_events_router(service);
-    axum::serve(listener, app).await?;
-    Ok(())
-}}
-"#,
-                crate_ident = self.names.crate_ident,
-            ),
-        }
-    }
-
-    fn manifest_rs(&self) -> String {
-        let read_model_import = if self.include_read_models && !self.read_models.is_empty() {
-            format!(
-                "use crate::read_models::{{{}}};\n\n",
-                self.read_models
-                    .iter()
-                    .map(|model| model.view_ident.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        } else {
-            String::new()
-        };
-        let read_model_registration = self
-            .read_models
-            .iter()
-            .map(|model| format!("        .read_model::<{}>()\n", model.view_ident))
-            .collect::<String>();
-        format!(
-            r#"use distributed::{{
-    DistributedProjectManifest, ServiceManifest,
-}};
-
-{read_model_import}pub fn distributed_manifest() -> DistributedProjectManifest {{
-    DistributedProjectManifest::new({project_name})
-{read_model_registration}        .service(crate::service::manifest())
-}}
-
-pub fn service_manifest() -> ServiceManifest {{
-    crate::service::manifest()
-}}
-"#,
-            read_model_import = read_model_import,
-            project_name = rust_string(&self.names.package_name),
-            read_model_registration = read_model_registration,
-        )
-    }
-
-    fn service_rs(&self) -> String {
-        let registrations = self
-            .commands
-            .iter()
-            .map(|handler| format!("        command handlers::{},\n", handler.module_ident))
-            .chain(
-                self.events
-                    .iter()
-                    .map(|handler| format!("        event handlers::{},\n", handler.module_ident)),
-            )
-            .collect::<String>();
-        let manifest_commands = self
-            .commands
-            .iter()
-            .map(|handler| {
-                format!(
-                    "        .command(handlers::{}::COMMAND)\n",
-                    handler.module_ident
-                )
-            })
-            .collect::<String>();
-        let manifest_events = self
-            .events
-            .iter()
-            .map(|handler| {
-                format!(
-                    "        .event(handlers::{}::EVENT)\n",
-                    handler.module_ident
-                )
-            })
-            .collect::<String>();
-        let transport = match self.transport {
-            Transport::Http => "http",
-            Transport::Knative => "knative",
-        };
-
-        format!(
-            r#"use std::sync::Arc;
-
-use distributed::{{microsvc::Service, HashMapRepository, ServiceManifest}};
-
-use crate::handlers;
-
-pub type ServiceRepo = HashMapRepository;
-
-pub fn in_memory() -> Arc<Service<ServiceRepo>> {{
-    build(HashMapRepository::new())
-}}
-
-pub fn build(repo: ServiceRepo) -> Arc<Service<ServiceRepo>> {{
-    Arc::new(distributed::register_handlers!(
-        Service::with_repo(repo),
-{registrations}    ))
-}}
-
-pub fn manifest() -> ServiceManifest {{
-    ServiceManifest::new({service_name})
-{manifest_commands}{manifest_events}        .transport({transport})
-}}
-"#,
-            registrations = registrations,
-            service_name = rust_string(&self.names.package_name),
-            manifest_commands = manifest_commands,
-            manifest_events = manifest_events,
-            transport = rust_string(transport),
-        )
-    }
-
-    fn models_mod_rs(&self) -> String {
-        let modules = self
-            .models
-            .iter()
-            .map(|model| {
-                format!(
-                    "pub mod {module_ident};\npub use {module_ident}::{type_ident};\n",
-                    module_ident = model.module_ident,
-                    type_ident = model.type_ident,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("");
-
-        format!(
-            r#"{modules}
-use serde::{{Deserialize, Serialize}};
-
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CommandInput {{
-    pub id: String,
-    #[serde(default)]
-    pub name: Option<String>,
-}}
-"#,
-            modules = modules,
-        )
-    }
-
-    fn model_rs(&self, model: &ModelScaffold) -> String {
-        format!(
-            r#"use distributed::{{sourced, Entity, Snapshot}};
-
-#[derive(Default, Snapshot)]
-pub struct {model_struct} {{
-    pub entity: Entity,
-    pub name: Option<String>,
-    pub status: String,
-}}
-
-#[sourced(entity)]
-impl {model_struct} {{
-    #[event({command_recorded_event})]
-    pub fn record_command(&mut self, command: String, id: String, name: Option<String>) {{
-        self.entity.set_id(&id);
-        if let Some(name) = name {{
-            self.name = Some(name);
-        }}
-        self.status = command;
-    }}
-}}
-"#,
-            model_struct = model.type_ident,
-            command_recorded_event =
-                rust_string(&format!("{}.command_recorded", model.message_prefix)),
-        )
-    }
-
-    fn handlers_mod_rs(&self) -> String {
-        self.commands
-            .iter()
-            .chain(self.events.iter())
-            .map(|handler| format!("pub mod {};\n", handler.module_ident))
-            .collect()
-    }
-
-    fn command_handler_rs(&self, handler: &MessageHandler) -> String {
-        if let Some(model) = self.command_model(handler) {
-            format!(
-                r#"use distributed::{{
-    microsvc::{{Context, HandlerError}}, Aggregate, CommitBatch, StreamIdentity, StreamWrite,
-    TransactionalCommit,
-}};
-use serde_json::{{json, Value}};
-
-use crate::models::{{CommandInput, {model_type}}};
-use crate::service::ServiceRepo;
-
-pub const COMMAND: &str = {message_name};
-pub const MODEL: &str = {model_name};
-
-pub fn guard(ctx: &Context<ServiceRepo>) -> bool {{
-    ctx.has_fields(&["id"])
-}}
-
-pub async fn handle(ctx: &Context<'_, ServiceRepo>) -> Result<Value, HandlerError> {{
-    let input = ctx.input::<CommandInput>()?;
-    let mut aggregate = {model_type}::default();
-    aggregate.record_command(COMMAND.to_string(), input.id.clone(), input.name.clone())?;
-    let identity = StreamIdentity::new({model_type}::aggregate_type(), aggregate.entity().id())?;
-    let stream = StreamWrite::new(identity, aggregate.entity_mut());
-    ctx.repo().commit_batch(CommitBatch::new(vec![stream])).await?;
-    Ok(json!({{ "command": COMMAND, "id": input.id, "model": MODEL, "name": input.name }}))
-}}
-"#,
-                model_type = model.type_ident,
-                message_name = rust_string(&handler.message_name),
-                model_name = rust_string(&model.name),
-            )
-        } else {
-            format!(
-                r#"use distributed::microsvc::{{Context, HandlerError}};
-use serde_json::{{json, Value}};
-
-use crate::service::ServiceRepo;
-
-pub const COMMAND: &str = {message_name};
-
-pub fn guard(_ctx: &Context<ServiceRepo>) -> bool {{
-    true
-}}
-
-pub async fn handle(ctx: &Context<'_, ServiceRepo>) -> Result<Value, HandlerError> {{
-    let input = ctx.input::<Value>()?;
-    Ok(json!({{ "command": COMMAND, "input": input }}))
-}}
-"#,
-                message_name = rust_string(&handler.message_name),
-            )
-        }
-    }
-
-    fn event_handler_rs(&self, handler: &MessageHandler) -> String {
-        format!(
-            r#"use distributed::microsvc::{{Context, HandlerError}};
-use serde_json::{{json, Value}};
-
-use crate::service::ServiceRepo;
-
-pub const EVENT: &str = {message_name};
-
-pub fn guard(_ctx: &Context<ServiceRepo>) -> bool {{
-    true
-}}
-
-pub async fn handle(ctx: &Context<'_, ServiceRepo>) -> Result<Value, HandlerError> {{
-    let input = ctx.input::<Value>()?;
-    Ok(json!({{ "event": EVENT, "input": input }}))
-}}
-"#,
-            message_name = rust_string(&handler.message_name),
-        )
-    }
-
-    fn read_models_mod_rs(&self) -> String {
-        let views = self
-            .read_models
-            .iter()
-            .map(|model| {
-                format!(
-                    r#"#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
-#[table({table_name})]
-pub struct {view_struct} {{
-    #[id("id")]
-    pub id: String,
-    pub name: String,
-    pub status: String,
-}}
-"#,
-                    table_name = rust_string(&model.table_name),
-                    view_struct = model.view_ident,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        format!(
-            r#"use distributed::ReadModel;
-use serde::{{Deserialize, Serialize}};
-
-{views}
-"#,
-            views = views,
-        )
-    }
-
-    fn write_gitops_deploy(&self) -> Result<(), Box<dyn Error>> {
-        self.write_file(".gitops/deploy/Chart.yaml", self.gitops_deploy_chart_yaml())?;
-        self.write_file(
-            ".gitops/deploy/values.yaml",
-            self.gitops_deploy_values_yaml(),
-        )?;
-        match self.transport {
-            Transport::Http => {
-                self.write_file(
-                    ".gitops/deploy/templates/deployment.yaml",
-                    self.gitops_http_deployment_yaml(),
-                )?;
-                self.write_file(
-                    ".gitops/deploy/templates/service.yaml",
-                    self.gitops_http_service_yaml(),
-                )?;
-            }
-            Transport::Knative => {
-                self.write_file(
-                    ".gitops/deploy/templates/knative-service.yaml",
-                    self.gitops_knative_service_yaml(),
-                )?;
-                self.write_file(
-                    ".gitops/deploy/templates/knative-brokers.yaml",
-                    self.gitops_knative_brokers_yaml(),
-                )?;
-                self.write_file(
-                    ".gitops/deploy/templates/knative-triggers.yaml",
-                    self.gitops_knative_triggers_yaml(),
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn write_gitops_promote(&self, promote: GitopsPromote) -> Result<(), Box<dyn Error>> {
-        self.write_file(
-            ".gitops/promote/Chart.yaml",
-            self.gitops_promote_chart_yaml(promote),
-        )?;
-        self.write_file(
-            ".gitops/promote/values.yaml",
-            self.gitops_promote_values_yaml(),
-        )?;
-        match promote {
-            GitopsPromote::Argo => self.write_file(
-                ".gitops/promote/templates/application.yaml",
-                self.gitops_argo_application_yaml(),
-            )?,
-            GitopsPromote::Flux => self.write_file(
-                ".gitops/promote/templates/helmrelease.yaml",
-                self.gitops_flux_helmrelease_yaml(),
-            )?,
-        }
-        Ok(())
-    }
-
-    fn write_github_release_workflows(&self) -> Result<(), Box<dyn Error>> {
-        self.write_file(
-            ".github/workflows/version.yaml",
-            self.github_version_workflow_yaml(),
-        )?;
-        self.write_file(
-            ".github/workflows/release.yaml",
-            self.github_release_workflow_yaml(),
-        )?;
-        Ok(())
-    }
-
-    fn write_github_preview_workflow(&self) -> Result<(), Box<dyn Error>> {
-        self.write_file(
-            ".github/workflows/preview.yaml",
-            self.github_preview_workflow_yaml(),
-        )
-    }
-
-    fn write_github_promote_workflow(&self) -> Result<(), Box<dyn Error>> {
-        self.write_file(
-            ".github/workflows/promote.yaml",
-            self.github_promote_workflow_yaml(),
-        )
-    }
-
-    fn write_github_promotion_chart(&self, path: &str) -> Result<(), Box<dyn Error>> {
-        self.write_file(
-            &format!("{path}/Chart.yaml"),
-            self.github_promotion_chart_yaml(),
-        )?;
-        self.write_file(
-            &format!("{path}/values.yaml"),
-            self.github_promotion_values_yaml(),
-        )?;
-        self.write_file(
-            &format!("{path}/templates/application.yaml"),
-            self.github_promotion_application_yaml(),
-        )?;
-        Ok(())
-    }
-
-    fn gitops_deploy_chart_yaml(&self) -> String {
-        format!(
-            r#"apiVersion: v2
-name: {chart_name}
-description: Deploy chart for {service_name}
-type: application
-version: 0.1.0
-appVersion: "0.1.0"
-"#,
-            chart_name = k8s_name(&format!("{}-deploy", self.names.package_name)),
-            service_name = self.names.package_name,
-        )
-    }
-
-    fn gitops_deploy_values_yaml(&self) -> String {
-        let bus = self
-            .bus
-            .map(|bus| format!("bus:\n  kind: {}\n", bus.kind()))
-            .unwrap_or_default();
-        format!(
-            r#"image:
-  repository: {image_repository}
-  tag: latest
-service:
-  port: 3000
-{bus}
-"#,
-            image_repository = self.image_repository(),
-            bus = bus,
-        )
-    }
-
-    fn gitops_http_deployment_yaml(&self) -> String {
-        let name = k8s_name(&self.names.package_name);
-        let bus_env = self.bus_env_yaml();
-        format!(
-            r#"apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {name}
-  labels:
-    app.kubernetes.io/name: {name}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: {name}
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: {name}
-    spec:
-      containers:
-        - name: {name}
-          image: {image_repository}:latest
-          ports:
-            - containerPort: 3000
-          env:
-            - name: BIND_ADDR
-              value: 0.0.0.0:3000
-{bus_env}
-"#,
-            name = name,
-            image_repository = self.image_repository(),
-            bus_env = bus_env,
-        )
-    }
-
-    fn gitops_http_service_yaml(&self) -> String {
-        let name = k8s_name(&self.names.package_name);
-        format!(
-            r#"apiVersion: v1
-kind: Service
-metadata:
-  name: {name}
-  labels:
-    app.kubernetes.io/name: {name}
-spec:
-  selector:
-    app.kubernetes.io/name: {name}
-  ports:
-    - name: http
-      port: 80
-      targetPort: 3000
-"#,
-            name = name,
-        )
-    }
-
-    fn gitops_knative_service_yaml(&self) -> String {
-        let name = k8s_name(&self.names.package_name);
-        let bus_env = self.bus_env_yaml();
-        format!(
-            r#"apiVersion: serving.knative.dev/v1
-kind: Service
-metadata:
-  name: {name}
-  labels:
-    app.kubernetes.io/name: {name}
-spec:
-  template:
-    metadata:
-      annotations:
-        autoscaling.knative.dev/min-scale: "0"
-    spec:
-      containers:
-        - image: {image_repository}:latest
-          ports:
-            - containerPort: 3000
-          env:
-            - name: BIND_ADDR
-              value: 0.0.0.0:3000
-{bus_env}
-"#,
-            name = name,
-            image_repository = self.image_repository(),
-            bus_env = bus_env,
-        )
-    }
-
-    fn gitops_knative_brokers_yaml(&self) -> String {
-        self.knative_broker_names()
-            .into_iter()
-            .map(|broker| {
-                format!(
-                    r#"apiVersion: eventing.knative.dev/v1
-kind: Broker
-metadata:
-  name: {broker}
-"#,
-                    broker = broker,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("---\n")
-    }
-
-    fn gitops_knative_triggers_yaml(&self) -> String {
-        self.knative_triggers()
-            .into_iter()
-            .map(|trigger| {
-                format!(
-                    r#"apiVersion: eventing.knative.dev/v1
-kind: Trigger
-metadata:
-  name: {name}
-spec:
-  broker: {broker}
-  filter:
-    attributes:
-      type: {event_type}
-  subscriber:
-    ref:
-      apiVersion: serving.knative.dev/v1
-      kind: Service
-      name: {service_name}
-    uri: /cloudevent/{event_type}
-"#,
-                    name = trigger.name,
-                    broker = trigger.broker,
-                    event_type = trigger.event_type,
-                    service_name = k8s_name(&self.names.package_name),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("---\n")
-    }
-
-    fn gitops_promote_chart_yaml(&self, promote: GitopsPromote) -> String {
-        let suffix = match promote {
-            GitopsPromote::Argo => "argo",
-            GitopsPromote::Flux => "flux",
-        };
-        format!(
-            r#"apiVersion: v2
-name: {chart_name}
-description: GitOps promotion chart for {service_name}
-type: application
-version: 0.1.0
-appVersion: "0.1.0"
-"#,
-            chart_name = k8s_name(&format!("{}-{}-promote", self.names.package_name, suffix)),
-            service_name = self.names.package_name,
-        )
-    }
-
-    fn gitops_promote_values_yaml(&self) -> String {
-        r#"repoUrl: https://example.invalid/repo.git
-targetRevision: HEAD
-destinationNamespace: default
-"#
-        .to_string()
-    }
-
-    fn gitops_argo_application_yaml(&self) -> String {
-        let name = k8s_name(&self.names.package_name);
-        format!(
-            r#"apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: {name}
-spec:
-  project: default
-  source:
-    repoURL: https://example.invalid/repo.git
-    targetRevision: HEAD
-    path: .gitops/deploy
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: default
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-"#,
-            name = name,
-        )
-    }
-
-    fn gitops_flux_helmrelease_yaml(&self) -> String {
-        let name = k8s_name(&self.names.package_name);
-        format!(
-            r#"apiVersion: source.toolkit.fluxcd.io/v1
-kind: GitRepository
-metadata:
-  name: {name}-gitops
-spec:
-  interval: 1m
-  url: https://example.invalid/repo.git
-  ref:
-    branch: main
----
-apiVersion: helm.toolkit.fluxcd.io/v2
-kind: HelmRelease
-metadata:
-  name: {name}
-spec:
-  interval: 5m
-  chart:
-    spec:
-      chart: .gitops/deploy
-      sourceRef:
-        kind: GitRepository
-        name: {name}-gitops
-      interval: 1m
-  targetNamespace: default
-"#,
-            name = name,
-        )
-    }
-
-    fn github_version_workflow_yaml(&self) -> String {
-        r#"name: Version and Tag
-
-on:
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: write
-
-jobs:
-  version-and-tag:
-    name: Version and Tag
-    uses: unbounded-tech/workflow-vnext-tag/.github/workflows/workflow.yaml@v1.21.3
-    secrets: inherit
-    with:
-      useDeployKey: true
-      rust: true
-      yqPatches: |
-        patches:
-          - filePath: .gitops/deploy/values.yaml
-            selector: .image.tag
-            valuePrefix: v
-          - filePath: .gitops/deploy/Chart.yaml
-            selector: .version
-            valuePrefix: ""
-          - filePath: .gitops/deploy/Chart.yaml
-            selector: .appVersion
-            valuePrefix: v
-"#
-        .to_string()
-    }
-
-    fn github_release_workflow_yaml(&self) -> String {
-        r#"name: Release
-
-on:
-  push:
-    tags:
-      - "v*.*.*"
-
-permissions:
-  contents: write
-
-jobs:
-  release:
-    name: GitHub Release
-    uses: unbounded-tech/workflow-simple-release/.github/workflows/workflow.yaml@v2.1.3
-    with:
-      tag: ${{ github.ref_name }}
-      name: ${{ github.ref_name }}
-"#
-        .to_string()
-    }
-
-    fn github_preview_workflow_yaml(&self) -> String {
-        let preview_repo = self
-            .github_preview
-            .as_ref()
-            .expect("preview workflow requires preview repo");
-        let environment_name = preview_repo.environment_name();
-        format!(
-            r#"name: Preview
-
-on:
-  pull_request:
-    branches:
-      - main
-    types:
-      - labeled
-      - opened
-      - reopened
-      - synchronize
-
-permissions:
-  contents: write
-  issues: write
-  packages: write
-  pull-requests: write
-
-jobs:
-  preview:
-    name: Preview Promotion PR
-    if: contains(github.event.pull_request.labels.*.name, 'preview')
-    uses: unbounded-tech/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@v1
-    secrets:
-      GH_PAT: ${{{{ secrets.GH_ORG_ACTIONS_REPO_WRITE_PACKAGES }}}}
-    with:
-      promotion_chart_path: .gitops/preview/helm
-      environment_repository: {environment_repository}
-      environment_name: {environment_name}
-      project: {environment_name}
-      name: ${{{{ github.event.repository.name }}}}
-      preview: true
-      promotion_pr: true
-      values: |
-        image:
-          repository: {image_repository}
-      comment: |
-        Preview promoted for `${{{{ github.event.repository.name }}}}`.
-        The current tag is: `pr-${{{{ github.event.pull_request.number }}}}-${{{{ github.event.pull_request.head.sha }}}}`
-"#,
-            environment_repository = preview_repo.full_name,
-            environment_name = environment_name,
-            image_repository = self.image_repository(),
-        )
-    }
-
-    fn github_promote_workflow_yaml(&self) -> String {
-        let promote_repo = self
-            .github_promote
-            .as_ref()
-            .expect("promote workflow requires promote repo");
-        let environment_name = promote_repo.environment_name();
-        format!(
-            r#"name: Promote
-
-on:
-  push:
-    tags:
-      - "v*.*.*"
-
-permissions:
-  contents: write
-  issues: write
-  packages: write
-  pull-requests: write
-
-jobs:
-  promote:
-    name: Release Promotion
-    uses: unbounded-tech/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@v1
-    secrets:
-      GH_PAT: ${{{{ secrets.GH_ORG_ACTIONS_REPO_WRITE_PACKAGES }}}}
-    with:
-      promotion_chart_path: .gitops/promote/helm
-      destination_path: .gitops/deploy
-      environment_repository: {environment_repository}
-      environment_name: {environment_name}
-      project: {environment_name}
-      name: {application_name}
-      values: |
-        image:
-          repository: {image_repository}
-          tag: ${{{{ github.ref_name }}}}
-"#,
-            environment_repository = promote_repo.full_name,
-            environment_name = environment_name,
-            application_name = self.names.package_name,
-            image_repository = self.image_repository(),
-        )
-    }
-
-    fn github_promotion_chart_yaml(&self) -> String {
-        format!(
-            r#"apiVersion: v2
-name: {chart_name}-promotion
-description: Argo CD promotion chart for {service_name}
-type: application
-version: 0.1.0
-appVersion: "0.1.0"
-"#,
-            chart_name = k8s_name(&self.names.package_name),
-            service_name = self.names.package_name,
-        )
-    }
-
-    fn github_promotion_values_yaml(&self) -> String {
-        format!(
-            r#"application:
-  name: {service_name}
-  repository: https://github.com/{github_repository}.git
-  targetRevision: main
-  path: .gitops/deploy
-  values: ""
-  destination:
-    namespace: default
-    server: https://kubernetes.default.svc
-  image:
-    tag: latest
-
-project: default
-preview: false
-"#,
-            service_name = self.names.package_name,
-            github_repository = self
-                .github
-                .as_ref()
-                .map(|repo| repo.full_name.as_str())
-                .unwrap_or("OWNER/REPO"),
-        )
-    }
-
-    fn github_promotion_application_yaml(&self) -> String {
-        r#"apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: {{ .Values.project }}-{{ .Values.application.name }}
-  namespace: argocd
-  finalizers:
-    - resources-finalizer.argocd.argoproj.io
-spec:
-  project: {{ .Values.project }}
-  source:
-    path: {{ .Values.application.path }}
-    repoURL: {{ .Values.application.repository }}
-    targetRevision: {{ .Values.application.targetRevision }}
-    helm:
-      version: v3
-      values: |
-        {{- if .Values.preview }}
-        image:
-          tag: {{ .Values.application.image.tag }}
-        {{- end }}
-        {{- if .Values.application.values }}
-        {{ .Values.application.values | nindent 8 }}
-        {{- end }}
-  destination:
-    namespace: {{ .Values.application.destination.namespace }}
-    server: {{ .Values.application.destination.server }}
-  syncPolicy:
-    automated:
-      selfHeal: true
-      prune: true
-"#
-        .to_string()
-    }
-
-    fn image_repository(&self) -> String {
-        self.github
-            .as_ref()
-            .map(GithubRepo::image_repository)
-            .unwrap_or_else(|| format!("ghcr.io/hops-ops/{}", self.names.package_name))
-    }
-
-    fn command_model(&self, handler: &MessageHandler) -> Option<&ModelScaffold> {
-        if self.models.is_empty() {
-            return None;
-        }
-        let message_model = message_owner(&handler.message_name);
-        self.models
-            .iter()
-            .find(|model| model.name == message_model)
-            .or_else(|| self.models.first())
-    }
-
-    fn knative_broker_names(&self) -> Vec<String> {
-        let mut brokers = BTreeSet::new();
-        for model in &self.models {
-            brokers.insert(model.command_broker.clone());
-            brokers.insert(model.event_broker.clone());
-        }
-        for command in &self.commands {
-            let broker = self
-                .command_model(command)
-                .map(|model| model.command_broker.clone())
-                .unwrap_or_else(|| command_broker_for_message(&command.message_name));
-            brokers.insert(broker);
-        }
-        for event in &self.events {
-            brokers.insert(event_broker_for_message(&event.message_name));
-        }
-        brokers.into_iter().collect()
-    }
-
-    fn knative_triggers(&self) -> Vec<KnativeTrigger> {
-        self.commands
-            .iter()
-            .map(|command| {
-                let broker = self
-                    .command_model(command)
-                    .map(|model| model.command_broker.clone())
-                    .unwrap_or_else(|| command_broker_for_message(&command.message_name));
-                KnativeTrigger::new(&command.message_name, &broker, "command")
-            })
-            .chain(self.events.iter().map(|event| {
-                let broker = event_broker_for_message(&event.message_name);
-                KnativeTrigger::new(&event.message_name, &broker, "event")
-            }))
-            .collect()
-    }
-
-    fn bus_env_yaml(&self) -> String {
-        self.bus
-            .map(|bus| {
-                format!(
-                    r#"            - name: HOPS_BUS
-              value: {}
-"#,
-                    bus.kind()
-                )
-            })
-            .unwrap_or_default()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct GithubRepo {
-    owner: String,
-    repo: String,
-    full_name: String,
-}
-
-impl GithubRepo {
-    fn parse(raw: &str, flag: &str) -> Result<Self, Box<dyn Error>> {
-        let trimmed = raw.trim();
-        let Some((owner, repo)) = trimmed.split_once('/') else {
-            return Err(format!("{flag} must be in OWNER/REPO form").into());
-        };
-        if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-            return Err(format!("{flag} must be in OWNER/REPO form").into());
-        }
-        let valid = [owner, repo].into_iter().all(|part| {
-            part.chars().all(|char| {
-                char.is_ascii_alphanumeric() || char == '-' || char == '_' || char == '.'
-            })
-        });
-        if !valid {
-            return Err(format!("{flag} contains unsupported GitHub repository characters").into());
-        }
-
-        Ok(Self {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            full_name: format!("{owner}/{repo}"),
-        })
-    }
-
-    fn environment_name(&self) -> String {
-        k8s_name(&self.repo)
-    }
-
-    fn image_repository(&self) -> String {
-        format!("ghcr.io/{}", self.full_name.to_ascii_lowercase())
-    }
-}
-
-fn parse_optional_github_repo(
-    raw: Option<&str>,
-    flag: &str,
-) -> Result<Option<GithubRepo>, Box<dyn Error>> {
-    raw.map(|value| GithubRepo::parse(value, flag)).transpose()
-}
-
-fn ensure_github_repo(repo: &GithubRepo) -> Result<(), Box<dyn Error>> {
-    let view_output = Command::new("gh")
-        .args(["repo", "view", &repo.full_name, "--json", "nameWithOwner"])
-        .output();
-
-    match view_output {
-        Ok(output) if output.status.success() => {
-            println!("GitHub repository {} already exists", repo.full_name);
-            return Ok(());
-        }
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(
-                "GitHub CLI (`gh`) is not installed or not in PATH. Install it before using --github."
-                    .into(),
-            );
-        }
-        Err(err) => return Err(Box::new(err)),
-    }
-
-    let output = Command::new("gh")
-        .args(github_repo_create_args(repo))
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh repo create failed: {stderr}").into());
-    }
-    println!("Created GitHub repository {}", repo.full_name);
-    Ok(())
-}
-
-fn github_repo_create_args(repo: &GithubRepo) -> Vec<&str> {
-    vec!["repo", "create", repo.full_name.as_str(), "--private"]
-}
-
-#[derive(Clone, Debug)]
-struct ModelScaffold {
-    name: String,
-    message_prefix: String,
-    module_ident: String,
-    type_ident: String,
-    view_ident: String,
-    table_name: String,
-    command_broker: String,
-    event_broker: String,
-}
-
-impl ModelScaffold {
-    fn new(raw_name: &str) -> Result<Self, Box<dyn Error>> {
-        let name = to_kebab_case(raw_name);
-        if name.is_empty() {
-            return Err("model name must contain at least one ASCII letter or digit".into());
-        }
-        let ident = name.replace('-', "_");
-        let type_ident = to_pascal_case(&name);
-        let view_ident = format!("{type_ident}View");
-        Ok(Self {
-            name: name.clone(),
-            message_prefix: name.clone(),
-            module_ident: ident.clone(),
-            type_ident,
-            view_ident,
-            table_name: format!("{ident}_views"),
-            command_broker: format!("{name}-commands"),
-            event_broker: format!("{name}-events"),
-        })
-    }
-}
-
-fn model_scaffolds(raw_models: &[String]) -> Result<Vec<ModelScaffold>, Box<dyn Error>> {
-    let mut seen = BTreeSet::new();
-    let mut models = Vec::new();
-    for raw_model in raw_models {
-        let model = ModelScaffold::new(&raw_model)?;
-        if !seen.insert(model.name.clone()) {
-            return Err(format!("duplicate model `{}`", model.name).into());
-        }
-        models.push(model);
-    }
-    Ok(models)
-}
-
-fn default_command_name(names: &ScaffoldNames, models: &[ModelScaffold]) -> String {
-    models
-        .first()
-        .map(|model| format!("{}.create", model.name))
-        .unwrap_or_else(|| names.command_name.clone())
-}
-
-#[derive(Clone, Debug)]
-struct KnativeTrigger {
-    name: String,
-    broker: String,
-    event_type: String,
-}
-
-impl KnativeTrigger {
-    fn new(event_type: &str, broker: &str, suffix: &str) -> Self {
-        Self {
-            name: k8s_name(&format!("{}-{suffix}", event_type.replace('.', "-"))),
-            broker: broker.to_string(),
-            event_type: event_type.to_string(),
-        }
-    }
-}
-
-fn command_broker_for_message(message_name: &str) -> String {
-    format!("{}-commands", message_owner(message_name))
-}
-
-fn event_broker_for_message(message_name: &str) -> String {
-    let parts = message_name
-        .split('.')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    let owner = if parts.len() >= 3 {
-        parts[0]
-    } else {
-        parts.first().copied().unwrap_or("events")
-    };
-    format!("{}-events", k8s_name(owner))
-}
-
-fn message_owner(message_name: &str) -> String {
-    message_name
-        .split('.')
-        .find(|part| !part.is_empty())
-        .map(k8s_name)
-        .unwrap_or_else(|| "message".to_string())
-}
-
-fn k8s_name(value: &str) -> String {
-    let name = to_kebab_case(value);
-    if name.is_empty() {
-        "generated".to_string()
-    } else {
-        name
-    }
-}
-
-#[derive(Clone, Debug)]
-struct MessageHandler {
-    message_name: String,
-    module_ident: String,
-}
-
-#[cfg(test)]
-fn message_handlers(
-    names: Vec<String>,
-    fallback_prefix: &str,
-) -> Result<Vec<MessageHandler>, Box<dyn Error>> {
-    let mut seen_modules = BTreeSet::new();
-    message_handlers_with_modules(names, fallback_prefix, &mut seen_modules)
-}
-
-fn message_handlers_with_modules(
-    names: Vec<String>,
-    fallback_prefix: &str,
-    seen_modules: &mut BTreeSet<String>,
-) -> Result<Vec<MessageHandler>, Box<dyn Error>> {
-    let mut seen_names = BTreeSet::new();
-    let mut handlers = Vec::new();
-
-    for raw_name in names {
-        let message_name = raw_name.trim();
-        validate_message_name(message_name, fallback_prefix)?;
-        if !seen_names.insert(message_name.to_string()) {
-            return Err(format!("duplicate {fallback_prefix} `{message_name}`").into());
-        }
-
-        let base_module = to_rust_ident(message_name, fallback_prefix);
-        let mut module_ident = base_module.clone();
-        let mut suffix = 2;
-        while !seen_modules.insert(module_ident.clone()) {
-            module_ident = format!("{base_module}_{suffix}");
-            suffix += 1;
-        }
-
-        handlers.push(MessageHandler {
-            message_name: message_name.to_string(),
-            module_ident,
-        });
-    }
-
-    Ok(handlers)
-}
-
-fn validate_message_name(name: &str, kind: &str) -> Result<(), Box<dyn Error>> {
-    if name.is_empty() {
-        return Err(format!("{kind} name cannot be empty").into());
-    }
-    if name.chars().any(char::is_control) {
-        return Err(format!("{kind} `{name}` contains a control character").into());
-    }
-    Ok(())
-}
-
-fn to_rust_ident(value: &str, fallback_prefix: &str) -> String {
-    let mut ident = String::new();
-    let mut last_was_separator = false;
-    for char in value.chars() {
-        if char.is_ascii_alphanumeric() {
-            ident.push(char.to_ascii_lowercase());
-            last_was_separator = false;
-        } else if !last_was_separator {
-            ident.push('_');
-            last_was_separator = true;
-        }
-    }
-    while ident.ends_with('_') {
-        ident.pop();
-    }
-    while ident.starts_with('_') {
-        ident.remove(0);
-    }
-    if ident.is_empty() {
-        ident = fallback_prefix.to_string();
-    }
-    if ident
-        .chars()
-        .next()
-        .is_some_and(|char| char.is_ascii_digit())
-        || is_rust_keyword(&ident)
-    {
-        ident = format!("{fallback_prefix}_{ident}");
-    }
-    ident
-}
-
-fn is_rust_keyword(value: &str) -> bool {
-    matches!(
-        value,
-        "as" | "break"
-            | "const"
-            | "continue"
-            | "crate"
-            | "else"
-            | "enum"
-            | "extern"
-            | "false"
-            | "fn"
-            | "for"
-            | "if"
-            | "impl"
-            | "in"
-            | "let"
-            | "loop"
-            | "match"
-            | "mod"
-            | "move"
-            | "mut"
-            | "pub"
-            | "ref"
-            | "return"
-            | "self"
-            | "Self"
-            | "static"
-            | "struct"
-            | "super"
-            | "trait"
-            | "true"
-            | "type"
-            | "unsafe"
-            | "use"
-            | "where"
-            | "while"
-            | "async"
-            | "await"
-            | "dyn"
-    )
-}
-
-#[derive(Clone, Debug)]
-struct ScaffoldNames {
-    package_name: String,
-    crate_ident: String,
-    command_name: String,
-}
-
-impl ScaffoldNames {
-    fn new(input: &str) -> Result<Self, Box<dyn Error>> {
-        let package_name = to_kebab_case(input);
-        if package_name.is_empty() {
-            return Err("service name must contain at least one ASCII letter or digit".into());
-        }
-        let crate_ident = package_name.replace('-', "_");
-        let command_name = format!("{crate_ident}.create");
-
-        Ok(Self {
-            package_name,
-            crate_ident,
-            command_name,
-        })
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1950,7 +591,7 @@ fn harness_cargo_toml(
 ) -> String {
     let features = features
         .iter()
-        .map(|feature| toml_string(feature))
+        .map(toml_string)
         .collect::<Vec<_>>()
         .join(", ");
     let default_features = if no_default_features {
@@ -1973,9 +614,9 @@ serde_json = "1"
 {crate_ident} = {{ package = {package_name}, path = {package_dir}{default_features}, features = [{features}] }}
 "#,
         harness_package_name = toml_string(harness_package_name),
-        distributed_path = toml_string(&path_for_toml(distributed_path)),
+        distributed_path = toml_string(path_for_toml(distributed_path)),
         package_name = toml_string(package_name),
-        package_dir = toml_string(&path_for_toml(package_dir)),
+        package_dir = toml_string(path_for_toml(package_dir)),
     )
 }
 
@@ -2241,47 +882,8 @@ fn path_for_toml(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn to_kebab_case(input: &str) -> String {
-    let mut out = String::new();
-    let mut last_was_separator = true;
-    for char in input.chars() {
-        if char.is_ascii_alphanumeric() {
-            out.push(char.to_ascii_lowercase());
-            last_was_separator = false;
-        } else if !last_was_separator {
-            out.push('-');
-            last_was_separator = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
-}
-
-fn to_pascal_case(input: &str) -> String {
-    input
-        .split(['-', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            let Some(first) = chars.next() else {
-                return String::new();
-            };
-            let mut out = String::new();
-            out.push(first.to_ascii_uppercase());
-            out.extend(chars);
-            out
-        })
-        .collect()
-}
-
 fn toml_string(value: impl AsRef<str>) -> String {
     serde_json::to_string(value.as_ref()).expect("string serialization should succeed")
-}
-
-fn rust_string(value: &str) -> String {
-    toml_string(value)
 }
 
 #[cfg(test)]
@@ -2289,286 +891,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_scaffold_names() {
-        let names = ScaffoldNames::new("Checkout Saga").unwrap();
-
-        assert_eq!(names.package_name, "checkout-saga");
-        assert_eq!(names.crate_ident, "checkout_saga");
-        assert_eq!(names.command_name, "checkout_saga.create");
-
-        let models = model_scaffolds(&["checkout-saga".to_string()]).unwrap();
-        assert_eq!(models[0].name, "checkout-saga");
-        assert_eq!(models[0].module_ident, "checkout_saga");
-        assert_eq!(models[0].type_ident, "CheckoutSaga");
-        assert_eq!(models[0].view_ident, "CheckoutSagaView");
-        assert_eq!(models[0].table_name, "checkout_saga_views");
-        assert_eq!(models[0].command_broker, "checkout-saga-commands");
-        assert_eq!(models[0].event_broker, "checkout-saga-events");
-    }
-
-    #[test]
-    fn scaffold_is_standalone_and_omits_read_models_by_default() {
-        let names = ScaffoldNames::new("Todo Model").unwrap();
-        let scaffold = Scaffold {
-            names,
-            output_dir: PathBuf::from("/tmp/todo-model"),
-            distributed_dependency_path: PathBuf::from("../distributed"),
-            transport: Transport::Http,
-            store: Store::Postgres,
-            bus: None,
-            include_read_models: false,
-            gitops: false,
-            gitops_promote: None,
-            github: None,
-            github_preview: None,
-            github_promote: None,
-            read_models: Vec::new(),
-            models: Vec::new(),
-            commands: message_handlers(vec!["todo.create".into()], "command").unwrap(),
-            events: Vec::new(),
-        };
-
-        let cargo_toml = scaffold.cargo_toml();
-        assert!(cargo_toml.contains("\n[workspace]\n"));
-
-        let manifest = scaffold.manifest_rs();
-        assert!(!manifest.contains(".read_model::<"));
-        assert!(!manifest.contains("outbox_message_schema"));
-        assert!(!manifest.contains(".table_schema("));
-        assert!(!scaffold.lib_rs().contains("pub mod models;"));
-        assert!(!scaffold.lib_rs().contains("pub mod read_models;"));
-    }
-
-    #[test]
-    fn scaffold_registers_read_models_when_requested() {
-        let names = ScaffoldNames::new("Todo Model").unwrap();
-        let read_models = vec![ModelScaffold::new(&names.package_name).unwrap()];
-        let scaffold = Scaffold {
-            names,
-            output_dir: PathBuf::from("/tmp/todo-model"),
-            distributed_dependency_path: PathBuf::from("../distributed"),
-            transport: Transport::Http,
-            store: Store::Postgres,
-            bus: None,
-            include_read_models: true,
-            gitops: false,
-            gitops_promote: None,
-            github: None,
-            github_preview: None,
-            github_promote: None,
-            read_models,
-            models: Vec::new(),
-            commands: message_handlers(vec!["todo.create".into()], "command").unwrap(),
-            events: Vec::new(),
-        };
-
-        let manifest = scaffold.manifest_rs();
-        assert!(manifest.contains(".read_model::<TodoModelView>()"));
-        assert!(!manifest.contains("outbox_message_schema"));
-        assert!(!manifest.contains(".table_schema("));
-        assert!(scaffold.lib_rs().contains("pub mod read_models;"));
-        assert!(scaffold
-            .read_models_mod_rs()
-            .contains("pub struct TodoModelView"));
-    }
-
-    #[test]
-    fn scaffold_registers_requested_commands_and_events() {
-        let names = ScaffoldNames::new("Todo Model").unwrap();
-        let scaffold = Scaffold {
-            names,
-            output_dir: PathBuf::from("/tmp/todo-model"),
-            distributed_dependency_path: PathBuf::from("../distributed"),
-            transport: Transport::Http,
-            store: Store::Postgres,
-            bus: None,
-            include_read_models: false,
-            gitops: false,
-            gitops_promote: None,
-            github: None,
-            github_preview: None,
-            github_promote: None,
-            read_models: Vec::new(),
-            models: Vec::new(),
-            commands: message_handlers(
-                vec!["todo.create".into(), "todo.complete".into()],
-                "command",
-            )
-            .unwrap(),
-            events: message_handlers(vec!["github-projects.issue.created".into()], "event")
-                .unwrap(),
-        };
-
-        let handlers_mod = scaffold.handlers_mod_rs();
-        assert!(handlers_mod.contains("pub mod todo_create;"));
-        assert!(handlers_mod.contains("pub mod todo_complete;"));
-        assert!(handlers_mod.contains("pub mod github_projects_issue_created;"));
-
-        let service = scaffold.service_rs();
-        assert!(service.contains(".command(handlers::todo_create::COMMAND)"));
-        assert!(service.contains(".command(handlers::todo_complete::COMMAND)"));
-        assert!(service.contains(".event(handlers::github_projects_issue_created::EVENT)"));
-    }
-
-    #[test]
-    fn scaffold_generates_knative_gitops_from_models_commands_and_events() {
-        let names = ScaffoldNames::new("Checkout Saga").unwrap();
-        let explicit_models = vec!["todo".to_string(), "somethingelse".to_string()];
-        let models = model_scaffolds(&explicit_models).unwrap();
-        let scaffold = Scaffold {
-            names,
-            output_dir: PathBuf::from("/tmp/checkout-saga"),
-            distributed_dependency_path: PathBuf::from("../distributed"),
-            transport: Transport::Knative,
-            store: Store::Postgres,
-            bus: Some(Bus::Nats),
-            include_read_models: true,
-            gitops: true,
-            gitops_promote: Some(GitopsPromote::Argo),
-            github: None,
-            github_preview: None,
-            github_promote: None,
-            read_models: models.clone(),
-            models,
-            commands: message_handlers(
-                vec!["todo.create".into(), "somethingelse.complete".into()],
-                "command",
-            )
-            .unwrap(),
-            events: message_handlers(
-                vec![
-                    "checkout-saga.started".into(),
-                    "github-projects.issue.created".into(),
-                ],
-                "event",
-            )
-            .unwrap(),
-        };
-
-        assert!(scaffold.cargo_toml().contains("axum = \"0.7\""));
-        assert!(scaffold.service_rs().contains(".transport(\"knative\")"));
-        assert!(scaffold.gitops_deploy_values_yaml().contains("kind: nats"));
-        assert!(scaffold.gitops_knative_service_yaml().contains("HOPS_BUS"));
-        assert!(scaffold
-            .gitops_knative_service_yaml()
-            .contains("value: nats"));
-        assert!(scaffold.models_mod_rs().contains("pub mod todo;"));
-        assert!(scaffold.models_mod_rs().contains("pub use todo::Todo;"));
-        assert!(scaffold
-            .model_rs(&scaffold.models[0])
-            .contains("pub struct Todo"));
-        assert!(scaffold.models_mod_rs().contains("pub mod somethingelse;"));
-        assert!(scaffold
-            .models_mod_rs()
-            .contains("pub use somethingelse::Somethingelse;"));
-        assert!(scaffold
-            .model_rs(&scaffold.models[1])
-            .contains("pub struct Somethingelse"));
-        assert!(scaffold
-            .read_models_mod_rs()
-            .contains("pub struct TodoView"));
-        assert!(scaffold
-            .read_models_mod_rs()
-            .contains("pub struct SomethingelseView"));
-
-        let brokers = scaffold.gitops_knative_brokers_yaml();
-        assert!(brokers.contains("name: todo-commands"));
-        assert!(brokers.contains("name: todo-events"));
-        assert!(brokers.contains("name: somethingelse-commands"));
-        assert!(brokers.contains("name: somethingelse-events"));
-        assert!(brokers.contains("name: checkout-saga-events"));
-        assert!(brokers.contains("name: github-projects-events"));
-
-        let triggers = scaffold.gitops_knative_triggers_yaml();
-        assert!(triggers.contains("broker: todo-commands"));
-        assert!(triggers.contains("type: todo.create"));
-        assert!(triggers.contains("broker: somethingelse-commands"));
-        assert!(triggers.contains("type: somethingelse.complete"));
-        assert!(triggers.contains("broker: checkout-saga-events"));
-        assert!(triggers.contains("type: checkout-saga.started"));
-        assert!(triggers.contains("broker: github-projects-events"));
-        assert!(triggers.contains("type: github-projects.issue.created"));
-
-        assert!(scaffold
-            .gitops_argo_application_yaml()
-            .contains("path: .gitops/deploy"));
-        assert!(scaffold
-            .gitops_flux_helmrelease_yaml()
-            .contains("chart: .gitops/deploy"));
-    }
-
-    #[test]
-    fn parses_github_repositories_and_create_args() {
-        let repo = GithubRepo::parse("hops-ops/test-domain", "--github").unwrap();
-
-        assert_eq!(repo.owner, "hops-ops");
-        assert_eq!(repo.repo, "test-domain");
-        assert_eq!(repo.full_name, "hops-ops/test-domain");
-        assert_eq!(repo.environment_name(), "test-domain");
-        assert_eq!(repo.image_repository(), "ghcr.io/hops-ops/test-domain");
+    fn github_repo_create_args_are_private() {
         assert_eq!(
-            github_repo_create_args(&repo),
+            github_repo_create_args("hops-ops/test-domain"),
             vec!["repo", "create", "hops-ops/test-domain", "--private"]
         );
-
-        assert!(GithubRepo::parse("missing-repo", "--github").is_err());
-        assert!(GithubRepo::parse("owner/repo/extra", "--github").is_err());
     }
 
     #[test]
-    fn scaffold_generates_github_workflows_and_promotion_charts() {
-        let names = ScaffoldNames::new("Test Domain").unwrap();
-        let scaffold = Scaffold {
-            names,
-            output_dir: PathBuf::from("/tmp/test-domain"),
-            distributed_dependency_path: PathBuf::from("../distributed"),
-            transport: Transport::Http,
-            store: Store::Postgres,
-            bus: Some(Bus::Rabbitmq),
-            include_read_models: false,
-            gitops: true,
-            gitops_promote: None,
-            github: Some(GithubRepo::parse("hops-ops/test-domain", "--github").unwrap()),
-            github_preview: Some(
-                GithubRepo::parse("hops-ops/test-previews", "--github-preview").unwrap(),
-            ),
-            github_promote: Some(
-                GithubRepo::parse("hops-ops/test-staging", "--github-promote").unwrap(),
-            ),
-            read_models: Vec::new(),
-            models: Vec::new(),
-            commands: message_handlers(vec!["test-domain.create".into()], "command").unwrap(),
-            events: Vec::new(),
-        };
-
-        let workflows = [
-            scaffold.github_version_workflow_yaml(),
-            scaffold.github_release_workflow_yaml(),
-            scaffold.github_preview_workflow_yaml(),
-            scaffold.github_promote_workflow_yaml(),
-        ];
-        for workflow in &workflows {
-            serde_yaml::from_str::<serde_yaml::Value>(workflow).unwrap();
-        }
-
-        assert!(scaffold
-            .gitops_deploy_values_yaml()
-            .contains("repository: ghcr.io/hops-ops/test-domain"));
-        assert!(workflows[0].contains("unbounded-tech/workflow-vnext-tag"));
-        assert!(workflows[0].contains("rust: true"));
-        assert!(workflows[1].contains("unbounded-tech/workflow-simple-release"));
-        assert!(workflows[2].contains("environment_repository: hops-ops/test-previews"));
-        assert!(workflows[2].contains("promotion_chart_path: .gitops/preview/helm"));
-        assert!(workflows[2].contains("preview: true"));
-        assert!(workflows[3].contains("environment_repository: hops-ops/test-staging"));
-        assert!(workflows[3].contains("promotion_chart_path: .gitops/promote/helm"));
-        assert!(workflows[3].contains("destination_path: .gitops/deploy"));
-        assert!(scaffold
-            .github_promotion_values_yaml()
-            .contains("path: .gitops/deploy"));
-        assert!(scaffold
-            .github_promotion_application_yaml()
-            .contains("{{ .Values.application.name }}"));
+    fn optional_github_repo_reports_the_flag_on_error() {
+        let err = parse_optional_github_repo(Some("missing-repo"), "--github")
+            .expect_err("invalid repo should error");
+        assert!(err.to_string().contains("--github"));
+        assert!(parse_optional_github_repo(None, "--github")
+            .unwrap()
+            .is_none());
+        let ok = parse_optional_github_repo(Some("hops-ops/test-domain"), "--github")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok.slug(), "hops-ops/test-domain");
     }
 
     #[test]
