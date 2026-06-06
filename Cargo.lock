@@ -340,8 +340,9 @@ dependencies = [
 
 [[package]]
 name = "distributed_cli"
-version = "0.1.0"
-source = "git+https://github.com/hops-ops/distributed.git?branch=feat%2Fatlas-schema-resource#f2d49238614a8be382a1a2f0ddf1f6459254dfc8"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4be735be56ceb9b89e025a68f0e3374328e2173ceb4b0f5a67048641457ae761"
 dependencies = [
  "clap",
  "serde",

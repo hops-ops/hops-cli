@@ -8,9 +8,7 @@ fern = "0.7.1"
 log = "0.4.27"
 colored = "3.0.0"
 clap = { version = "4.5.35", features = ["derive"] }
-# Temporary git dep until distributed_cli is published (distributed PR #74).
-# TODO: replace with a registry version once published: distributed_cli = "<version>".
-distributed_cli = { git = "https://github.com/hops-ops/distributed.git", branch = "feat/atlas-schema-resource" }
+distributed_cli = "1.6"
 openssl-sys = { version = "0.9.106", optional = true }
 flate2 = "1.1.0"
 tar = "0.4.44"
