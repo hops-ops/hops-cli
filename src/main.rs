@@ -25,7 +25,7 @@ enum Commands {
     /// Manage Crossplane provider packages in the connected cluster
     Provider(commands::provider::ProviderArgs),
     /// Create and inspect application services
-    Service(commands::service::ServiceArgs),
+    Service(distributed_cli::ServiceArgs),
     /// Manage validation helpers for Crossplane projects
     Validate(commands::validate::ValidateArgs),
     /// Manage live XR observe/manage/adopt workflows
@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             commands::provider::run(provider_args)?;
         }
         Some(Commands::Service(service_args)) => {
-            commands::service::run(service_args)?;
+            distributed_cli::run(service_args)?;
         }
         Some(Commands::Validate(validate_args)) => {
             commands::validate::run(validate_args)?;
