@@ -341,6 +341,7 @@ dependencies = [
 [[package]]
 name = "distributed_tooling"
 version = "0.1.0"
+source = "git+https://github.com/hops-ops/distributed.git?branch=codex%2Fhops-service-create-microsvc-scaffold#75470332ceb1c6b8983db82033ff7b66c85b64e9"
 dependencies = [
  "serde_json",
 ]
