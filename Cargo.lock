@@ -340,9 +340,9 @@ dependencies = [
 
 [[package]]
 name = "distributed_tooling"
-version = "1.5.0"
+version = "1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3a89778a5e81e9488479434f07f8b0e44b741422130944f57a1b7a7fa22515b"
+checksum = "6526e2da92a61a1da48b309c198ecb9ef47ba4677bcc9aeeef3af4439327011e"
 dependencies = [
  "serde_json",
 ]
