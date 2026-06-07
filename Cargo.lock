@@ -339,11 +339,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "distributed_tooling"
-version = "1.5.0"
+name = "distributed_cli"
+version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3a89778a5e81e9488479434f07f8b0e44b741422130944f57a1b7a7fa22515b"
+checksum = "4be735be56ceb9b89e025a68f0e3374328e2173ceb4b0f5a67048641457ae761"
 dependencies = [
+ "clap",
+ "serde",
  "serde_json",
 ]
 
@@ -635,7 +637,7 @@ dependencies = [
  "clap",
  "colored",
  "dialoguer",
- "distributed_tooling",
+ "distributed_cli",
  "fern",
  "flate2",
  "log",
