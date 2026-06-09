@@ -237,14 +237,7 @@ fn run_local_path(
     crossplane_xpkg_push(&xpkg_path, &push_xpkg_ref)?;
 
     let runtime_src = find_runtime_image(&provider_name, arch)?;
-    let push_runtime_ref = format!(
-        "{}/hops-ops/{}-{}:{}",
-        REGISTRY_PUSH, provider_name, arch, dev_tag
-    );
-    let pull_runtime_ref = format!(
-        "{}/hops-ops/{}-{}:{}",
-        REGISTRY_PULL, provider_name, arch, dev_tag
-    );
+    let push_runtime_ref = local_runtime_image_ref(&provider_name, arch, &dev_tag);
     log::info!(
         "Tagging runtime image {} as {}...",
         runtime_src,
@@ -263,7 +256,7 @@ fn run_local_path(
         &resolved,
         &spec_package,
         Some((&upstream_url_prefix, &local_pull_xpkg_path)),
-        Some(&pull_runtime_ref),
+        Some(&push_runtime_ref),
         skip_dependency_resolution,
     )
 }
@@ -395,6 +388,15 @@ fn find_runtime_image(provider_name: &str, arch: &str) -> Result<String, Box<dyn
         .pop()
         .map(str::to_string)
         .ok_or_else(|| format!("no runtime image matching build-*{} found", suffix).into())
+}
+
+fn local_runtime_image_ref(provider_name: &str, arch: &str, tag: &str) -> String {
+    // Provider runtime pods are pulled by the node runtime, not Crossplane's
+    // package manager, so they need the node-pullable local registry address.
+    format!(
+        "{}/hops-ops/{}-{}:{}",
+        REGISTRY_PUSH, provider_name, arch, tag
+    )
 }
 
 fn crossplane_xpkg_push(xpkg_path: &Path, push_ref: &str) -> Result<(), Box<dyn Error>> {
@@ -1115,6 +1117,17 @@ mod tests {
         assert!(!without.contains("deploymentTemplate"));
         assert!(without.contains("serviceAccountTemplate"));
         assert!(without.contains("app.kubernetes.io/managed-by: hops-provider-install"));
+    }
+
+
+    #[test]
+    fn local_runtime_image_ref_uses_nodeport_registry() {
+        let image = local_runtime_image_ref("provider-helm", "arm64", "v1.999.3");
+        assert_eq!(
+            image,
+            "localhost:30500/hops-ops/provider-helm-arm64:v1.999.3"
+        );
+        assert!(!image.contains(REGISTRY_PULL));
     }
 
     #[test]
