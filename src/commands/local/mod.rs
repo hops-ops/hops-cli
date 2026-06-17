@@ -6,6 +6,7 @@ mod install;
 mod listmonk;
 pub mod package_install;
 mod reset;
+mod resize;
 mod start;
 mod stop;
 mod uninstall;
@@ -74,7 +75,9 @@ pub enum LocalCommands {
     /// Reset local Colima Kubernetes state
     Reset,
     /// Start local k8s cluster with Crossplane and providers
-    Start,
+    Start(start::StartArgs),
+    /// Resize the local Colima VM without destroying cluster state
+    Resize(resize::ResizeArgs),
     /// Check what `hops local start` set up and report drift
     Doctor,
     /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
@@ -104,7 +107,8 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
     match &args.command {
         LocalCommands::Install => install::run(),
         LocalCommands::Reset => reset::run(),
-        LocalCommands::Start => start::run(),
+        LocalCommands::Start(start_args) => start::run(start_args),
+        LocalCommands::Resize(resize_args) => resize::run(resize_args),
         LocalCommands::Doctor => doctor::run(),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Github(github_args) => github::run(github_args),
