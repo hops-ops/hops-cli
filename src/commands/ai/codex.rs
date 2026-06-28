@@ -14,6 +14,7 @@ const REF_LOCAL_SETUP: &str = include_str!("../../../skills/claude/references/lo
 const REF_STACKS_AND_XRS: &str =
     include_str!("../../../skills/claude/references/stacks-and-xrs.md");
 const REF_DEBUGGING: &str = include_str!("../../../skills/claude/references/debugging.md");
+const REF_VARS: &str = include_str!("../../../skills/claude/references/vars.md");
 
 #[derive(Args, Debug)]
 pub struct CodexArgs {
@@ -43,6 +44,7 @@ pub fn run(args: &CodexArgs) -> Result<(), Box<dyn Error>> {
             REF_STACKS_AND_XRS,
         ),
         (".agents/skills/hops/references/debugging.md", REF_DEBUGGING),
+        (".agents/skills/hops/references/vars.md", REF_VARS),
     ];
 
     let mut wrote = 0usize;
