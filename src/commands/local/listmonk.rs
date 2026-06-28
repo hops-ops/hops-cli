@@ -197,7 +197,9 @@ fn resolve_endpoint(args: &ListmonkArgs) -> Result<String, Box<dyn Error>> {
     let release = args
         .source_secret_name
         .strip_suffix("-provider-creds")
-        .ok_or("--endpoint required when --source-secret-name doesn't end with `-provider-creds`")?;
+        .ok_or(
+            "--endpoint required when --source-secret-name doesn't end with `-provider-creds`",
+        )?;
     Ok(format!(
         "http://{}.{}.svc.cluster.local:9000",
         release, args.source_namespace
@@ -335,11 +337,8 @@ mod tests {
 
     #[test]
     fn provider_config_yaml_uses_cluster_scoped_api_group() {
-        let yaml = build_provider_config_yaml(
-            "default",
-            "crossplane-system",
-            "listmonk-credentials",
-        );
+        let yaml =
+            build_provider_config_yaml("default", "crossplane-system", "listmonk-credentials");
         assert!(yaml.contains("apiVersion: listmonk.crossplane.io/v1beta1"));
         assert!(yaml.contains("kind: ProviderConfig"));
         assert!(yaml.contains("name: default"));
