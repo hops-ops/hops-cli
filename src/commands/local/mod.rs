@@ -1,4 +1,5 @@
 mod aws;
+mod cloudflare;
 mod destroy;
 mod doctor;
 mod github;
@@ -82,6 +83,8 @@ pub enum LocalCommands {
     Doctor,
     /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
     Aws(aws::AwsArgs),
+    /// Configure Wildbit Cloudflare DNS provider and ProviderConfig
+    Cloudflare(cloudflare::CloudflareArgs),
     /// Configure crossplane-contrib provider-upjet-github and GitHub ProviderConfig
     Github(github::GithubArgs),
     /// Configure crossplane-contrib provider-upjet-zitadel and Zitadel ProviderConfig
@@ -111,6 +114,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Resize(resize_args) => resize::run(resize_args),
         LocalCommands::Doctor => doctor::run(),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
+        LocalCommands::Cloudflare(cloudflare_args) => cloudflare::run(cloudflare_args),
         LocalCommands::Github(github_args) => github::run(github_args),
         LocalCommands::Zitadel(zitadel_args) => zitadel::run(zitadel_args),
         LocalCommands::Listmonk(listmonk_args) => listmonk::run(listmonk_args),
@@ -293,7 +297,15 @@ pub fn kubectl_patch_merge(
         "patch", resource, name, "-n", namespace, "--type", "merge", "-p", patch_json,
     ];
     let base_logged = [
-        "patch", resource, name, "-n", namespace, "--type", "merge", "-p", "<REDACTED>",
+        "patch",
+        resource,
+        name,
+        "-n",
+        namespace,
+        "--type",
+        "merge",
+        "-p",
+        "<REDACTED>",
     ];
     let full_args = with_kube_context(&base_args);
     let full_logged = with_kube_context(&base_logged);
