@@ -9,6 +9,8 @@ use std::time::Duration;
 const DEFAULT_PROVIDER_PACKAGE: &str =
     "xpkg.crossplane.io/crossplane-contrib/provider-family-aws:v2.4.0";
 const DEFAULT_PROVIDER_NAME: &str = "crossplane-contrib-provider-family-aws";
+const DEFAULT_AWS_REGION: &str = "us-east-2";
+const DEFAULT_AWS_RUNTIME_CONFIG_NAME: &str = "aws";
 const PROVIDER_CONFIG_CRD: &str = "providerconfigs.aws.m.upbound.io";
 
 #[derive(Args, Debug)]
@@ -17,6 +19,11 @@ pub struct AwsArgs {
     /// (falls back to AWS_PROFILE/AWS_DEFAULT_PROFILE, then prompts)
     #[arg(long, short = 'p')]
     pub profile: Option<String>,
+
+    /// AWS region to write into the ProviderConfig credentials file
+    /// (falls back to AWS_REGION/AWS_DEFAULT_REGION, then us-east-2)
+    #[arg(long, short = 'r')]
+    pub region: Option<String>,
 
     /// Namespace for the generated Secret and ProviderConfig
     #[arg(long, short = 'n', default_value = "default")]
@@ -30,6 +37,10 @@ pub struct AwsArgs {
     #[arg(long, default_value = "default")]
     pub provider_config_name: String,
 
+    /// DeploymentRuntimeConfig name to use for AWS provider pods
+    #[arg(long, default_value = DEFAULT_AWS_RUNTIME_CONFIG_NAME)]
+    pub runtime_config_name: String,
+
     /// Provider resource name for provider-family-aws
     #[arg(long, default_value = DEFAULT_PROVIDER_NAME)]
     pub provider_name: String,
@@ -38,7 +49,7 @@ pub struct AwsArgs {
     #[arg(long, default_value = DEFAULT_PROVIDER_PACKAGE)]
     pub provider_package: String,
 
-    /// Refresh credentials in the secret only; skips Provider and ProviderConfig apply
+    /// Refresh credentials and AWS runtime region; skips Provider and ProviderConfig apply
     #[arg(long)]
     pub refresh: bool,
 }
@@ -55,12 +66,23 @@ struct AwsExportCredentials {
 
 pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
     let profile = resolve_profile(args.profile.as_deref())?;
+    let region = resolve_region(args.region.as_deref())?;
 
     log::info!("Exporting AWS credentials from profile '{}'...", profile);
     let creds = export_credentials(&profile)?;
-    let credentials_ini = build_credentials_ini(&creds);
+    let credentials_ini = build_credentials_ini(&creds, &region);
 
     if args.refresh {
+        log::info!(
+            "Applying AWS provider runtime '{}' for region '{}'...",
+            args.runtime_config_name,
+            region
+        );
+        kubectl_apply_stdin(&build_runtime_config_yaml(
+            &args.runtime_config_name,
+            &region,
+        ))?;
+
         log::info!(
             "Refreshing secret '{}/{}' with generated credentials...",
             args.namespace,
@@ -72,13 +94,24 @@ pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
             &credentials_ini,
         ))?;
         log::info!(
-            "AWS credentials secret refreshed from profile '{}' ({}/{})",
+            "AWS credentials secret refreshed from profile '{}' for region '{}' ({}/{})",
             profile,
+            region,
             args.namespace,
             args.secret_name
         );
         return Ok(());
     }
+
+    log::info!(
+        "Applying AWS provider runtime '{}' for region '{}'...",
+        args.runtime_config_name,
+        region
+    );
+    kubectl_apply_stdin(&build_runtime_config_yaml(
+        &args.runtime_config_name,
+        &region,
+    ))?;
 
     log::info!(
         "Applying provider-family-aws package '{}'...",
@@ -87,6 +120,7 @@ pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
     kubectl_apply_stdin(&build_provider_yaml(
         &args.provider_name,
         &args.provider_package,
+        &args.runtime_config_name,
     ))?;
 
     wait_for_crd(PROVIDER_CONFIG_CRD)?;
@@ -114,8 +148,9 @@ pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
     ))?;
 
     log::info!(
-        "AWS provider configured from profile '{}' (ProviderConfig: {}/{})",
+        "AWS provider configured from profile '{}' for region '{}' (ProviderConfig: {}/{})",
         profile,
+        region,
         args.namespace,
         args.provider_config_name
     );
@@ -135,6 +170,39 @@ fn resolve_profile(cli_profile: Option<&str>) -> Result<String, Box<dyn Error>> 
     }
 
     prompt_for_profile()
+}
+
+fn resolve_region(cli_region: Option<&str>) -> Result<String, Box<dyn Error>> {
+    let env_region = std::env::var("AWS_REGION").ok();
+    let env_default_region = std::env::var("AWS_DEFAULT_REGION").ok();
+
+    let region = select_region(
+        cli_region,
+        env_region.as_deref(),
+        env_default_region.as_deref(),
+    );
+
+    if !region
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return Err(format!("Invalid AWS region '{}'.", region).into());
+    }
+
+    Ok(region.to_string())
+}
+
+fn select_region<'a>(
+    cli_region: Option<&'a str>,
+    env_region: Option<&'a str>,
+    env_default_region: Option<&'a str>,
+) -> &'a str {
+    [cli_region, env_region, env_default_region]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|region| !region.is_empty())
+        .unwrap_or(DEFAULT_AWS_REGION)
 }
 
 fn select_profile(
@@ -265,10 +333,10 @@ fn wait_for_crd(crd: &str) -> Result<(), Box<dyn Error>> {
     Err(format!("Timed out waiting for CRD {}", crd).into())
 }
 
-fn build_credentials_ini(creds: &AwsExportCredentials) -> String {
+fn build_credentials_ini(creds: &AwsExportCredentials, region: &str) -> String {
     let mut ini = format!(
-        "[default]\naws_access_key_id = {}\naws_secret_access_key = {}\n",
-        creds.access_key_id, creds.secret_access_key
+        "[default]\naws_access_key_id = {}\naws_secret_access_key = {}\nregion = {}\n",
+        creds.access_key_id, creds.secret_access_key, region
     );
 
     if let Some(session_token) = creds.session_token.as_deref() {
@@ -280,9 +348,19 @@ fn build_credentials_ini(creds: &AwsExportCredentials) -> String {
     ini
 }
 
-fn build_provider_yaml(provider_name: &str, provider_package: &str) -> String {
+fn build_runtime_config_yaml(runtime_config_name: &str, region: &str) -> String {
     format!(
-        "apiVersion: pkg.crossplane.io/v1\nkind: Provider\nmetadata:\n  name: {provider_name}\nspec:\n  package: {provider_package}\n"
+        "apiVersion: pkg.crossplane.io/v1beta1\nkind: DeploymentRuntimeConfig\nmetadata:\n  name: {runtime_config_name}\nspec:\n  deploymentTemplate:\n    spec:\n      selector: {{}}\n      template:\n        spec:\n          containers:\n            - name: package-runtime\n              env:\n                - name: AWS_REGION\n                  value: {region}\n                - name: AWS_DEFAULT_REGION\n                  value: {region}\n"
+    )
+}
+
+fn build_provider_yaml(
+    provider_name: &str,
+    provider_package: &str,
+    runtime_config_name: &str,
+) -> String {
+    format!(
+        "apiVersion: pkg.crossplane.io/v1\nkind: Provider\nmetadata:\n  name: {provider_name}\nspec:\n  package: {provider_package}\n  runtimeConfigRef:\n    name: {runtime_config_name}\n"
     )
 }
 
@@ -360,10 +438,30 @@ mod tests {
             session_token: Some("token".to_string()),
         };
 
-        let ini = build_credentials_ini(&creds);
+        let ini = build_credentials_ini(&creds, "us-east-2");
         assert!(ini.contains("aws_access_key_id = AKIA..."));
         assert!(ini.contains("aws_secret_access_key = secret"));
+        assert!(ini.contains("region = us-east-2"));
         assert!(ini.contains("aws_session_token = token"));
+    }
+
+    #[test]
+    fn resolve_region_prefers_cli_then_envs_then_default() {
+        assert_eq!(
+            select_region(Some("us-west-2"), Some("eu-west-1"), Some("ap-south-1")),
+            "us-west-2"
+        );
+        assert_eq!(
+            select_region(None, Some("eu-west-1"), Some("ap-south-1")),
+            "eu-west-1"
+        );
+        assert_eq!(select_region(None, None, Some("ap-south-1")), "ap-south-1");
+        assert_eq!(select_region(None, None, None), DEFAULT_AWS_REGION);
+    }
+
+    #[test]
+    fn resolve_region_rejects_unexpected_characters() {
+        assert!(resolve_region(Some("us-east-2;rm")).is_err());
     }
 
     #[test]
@@ -373,5 +471,25 @@ mod tests {
         assert!(yaml.contains("kind: ProviderConfig"));
         assert!(yaml.contains("name: aws-creds"));
         assert!(yaml.contains("key: credentials"));
+    }
+
+    #[test]
+    fn runtime_config_yaml_sets_aws_region_env() {
+        let yaml = build_runtime_config_yaml("aws", "us-east-2");
+        assert!(yaml.contains("kind: DeploymentRuntimeConfig"));
+        assert!(yaml.contains("name: aws"));
+        assert!(yaml.contains("name: AWS_REGION"));
+        assert!(yaml.contains("value: us-east-2"));
+        assert!(yaml.contains("name: AWS_DEFAULT_REGION"));
+    }
+
+    #[test]
+    fn provider_yaml_uses_aws_runtime_config() {
+        let yaml = build_provider_yaml("aws-provider", "xpkg.example/provider:v1", "aws");
+        assert!(yaml.contains("kind: Provider"));
+        assert!(yaml.contains("name: aws-provider"));
+        assert!(yaml.contains("package: xpkg.example/provider:v1"));
+        assert!(yaml.contains("runtimeConfigRef:"));
+        assert!(yaml.contains("name: aws"));
     }
 }
