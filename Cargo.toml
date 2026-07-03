@@ -8,7 +8,7 @@ fern = "0.7.1"
 log = "0.4.27"
 colored = "3.0.0"
 clap = { version = "4.5.35", features = ["derive"] }
-distributed_cli = "1.6"
+distributed_cli = "2.0"
 openssl-sys = { version = "0.9.106", optional = true }
 flate2 = "1.1.0"
 tar = "0.4.44"
