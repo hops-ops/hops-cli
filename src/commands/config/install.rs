@@ -1,13 +1,13 @@
+use crate::commands::local::backend::{self, wire_local_registry};
+use crate::commands::local::package_install::run_watch;
 use crate::commands::local::package_install::{
     docker_arch, ensure_cached_repo_checkout, ensure_registry, image_config_name,
     parse_docker_push_digest, parse_repo_spec, resolve_repo_install_target, rewrite_registry,
     rewrite_registry_with_tag, sanitize_name_component, short_hash, split_ref, strip_registry,
-    unique_suffix, RepoInstallTarget, RepoSpec, REGISTRY_HOSTNAME, REGISTRY_PULL, REGISTRY_PUSH,
+    unique_suffix, RepoInstallTarget, RepoSpec, REGISTRY_PULL, REGISTRY_PUSH,
 };
-use crate::commands::local::package_install::run_watch;
 use crate::commands::local::{
-    kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output, sync_registry_hosts_entry,
-    HOPS_KUBE_CONTEXT_ENV,
+    kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output, HOPS_KUBE_CONTEXT_ENV,
 };
 use clap::Args;
 use flate2::read::GzDecoder;
@@ -134,10 +134,7 @@ pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn run_repo_install(
-    repo: &str,
-    skip_dependency_resolution: bool,
-) -> Result<(), Box<dyn Error>> {
+fn run_repo_install(repo: &str, skip_dependency_resolution: bool) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
     match resolve_repo_install_target(&spec)? {
         RepoInstallTarget::SourceBuild => run_repo_clone(&spec, skip_dependency_resolution),
@@ -147,10 +144,7 @@ fn run_repo_install(
     }
 }
 
-fn run_repo_clone(
-    spec: &RepoSpec,
-    skip_dependency_resolution: bool,
-) -> Result<(), Box<dyn Error>> {
+fn run_repo_clone(spec: &RepoSpec, skip_dependency_resolution: bool) -> Result<(), Box<dyn Error>> {
     let cache_path = ensure_cached_repo_checkout(&spec)?;
     run_local_path(&cache_path.to_string_lossy(), skip_dependency_resolution)
 }
@@ -216,17 +210,14 @@ fn apply_repo_version(
     apply_repo_version_spec(&spec, version, skip_dependency_resolution)
 }
 
-fn run_local_path(
-    path: &str,
-    skip_dependency_resolution: bool,
-) -> Result<(), Box<dyn Error>> {
+fn run_local_path(path: &str, skip_dependency_resolution: bool) -> Result<(), Box<dyn Error>> {
     let dir = Path::new(path);
     if !dir.is_dir() {
         return Err(format!("{} is not a directory", path).into());
     }
 
     ensure_registry()?;
-    sync_registry_hosts_entry("crossplane-system", "registry", REGISTRY_HOSTNAME)?;
+    wire_local_registry(backend::resolve(None))?;
 
     // Build the Crossplane package
     log::info!("Building Crossplane package in {}...", path);

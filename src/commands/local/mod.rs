@@ -1,4 +1,5 @@
 mod aws;
+pub mod backend;
 mod cloudflare;
 mod destroy;
 mod doctor;
@@ -107,20 +108,21 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
             std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx);
         }
     }
+    let backend = backend::resolve(None);
     match &args.command {
-        LocalCommands::Install => install::run(),
-        LocalCommands::Reset => reset::run(),
-        LocalCommands::Start(start_args) => start::run(start_args),
-        LocalCommands::Resize(resize_args) => resize::run(resize_args),
+        LocalCommands::Install => install::run(backend),
+        LocalCommands::Reset => reset::run(backend),
+        LocalCommands::Start(start_args) => start::run(backend, start_args),
+        LocalCommands::Resize(resize_args) => resize::run(backend, resize_args),
         LocalCommands::Doctor => doctor::run(),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Cloudflare(cloudflare_args) => cloudflare::run(cloudflare_args),
         LocalCommands::Github(github_args) => github::run(github_args),
         LocalCommands::Zitadel(zitadel_args) => zitadel::run(zitadel_args),
         LocalCommands::Listmonk(listmonk_args) => listmonk::run(listmonk_args),
-        LocalCommands::Stop => stop::run(),
-        LocalCommands::Destroy => destroy::run(),
-        LocalCommands::Uninstall => uninstall::run(),
+        LocalCommands::Stop => stop::run(backend),
+        LocalCommands::Destroy => destroy::run(backend),
+        LocalCommands::Uninstall => uninstall::run(backend),
     }
 }
 
@@ -195,72 +197,17 @@ fn command_exists(program: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Ensure Colima's /etc/hosts maps a service hostname to the current ClusterIP.
-pub fn sync_registry_hosts_entry(
-    namespace: &str,
-    service: &str,
-    hostname: &str,
-) -> Result<(), Box<dyn Error>> {
-    let cluster_ip = run_cmd_output(
-        "kubectl",
-        &[
-            "get",
-            "svc",
-            service,
-            "-n",
-            namespace,
-            "-o",
-            "jsonpath={.spec.clusterIP}",
-        ],
-    )?;
-    let cluster_ip = cluster_ip.trim();
-    if cluster_ip.is_empty() {
-        return Err(format!("Service {}/{} has no ClusterIP", namespace, service).into());
+/// Poll until the Kubernetes API server is reachable.
+pub(crate) fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
+    log::info!("Waiting for Kubernetes API...");
+    for _ in 0..60 {
+        let result = run_cmd_output("kubectl", &["cluster-info"]);
+        if result.is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
-
-    let current_ip = run_cmd_output(
-        "colima",
-        &[
-            "ssh",
-            "--",
-            "sh",
-            "-c",
-            &format!("awk '$2 == \"{}\" {{print $1; exit}}' /etc/hosts", hostname),
-        ],
-    )
-    .unwrap_or_default();
-    if current_ip.trim() == cluster_ip {
-        return Ok(());
-    }
-
-    log::info!("Updating hosts entry: {} -> {}", hostname, cluster_ip);
-
-    let escaped_host = hostname.replace('.', "\\.");
-    run_cmd(
-        "colima",
-        &[
-            "ssh",
-            "--",
-            "sudo",
-            "sed",
-            "-i",
-            &format!("/{}/d", escaped_host),
-            "/etc/hosts",
-        ],
-    )?;
-    run_cmd(
-        "colima",
-        &[
-            "ssh",
-            "--",
-            "sudo",
-            "sh",
-            "-c",
-            &format!("echo '{} {}' >> /etc/hosts", cluster_ip, hostname),
-        ],
-    )?;
-
-    Ok(())
+    Err("Timed out waiting for Kubernetes API".into())
 }
 
 /// Pipe a YAML string into `kubectl apply -f -`.
