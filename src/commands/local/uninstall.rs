@@ -14,6 +14,7 @@ pub fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
 
     if input.trim().eq_ignore_ascii_case("y") {
         backend.uninstall()?;
+        super::backend::clear_persisted()?;
     } else {
         log::info!("Uninstall cancelled");
     }

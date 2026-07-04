@@ -29,6 +29,10 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
     // 1. Bring the backend cluster up
     backend.start(&args.size, args.yes)?;
 
+    // Remember the choice so stop/destroy/doctor and package installs target
+    // this backend without needing the flag again.
+    backend::persist(backend)?;
+
     // 2. Wait for the Kubernetes API to become reachable.
     //    The backend may return immediately ("already running") before the
     //    API server is ready, or a fresh start needs time to initialise.
