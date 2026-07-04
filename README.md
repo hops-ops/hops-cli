@@ -214,14 +214,21 @@ hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
 
 ### Cluster backends
 
-`hops local` supports two backends behind the same commands:
+`hops local` supports three backends behind the same commands:
 
 - **colima** — a VM running dockerd + k3s. macOS/Linux; supports `--cpus`,
   `--memory`, `--disk`, and `hops local resize`.
 - **kind** — cluster nodes as docker containers on any reachable docker
-  daemon: Docker Desktop, colima's dockerd, [dory](https://augani.github.io/dory),
-  or CI runners. No VM of its own, so sizing flags don't apply (size the
-  docker daemon instead); requires kind >= v0.27.
+  daemon: Docker Desktop, colima's dockerd, or CI runners. No VM of its own,
+  so sizing flags don't apply (size the docker daemon instead); requires
+  kind >= v0.27.
+- **dory** — [dory](https://augani.github.io/dory)'s built-in k3s, driven
+  headlessly through the `dory` CLI (`dory k8s enable/disable/status`).
+  Requires the Dory app running (it provides the engine and forwards
+  published ports to localhost) and a `dory` CLI with headless k8s support.
+  hops writes `~/.dory/k8s/registries.yaml` (k3s' native registry trust) and
+  publishes the registry NodePort at cluster create. The VM is sized in the
+  Dory app, so hops sizing flags don't apply.
 
 Select with the global `--backend` flag:
 
@@ -236,21 +243,30 @@ persisted choice > existing cluster detection (colima wins) > platform
 default (macOS: colima, otherwise kind).
 
 Unless `--context` is given, kubectl commands automatically use the backend's
-kubeconfig context (`colima` or `kind-hops`), regardless of your
-current-context.
+kubeconfig context (`colima`, `kind-hops`, or `dory`), regardless of your
+current-context. For dory, hops also prepends `~/.kube/dory-config` (where
+dory keeps its kubeconfig) to `KUBECONFIG` for its own kubectl/helm calls.
 
 #### Using dory
 
-[dory](https://augani.github.io/dory) exposes a real docker socket, so run the
-kind backend against it:
+With a `dory` CLI that supports `dory k8s enable` (headless Kubernetes),
+use the native backend:
+
+```bash
+hops local start --backend dory
+```
+
+For `hops provider install` / `hops config install` builds, point your docker
+CLI at dory's engine (`export DOCKER_HOST=unix://$HOME/.dory/engine.sock`) so
+image builds/pushes land on the daemon that reaches the registry.
+
+Without the headless CLI, dory still exposes a real docker socket, so the
+kind backend works against it:
 
 ```bash
 docker context use dory   # or: export DOCKER_HOST=unix://$HOME/.dory/dory.sock
 hops local start --backend kind
 ```
-
-Don't use dory's built-in Kubernetes for hops — it publishes only the API
-port, so the local package registry would be unreachable from the host.
 
 ### Local provider setup and auth
 

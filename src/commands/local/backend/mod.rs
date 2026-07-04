@@ -5,6 +5,7 @@
 //! shaped lives outside this module and is backend-agnostic.
 
 mod colima;
+mod dory;
 mod kind;
 
 use super::{local_state_dir, run_cmd_output};
@@ -61,6 +62,8 @@ pub enum Backend {
     /// docker containers as nodes; works on any docker daemon
     /// (Docker Desktop, colima, dory, CI runners)
     Kind,
+    /// k3s on dory's shared-VM engine, via the `dory` CLI
+    Dory,
 }
 
 impl Backend {
@@ -69,6 +72,7 @@ impl Backend {
         match self {
             Backend::Colima => "colima",
             Backend::Kind => "kind",
+            Backend::Dory => "dory",
         }
     }
 
@@ -77,6 +81,7 @@ impl Backend {
         match self {
             Backend::Colima => "colima",
             Backend::Kind => "kind-hops",
+            Backend::Dory => "dory",
         }
     }
 
@@ -84,6 +89,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::install(),
             Backend::Kind => kind::install(),
+            Backend::Dory => dory::install(),
         }
     }
 
@@ -91,6 +97,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::uninstall(),
             Backend::Kind => kind::uninstall(),
+            Backend::Dory => dory::uninstall(),
         }
     }
 
@@ -100,6 +107,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::start(size, assume_yes),
             Backend::Kind => kind::start(size),
+            Backend::Dory => dory::start(size),
         }
     }
 
@@ -107,6 +115,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::stop(),
             Backend::Kind => kind::stop(),
+            Backend::Dory => dory::stop(),
         }
     }
 
@@ -114,6 +123,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::destroy(),
             Backend::Kind => kind::destroy(),
+            Backend::Dory => dory::destroy(),
         }
     }
 
@@ -121,6 +131,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::reset(),
             Backend::Kind => kind::reset(),
+            Backend::Dory => dory::reset(),
         }
     }
 
@@ -128,6 +139,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::resize(size),
             Backend::Kind => kind::resize(size),
+            Backend::Dory => dory::resize(size),
         }
     }
 
@@ -139,6 +151,9 @@ impl Backend {
             // containerd trust is per-name via certs.d, written in
             // wire_registry once the registry Service's ClusterIP is known.
             Backend::Kind => Ok(()),
+            // trust is static registries.yaml, written by dory::start before
+            // the cluster boots (k3s reads it at boot).
+            Backend::Dory => Ok(()),
         }
     }
 
@@ -149,6 +164,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::sync_hosts_entry(cluster_ip),
             Backend::Kind => kind::wire_registry(cluster_ip),
+            Backend::Dory => dory::wire_registry(cluster_ip),
         }
     }
 }
@@ -166,8 +182,9 @@ impl FromStr for Backend {
         match s.trim() {
             "colima" => Ok(Backend::Colima),
             "kind" => Ok(Backend::Kind),
+            "dory" => Ok(Backend::Dory),
             other => Err(format!(
-                "unknown backend '{}' (expected colima or kind)",
+                "unknown backend '{}' (expected colima, kind, or dory)",
                 other
             )),
         }
@@ -185,6 +202,7 @@ pub fn resolve(flag: Option<Backend>) -> Backend {
         persisted(),
         colima::instance_exists,
         kind::cluster_exists,
+        dory::cluster_exists,
         cfg!(target_os = "macos"),
     )
 }
@@ -194,6 +212,7 @@ fn resolve_from(
     persisted: Option<Backend>,
     colima_detected: impl FnOnce() -> bool,
     kind_detected: impl FnOnce() -> bool,
+    dory_detected: impl FnOnce() -> bool,
     macos: bool,
 ) -> Backend {
     if let Some(backend) = flag {
@@ -207,6 +226,9 @@ fn resolve_from(
     }
     if kind_detected() {
         return Backend::Kind;
+    }
+    if dory_detected() {
+        return Backend::Dory;
     }
     if macos {
         Backend::Colima
@@ -265,6 +287,15 @@ pub fn wire_local_registry(backend: Backend) -> Result<(), Box<dyn Error>> {
     backend.wire_registry(&registry_cluster_ip()?)
 }
 
+/// Backend-specific process env so kubectl/helm children can address the
+/// cluster. dory keeps its kubeconfig in a side file, so `--context dory`
+/// only resolves once that file is on the KUBECONFIG path.
+pub fn export_kube_env(backend: Backend) {
+    if backend == Backend::Dory {
+        dory::export_kubeconfig_env();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +311,7 @@ mod tests {
             Some(Backend::Colima),
             || true,
             no_detect,
+            no_detect,
             true,
         );
 
@@ -288,21 +320,35 @@ mod tests {
 
     #[test]
     fn persisted_beats_detection() {
-        let resolved = resolve_from(None, Some(Backend::Kind), || true, no_detect, true);
+        let resolved = resolve_from(
+            None,
+            Some(Backend::Kind),
+            || true,
+            no_detect,
+            no_detect,
+            true,
+        );
 
         assert_eq!(resolved, Backend::Kind);
     }
 
     #[test]
     fn colima_detection_beats_kind_detection() {
-        let resolved = resolve_from(None, None, || true, || true, false);
+        let resolved = resolve_from(None, None, || true, || true, || true, false);
 
         assert_eq!(resolved, Backend::Colima);
     }
 
     #[test]
+    fn dory_detection_used_when_no_colima_or_kind() {
+        let resolved = resolve_from(None, None, no_detect, no_detect, || true, true);
+
+        assert_eq!(resolved, Backend::Dory);
+    }
+
+    #[test]
     fn kind_detection_used_when_no_colima() {
-        let resolved = resolve_from(None, None, no_detect, || true, true);
+        let resolved = resolve_from(None, None, no_detect, || true, no_detect, true);
 
         assert_eq!(resolved, Backend::Kind);
     }
@@ -310,20 +356,20 @@ mod tests {
     #[test]
     fn platform_default_when_nothing_detected() {
         assert_eq!(
-            resolve_from(None, None, no_detect, no_detect, true),
+            resolve_from(None, None, no_detect, no_detect, no_detect, true),
             Backend::Colima
         );
         assert_eq!(
-            resolve_from(None, None, no_detect, no_detect, false),
+            resolve_from(None, None, no_detect, no_detect, no_detect, false),
             Backend::Kind
         );
     }
 
     #[test]
     fn backend_name_round_trips_through_from_str() {
-        for backend in [Backend::Colima, Backend::Kind] {
+        for backend in [Backend::Colima, Backend::Kind, Backend::Dory] {
             assert_eq!(backend.name().parse::<Backend>().unwrap(), backend);
         }
-        assert!("dory".parse::<Backend>().is_err());
+        assert!("podman".parse::<Backend>().is_err());
     }
 }

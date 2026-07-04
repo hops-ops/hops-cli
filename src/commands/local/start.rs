@@ -52,7 +52,9 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
             "https://charts.crossplane.io/stable",
         ],
     )?;
-    run_cmd("helm", &["repo", "update"])?;
+    // Update only our repo — a bare `helm repo update` fails outright when any
+    // unrelated repo in the user's helm config has gone stale.
+    run_cmd("helm", &["repo", "update", "crossplane-stable"])?;
 
     // 5. Install Crossplane
     log::info!("Installing Crossplane...");

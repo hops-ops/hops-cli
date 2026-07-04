@@ -77,6 +77,7 @@ pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
     if let Some(ctx) = &args.context {
         std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx);
     }
+    backend::export_kube_env(backend::resolve(None));
 
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => {

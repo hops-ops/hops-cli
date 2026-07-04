@@ -118,6 +118,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         Some(ctx) if !ctx.is_empty() => std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx),
         _ => std::env::set_var(HOPS_KUBE_CONTEXT_ENV, backend.kube_context()),
     }
+    backend::export_kube_env(backend);
     match &args.command {
         LocalCommands::Install => install::run(backend),
         LocalCommands::Reset => reset::run(backend),
