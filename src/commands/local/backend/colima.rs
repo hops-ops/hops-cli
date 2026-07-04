@@ -250,6 +250,12 @@ fn requested_size_changes(size: &SizeArgs, instance: &ColimaInstance) -> Vec<Str
     changes
 }
 
+/// Whether a Colima instance exists (running or stopped). Missing binary or
+/// failing command reads as "no instance".
+pub fn instance_exists() -> bool {
+    matches!(colima_instance(), Ok(Some(_)))
+}
+
 fn colima_instance() -> Result<Option<ColimaInstance>, Box<dyn Error>> {
     let output = match run_cmd_output("colima", &["list", "--json"]) {
         Ok(output) => output,

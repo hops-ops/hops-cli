@@ -64,21 +64,29 @@ pub struct LocalArgs {
     pub command: LocalCommands,
 
     /// Kubernetes context to use for all kubectl commands (e.g. "colima").
-    /// Global: applies to every `hops local` subcommand and may be given before
-    /// or after the subcommand.
+    /// Defaults to the resolved backend's own context. Global: applies to
+    /// every `hops local` subcommand and may be given before or after the
+    /// subcommand.
     #[arg(long, global = true)]
     pub context: Option<String>,
+
+    /// Local cluster backend to target. Defaults to the backend persisted by
+    /// the last successful `hops local start`, else an existing cluster if
+    /// one is detected, else the platform default (macOS: colima, otherwise
+    /// kind).
+    #[arg(long, global = true, value_enum)]
+    pub backend: Option<backend::Backend>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum LocalCommands {
-    /// Install Colima via Homebrew
+    /// Install the local cluster backend (colima or kind) via Homebrew
     Install,
-    /// Reset local Colima Kubernetes state
+    /// Reset local Kubernetes state (colima: k8s reset; kind: recreate cluster)
     Reset,
     /// Start local k8s cluster with Crossplane and providers
     Start(start::StartArgs),
-    /// Resize the local Colima VM without destroying cluster state
+    /// Resize the local cluster VM without destroying cluster state (colima only)
     Resize(resize::ResizeArgs),
     /// Check what `hops local start` set up and report drift
     Doctor,
@@ -94,21 +102,22 @@ pub enum LocalCommands {
     Listmonk(listmonk::ListmonkArgs),
     /// Stop the local cluster
     Stop,
-    /// Destroy the local cluster VM
+    /// Destroy the local cluster
     Destroy,
-    /// Uninstall Colima
+    /// Uninstall the local cluster backend
     Uninstall,
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
-    // Plumb --context through the same env channel the kubectl helpers read, so
-    // every subcommand's kubectl calls target the chosen context.
-    if let Some(ctx) = &args.context {
-        if !ctx.is_empty() {
-            std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx);
-        }
+    let backend = backend::resolve(args.backend);
+    // Plumb the context through the same env channel the kubectl helpers
+    // read, so every subcommand's kubectl calls target the chosen cluster.
+    // Without an explicit --context, use the backend's own context so
+    // commands work regardless of kubeconfig's current-context.
+    match &args.context {
+        Some(ctx) if !ctx.is_empty() => std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx),
+        _ => std::env::set_var(HOPS_KUBE_CONTEXT_ENV, backend.kube_context()),
     }
-    let backend = backend::resolve(None);
     match &args.command {
         LocalCommands::Install => install::run(backend),
         LocalCommands::Reset => reset::run(backend),
@@ -183,13 +192,13 @@ pub fn repo_cache_path(org: &str, repo: &str) -> Result<PathBuf, Box<dyn Error>>
     Ok(local_state_dir()?.join(REPO_CACHE_DIR).join(org).join(repo))
 }
 
-fn local_state_dir() -> Result<PathBuf, Box<dyn Error>> {
+pub(crate) fn local_state_dir() -> Result<PathBuf, Box<dyn Error>> {
     let home = std::env::var("HOME")
         .map_err(|_| "HOME is not set; unable to determine local state directory")?;
     Ok(Path::new(&home).join(LOCAL_STATE_DIR))
 }
 
-fn command_exists(program: &str) -> bool {
+pub(crate) fn command_exists(program: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {} >/dev/null 2>&1", program)])
         .status()
