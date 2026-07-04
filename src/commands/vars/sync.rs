@@ -243,11 +243,6 @@ fn set_github_variable(
     if !status.success() {
         return Err(format!("gh variable set exited with {}", status).into());
     }
-    log::info!(
-        "Set GitHub variable '{}' in '{}/{}'",
-        var_name,
-        owner,
-        repo
-    );
+    log::info!("Set GitHub variable '{}' in '{}/{}'", var_name, owner, repo);
     Ok(())
 }

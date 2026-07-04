@@ -231,7 +231,10 @@ pub fn parse_repo_install_choice(input: &str) -> Result<RepoInstallChoice, Strin
     }
 }
 
-pub fn resolve_published_version_input(input: &str, default_version: Option<&str>) -> Option<String> {
+pub fn resolve_published_version_input(
+    input: &str,
+    default_version: Option<&str>,
+) -> Option<String> {
     let trimmed = input.trim();
     if !trimmed.is_empty() {
         return Some(trimmed.to_string());
@@ -394,7 +397,9 @@ fn clone_repo_into_cache(
         "Cloning {} into local cache at {}{}...",
         clone_url,
         cache_path.display(),
-        branch.map(|b| format!(" (branch {})", b)).unwrap_or_default()
+        branch
+            .map(|b| format!(" (branch {})", b))
+            .unwrap_or_default()
     );
     let mut args: Vec<&str> = vec!["clone"];
     if let Some(b) = branch {
@@ -405,10 +410,7 @@ fn clone_repo_into_cache(
     Ok(())
 }
 
-fn refresh_cached_repo(
-    cache_path: &Path,
-    branch: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
+fn refresh_cached_repo(cache_path: &Path, branch: Option<&str>) -> Result<(), Box<dyn Error>> {
     let cache_path_str = cache_path.to_string_lossy().to_string();
     run_cmd(
         "git",
@@ -445,11 +447,7 @@ fn should_ignore_path(path: &Path) -> bool {
 
 /// Watch `path` for filesystem events and invoke `rebuild` after a debounced
 /// quiet period. Loops until the watcher channel closes (typically Ctrl+C).
-pub fn run_watch<F>(
-    path: &str,
-    debounce_secs: u64,
-    mut rebuild: F,
-) -> Result<(), Box<dyn Error>>
+pub fn run_watch<F>(path: &str, debounce_secs: u64, mut rebuild: F) -> Result<(), Box<dyn Error>>
 where
     F: FnMut() -> Result<(), Box<dyn Error>>,
 {
@@ -457,8 +455,8 @@ where
     let debounce = Duration::from_secs(debounce_secs);
 
     let (tx, rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        match res {
+    let mut watcher =
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
             Ok(event) => {
                 let dominated_by_ignored = event.paths.iter().all(|p| should_ignore_path(p));
                 log::debug!(
@@ -472,8 +470,7 @@ where
                 }
             }
             Err(e) => log::debug!("watch error: {:?}", e),
-        }
-    })?;
+        })?;
     watcher.watch(&dir, RecursiveMode::Recursive)?;
 
     log::info!(

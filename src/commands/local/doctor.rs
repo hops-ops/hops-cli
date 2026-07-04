@@ -220,20 +220,17 @@ fn check_provider(d: &mut Doctor, e: &ProviderExpectation) {
         },
     );
 
-    let pc_ok = exists(&[
-        "get",
-        e.pc_resource,
-        e.pc_name,
-        "-n",
-        e.pc_namespace,
-    ]);
+    let pc_ok = exists(&["get", e.pc_resource, e.pc_name, "-n", e.pc_namespace]);
     d.check(
         "ProviderConfig present",
         pc_ok,
         if pc_ok {
             String::new()
         } else {
-            format!("{}/{} missing in namespace {}", e.pc_resource, e.pc_name, e.pc_namespace)
+            format!(
+                "{}/{} missing in namespace {}",
+                e.pc_resource, e.pc_name, e.pc_namespace
+            )
         },
     );
 }
@@ -244,7 +241,10 @@ fn provider_condition(provider: &str, cond: &str) -> String {
         "provider.pkg.crossplane.io",
         provider,
         "-o",
-        &format!("jsonpath={{.status.conditions[?(@.type==\"{}\")].status}}", cond),
+        &format!(
+            "jsonpath={{.status.conditions[?(@.type==\"{}\")].status}}",
+            cond
+        ),
     ])
     .unwrap_or_default()
 }
@@ -253,7 +253,11 @@ fn cond_detail(cond: &str, status: &str) -> String {
     if status == "True" {
         String::new()
     } else {
-        format!("{}={}", cond, if status.is_empty() { "<none>" } else { status })
+        format!(
+            "{}={}",
+            cond,
+            if status.is_empty() { "<none>" } else { status }
+        )
     }
 }
 
