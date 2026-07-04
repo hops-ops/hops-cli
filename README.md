@@ -6,13 +6,13 @@
 
 This tool supports three related workflows:
 
-- Local cluster setup on Colima
+- Local cluster setup on colima or kind
 - Configuration package install/uninstall against the connected cluster
 - XR observe/manage/adopt/orphan workflows for existing infrastructure
 
 For local development, it can also:
 
-- Install and manage Colima
+- Install and manage a local cluster backend (colima or kind)
 - Start a local k8s cluster with Crossplane installed via Helm
 - Install the Kubernetes and Helm Crossplane providers
 - Deploy an in-cluster OCI registry (`crossplane-system/registry`)
@@ -56,7 +56,7 @@ See "Releases" for available versions and changenotes.
 - `up` (Upbound CLI, used by `up project build`)
 - `aws` CLI v2 (used by `local aws` to export profile credentials)
 
-Note: `hops-cli local install` installs `colima` through Homebrew.
+Note: `hops-cli local install` installs the selected backend (`colima` or `kind`) through Homebrew.
 
 ## Build
 
@@ -87,7 +87,7 @@ hops service --help
 `hops-cli` is organized into a few command groups:
 
 - `local`
-  - Manage a local Colima-based control plane, install providers, and bootstrap AWS or GitHub provider auth.
+  - Manage a local control plane (colima or kind backend), install providers, and bootstrap AWS or GitHub provider auth.
 - `config`
   - Build, install, reload, and uninstall Crossplane configuration packages against the connected cluster.
 - `secrets`
@@ -192,7 +192,8 @@ Examples:
 ## Create a Local Control Plane
 
 ```bash
-# 1) Install Colima (via Homebrew)
+# 1) Install the backend (via Homebrew). Defaults to colima on macOS;
+#    pass --backend kind to use kind on any docker daemon.
 hops local install
 
 # 2) Start local k8s + Crossplane + providers + local registry
@@ -210,6 +211,46 @@ hops local zitadel --source-context pat-local --domain auth.ops.com.ai
 # 6) Install a Crossplane configuration package from an Upbound-format XRD project
 hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
 ```
+
+### Cluster backends
+
+`hops local` supports two backends behind the same commands:
+
+- **colima** — a VM running dockerd + k3s. macOS/Linux; supports `--cpus`,
+  `--memory`, `--disk`, and `hops local resize`.
+- **kind** — cluster nodes as docker containers on any reachable docker
+  daemon: Docker Desktop, colima's dockerd, [dory](https://augani.github.io/dory),
+  or CI runners. No VM of its own, so sizing flags don't apply (size the
+  docker daemon instead); requires kind >= v0.27.
+
+Select with the global `--backend` flag:
+
+```bash
+hops local start --backend kind
+```
+
+The chosen backend is persisted to `~/.hops/local/backend` on a successful
+start, so later commands (`stop`, `destroy`, `doctor`, package installs)
+target the same cluster without the flag. Resolution order: `--backend` flag >
+persisted choice > existing cluster detection (colima wins) > platform
+default (macOS: colima, otherwise kind).
+
+Unless `--context` is given, kubectl commands automatically use the backend's
+kubeconfig context (`colima` or `kind-hops`), regardless of your
+current-context.
+
+#### Using dory
+
+[dory](https://augani.github.io/dory) exposes a real docker socket, so run the
+kind backend against it:
+
+```bash
+docker context use dory   # or: export DOCKER_HOST=unix://$HOME/.dory/dory.sock
+hops local start --backend kind
+```
+
+Don't use dory's built-in Kubernetes for hops — it publishes only the API
+port, so the local package registry would be unreachable from the host.
 
 ### Local provider setup and auth
 
