@@ -1,0 +1,62 @@
+name: kind backend smoke
+
+# End-to-end check of `hops local` on the kind backend, which is the CI
+# path (ubuntu runners ship kind, docker, kubectl, and helm). Exercises the
+# registry NodePort mapping and BOTH containerd certs.d trust names, plus the
+# stop/start resume path.
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  kind-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build hops
+        run: cargo build
+
+      - name: hops local start --backend kind
+        run: ./target/debug/hops-cli local start --backend kind
+
+      - name: hops local doctor
+        run: ./target/debug/hops-cli local doctor
+
+      - name: Registry round-trip through both pull names
+        run: |
+          set -euxo pipefail
+          docker pull public.ecr.aws/docker/library/busybox:stable
+          docker tag public.ecr.aws/docker/library/busybox:stable localhost:30500/smoke/busybox:ci
+          docker push localhost:30500/smoke/busybox:ci
+
+          # Service-name pull: containerd resolves via its certs.d alias.
+          kubectl --context kind-hops run smoke-svc-name \
+            --image=registry.crossplane-system.svc.cluster.local:5000/smoke/busybox:ci \
+            --restart=Never --command -- sleep 300
+
+          # localhost:30500 pull: what provider runtime pods reference.
+          kubectl --context kind-hops run smoke-localhost \
+            --image=localhost:30500/smoke/busybox:ci \
+            --restart=Never --command -- sleep 300
+
+          kubectl --context kind-hops wait --for=condition=Ready \
+            pod/smoke-svc-name pod/smoke-localhost --timeout=180s
+          kubectl --context kind-hops delete pod smoke-svc-name smoke-localhost --wait=false
+
+      - name: Stop/start resume path (uses persisted backend, no flag)
+        run: |
+          set -euxo pipefail
+          ./target/debug/hops-cli local stop
+          ./target/debug/hops-cli local start
+          kubectl --context kind-hops -n crossplane-system wait \
+            --for=condition=Available deployment/crossplane deployment/registry --timeout=300s
+          ./target/debug/hops-cli local doctor
+
+      - name: hops local destroy
+        run: ./target/debug/hops-cli local destroy
