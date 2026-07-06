@@ -38,7 +38,9 @@ fn engine_socket() -> Result<PathBuf, Box<dyn Error>> {
     Ok(home()?.join(".dory/engine.sock"))
 }
 
-/// dory writes the cluster kubeconfig here (context name `dory`), unmerged.
+/// dory's side-file kubeconfig (context name `dory`). Current dory also
+/// merges the context into ~/.kube/config at enable time; the side file is
+/// the pre-merge fallback and dory's own `--kubeconfig` input.
 pub fn kubeconfig_path() -> Option<String> {
     home()
         .ok()
@@ -452,9 +454,15 @@ pub fn wire_registry(cluster_ip: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Make `--context dory` resolvable: dory's kubeconfig is a side file, so
-/// prepend it to KUBECONFIG (preserving whatever the user already has).
+/// Make `--context dory` resolvable. Current dory merges the context into
+/// ~/.kube/config at enable time, so normally there is nothing to do —
+/// mutating KUBECONFIG for every child process is then pure noise. Older
+/// dory versions only write the side file; for those, prepend it to
+/// KUBECONFIG (preserving whatever the user already has).
 pub fn export_kubeconfig_env() {
+    if effective_kubeconfig_has_dory_context() {
+        return;
+    }
     let Some(dory_cfg) = kubeconfig_path() else {
         return;
     };
@@ -473,9 +481,50 @@ pub fn export_kubeconfig_env() {
     std::env::set_var("KUBECONFIG", format!("{}:{}", dory_cfg, rest));
 }
 
+/// Whether the kubeconfig(s) kubectl will read without our help — the
+/// $KUBECONFIG chain when set, else ~/.kube/config — already define a
+/// `dory` entry (i.e. dory's kubectl-merge ran against a file in scope).
+fn effective_kubeconfig_has_dory_context() -> bool {
+    let paths: Vec<PathBuf> = match std::env::var("KUBECONFIG") {
+        Ok(chain) if !chain.is_empty() => chain.split(':').map(PathBuf::from).collect(),
+        _ => match home() {
+            Ok(h) => vec![h.join(".kube/config")],
+            Err(_) => return false,
+        },
+    };
+    paths.iter().any(|path| {
+        std::fs::read_to_string(path)
+            .map(|content| has_dory_entry(&content))
+            .unwrap_or(false)
+    })
+}
+
+/// Line-anchored scan for a kubeconfig entry named `dory` — the mapping
+/// form (`name: dory`, as kubectl writes context/cluster names) or the
+/// sequence-item form (`- name: dory`, the users list). `name: dory-prod`
+/// or `username: dory` must not count.
+fn has_dory_entry(kubeconfig: &str) -> bool {
+    kubeconfig.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == "name: dory" || trimmed == "- name: dory"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_dory_entry_matches_mapping_and_sequence_forms_only() {
+        let merged = "contexts:\n- context:\n    cluster: dory\n    user: dory\n  name: dory\n";
+        let users_list = "users:\n- name: dory\n  user: {}\n";
+        let near_misses = "name: dory-prod\nusername: dory\n# name: dory\nfullname: dory\n";
+
+        assert!(has_dory_entry(merged));
+        assert!(has_dory_entry(users_list));
+        assert!(!has_dory_entry(near_misses));
+        assert!(!has_dory_entry(""));
+    }
 
     #[test]
     fn registries_yaml_aliases_both_pull_names_to_the_service_over_http() {
