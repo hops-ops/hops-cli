@@ -257,10 +257,78 @@ fn write_ports_file() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Seconds after the Dory app (re)creates its engine socket during which it is
+/// still provisioning the engine. A dockerd restart at the end of that window
+/// SIGTERMs every container — including a k3s node enabled meanwhile, which
+/// reports Ready and then dies under the bootstrap (observed ~90s on Dory
+/// 0.2.0; padded for slower machines).
+const ENGINE_LAUNCH_WINDOW_SECS: u64 = 180;
+
+/// Age of the current engine session: the app recreates the engine socket at
+/// launch, so its mtime marks when provisioning began. None when unreadable.
+fn engine_session_age() -> Option<std::time::Duration> {
+    let sock = engine_socket().ok()?;
+    let modified = std::fs::metadata(&sock).ok()?.modified().ok()?;
+    std::time::SystemTime::now().duration_since(modified).ok()
+}
+
+/// Time left inside the app's provisioning window for a given engine session
+/// age; None once the window has passed.
+fn launch_window_remaining(age: std::time::Duration) -> Option<std::time::Duration> {
+    std::time::Duration::from_secs(ENGINE_LAUNCH_WINDOW_SECS)
+        .checked_sub(age)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn node_running() -> bool {
+    engine_docker_output(&["inspect", "-f", "{{.State.Running}}", NODE_CONTAINER])
+        .map(|state| state.trim() == "true")
+        .unwrap_or(false)
+}
+
+/// Hold a freshly-enabled cluster under observation while the Dory app may
+/// still be provisioning its engine, re-enabling if the engine restart takes
+/// the node down. Immediate no-op when the window has already passed, so
+/// steady-state starts pay one container inspect and nothing more.
+fn hold_through_engine_launch_window() -> Result<(), Box<dyn Error>> {
+    let in_window = |age: Option<std::time::Duration>| {
+        age.map(|a| launch_window_remaining(a).is_some())
+            .unwrap_or(false)
+    };
+    if in_window(engine_session_age()) {
+        log::info!(
+            "Dory engine session is younger than {}s; watching the k8s node through the app's provisioning window...",
+            ENGINE_LAUNCH_WINDOW_SECS
+        );
+    }
+    let mut reenables = 0;
+    loop {
+        match (node_running(), in_window(engine_session_age())) {
+            (true, false) => return Ok(()),
+            (true, true) => {}
+            (false, _) => {
+                if reenables >= 3 {
+                    return Err("the dory engine keeps stopping the k8s node during app startup; \
+                         wait for the Dory app to finish provisioning, then re-run `hops local start --backend dory`"
+                        .into());
+                }
+                reenables += 1;
+                log::warn!(
+                    "dory engine restart stopped the k8s node; re-enabling ({}/3)...",
+                    reenables
+                );
+                let args = dory_enable_args(false);
+                run_cmd("dory", &args)?;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+}
+
 fn run_dory_enable(recreate: bool) -> Result<(), Box<dyn Error>> {
     let args = dory_enable_args(recreate);
     match run_cmd("dory", &args) {
-        Ok(()) => Ok(()),
+        Ok(()) => hold_through_engine_launch_window(),
         Err(err) if !recreate && err.to_string().contains("exit status: 3") => Err(format!(
             "{}\nhint: run `hops local reset --backend dory` to recreate the dory cluster and apply create-time config drift",
             err
@@ -513,6 +581,25 @@ fn has_dory_entry(kubeconfig: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_window_remaining_covers_only_the_provisioning_window() {
+        use std::time::Duration;
+
+        assert_eq!(
+            launch_window_remaining(Duration::ZERO),
+            Some(Duration::from_secs(ENGINE_LAUNCH_WINDOW_SECS))
+        );
+        assert_eq!(
+            launch_window_remaining(Duration::from_secs(ENGINE_LAUNCH_WINDOW_SECS - 1)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            launch_window_remaining(Duration::from_secs(ENGINE_LAUNCH_WINDOW_SECS)),
+            None
+        );
+        assert_eq!(launch_window_remaining(Duration::from_secs(3600)), None);
+    }
 
     #[test]
     fn has_dory_entry_matches_mapping_and_sequence_forms_only() {
