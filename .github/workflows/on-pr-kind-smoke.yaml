@@ -7,8 +7,6 @@ name: kind backend smoke
 
 on:
   pull_request:
-    branches:
-      - main
 
 jobs:
   kind-smoke:
