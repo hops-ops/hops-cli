@@ -1,0 +1,93 @@
+name: colima backend smoke
+
+# End-to-end check of `hops local` on the colima backend on macOS.
+# Mirrors on-pr-kind-smoke.yaml with --backend colima and kubectl --context colima.
+#
+# Runner constraints:
+# - Colima needs nested virtualization (Lima VM). Pin macos-15-intel — that
+#   image is known to support nested virt for Colima/Lima on GHA.
+# - Do NOT use bare macos-latest alone (tracks arm images; arm64 GHA macOS
+#   historically fails with HV_UNSUPPORTED for nested virt).
+# - Prefer localhost:30500 for registry traffic, not the Colima VM IP
+#   (macOS 15 Local Network Privacy can block non-root VM-IP access).
+#
+# Install: brew provides colima/docker/kubectl/helm only. Do not pre-start
+# colima here — hops local start --backend colima owns cluster bring-up.
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  colima-smoke:
+    # Nested-virt-capable Intel pin (not bare macos-latest).
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install colima, docker, kubectl, helm
+        run: |
+          set -euxo pipefail
+          # Tools only — do not `colima start` here so the smoke exercises hops.
+          brew install colima docker kubectl helm
+          colima version
+          docker version --format '{{.Client.Version}}' || docker --version
+          kubectl version --client
+          helm version --short
+
+      - name: Build hops
+        run: cargo build
+
+      - name: hops local start --backend colima
+        run: ./target/debug/hops-cli local start --backend colima
+
+      - name: hops local doctor
+        run: ./target/debug/hops-cli local doctor
+
+      - name: Registry round-trip through both pull names
+        run: |
+          set -euxo pipefail
+          docker pull public.ecr.aws/docker/library/busybox:stable
+          docker tag public.ecr.aws/docker/library/busybox:stable localhost:30500/smoke/busybox:ci
+          docker push localhost:30500/smoke/busybox:ci
+
+          # Service-name pull: containerd resolves via its certs.d alias.
+          kubectl --context colima run smoke-svc-name \
+            --image=registry.crossplane-system.svc.cluster.local:5000/smoke/busybox:ci \
+            --restart=Never --command -- sleep 300
+
+          # localhost:30500 pull: what provider runtime pods reference.
+          kubectl --context colima run smoke-localhost \
+            --image=localhost:30500/smoke/busybox:ci \
+            --restart=Never --command -- sleep 300
+
+          kubectl --context colima wait --for=condition=Ready \
+            pod/smoke-svc-name pod/smoke-localhost --timeout=180s
+          kubectl --context colima delete pod smoke-svc-name smoke-localhost --wait=false
+
+      - name: Stop/start resume path (uses persisted backend, no flag)
+        run: |
+          set -euxo pipefail
+          ./target/debug/hops-cli local stop
+          ./target/debug/hops-cli local start
+          kubectl --context colima -n crossplane-system wait \
+            --for=condition=Available deployment/crossplane deployment/registry --timeout=300s
+          ./target/debug/hops-cli local doctor
+
+      - name: hops local destroy
+        if: always()
+        run: ./target/debug/hops-cli local destroy
+
+      - name: Debug dump on failure
+        if: failure()
+        run: |
+          set +e
+          colima status || true
+          colima list || true
+          kubectl --context colima get nodes,pods -A || true
+          ./target/debug/hops-cli local doctor || true
