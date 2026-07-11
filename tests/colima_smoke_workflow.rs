@@ -78,6 +78,11 @@ fn colima_smoke_workflow_sizes_vm_for_gha_intel_runner() {
         text.contains("--cpus") && text.contains("--memory") && text.contains("--disk"),
         "must pass --cpus/--memory/--disk so the VZ VM fits the runner"
     );
+    // 8Gi left CoreDNS thrashing; smoke needs headroom above that floor.
+    assert!(
+        text.contains("--memory 10") || text.contains("--memory 11") || text.contains("--memory 12"),
+        "must allocate at least 10Gi to the colima VM on GHA intel runners"
+    );
     assert!(
         text.contains("ha.stderr.log"),
         "failure dump must include lima hostagent stderr for nested-virt debug"
