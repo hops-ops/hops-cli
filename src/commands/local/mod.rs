@@ -267,24 +267,47 @@ pub(crate) fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
 
 /// Pipe a YAML string into `kubectl apply -f -`.
 /// Automatically injects `--context` when configured.
+///
+/// Uses `--validate=false` so a slow/overloaded API server (common on nested
+/// virt CI while Crossplane is warming) does not fail the apply solely because
+/// OpenAPI schema download timed out. Retries a few times for transient
+/// connection errors.
 pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
-    let full = with_kube_context(&["apply", "-f", "-"]);
-    let mut child = Command::new("kubectl")
-        .args(&full)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+    let full = with_kube_context(&["apply", "--validate=false", "-f", "-"]);
+    let mut last_status = None;
 
-    if let Some(ref mut stdin) = child.stdin {
-        stdin.write_all(yaml.as_bytes())?;
+    for attempt in 1..=5 {
+        let mut child = Command::new("kubectl")
+            .args(&full)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        if let Some(ref mut stdin) = child.stdin {
+            stdin.write_all(yaml.as_bytes())?;
+        }
+
+        let status = child.wait()?;
+        if status.success() {
+            return Ok(());
+        }
+        last_status = Some(status);
+        log::warn!(
+            "kubectl apply failed (attempt {}/5, status {}); retrying...",
+            attempt,
+            status
+        );
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
 
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("kubectl apply exited with {}", status).into());
-    }
-    Ok(())
+    Err(format!(
+        "kubectl apply exited with {} after retries",
+        last_status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    )
+    .into())
 }
 
 /// Apply a JSON merge patch with `kubectl patch --type merge`.

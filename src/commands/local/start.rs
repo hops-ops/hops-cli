@@ -92,10 +92,20 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
         ],
     )?;
 
-    // 6. Wait for Crossplane deployment (and rbac-manager, which shares the chart)
+    // 6. Wait for Crossplane core deployment.
+    // rbac-manager can flap under nested-virt resource pressure; the core
+    // controller is what providers need. Best-effort wait for rbac-manager.
     log::info!("Waiting for Crossplane to be ready...");
     wait_for_deployment_with_diagnostics("crossplane-system", "crossplane")?;
-    wait_for_deployment_with_diagnostics("crossplane-system", "crossplane-rbac-manager")?;
+    if let Err(e) = wait_for_deployment_attempts("crossplane-system", "crossplane-rbac-manager", 36)
+    {
+        log::warn!(
+            "crossplane-rbac-manager not Available yet ({e}); continuing — core Crossplane is ready"
+        );
+    }
+
+    // API can be briefly overloaded right after Crossplane becomes leader.
+    wait_for_kubernetes()?;
 
     // 7. Deploy per-provider DRCs (each pins its own cluster-admin SA)
     log::info!("Applying DeploymentRuntimeConfigs (per-provider)...");
@@ -111,6 +121,10 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
     log::info!("Waiting for provider CRDs...");
     wait_for_crd("providerconfigs.helm.m.crossplane.io")?;
     wait_for_crd("providerconfigs.kubernetes.m.crossplane.io")?;
+
+    // Re-check API before ProviderConfigs (openapi validation can time out if
+    // the apiserver is still busy — apply also uses --validate=false).
+    wait_for_kubernetes()?;
 
     // 10. Apply ProviderConfigs
     log::info!("Applying ProviderConfigs...");
