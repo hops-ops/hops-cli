@@ -69,8 +69,10 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
             "crossplane-system",
             "--create-namespace",
             "--wait",
+            // Nested-virt CI (colima on GHA) routinely needs >5m for image pull
+            // + schedule after the docker-daemon restart path.
             "--timeout",
-            "5m",
+            "10m",
         ],
     )?;
 

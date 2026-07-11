@@ -56,8 +56,10 @@ jobs:
         run: |
           set -euxo pipefail
           # Fit macos-15-intel (~4 CPU / ~14 GiB). Defaults (8/16/60) OOM the VZ VM.
+          # 2/4 was enough to boot but Crossplane stayed 0/1 within helm 5m;
+          # use 3/8 so k3s + Crossplane can schedule on nested virt.
           ./target/debug/hops-cli local start --backend colima \
-            --cpus 2 --memory 4 --disk 20
+            --cpus 3 --memory 8 --disk 20
 
       - name: hops local doctor
         run: ./target/debug/hops-cli local doctor
