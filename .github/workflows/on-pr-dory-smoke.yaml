@@ -1,0 +1,161 @@
+name: dory backend smoke
+
+# Spike / non-required smoke for `hops local --backend dory` on public GHA macOS.
+# Mirrors on-pr-kind-smoke.yaml when the engine boots; remains workflow_dispatch
+# (and optional non-required PR) until a green public-GHA run exists.
+#
+# Install contract (mandatory — not brew cask / official release):
+# 1. Clone patrickleet/dory @ feat/hops-local-integration
+# 2. Build in-pipeline (xcodebuild with deterministic -derivedDataPath)
+# 3. Put scripts/dory on PATH
+# 4. Launch Dory.app; wait for ~/.dory/engine.sock before hops start
+#
+# Runner constraints:
+# - Prefer explicit arm64 macOS (macos-15) for Dory's native engine path.
+#   Intel often proxies to external Docker and may not produce engine.sock.
+# - GHA arm64 macOS historically lacks nested virt; engine boot may fail.
+#   That is an allowed spike outcome — do not make this a required check
+#   while red for platform reasons.
+# - Do not use bare macos-latest alone without documenting the resolved arch.
+
+on:
+  workflow_dispatch:
+  # Non-required until a green public-GHA engine boot is proven. Branch
+  # filter matches kind smoke once this is promoted.
+  # pull_request:
+  #   branches: [main]
+
+jobs:
+  dory-smoke:
+    # Explicit arm pin for native engine experiments (not bare macos-latest).
+    # Nested virt may still fail on public GHA — capture logs and keep
+    # this job non-required / dispatch-oriented until green.
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout hops-cli
+        uses: actions/checkout@v4
+
+      - name: Checkout patrickleet/dory (hops integration branch)
+        uses: actions/checkout@v4
+        with:
+          repository: patrickleet/dory
+          ref: feat/hops-local-integration
+          path: dory-src
+
+      - name: Select Xcode
+        run: |
+          set -euxo pipefail
+          newest="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          echo "Using Xcode at $newest"
+          echo "DEVELOPER_DIR=$newest/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$newest/Contents/Developer"
+
+      - name: Build Dory from source
+        working-directory: dory-src
+        run: |
+          set -euxo pipefail
+          # Match dory CI: Metal toolchain download can be flaky; best-effort.
+          xcodebuild -downloadComponent MetalToolchain || true
+          # Prefer deterministic product path via -derivedDataPath (not scripts/build.sh
+          # alone, which may use a user-local DerivedData path).
+          xcodebuild -project Dory.xcodeproj -scheme Dory \
+            -destination 'platform=macOS' -configuration Debug \
+            -derivedDataPath build \
+            build CODE_SIGNING_ALLOWED=NO
+          test -d build/Build/Products/Debug/Dory.app
+
+      - name: Install dory CLI on PATH
+        run: |
+          set -euxo pipefail
+          chmod +x dory-src/scripts/dory
+          echo "$GITHUB_WORKSPACE/dory-src/scripts" >> "$GITHUB_PATH"
+          # Verify the script is present (version/status may fail before app launch).
+          test -x dory-src/scripts/dory
+          dory-src/scripts/dory version || dory-src/scripts/dory k8s status || true
+
+      - name: Install docker CLI, kubectl, helm
+        run: |
+          set -euxo pipefail
+          # docker CLI only — daemon is Dory's engine.sock, not brew dockerd.
+          brew install docker kubectl helm
+          docker --version
+          kubectl version --client
+          helm version --short
+
+      - name: Launch Dory.app and wait for engine.sock
+        run: |
+          set -euxo pipefail
+          DORY_APP="$GITHUB_WORKSPACE/dory-src/build/Build/Products/Debug/Dory.app"
+          test -d "$DORY_APP"
+          open "$DORY_APP"
+          # Engine provisioning can take ~90s+; hops also holds, but preflight
+          # requires engine.sock before start.
+          for i in $(seq 1 120); do
+            if [ -S "$HOME/.dory/engine.sock" ]; then
+              echo "engine.sock ready after ${i} attempts"
+              ls -la "$HOME/.dory"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "engine.sock never appeared (spike may be blocked on public GHA nested virt / headless)" >&2
+          ls -la "$HOME/.dory" || true
+          exit 1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build hops
+        run: cargo build
+
+      - name: hops local start --backend dory
+        run: |
+          set -euxo pipefail
+          # docker CLI talks to Dory's engine socket (not a brew dockerd).
+          export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
+          ./target/debug/hops-cli local start --backend dory
+
+      - name: hops local doctor
+        run: ./target/debug/hops-cli local doctor
+
+      - name: Registry round-trip through both pull names
+        run: |
+          set -euxo pipefail
+          export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
+          docker pull public.ecr.aws/docker/library/busybox:stable
+          docker tag public.ecr.aws/docker/library/busybox:stable localhost:30500/smoke/busybox:ci
+          docker push localhost:30500/smoke/busybox:ci
+
+          kubectl --context dory run smoke-svc-name \
+            --image=registry.crossplane-system.svc.cluster.local:5000/smoke/busybox:ci \
+            --restart=Never --command -- sleep 300
+
+          kubectl --context dory run smoke-localhost \
+            --image=localhost:30500/smoke/busybox:ci \
+            --restart=Never --command -- sleep 300
+
+          kubectl --context dory wait --for=condition=Ready \
+            pod/smoke-svc-name pod/smoke-localhost --timeout=180s
+          kubectl --context dory delete pod smoke-svc-name smoke-localhost --wait=false
+
+      - name: Stop/start resume path (uses persisted backend, no flag)
+        run: |
+          set -euxo pipefail
+          export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
+          ./target/debug/hops-cli local stop
+          ./target/debug/hops-cli local start
+          kubectl --context dory -n crossplane-system wait \
+            --for=condition=Available deployment/crossplane deployment/registry --timeout=300s
+          ./target/debug/hops-cli local doctor
+
+      - name: hops local destroy
+        if: always()
+        run: ./target/debug/hops-cli local destroy || true
+
+      - name: Teardown Dory
+        if: always()
+        run: |
+          set +e
+          dory k8s disable || true
+          pkill -f 'Dory.app/Contents/MacOS/Dory' || true
+          ls -la "$HOME/.dory" || true
