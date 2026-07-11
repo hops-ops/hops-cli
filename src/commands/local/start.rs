@@ -134,7 +134,9 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
     // 11. Deploy local OCI registry for Crossplane packages
     log::info!("Deploying local package registry...");
     kubectl_apply_stdin(REGISTRY)?;
-    wait_for_deployment("crossplane-system", "registry")?;
+    // Nested virt: image pull + schedule for the registry can exceed the
+    // default ~5m wait used for lighter resources.
+    wait_for_deployment_with_diagnostics("crossplane-system", "registry")?;
 
     // 12. Point the node at the registry Service's ClusterIP so pulls of the
     //     cluster-internal registry names resolve.
@@ -224,15 +226,34 @@ fn dump_namespace_diagnostics(namespace: &str) {
     let _ = run_cmd("kubectl", &["get", "nodes", "-o", "wide"]);
 }
 
-/// Poll until a CRD exists in the cluster.
+/// Poll until a CRD exists **and** is Established (API serves the kind).
+///
+/// Merely creating the CRD object is not enough: under load the apiserver can
+/// return the CRD while discovery still lacks the kind, causing
+/// `no matches for kind "ProviderConfig"` on the next apply.
 fn wait_for_crd(crd: &str) -> Result<(), Box<dyn Error>> {
     log::info!("Waiting for CRD {}...", crd);
-    for _ in 0..60 {
-        let result = run_cmd_output("kubectl", &["get", "crd", crd]);
-        if result.is_ok() {
-            return Ok(());
+    for _ in 0..120 {
+        let exists = run_cmd_output("kubectl", &["get", "crd", crd]).is_ok();
+        if exists {
+            let established = run_cmd_output(
+                "kubectl",
+                &[
+                    "get",
+                    "crd",
+                    crd,
+                    "-o",
+                    "jsonpath={.status.conditions[?(@.type==\"Established\")].status}",
+                ],
+            )
+            .unwrap_or_default();
+            if established.trim() == "True" {
+                // Brief settle so discovery caches pick up the new kind.
+                thread::sleep(Duration::from_secs(2));
+                return Ok(());
+            }
         }
         thread::sleep(Duration::from_secs(5));
     }
-    Err(format!("Timed out waiting for CRD {}", crd).into())
+    Err(format!("Timed out waiting for CRD {} to be Established", crd).into())
 }
