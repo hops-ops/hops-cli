@@ -255,9 +255,14 @@ pub(crate) fn command_exists(program: &str) -> bool {
 /// Poll until the Kubernetes API server is reachable.
 pub(crate) fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
     log::info!("Waiting for Kubernetes API...");
-    for _ in 0..60 {
-        let result = run_cmd_output("kubectl", &["cluster-info"]);
+    // ~10 minutes — nested-virt apiserver can stay overloaded after package install.
+    for _ in 0..120 {
+        let result = run_cmd_output("kubectl", &["get", "--raw", "/readyz"]);
         if result.is_ok() {
+            return Ok(());
+        }
+        // Fall back to a cheap list if /readyz is denied on some setups.
+        if run_cmd_output("kubectl", &["get", "ns", "default"]).is_ok() {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_secs(5));
@@ -275,8 +280,12 @@ pub(crate) fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
 pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
     let full = with_kube_context(&["apply", "--validate=false", "-f", "-"]);
     let mut last_status = None;
+    // Nested-virt CI (colima/GHA) can lose the apiserver for minutes after
+    // Crossplane/provider install (TLS handshake timeouts). Retry with backoff
+    // and re-probe the API between attempts.
+    const ATTEMPTS: u32 = 12;
 
-    for attempt in 1..=5 {
+    for attempt in 1..=ATTEMPTS {
         let mut child = Command::new("kubectl")
             .args(&full)
             .stdin(Stdio::piped())
@@ -294,11 +303,14 @@ pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
         }
         last_status = Some(status);
         log::warn!(
-            "kubectl apply failed (attempt {}/5, status {}); retrying...",
+            "kubectl apply failed (attempt {}/{}, status {}); waiting for API...",
             attempt,
+            ATTEMPTS,
             status
         );
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        // Best-effort API recovery before the next apply.
+        let _ = wait_for_kubernetes();
+        std::thread::sleep(std::time::Duration::from_secs(10));
     }
 
     Err(format!(

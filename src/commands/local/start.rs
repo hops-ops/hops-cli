@@ -132,6 +132,12 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
     kubectl_apply_stdin(PC_K8S)?;
 
     // 11. Deploy local OCI registry for Crossplane packages
+    //
+    // Provider install can leave the apiserver briefly unresponsive; re-wait
+    // and best-effort pre-pull registry:2 so the pod is not cold-started.
+    wait_for_kubernetes()?;
+    log::info!("Pre-pulling registry:2 (best effort)...");
+    let _ = run_cmd("docker", &["pull", "registry:2"]);
     log::info!("Deploying local package registry...");
     kubectl_apply_stdin(REGISTRY)?;
     // Nested virt: image pull + schedule for the registry can exceed the
