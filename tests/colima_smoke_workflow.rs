@@ -69,3 +69,17 @@ fn colima_smoke_workflow_kind_parity_sequence() {
         );
     }
 }
+
+#[test]
+fn colima_smoke_workflow_sizes_vm_for_gha_intel_runner() {
+    let text = workflow_text();
+    // Defaults (8/16/60) exceed macos-15-intel; CI must pass explicit smaller sizes.
+    assert!(
+        text.contains("--cpus") && text.contains("--memory") && text.contains("--disk"),
+        "must pass --cpus/--memory/--disk so the VZ VM fits the runner"
+    );
+    assert!(
+        text.contains("ha.stderr.log"),
+        "failure dump must include lima hostagent stderr for nested-virt debug"
+    );
+}
