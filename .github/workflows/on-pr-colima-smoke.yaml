@@ -91,8 +91,20 @@ jobs:
           set -euxo pipefail
           ./target/debug/hops-cli local stop
           ./target/debug/hops-cli local start
-          kubectl --context colima -n crossplane-system wait \
-            --for=condition=Available deployment/crossplane deployment/registry --timeout=300s
+          # After colima VM stop/start, docker container IDs are gone and pods
+          # often sit in Error until kubelet recreates them. Wait generously and
+          # force a rollout restart if Available still stalls.
+          if ! kubectl --context colima -n crossplane-system wait \
+              --for=condition=Available deployment/crossplane deployment/registry \
+              --timeout=420s; then
+            echo "deployments not Available after resume; restarting..."
+            kubectl --context colima -n crossplane-system get pods -o wide || true
+            kubectl --context colima -n crossplane-system rollout restart \
+              deployment/crossplane deployment/crossplane-rbac-manager deployment/registry || true
+            kubectl --context colima -n crossplane-system wait \
+              --for=condition=Available deployment/crossplane deployment/registry \
+              --timeout=420s
+          fi
           ./target/debug/hops-cli local doctor
 
       # Capture live cluster state BEFORE destroy so failures are diagnosable.
