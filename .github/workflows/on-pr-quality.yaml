@@ -1,9 +1,8 @@
 name: Rust Quality Pipeline for PRs
 
+# Run on every PR regardless of base branch (feature stacks included).
 on:
   pull_request:
-    branches:
-      - main
 
 jobs:
   quality:
