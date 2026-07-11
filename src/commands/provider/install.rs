@@ -1,12 +1,11 @@
-use crate::commands::local::backend::{self, wire_local_registry};
+use crate::commands::local::backend::{self, Backend};
 use crate::commands::local::package_install::{
     docker_arch, ensure_cached_repo_checkout_at, ensure_registry, parse_repo_spec,
     resolve_repo_install_target, run_watch, sanitize_name_component, RepoInstallTarget, RepoSpec,
     REGISTRY_PULL, REGISTRY_PUSH,
 };
 use crate::commands::local::{
-    kubectl_apply_stdin, run_cmd, run_cmd_output, HOPS_KUBE_CONTEXT_ENV, MANAGED_BY_LABEL,
-    PROVIDER_INSTALL_MANAGED_BY,
+    kubectl_apply_stdin, run_cmd, run_cmd_output, MANAGED_BY_LABEL, PROVIDER_INSTALL_MANAGED_BY,
 };
 use clap::Args;
 use serde::Deserialize;
@@ -54,6 +53,10 @@ pub struct ProviderInstallArgs {
     #[arg(long)]
     pub context: Option<String>,
 
+    /// Local cluster backend whose node should be wired for local package pulls.
+    #[arg(long, value_enum)]
+    pub backend: Option<Backend>,
+
     /// Watch the project directory for changes and re-run install automatically
     #[arg(long, conflicts_with = "repo")]
     pub watch: bool,
@@ -74,9 +77,7 @@ struct PackageMetadata {
 }
 
 pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
-    if let Some(ctx) = &args.context {
-        std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx);
-    }
+    let backend = backend::activate(args.backend, args.context.as_deref());
 
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => {
@@ -87,10 +88,14 @@ pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
             args.skip_dependency_resolution,
             args.version_prefix.as_deref(),
             args.branch.as_deref(),
+            backend,
+            args.backend,
+            args.context.as_deref(),
         ),
         (None, _) => {
             let path = args.path.as_deref().unwrap_or(".");
             let prefix = args.version_prefix.clone();
+            prepare_local_registry(backend, args.backend, args.context.as_deref())?;
             run_local_path(path, args.skip_dependency_resolution, prefix.as_deref())?;
 
             if args.watch {
@@ -112,11 +117,15 @@ fn run_repo_install(
     skip_dependency_resolution: bool,
     version_prefix: Option<&str>,
     branch: Option<&str>,
+    backend: Backend,
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
     match resolve_repo_install_target(&spec)? {
         RepoInstallTarget::SourceBuild => {
             let cache_path = ensure_cached_repo_checkout_at(&spec, branch)?;
+            prepare_local_registry(backend, backend_flag, context)?;
             run_local_path(
                 &cache_path.to_string_lossy(),
                 skip_dependency_resolution,
@@ -127,6 +136,15 @@ fn run_repo_install(
             apply_repo_version_spec(&spec, &version, skip_dependency_resolution)
         }
     }
+}
+
+fn prepare_local_registry(
+    backend: Backend,
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    ensure_registry()?;
+    backend::wire_local_registry_for_target(backend, backend_flag, context)
 }
 
 fn apply_repo_version(
@@ -185,9 +203,6 @@ fn run_local_path(
 
     let provider_name = read_provider_name(dir)?;
     log::info!("Provider package name: {}", provider_name);
-
-    ensure_registry()?;
-    wire_local_registry(backend::resolve(None))?;
 
     // Resolve the existing upstream Provider before building so we can:
     //   1. carry the upstream package URL into the new `spec.package` (Crossplane
@@ -337,10 +352,10 @@ fn find_xpkg_for_provider(
         .filter_map(|e| e.ok())
         .filter(|e| {
             let p = e.path();
-            p.extension().map_or(false, |ext| ext == "xpkg")
+            p.extension().is_some_and(|ext| ext == "xpkg")
                 && p.file_name()
                     .and_then(|n| n.to_str())
-                    .map_or(false, |n| n.starts_with(&prefix))
+                    .is_some_and(|n| n.starts_with(&prefix))
         })
         .map(|e| e.path())
         .collect();
@@ -1111,6 +1126,15 @@ mod tests {
             "localhost:30500/hops-ops/provider-helm-arm64:v1.999.3"
         );
         assert!(!image.contains(REGISTRY_PULL));
+    }
+
+    #[test]
+    fn local_registry_wiring_skips_foreign_context_without_backend_flag() {
+        assert!(!backend::should_wire_local_registry(
+            None,
+            Some("kind-hops"),
+            Backend::Colima
+        ));
     }
 
     #[test]

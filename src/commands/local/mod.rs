@@ -34,19 +34,50 @@ pub const PROVIDER_INSTALL_MANAGED_BY: &str = "hops-provider-install";
 /// Env var checked by kubectl helpers to inject `--context <name>`.
 pub const HOPS_KUBE_CONTEXT_ENV: &str = "HOPS_KUBE_CONTEXT";
 
-/// Build the kubectl args prefix. Returns `["--context", ctx]` when the env var
-/// is set, or an empty vec otherwise.
-fn kubectl_context_args() -> Vec<String> {
-    match std::env::var(HOPS_KUBE_CONTEXT_ENV) {
-        Ok(ctx) if !ctx.is_empty() => vec!["--context".to_string(), ctx],
-        _ => vec![],
-    }
+fn kube_context_from_env() -> Option<String> {
+    std::env::var(HOPS_KUBE_CONTEXT_ENV)
+        .ok()
+        .filter(|ctx| !ctx.is_empty())
 }
 
 /// Prepend `--context` to a kubectl arg slice when configured.
 fn with_kube_context(args: &[&str]) -> Vec<String> {
-    let mut out = kubectl_context_args();
+    let ctx = kube_context_from_env();
+    with_kube_context_value(args, ctx.as_deref())
+}
+
+fn with_kube_context_value(args: &[&str], context: Option<&str>) -> Vec<String> {
+    let mut out = match context {
+        Some(ctx) if !ctx.is_empty() => vec!["--context".to_string(), ctx.to_string()],
+        _ => vec![],
+    };
     out.extend(args.iter().map(|s| s.to_string()));
+    out
+}
+
+fn with_helm_kube_context(args: &[&str]) -> Vec<String> {
+    let ctx = kube_context_from_env();
+    with_helm_kube_context_value(args, ctx.as_deref())
+}
+
+fn with_helm_kube_context_value(args: &[&str], context: Option<&str>) -> Vec<String> {
+    let Some(ctx) = context.filter(|ctx| !ctx.is_empty()) else {
+        return args.iter().map(|s| s.to_string()).collect();
+    };
+    if args.first() == Some(&"repo") {
+        return args.iter().map(|s| s.to_string()).collect();
+    }
+
+    let mut out = Vec::with_capacity(args.len() + 2);
+    if let Some((command, rest)) = args.split_first() {
+        out.push((*command).to_string());
+        out.push("--kube-context".to_string());
+        out.push(ctx.to_string());
+        out.extend(rest.iter().map(|s| s.to_string()));
+    } else {
+        out.push("--kube-context".to_string());
+        out.push(ctx.to_string());
+    }
     out
 }
 
@@ -105,19 +136,18 @@ pub enum LocalCommands {
     /// Destroy the local cluster
     Destroy,
     /// Uninstall the local cluster backend
-    Uninstall,
+    Uninstall(uninstall::UninstallArgs),
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
-    let backend = backend::resolve(args.backend);
-    // Plumb the context through the same env channel the kubectl helpers
-    // read, so every subcommand's kubectl calls target the chosen cluster.
-    // Without an explicit --context, use the backend's own context so
-    // commands work regardless of kubeconfig's current-context.
-    match &args.context {
-        Some(ctx) if !ctx.is_empty() => std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx),
-        _ => std::env::set_var(HOPS_KUBE_CONTEXT_ENV, backend.kube_context()),
-    }
+    let explicit_context = args.context.as_deref().filter(|ctx| !ctx.is_empty());
+    let install_backend = matches!(&args.command, LocalCommands::Install)
+        .then(|| args.backend.unwrap_or_else(backend::platform_default));
+    let activation_flag = install_backend.or(args.backend);
+    let install_context = install_backend.map(backend::Backend::kube_context);
+    let activation_context = explicit_context.or(install_context);
+    let backend = backend::activate(activation_flag, activation_context);
+
     match &args.command {
         LocalCommands::Install => install::run(backend),
         LocalCommands::Reset => reset::run(backend),
@@ -131,7 +161,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Listmonk(listmonk_args) => listmonk::run(listmonk_args),
         LocalCommands::Stop => stop::run(backend),
         LocalCommands::Destroy => destroy::run(backend),
-        LocalCommands::Uninstall => uninstall::run(backend),
+        LocalCommands::Uninstall(uninstall_args) => uninstall::run(backend, uninstall_args),
     }
 }
 
@@ -143,14 +173,30 @@ pub fn run_cmd(program: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
         let refs: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
         return run_cmd_with_logged_args(program, &refs, &refs);
     }
+    if program == "helm" {
+        let full = with_helm_kube_context(args);
+        let refs: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
+        return run_cmd_with_logged_args(program, &refs, &refs);
+    }
     run_cmd_with_logged_args(program, args, args)
 }
 
 /// Run an external command and capture stdout.
-/// For kubectl commands, automatically injects `--context` when configured.
+/// For kubectl/helm commands, automatically injects the active context when
+/// configured.
 pub fn run_cmd_output(program: &str, args: &[&str]) -> Result<String, Box<dyn Error>> {
     if program == "kubectl" {
         let full = with_kube_context(args);
+        log::debug!("Running: {} {}", program, full.join(" "));
+        let output = Command::new(program).args(&full).output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("{} exited with {}: {}", program, output.status, stderr).into());
+        }
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    if program == "helm" {
+        let full = with_helm_kube_context(args);
         log::debug!("Running: {} {}", program, full.join(" "));
         let output = Command::new(program).args(&full).output()?;
         if !output.status.success() {
@@ -268,4 +314,49 @@ pub fn kubectl_patch_merge(
     let args_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
     let logged_refs: Vec<&str> = full_logged.iter().map(|s| s.as_str()).collect();
     run_cmd_with_logged_args("kubectl", &args_refs, &logged_refs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(args: Vec<String>) -> Vec<String> {
+        args
+    }
+
+    #[test]
+    fn kubectl_args_prepend_context() {
+        assert_eq!(
+            strings(with_kube_context_value(&["get", "pods"], Some("kind-hops"))),
+            vec!["--context", "kind-hops", "get", "pods"]
+        );
+    }
+
+    #[test]
+    fn helm_upgrade_injects_kube_context_after_subcommand() {
+        assert_eq!(
+            strings(with_helm_kube_context_value(
+                &["upgrade", "--install", "crossplane"],
+                Some("kind-hops")
+            )),
+            vec![
+                "upgrade",
+                "--kube-context",
+                "kind-hops",
+                "--install",
+                "crossplane"
+            ]
+        );
+    }
+
+    #[test]
+    fn helm_repo_commands_skip_kube_context() {
+        assert_eq!(
+            strings(with_helm_kube_context_value(
+                &["repo", "update", "crossplane-stable"],
+                Some("kind-hops")
+            )),
+            vec!["repo", "update", "crossplane-stable"]
+        );
+    }
 }

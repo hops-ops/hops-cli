@@ -1,4 +1,4 @@
-use crate::commands::local::backend::{self, wire_local_registry};
+use crate::commands::local::backend::{self, Backend};
 use crate::commands::local::package_install::run_watch;
 use crate::commands::local::package_install::{
     docker_arch, ensure_cached_repo_checkout, ensure_registry, image_config_name,
@@ -6,9 +6,7 @@ use crate::commands::local::package_install::{
     rewrite_registry_with_tag, sanitize_name_component, short_hash, split_ref, strip_registry,
     unique_suffix, RepoInstallTarget, RepoSpec, REGISTRY_PULL, REGISTRY_PUSH,
 };
-use crate::commands::local::{
-    kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output, HOPS_KUBE_CONTEXT_ENV,
-};
+use crate::commands::local::{kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output};
 use clap::Args;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
@@ -42,6 +40,10 @@ pub struct ConfigArgs {
     /// Kubernetes context to use for all kubectl commands (e.g. "colima")
     #[arg(long)]
     pub context: Option<String>,
+
+    /// Local cluster backend whose node should be wired for local package pulls.
+    #[arg(long, value_enum)]
+    pub backend: Option<Backend>,
 
     /// Watch the project directory for changes and re-run install automatically
     #[arg(long, conflicts_with = "repo")]
@@ -108,17 +110,22 @@ struct PackageResource {
 }
 
 pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
-    if let Some(ctx) = &args.context {
-        std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx);
-    }
+    let backend = backend::activate(args.backend, args.context.as_deref());
 
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => {
             apply_repo_version(repo, version, args.skip_dependency_resolution)
         }
-        (Some(repo), None) => run_repo_install(repo, args.skip_dependency_resolution),
+        (Some(repo), None) => run_repo_install(
+            repo,
+            args.skip_dependency_resolution,
+            backend,
+            args.backend,
+            args.context.as_deref(),
+        ),
         (None, _) => {
             let path = args.path.as_deref().unwrap_or(".");
+            prepare_local_registry(backend, args.backend, args.context.as_deref())?;
             run_local_path(path, args.skip_dependency_resolution)?;
 
             if args.watch {
@@ -134,19 +141,47 @@ pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn run_repo_install(repo: &str, skip_dependency_resolution: bool) -> Result<(), Box<dyn Error>> {
+fn run_repo_install(
+    repo: &str,
+    skip_dependency_resolution: bool,
+    backend: Backend,
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
     match resolve_repo_install_target(&spec)? {
-        RepoInstallTarget::SourceBuild => run_repo_clone(&spec, skip_dependency_resolution),
+        RepoInstallTarget::SourceBuild => run_repo_clone(
+            &spec,
+            skip_dependency_resolution,
+            backend,
+            backend_flag,
+            context,
+        ),
         RepoInstallTarget::PublishedVersion(version) => {
             apply_repo_version_spec(&spec, &version, skip_dependency_resolution)
         }
     }
 }
 
-fn run_repo_clone(spec: &RepoSpec, skip_dependency_resolution: bool) -> Result<(), Box<dyn Error>> {
-    let cache_path = ensure_cached_repo_checkout(&spec)?;
+fn run_repo_clone(
+    spec: &RepoSpec,
+    skip_dependency_resolution: bool,
+    backend: Backend,
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let cache_path = ensure_cached_repo_checkout(spec)?;
+    prepare_local_registry(backend, backend_flag, context)?;
     run_local_path(&cache_path.to_string_lossy(), skip_dependency_resolution)
+}
+
+fn prepare_local_registry(
+    backend: Backend,
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    ensure_registry()?;
+    backend::wire_local_registry_for_target(backend, backend_flag, context)
 }
 
 fn apply_repo_version_spec(
@@ -216,9 +251,6 @@ fn run_local_path(path: &str, skip_dependency_resolution: bool) -> Result<(), Bo
         return Err(format!("{} is not a directory", path).into());
     }
 
-    ensure_registry()?;
-    wire_local_registry(backend::resolve(None))?;
-
     // Build the Crossplane package
     log::info!("Building Crossplane package in {}...", path);
     let status = Command::new("up")
@@ -237,7 +269,7 @@ fn run_local_path(path: &str, skip_dependency_resolution: bool) -> Result<(), Bo
     let packages: Vec<_> = fs::read_dir(&output_dir)
         .map_err(|e| format!("Failed to read {}: {}", output_dir.display(), e))?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "uppkg"))
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "uppkg"))
         .collect();
 
     if packages.is_empty() {
@@ -1036,6 +1068,15 @@ spec:
 
         let without_skip = build_configuration_yaml("cfg", "ghcr.io/hops-ops/x:v1", false);
         assert!(!without_skip.contains("skipDependencyResolution: true"));
+    }
+
+    #[test]
+    fn local_registry_wiring_skips_foreign_context_without_backend_flag() {
+        assert!(!backend::should_wire_local_registry(
+            None,
+            Some("kind-hops"),
+            Backend::Colima
+        ));
     }
 
     #[test]

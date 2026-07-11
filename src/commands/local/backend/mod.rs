@@ -5,12 +5,14 @@
 //! shaped lives outside this module and is backend-agnostic.
 
 mod colima;
+mod dory;
 mod kind;
 
-use super::{local_state_dir, run_cmd_output};
+use super::{local_state_dir, run_cmd_output, HOPS_KUBE_CONTEXT_ENV};
 use clap::Args;
 use std::error::Error;
 use std::fmt;
+use std::process::Command;
 use std::str::FromStr;
 
 /// Sizing flags for backends with a resizable VM.
@@ -61,6 +63,8 @@ pub enum Backend {
     /// docker containers as nodes; works on any docker daemon
     /// (Docker Desktop, colima, dory, CI runners)
     Kind,
+    /// k3s on dory's shared-VM engine, via the `dory` CLI
+    Dory,
 }
 
 impl Backend {
@@ -69,6 +73,7 @@ impl Backend {
         match self {
             Backend::Colima => "colima",
             Backend::Kind => "kind",
+            Backend::Dory => "dory",
         }
     }
 
@@ -77,6 +82,7 @@ impl Backend {
         match self {
             Backend::Colima => "colima",
             Backend::Kind => "kind-hops",
+            Backend::Dory => "dory",
         }
     }
 
@@ -84,6 +90,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::install(),
             Backend::Kind => kind::install(),
+            Backend::Dory => dory::install(),
         }
     }
 
@@ -91,6 +98,16 @@ impl Backend {
         match self {
             Backend::Colima => colima::uninstall(),
             Backend::Kind => kind::uninstall(),
+            Backend::Dory => dory::uninstall(),
+        }
+    }
+
+    /// Whether this backend's local cluster/VM exists, running or stopped.
+    pub fn cluster_exists(self) -> bool {
+        match self {
+            Backend::Colima => colima::instance_exists(),
+            Backend::Kind => kind::cluster_exists(),
+            Backend::Dory => dory::cluster_exists(),
         }
     }
 
@@ -100,6 +117,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::start(size, assume_yes),
             Backend::Kind => kind::start(size),
+            Backend::Dory => dory::start(size),
         }
     }
 
@@ -107,6 +125,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::stop(),
             Backend::Kind => kind::stop(),
+            Backend::Dory => dory::stop(),
         }
     }
 
@@ -114,6 +133,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::destroy(),
             Backend::Kind => kind::destroy(),
+            Backend::Dory => dory::destroy(),
         }
     }
 
@@ -121,6 +141,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::reset(),
             Backend::Kind => kind::reset(),
+            Backend::Dory => dory::reset(),
         }
     }
 
@@ -128,6 +149,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::resize(size),
             Backend::Kind => kind::resize(size),
+            Backend::Dory => dory::resize(size),
         }
     }
 
@@ -139,6 +161,9 @@ impl Backend {
             // containerd trust is per-name via certs.d, written in
             // wire_registry once the registry Service's ClusterIP is known.
             Backend::Kind => Ok(()),
+            // trust is static registries.yaml, written by dory::start before
+            // the cluster boots (k3s reads it at boot).
+            Backend::Dory => Ok(()),
         }
     }
 
@@ -149,6 +174,7 @@ impl Backend {
         match self {
             Backend::Colima => colima::sync_hosts_entry(cluster_ip),
             Backend::Kind => kind::wire_registry(cluster_ip),
+            Backend::Dory => dory::wire_registry(cluster_ip),
         }
     }
 }
@@ -166,8 +192,9 @@ impl FromStr for Backend {
         match s.trim() {
             "colima" => Ok(Backend::Colima),
             "kind" => Ok(Backend::Kind),
+            "dory" => Ok(Backend::Dory),
             other => Err(format!(
-                "unknown backend '{}' (expected colima or kind)",
+                "unknown backend '{}' (expected colima, kind, or dory)",
                 other
             )),
         }
@@ -175,6 +202,14 @@ impl FromStr for Backend {
 }
 
 const BACKEND_FILE: &str = "backend";
+
+pub fn platform_default() -> Backend {
+    if cfg!(target_os = "macos") {
+        Backend::Colima
+    } else {
+        Backend::Kind
+    }
+}
 
 /// Resolve which backend to operate on: explicit flag > preference persisted
 /// by the last successful start > detection of an existing cluster (colima
@@ -185,8 +220,40 @@ pub fn resolve(flag: Option<Backend>) -> Backend {
         persisted(),
         colima::instance_exists,
         kind::cluster_exists,
-        cfg!(target_os = "macos"),
+        dory::cluster_exists,
+        platform_default() == Backend::Colima,
     )
+}
+
+/// Resolve the backend once and activate the kube-targeting environment for
+/// child kubectl/helm processes.
+pub fn activate(flag: Option<Backend>, context: Option<&str>) -> Backend {
+    let backend = resolve(flag);
+
+    if backend == Backend::Dory {
+        dory::export_kubeconfig_env();
+    }
+
+    let explicit_context = context.filter(|ctx| !ctx.is_empty());
+    let backend_context_exists = if explicit_context.is_none() {
+        kube_context_exists(backend.kube_context())
+    } else {
+        false
+    };
+
+    match kube_context_export(backend, explicit_context, backend_context_exists) {
+        KubeContextExport::Set(ctx) => std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx),
+        KubeContextExport::Unset { missing_context } => {
+            std::env::remove_var(HOPS_KUBE_CONTEXT_ENV);
+            log::warn!(
+                "Kubernetes context '{}' for backend '{}' was not found; using kubeconfig current-context. Pass --context to target a specific cluster.",
+                missing_context,
+                backend.name()
+            );
+        }
+    }
+
+    backend
 }
 
 fn resolve_from(
@@ -194,6 +261,7 @@ fn resolve_from(
     persisted: Option<Backend>,
     colima_detected: impl FnOnce() -> bool,
     kind_detected: impl FnOnce() -> bool,
+    dory_detected: impl FnOnce() -> bool,
     macos: bool,
 ) -> Backend {
     if let Some(backend) = flag {
@@ -207,6 +275,9 @@ fn resolve_from(
     }
     if kind_detected() {
         return Backend::Kind;
+    }
+    if dory_detected() {
+        return Backend::Dory;
     }
     if macos {
         Backend::Colima
@@ -265,6 +336,78 @@ pub fn wire_local_registry(backend: Backend) -> Result<(), Box<dyn Error>> {
     backend.wire_registry(&registry_cluster_ip()?)
 }
 
+pub fn should_wire_local_registry(
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
+    backend: Backend,
+) -> bool {
+    if backend_flag.is_some() {
+        return true;
+    }
+
+    match context.filter(|ctx| !ctx.is_empty()) {
+        Some(ctx) => ctx == backend.kube_context(),
+        None => true,
+    }
+}
+
+pub fn wire_local_registry_for_target(
+    backend: Backend,
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    if should_wire_local_registry(backend_flag, context, backend) {
+        return wire_local_registry(backend);
+    }
+
+    log::warn!(
+        "registry node wiring skipped: explicit --context does not match a selected backend"
+    );
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KubeContextExport<'a> {
+    Set(&'a str),
+    Unset { missing_context: &'static str },
+}
+
+fn kube_context_export<'a>(
+    backend: Backend,
+    explicit_context: Option<&'a str>,
+    backend_context_exists: bool,
+) -> KubeContextExport<'a> {
+    if let Some(ctx) = explicit_context {
+        return KubeContextExport::Set(ctx);
+    }
+
+    let backend_context = backend.kube_context();
+    if backend_context_exists {
+        KubeContextExport::Set(backend_context)
+    } else {
+        KubeContextExport::Unset {
+            missing_context: backend_context,
+        }
+    }
+}
+
+fn kube_context_exists(context: &str) -> bool {
+    let output = Command::new("kubectl")
+        .args(["config", "get-contexts", "-o", "name"])
+        .output();
+
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim() == context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +423,7 @@ mod tests {
             Some(Backend::Colima),
             || true,
             no_detect,
+            no_detect,
             true,
         );
 
@@ -288,21 +432,35 @@ mod tests {
 
     #[test]
     fn persisted_beats_detection() {
-        let resolved = resolve_from(None, Some(Backend::Kind), || true, no_detect, true);
+        let resolved = resolve_from(
+            None,
+            Some(Backend::Kind),
+            || true,
+            no_detect,
+            no_detect,
+            true,
+        );
 
         assert_eq!(resolved, Backend::Kind);
     }
 
     #[test]
     fn colima_detection_beats_kind_detection() {
-        let resolved = resolve_from(None, None, || true, || true, false);
+        let resolved = resolve_from(None, None, || true, || true, || true, false);
 
         assert_eq!(resolved, Backend::Colima);
     }
 
     #[test]
+    fn dory_detection_used_when_no_colima_or_kind() {
+        let resolved = resolve_from(None, None, no_detect, no_detect, || true, true);
+
+        assert_eq!(resolved, Backend::Dory);
+    }
+
+    #[test]
     fn kind_detection_used_when_no_colima() {
-        let resolved = resolve_from(None, None, no_detect, || true, true);
+        let resolved = resolve_from(None, None, no_detect, || true, no_detect, true);
 
         assert_eq!(resolved, Backend::Kind);
     }
@@ -310,20 +468,74 @@ mod tests {
     #[test]
     fn platform_default_when_nothing_detected() {
         assert_eq!(
-            resolve_from(None, None, no_detect, no_detect, true),
+            resolve_from(None, None, no_detect, no_detect, no_detect, true),
             Backend::Colima
         );
         assert_eq!(
-            resolve_from(None, None, no_detect, no_detect, false),
+            resolve_from(None, None, no_detect, no_detect, no_detect, false),
             Backend::Kind
         );
     }
 
     #[test]
     fn backend_name_round_trips_through_from_str() {
-        for backend in [Backend::Colima, Backend::Kind] {
+        for backend in [Backend::Colima, Backend::Kind, Backend::Dory] {
             assert_eq!(backend.name().parse::<Backend>().unwrap(), backend);
         }
-        assert!("dory".parse::<Backend>().is_err());
+        assert!("podman".parse::<Backend>().is_err());
+    }
+
+    #[test]
+    fn explicit_context_is_exported_even_when_backend_context_is_absent() {
+        assert_eq!(
+            kube_context_export(Backend::Colima, Some("foreign"), false),
+            KubeContextExport::Set("foreign")
+        );
+    }
+
+    #[test]
+    fn backend_context_is_exported_only_when_present() {
+        assert_eq!(
+            kube_context_export(Backend::Kind, None, true),
+            KubeContextExport::Set("kind-hops")
+        );
+        assert_eq!(
+            kube_context_export(Backend::Kind, None, false),
+            KubeContextExport::Unset {
+                missing_context: "kind-hops"
+            }
+        );
+    }
+
+    #[test]
+    fn registry_wiring_allowed_without_explicit_context() {
+        assert!(should_wire_local_registry(None, None, Backend::Colima));
+    }
+
+    #[test]
+    fn registry_wiring_skips_foreign_explicit_context_without_backend_flag() {
+        assert!(!should_wire_local_registry(
+            None,
+            Some("kind-hops"),
+            Backend::Colima
+        ));
+    }
+
+    #[test]
+    fn registry_wiring_allowed_when_context_matches_backend() {
+        assert!(should_wire_local_registry(
+            None,
+            Some("kind-hops"),
+            Backend::Kind
+        ));
+    }
+
+    #[test]
+    fn registry_wiring_allowed_when_backend_is_explicit() {
+        assert!(should_wire_local_registry(
+            Some(Backend::Colima),
+            Some("foreign"),
+            Backend::Colima
+        ));
     }
 }
