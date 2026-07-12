@@ -76,10 +76,12 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
     // scheduling can exceed helm's single wait window, and a failed --wait
     // leaves us without structured kubectl diagnostics. Apply the chart, then
     // poll deployments ourselves with a longer budget + failure dumps.
+    //
+    // After stop/start the k3s API can report nodes Ready while openapi/v2 is
+    // still timing out (helm validate fails). Retry helm with API re-probes.
     log::info!("Installing Crossplane...");
-    run_cmd(
-        "helm",
-        &[
+    {
+        let helm_args = [
             "upgrade",
             "--install",
             "crossplane",
@@ -89,8 +91,26 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
             "--create-namespace",
             "--timeout",
             "5m",
-        ],
-    )?;
+        ];
+        let mut last_err: Option<Box<dyn Error>> = None;
+        for attempt in 1..=6 {
+            wait_for_kubernetes()?;
+            match run_cmd("helm", &helm_args) {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("helm install attempt {attempt}/6 failed: {e}");
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
 
     // 6. Wait for Crossplane core deployment.
     // rbac-manager can flap under nested-virt resource pressure; the core

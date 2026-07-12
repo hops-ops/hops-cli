@@ -238,8 +238,12 @@ jobs:
       - name: Stop/start resume path (uses persisted backend, no flag)
         run: |
           set -euxo pipefail
-          export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
+          export DOCKER_HOST="${DOCKER_HOST:-unix://$HOME/.dory/engine.sock}"
+          export DORY_ENGINE_SOCK="${DORY_ENGINE_SOCK:-$HOME/.dory/engine.sock}"
           ./target/debug/hops-cli local stop
+          # After docker stop/start of dory-k8s, give the apiserver a beat before
+          # hops re-runs helm (openapi can time out immediately after node Ready).
+          sleep 20
           ./target/debug/hops-cli local start
           if ! kubectl --context dory -n crossplane-system wait \
               --for=condition=Available deployment/crossplane deployment/registry \
