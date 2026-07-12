@@ -48,8 +48,8 @@ fn dory_smoke_workflow_clone_build_install_contract() {
         "must not use brew cask as primary install"
     );
     assert!(
-        text.contains("workflow_dispatch"),
-        "spike remains dispatch-oriented until public GHA engine boot is proven"
+        text.contains("workflow_dispatch") && text.contains("pull_request:"),
+        "must support pull_request (PR-branch runs) and workflow_dispatch"
     );
     assert!(
         text.lines().any(|l| l.trim() == "runs-on: macos-15"),

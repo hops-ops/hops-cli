@@ -28,11 +28,11 @@ name: dory backend smoke
 # rbac-manager, kubectl apply retries) — same hardness as colima smoke.
 
 on:
+  # PR trigger so the workflow runs from the PR branch (workflow_dispatch only
+  # works once the file exists on the default branch). Remains non-required /
+  # non-blocking until public GHA engine boot is proven green.
+  pull_request:
   workflow_dispatch:
-  # Non-required until a green public-GHA engine boot is proven. Branch
-  # filter matches kind smoke once this is promoted.
-  # pull_request:
-  #   branches: [main]
 
 jobs:
   dory-smoke:
