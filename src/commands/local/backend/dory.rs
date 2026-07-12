@@ -329,11 +329,16 @@ fn run_dory_enable(recreate: bool) -> Result<(), Box<dyn Error>> {
     let args = dory_enable_args(recreate);
     match run_cmd("dory", &args) {
         Ok(()) => hold_through_engine_launch_window(),
-        Err(err) if !recreate && err.to_string().contains("exit status: 3") => Err(format!(
-            "{}\nhint: run `hops local reset --backend dory` to recreate the dory cluster and apply create-time config drift",
-            err
-        )
-        .into()),
+        // Exit 3 = create-time config drift (ports / registries bind). hops just
+        // wrote the desired ports+registries files; applying them requires
+        // recreate. Auto-retry once so `local start` is not a dead end after
+        // hops updates publish config (reset remains available explicitly).
+        Err(err) if !recreate && err.to_string().contains("exit status: 3") => {
+            log::warn!(
+                "dory k8s enable reported create-time config drift; recreating cluster to apply ports/registry config..."
+            );
+            run_dory_enable(true)
+        }
         Err(err) => Err(err),
     }
 }

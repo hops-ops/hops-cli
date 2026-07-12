@@ -104,30 +104,31 @@ jobs:
           test -d "$DORY_APP"
           mkdir -p "$HOME/.dory"
 
-          # --- try native app path first (best-effort; often fails on public GHA) ---
-          open "$DORY_APP" || true
-          for i in $(seq 1 24); do
-            if [ -S "$HOME/.dory/engine.sock" ]; then
-              echo "native engine.sock ready after ${i} attempts"
-              ls -la "$HOME/.dory"
-              echo "DORY_ENGINE_SOURCE=native" >> "$GITHUB_ENV"
-              exit 0
-            fi
-            # Confirm process still alive periodically.
-            if [ $((i % 6)) -eq 0 ]; then
-              pgrep -lf 'Dory.app/Contents/MacOS/Dory' || echo "Dory process not running"
-            fi
-            sleep 5
-          done
-          echo "native engine.sock absent after ~2m; bootstrapping Colima docker as engine.sock"
-          pkill -f 'Dory.app/Contents/MacOS/Dory' || true
-          ls -la "$HOME/.dory" || true
+          ARCH="$(uname -m)"
+          # dory-hv requires Apple silicon; Intel hosts never produce a native sock.
+          # Public GHA arm also cannot nested-virt the engine (dory CI docs). Try
+          # native only briefly on arm; always fall through to Colima if missing.
+          if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "arm64e" ]; then
+            open "$DORY_APP" || true
+            for i in $(seq 1 12); do
+              if [ -S "$HOME/.dory/engine.sock" ]; then
+                echo "native engine.sock ready after ${i} attempts"
+                ls -la "$HOME/.dory"
+                echo "DORY_ENGINE_SOURCE=native" >> "$GITHUB_ENV"
+                exit 0
+              fi
+              sleep 5
+            done
+            pkill -f 'Dory.app/Contents/MacOS/Dory' || true
+            echo "native engine.sock absent; bootstrapping Colima docker as engine.sock"
+          else
+            echo "host arch $ARCH: native dory-hv unsupported; Colima surrogate"
+          fi
 
           # --- Colima-backed engine.sock (public GHA nested virt for docker) ---
           # Sizing fits macos-15-intel (~4 CPU / ~14 GiB). Disk 40 for registry PVC
           # when hops later creates the 20Gi registry volume inside k3s-on-docker.
           colima start --runtime docker --cpu 3 --memory 8 --disk 40
-          # Resolve docker.sock path across colima layouts.
           DOCKER_SOCK=""
           for candidate in \
             "$HOME/.colima/default/docker.sock" \
@@ -146,12 +147,17 @@ jobs:
             ls -la "$HOME/.colima/default" || true
             exit 1
           fi
+          # Prefer real path via env (dory's dk() uses DORY_ENGINE_SOCK) and
+          # keep symlink so hops preflight (`~/.dory/engine.sock`) passes.
           ln -sfn "$DOCKER_SOCK" "$HOME/.dory/engine.sock"
-          # hops/dory may also look at dory.sock; point both at the same daemon.
           ln -sfn "$DOCKER_SOCK" "$HOME/.dory/dory.sock"
-          test -S "$HOME/.dory/engine.sock"
-          export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
+          test -S "$HOME/.dory/engine.sock" || test -e "$HOME/.dory/engine.sock"
+          echo "DORY_ENGINE_SOCK=$DOCKER_SOCK" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST=unix://$DOCKER_SOCK" >> "$GITHUB_ENV"
+          export DORY_ENGINE_SOCK="$DOCKER_SOCK"
+          export DOCKER_HOST="unix://$DOCKER_SOCK"
           docker info >/dev/null
+          docker ps -a || true
           echo "engine.sock → $DOCKER_SOCK (colima surrogate)"
           ls -la "$HOME/.dory"
           echo "DORY_ENGINE_SOURCE=colima-surrogate" >> "$GITHUB_ENV"
@@ -173,7 +179,11 @@ jobs:
       - name: hops local start --backend dory
         run: |
           set -euxo pipefail
-          export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
+          export DOCKER_HOST="${DOCKER_HOST:-unix://$HOME/.dory/engine.sock}"
+          export DORY_ENGINE_SOCK="${DORY_ENGINE_SOCK:-$HOME/.dory/engine.sock}"
+          # Clean slate: partial dory-k8s can report create-time drift (exit 3).
+          dory k8s disable || true
+          docker ps -a || true
           ./target/debug/hops-cli local start --backend dory
 
       - name: hops local doctor
