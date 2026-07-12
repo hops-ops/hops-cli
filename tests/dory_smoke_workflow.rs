@@ -75,4 +75,47 @@ fn dory_smoke_workflow_kind_parity_when_engine_boots() {
             "dory smoke missing kind-parity fragment: {needle}"
         );
     }
+    // stop/start resume: start without --backend after stop
+    assert!(
+        text.contains("local start\n")
+            || text
+                .lines()
+                .any(|l| l.trim() == "./target/debug/hops-cli local start"),
+        "must start again without --backend after stop"
+    );
+}
+
+#[test]
+fn dory_smoke_workflow_carries_colima_lessons() {
+    let text = workflow_text();
+    // Nested-virt settle before registry pods (CoreDNS/node Ready).
+    assert!(
+        text.contains("kube-dns") || text.contains("coredns"),
+        "must wait for CoreDNS/kube-dns before registry round-trip"
+    );
+    // Smoke Ready timeout must outlast CNI lag under nested virt (colima: 420s).
+    assert!(
+        text.contains("--timeout=420s"),
+        "must use a long Ready/Available timeout for nested-virt lag"
+    );
+    // Resume recovery when container IDs churn after stop/start.
+    assert!(
+        text.contains("rollout restart"),
+        "stop/start resume must rollout-restart stalled deployments"
+    );
+    // Failure dump before destroy — smoke pods + dory state.
+    assert!(
+        text.contains("Debug dump on failure") && text.contains("engine.sock"),
+        "failure dump must capture dory/engine diagnostics"
+    );
+    assert!(
+        text.contains("describe pod smoke-svc-name")
+            || text.contains("describe pod smoke-svc-name smoke-localhost"),
+        "failure dump must describe smoke pods in default ns"
+    );
+    // Prefer localhost registry, not raw VM IP (macOS 15 privacy).
+    assert!(
+        text.to_lowercase().contains("localhost:30500"),
+        "must exercise localhost:30500 registry path"
+    );
 }

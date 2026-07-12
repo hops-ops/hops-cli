@@ -10,13 +10,22 @@ name: dory backend smoke
 # 3. Put scripts/dory on PATH
 # 4. Launch Dory.app; wait for ~/.dory/engine.sock before hops start
 #
-# Runner constraints:
+# Runner constraints (lessons from colima macOS smoke on public GHA):
 # - Prefer explicit arm64 macOS (macos-15) for Dory's native engine path.
 #   Intel often proxies to external Docker and may not produce engine.sock.
-# - GHA arm64 macOS historically lacks nested virt; engine boot may fail.
-#   That is an allowed spike outcome — do not make this a required check
-#   while red for platform reasons.
+# - GHA arm64 macOS historically lacks nested virt; engine boot may fail
+#   (same HV_UNSUPPORTED class as Colima on arm). Allowed spike outcome —
+#   do not make this a required check while red for platform reasons.
 # - Do not use bare macos-latest alone without documenting the resolved arch.
+# - Prefer localhost:30500 for registry traffic (macOS 15 Local Network Privacy
+#   can block non-root VM-IP access).
+# - After cold start, wait for CoreDNS/node Ready before registry pods: under
+#   nested-virt load, images can pull while CNI lags (ContainerCreating, no IP).
+# - Stop/start resume can leave pods in Error until kubelet recreates them —
+#   wait generously and rollout-restart if Available stalls.
+#
+# Shared hops start path must tolerate API overload (Established CRDs, soft
+# rbac-manager, kubectl apply retries) — same hardness as colima smoke.
 
 on:
   workflow_dispatch:
@@ -31,6 +40,7 @@ jobs:
     # Nested virt may still fail on public GHA — capture logs and keep
     # this job non-required / dispatch-oriented until green.
     runs-on: macos-15
+    # Build + engine provision + Crossplane cold pulls can exceed 30m.
     timeout-minutes: 90
     steps:
       - name: Checkout hops-cli
@@ -90,7 +100,7 @@ jobs:
           test -d "$DORY_APP"
           open "$DORY_APP"
           # Engine provisioning can take ~90s+; hops also holds, but preflight
-          # requires engine.sock before start.
+          # requires engine.sock before start. Nested virt may never produce it.
           for i in $(seq 1 120); do
             if [ -S "$HOME/.dory/engine.sock" ]; then
               echo "engine.sock ready after ${i} attempts"
@@ -101,12 +111,21 @@ jobs:
           done
           echo "engine.sock never appeared (spike may be blocked on public GHA nested virt / headless)" >&2
           ls -la "$HOME/.dory" || true
+          log show --predicate 'process == "Dory"' --last 5m 2>/dev/null | tail -80 || true
           exit 1
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Build hops
         run: cargo build
+
+      - name: Host resources (for diagnosis)
+        run: |
+          set -euxo pipefail
+          sysctl -n hw.ncpu || true
+          sysctl hw.memsize || true
+          uname -m
+          df -h / || true
 
       - name: hops local start --backend dory
         run: |
@@ -118,24 +137,56 @@ jobs:
       - name: hops local doctor
         run: ./target/debug/hops-cli local doctor
 
+      - name: Wait for node + CoreDNS (nested virt settles)
+        run: |
+          set -euxo pipefail
+          # Colima lesson: after cold start the control plane is soft — probes
+          # time out and new pods stick in ContainerCreating. Settle first.
+          kubectl --context dory wait --for=condition=Ready nodes --all --timeout=120s
+          kubectl --context dory -n kube-system wait --for=condition=Ready \
+            pod -l k8s-app=kube-dns --timeout=180s || \
+            kubectl --context dory -n kube-system wait --for=condition=Ready \
+              pod -l k8s-app=coredns --timeout=180s || true
+          kubectl --context dory -n kube-system get pods -o wide || true
+
       - name: Registry round-trip through both pull names
         run: |
           set -euxo pipefail
           export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
-          docker pull public.ecr.aws/docker/library/busybox:stable
+          # public.ecr.aws can rate-limit GHA (toomanyrequests) — retry briefly.
+          for attempt in 1 2 3 4 5; do
+            if docker pull public.ecr.aws/docker/library/busybox:stable; then
+              break
+            fi
+            echo "docker pull failed (attempt $attempt); sleeping..."
+            sleep $((attempt * 15))
+            if [ "$attempt" -eq 5 ]; then
+              exit 1
+            fi
+          done
           docker tag public.ecr.aws/docker/library/busybox:stable localhost:30500/smoke/busybox:ci
           docker push localhost:30500/smoke/busybox:ci
 
+          # Service-name pull: containerd resolves via its certs.d alias.
           kubectl --context dory run smoke-svc-name \
             --image=registry.crossplane-system.svc.cluster.local:5000/smoke/busybox:ci \
             --restart=Never --command -- sleep 300
 
+          # localhost:30500 pull: what provider runtime pods reference.
           kubectl --context dory run smoke-localhost \
             --image=localhost:30500/smoke/busybox:ci \
             --restart=Never --command -- sleep 300
 
-          kubectl --context dory wait --for=condition=Ready \
-            pod/smoke-svc-name pod/smoke-localhost --timeout=180s
+          # Nested virt: image pull can succeed while CNI/IP assignment lags.
+          if ! kubectl --context dory wait --for=condition=Ready \
+              pod/smoke-svc-name pod/smoke-localhost --timeout=420s; then
+            echo "==== smoke pods not Ready ===="
+            kubectl --context dory get pods smoke-svc-name smoke-localhost -o wide || true
+            kubectl --context dory describe pod smoke-svc-name smoke-localhost || true
+            kubectl --context dory get events -A --field-selector involvedObject.name=smoke-svc-name || true
+            kubectl --context dory get events -A --field-selector involvedObject.name=smoke-localhost || true
+            exit 1
+          fi
           kubectl --context dory delete pod smoke-svc-name smoke-localhost --wait=false
 
       - name: Stop/start resume path (uses persisted backend, no flag)
@@ -144,13 +195,52 @@ jobs:
           export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
           ./target/debug/hops-cli local stop
           ./target/debug/hops-cli local start
-          kubectl --context dory -n crossplane-system wait \
-            --for=condition=Available deployment/crossplane deployment/registry --timeout=300s
+          # After engine/VM stop/start, docker container IDs may churn and pods
+          # sit in Error until kubelet recreates them (colima lesson).
+          if ! kubectl --context dory -n crossplane-system wait \
+              --for=condition=Available deployment/crossplane deployment/registry \
+              --timeout=420s; then
+            echo "deployments not Available after resume; restarting..."
+            kubectl --context dory -n crossplane-system get pods -o wide || true
+            kubectl --context dory -n crossplane-system rollout restart \
+              deployment/crossplane deployment/crossplane-rbac-manager deployment/registry || true
+            kubectl --context dory -n crossplane-system wait \
+              --for=condition=Available deployment/crossplane deployment/registry \
+              --timeout=420s
+          fi
           ./target/debug/hops-cli local doctor
+
+      # Capture live state BEFORE destroy so failures are diagnosable.
+      - name: Debug dump on failure
+        if: failure()
+        run: |
+          set +e
+          echo "==== host ===="
+          sysctl -n hw.ncpu
+          sysctl hw.memsize
+          uname -m
+          df -h /
+          echo "==== dory ===="
+          ls -la "$HOME/.dory" || true
+          dory version || true
+          dory k8s status || true
+          export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
+          docker info 2>&1 | head -40 || true
+          echo "==== cluster ===="
+          kubectl --context dory get nodes,pods -A -o wide || true
+          echo "==== smoke pods (default) ===="
+          kubectl --context dory describe pod smoke-svc-name smoke-localhost 2>/dev/null || true
+          echo "==== crossplane-system ===="
+          kubectl --context dory describe pods -n crossplane-system || true
+          kubectl --context dory get events -A --sort-by=.lastTimestamp | tail -100 || true
+          ./target/debug/hops-cli local doctor || true
 
       - name: hops local destroy
         if: always()
-        run: ./target/debug/hops-cli local destroy || true
+        run: |
+          set +e
+          export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
+          ./target/debug/hops-cli local destroy || true
 
       - name: Teardown Dory
         if: always()
