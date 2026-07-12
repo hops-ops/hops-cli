@@ -1,0 +1,166 @@
+name: colima backend smoke
+
+# End-to-end check of `hops local` on the colima backend on macOS.
+# Mirrors on-pr-kind-smoke.yaml with --backend colima and kubectl --context colima.
+#
+# Runner constraints:
+# - Colima needs nested virtualization (Lima VM). Pin macos-15-intel — that
+#   image is known to support nested virt for Colima/Lima on GHA.
+# - Do NOT use bare macos-latest alone (tracks arm images; arm64 GHA macOS
+#   historically fails with HV_UNSUPPORTED for nested virt).
+# - Prefer localhost:30500 for registry traffic, not the Colima VM IP
+#   (macOS 15 Local Network Privacy can block non-root VM-IP access).
+#
+# Install: brew provides colima/docker/kubectl/helm only. Do not pre-start
+# colima here — hops local start --backend colima owns cluster bring-up.
+#
+# Sizing: hops defaults (8 CPU / 16 GiB / 60 GiB) exceed standard
+# macos-15-intel runners (~4 CPU / ~14 GiB). Pass explicit smaller sizes
+# so the VZ VM can allocate; stop/start resume uses the persisted profile.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  colima-smoke:
+    # Nested-virt-capable Intel pin (not bare macos-latest).
+    runs-on: macos-15-intel
+    # Nested virt + cold Crossplane pulls can take well over 30m.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install colima, docker, kubectl, helm
+        run: |
+          set -euxo pipefail
+          # Tools only — do not `colima start` here so the smoke exercises hops.
+          brew install colima docker kubectl helm
+          colima version
+          docker version --format '{{.Client.Version}}' || docker --version
+          kubectl version --client
+          helm version --short
+
+      - name: Build hops
+        run: cargo build
+
+      - name: Host resources (for sizing)
+        run: |
+          set -euxo pipefail
+          sysctl -n hw.ncpu
+          sysctl hw.memsize
+          df -h /
+
+      - name: hops local start --backend colima
+        run: |
+          set -euxo pipefail
+          # Fit macos-15-intel (~4 CPU / ~14 GiB RAM). Defaults (8/16/60) OOM VZ.
+          # Memory 10 (not 8): at 8Gi CoreDNS/metrics-server thrash and smoke pods
+          # sit in ContainerCreating without IPs even after images pull. Leave ~4Gi
+          # for host macOS + VZ. Disk 40: registry PVC requests 20Gi.
+          ./target/debug/hops-cli local start --backend colima \
+            --cpus 3 --memory 10 --disk 40
+
+      - name: hops local doctor
+        run: ./target/debug/hops-cli local doctor
+
+      - name: Wait for node + CoreDNS (nested virt settles)
+        run: |
+          set -euxo pipefail
+          # After cold start the control plane is still soft: probes time out and
+          # new pods stick in ContainerCreating. Wait for basics before registry.
+          kubectl --context colima wait --for=condition=Ready nodes --all --timeout=120s
+          kubectl --context colima -n kube-system wait --for=condition=Ready \
+            pod -l k8s-app=kube-dns --timeout=180s || \
+            kubectl --context colima -n kube-system wait --for=condition=Ready \
+              pod -l k8s-app=coredns --timeout=180s || true
+          kubectl --context colima -n kube-system get pods -o wide || true
+
+      - name: Registry round-trip through both pull names
+        run: |
+          set -euxo pipefail
+          docker pull public.ecr.aws/docker/library/busybox:stable
+          docker tag public.ecr.aws/docker/library/busybox:stable localhost:30500/smoke/busybox:ci
+          docker push localhost:30500/smoke/busybox:ci
+
+          # Service-name pull: containerd resolves via its certs.d alias.
+          kubectl --context colima run smoke-svc-name \
+            --image=registry.crossplane-system.svc.cluster.local:5000/smoke/busybox:ci \
+            --restart=Never --command -- sleep 300
+
+          # localhost:30500 pull: what provider runtime pods reference.
+          kubectl --context colima run smoke-localhost \
+            --image=localhost:30500/smoke/busybox:ci \
+            --restart=Never --command -- sleep 300
+
+          # Nested virt: image pull can succeed while CNI/IP assignment lags.
+          if ! kubectl --context colima wait --for=condition=Ready \
+              pod/smoke-svc-name pod/smoke-localhost --timeout=420s; then
+            echo "==== smoke pods not Ready ===="
+            kubectl --context colima get pods smoke-svc-name smoke-localhost -o wide || true
+            kubectl --context colima describe pod smoke-svc-name smoke-localhost || true
+            kubectl --context colima get events -A --field-selector involvedObject.name=smoke-svc-name || true
+            kubectl --context colima get events -A --field-selector involvedObject.name=smoke-localhost || true
+            exit 1
+          fi
+          kubectl --context colima delete pod smoke-svc-name smoke-localhost --wait=false
+
+      - name: Stop/start resume path (uses persisted backend, no flag)
+        run: |
+          set -euxo pipefail
+          ./target/debug/hops-cli local stop
+          ./target/debug/hops-cli local start
+          # After colima VM stop/start, docker container IDs are gone and pods
+          # often sit in Error until kubelet recreates them. Wait generously and
+          # force a rollout restart if Available still stalls.
+          if ! kubectl --context colima -n crossplane-system wait \
+              --for=condition=Available deployment/crossplane deployment/registry \
+              --timeout=420s; then
+            echo "deployments not Available after resume; restarting..."
+            kubectl --context colima -n crossplane-system get pods -o wide || true
+            kubectl --context colima -n crossplane-system rollout restart \
+              deployment/crossplane deployment/crossplane-rbac-manager deployment/registry || true
+            kubectl --context colima -n crossplane-system wait \
+              --for=condition=Available deployment/crossplane deployment/registry \
+              --timeout=420s
+          fi
+          ./target/debug/hops-cli local doctor
+
+      # Capture live cluster state BEFORE destroy so failures are diagnosable.
+      - name: Debug dump on failure
+        if: failure()
+        run: |
+          set +e
+          echo "==== host ===="
+          sysctl -n hw.ncpu
+          sysctl hw.memsize
+          df -h /
+          echo "==== colima ===="
+          colima status || true
+          colima list || true
+          echo "==== cluster ===="
+          kubectl --context colima get nodes,pods -A -o wide || true
+          echo "==== smoke pods (default) ===="
+          kubectl --context colima describe pod smoke-svc-name smoke-localhost 2>/dev/null || true
+          echo "==== crossplane-system ===="
+          kubectl --context colima describe pods -n crossplane-system || true
+          kubectl --context colima get events -A --sort-by=.lastTimestamp | tail -100 || true
+          echo "==== lima ha.stderr / serial ===="
+          for f in \
+            "$HOME/.colima/_lima/colima/ha.stderr.log" \
+            "$HOME/.colima/_lima/colima/ha.stdout.log" \
+            "$HOME/.colima/_lima/colima/serial.log" \
+            "$HOME/.colima/_lima/colima/serialv.log"
+          do
+            if [ -f "$f" ]; then
+              echo "----- $f -----"
+              tail -n 200 "$f" || true
+            fi
+          done
+          ./target/debug/hops-cli local doctor || true
+
+      - name: hops local destroy
+        if: always()
+        run: ./target/debug/hops-cli local destroy || true

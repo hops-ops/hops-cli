@@ -255,9 +255,14 @@ pub(crate) fn command_exists(program: &str) -> bool {
 /// Poll until the Kubernetes API server is reachable.
 pub(crate) fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
     log::info!("Waiting for Kubernetes API...");
-    for _ in 0..60 {
-        let result = run_cmd_output("kubectl", &["cluster-info"]);
+    // ~10 minutes — nested-virt apiserver can stay overloaded after package install.
+    for _ in 0..120 {
+        let result = run_cmd_output("kubectl", &["get", "--raw", "/readyz"]);
         if result.is_ok() {
+            return Ok(());
+        }
+        // Fall back to a cheap list if /readyz is denied on some setups.
+        if run_cmd_output("kubectl", &["get", "ns", "default"]).is_ok() {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_secs(5));
@@ -267,24 +272,54 @@ pub(crate) fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
 
 /// Pipe a YAML string into `kubectl apply -f -`.
 /// Automatically injects `--context` when configured.
+///
+/// Uses `--validate=false` so a slow/overloaded API server (common on nested
+/// virt CI while Crossplane is warming) does not fail the apply solely because
+/// OpenAPI schema download timed out. Retries a few times for transient
+/// connection errors.
 pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
-    let full = with_kube_context(&["apply", "-f", "-"]);
-    let mut child = Command::new("kubectl")
-        .args(&full)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+    let full = with_kube_context(&["apply", "--validate=false", "-f", "-"]);
+    let mut last_status = None;
+    // Nested-virt CI (colima/GHA) can lose the apiserver for minutes after
+    // Crossplane/provider install (TLS handshake timeouts). Retry with backoff
+    // and re-probe the API between attempts.
+    const ATTEMPTS: u32 = 12;
 
-    if let Some(ref mut stdin) = child.stdin {
-        stdin.write_all(yaml.as_bytes())?;
+    for attempt in 1..=ATTEMPTS {
+        let mut child = Command::new("kubectl")
+            .args(&full)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        if let Some(ref mut stdin) = child.stdin {
+            stdin.write_all(yaml.as_bytes())?;
+        }
+
+        let status = child.wait()?;
+        if status.success() {
+            return Ok(());
+        }
+        last_status = Some(status);
+        log::warn!(
+            "kubectl apply failed (attempt {}/{}, status {}); waiting for API...",
+            attempt,
+            ATTEMPTS,
+            status
+        );
+        // Best-effort API recovery before the next apply.
+        let _ = wait_for_kubernetes();
+        std::thread::sleep(std::time::Duration::from_secs(10));
     }
 
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("kubectl apply exited with {}", status).into());
-    }
-    Ok(())
+    Err(format!(
+        "kubectl apply exited with {} after retries",
+        last_status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    )
+    .into())
 }
 
 /// Apply a JSON merge patch with `kubectl patch --type merge`.
