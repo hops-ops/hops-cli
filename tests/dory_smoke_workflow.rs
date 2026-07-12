@@ -1,4 +1,4 @@
-//! Structural checks for the shipped dory macOS smoke (spike) workflow.
+//! Structural checks for the shipped dory macOS smoke workflow.
 //!
 //! Drives the real `.github/workflows/on-pr-dory-smoke.yaml` so the clone+build
 //! install contract and kind-parity smoke steps cannot silently regress.
@@ -41,7 +41,7 @@ fn dory_smoke_workflow_clone_build_install_contract() {
     );
     assert!(
         text.contains("engine.sock"),
-        "must wait for ~/.dory/engine.sock before hops start"
+        "must ensure ~/.dory/engine.sock before hops start"
     );
     assert!(
         !text.contains("brew install --cask") && !text.contains("homebrew/cask"),
@@ -51,9 +51,11 @@ fn dory_smoke_workflow_clone_build_install_contract() {
         text.contains("workflow_dispatch") && text.contains("pull_request:"),
         "must support pull_request (PR-branch runs) and workflow_dispatch"
     );
+    // Nested-virt pin for Colima-backed engine.sock on public GHA.
     assert!(
-        text.lines().any(|l| l.trim() == "runs-on: macos-15"),
-        "must pin explicit macos-15 (not bare macos-latest alone)"
+        text.lines()
+            .any(|l| l.trim() == "runs-on: macos-15-intel"),
+        "must pin macos-15-intel for nested virt (not bare macos-latest alone)"
     );
 }
 
@@ -88,22 +90,18 @@ fn dory_smoke_workflow_kind_parity_when_engine_boots() {
 #[test]
 fn dory_smoke_workflow_carries_colima_lessons() {
     let text = workflow_text();
-    // Nested-virt settle before registry pods (CoreDNS/node Ready).
     assert!(
         text.contains("kube-dns") || text.contains("coredns"),
         "must wait for CoreDNS/kube-dns before registry round-trip"
     );
-    // Smoke Ready timeout must outlast CNI lag under nested virt (colima: 420s).
     assert!(
         text.contains("--timeout=420s"),
         "must use a long Ready/Available timeout for nested-virt lag"
     );
-    // Resume recovery when container IDs churn after stop/start.
     assert!(
         text.contains("rollout restart"),
         "stop/start resume must rollout-restart stalled deployments"
     );
-    // Failure dump before destroy — smoke pods + dory state.
     assert!(
         text.contains("Debug dump on failure") && text.contains("engine.sock"),
         "failure dump must capture dory/engine diagnostics"
@@ -113,9 +111,29 @@ fn dory_smoke_workflow_carries_colima_lessons() {
             || text.contains("describe pod smoke-svc-name smoke-localhost"),
         "failure dump must describe smoke pods in default ns"
     );
-    // Prefer localhost registry, not raw VM IP (macOS 15 privacy).
     assert!(
         text.to_lowercase().contains("localhost:30500"),
         "must exercise localhost:30500 registry path"
+    );
+}
+
+#[test]
+fn dory_smoke_workflow_public_gha_engine_fallback() {
+    let text = workflow_text();
+    // Public GHA cannot run dory-hv; workflow must document and implement a
+    // Colima-backed engine.sock so hops --backend dory remains testable.
+    assert!(
+        text.contains("colima start") && text.contains("engine.sock"),
+        "must bootstrap Colima docker as engine.sock when native sock is absent"
+    );
+    assert!(
+        text.to_lowercase().contains("surrogate")
+            || text.contains("colima-surrogate")
+            || text.contains("Colima-backed"),
+        "must document Colima engine.sock surrogate for public GHA"
+    );
+    assert!(
+        text.contains("xattr") || text.contains("codesign"),
+        "must clear quarantine/sign Debug Dory.app before open"
     );
 }

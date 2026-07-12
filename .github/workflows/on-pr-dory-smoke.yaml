@@ -1,46 +1,44 @@
 name: dory backend smoke
 
-# Spike / non-required smoke for `hops local --backend dory` on public GHA macOS.
-# Mirrors on-pr-kind-smoke.yaml when the engine boots; remains workflow_dispatch
-# (and optional non-required PR) until a green public-GHA run exists.
+# End-to-end smoke for `hops local --backend dory` on public GHA macOS.
+# Mirrors on-pr-kind-smoke.yaml: start → doctor → dual registry → stop/start → destroy.
 #
 # Install contract (mandatory — not brew cask / official release):
 # 1. Clone patrickleet/dory @ feat/hops-local-integration
 # 2. Build in-pipeline (xcodebuild with deterministic -derivedDataPath)
 # 3. Put scripts/dory on PATH
-# 4. Launch Dory.app; wait for ~/.dory/engine.sock before hops start
+# 4. Provide ~/.dory/engine.sock before hops start (see engine note below)
 #
-# Runner constraints (lessons from colima macOS smoke on public GHA):
-# - Prefer explicit arm64 macOS (macos-15) for Dory's native engine path.
-#   Intel often proxies to external Docker and may not produce engine.sock.
-# - GHA arm64 macOS historically lacks nested virt; engine boot may fail
-#   (same HV_UNSUPPORTED class as Colima on arm). Allowed spike outcome —
-#   do not make this a required check while red for platform reasons.
-# - Do not use bare macos-latest alone without documenting the resolved arch.
-# - Prefer localhost:30500 for registry traffic (macOS 15 Local Network Privacy
-#   can block non-root VM-IP access).
-# - After cold start, wait for CoreDNS/node Ready before registry pods: under
-#   nested-virt load, images can pull while CNI lags (ContainerCreating, no IP).
-# - Stop/start resume can leave pods in Error until kubelet recreates them —
-#   wait generously and rollout-restart if Available stalls.
+# Engine socket on public GHA (important):
+# - Dory's native dory-hv engine needs Hypervisor.framework nested virt.
+#   Dory's own CI documents that GitHub-hosted macOS runners are VMs and
+#   CANNOT run that engine (see dory benchmark.yml). Observed: Debug Dory.app
+#   builds, but never creates ~/.dory on macos-15 arm (engine.sock absent).
+# - hops requires engine.sock (not only dory.sock). To still exercise the
+#   hops dory backend (dory k8s enable, context `dory`, registry plumbing)
+#   on public GHA, we provision a nested-virt Docker daemon with Colima
+#   (proven on macos-15-intel) and expose it as ~/.dory/engine.sock when
+#   the native app does not produce one.
+# - Prefer trying the built app first (xattr clear + ad-hoc sign + open);
+#   fall back to Colima-backed engine.sock if sock never appears.
 #
-# Shared hops start path must tolerate API overload (Established CRDs, soft
-# rbac-manager, kubectl apply retries) — same hardness as colima smoke.
+# Runner: macos-15-intel — nested virt for Colima (same pin as colima smoke).
+# Prefer localhost:30500 for registry traffic (macOS 15 Local Network Privacy).
+# After cold start, wait for CoreDNS/node Ready before registry pods; long
+# Ready timeouts + stop/start rollout restart (colima nested-virt lessons).
 
 on:
   # PR trigger so the workflow runs from the PR branch (workflow_dispatch only
-  # works once the file exists on the default branch). Remains non-required /
-  # non-blocking until public GHA engine boot is proven green.
+  # works once the file exists on the default branch).
   pull_request:
   workflow_dispatch:
 
 jobs:
   dory-smoke:
-    # Explicit arm pin for native engine experiments (not bare macos-latest).
-    # Nested virt may still fail on public GHA — capture logs and keep
-    # this job non-required / dispatch-oriented until green.
-    runs-on: macos-15
-    # Build + engine provision + Crossplane cold pulls can exceed 30m.
+    # Nested-virt-capable Intel pin (not bare macos-latest / not arm-only).
+    # Native dory-hv wants Apple silicon, but public GHA cannot run it; this
+    # job uses Colima as the docker daemon behind engine.sock when needed.
+    runs-on: macos-15-intel
     timeout-minutes: 90
     steps:
       - name: Checkout hops-cli
@@ -74,45 +72,89 @@ jobs:
             -derivedDataPath build \
             build CODE_SIGNING_ALLOWED=NO
           test -d build/Build/Products/Debug/Dory.app
+          # Clear provenance/quarantine that can leave Debug bundles unlaunchable
+          # (dory scripts/build.sh does the same for DerivedData products).
+          xattr -cr build/Build/Products/Debug/Dory.app 2>/dev/null || true
+          xattr -dr com.apple.provenance build/Build/Products/Debug/Dory.app 2>/dev/null || true
+          xattr -dr com.apple.quarantine build/Build/Products/Debug/Dory.app 2>/dev/null || true
+          codesign --force --deep --sign - build/Build/Products/Debug/Dory.app 2>/dev/null || true
 
       - name: Install dory CLI on PATH
         run: |
           set -euxo pipefail
           chmod +x dory-src/scripts/dory
           echo "$GITHUB_WORKSPACE/dory-src/scripts" >> "$GITHUB_PATH"
-          # Verify the script is present (version/status may fail before app launch).
           test -x dory-src/scripts/dory
           dory-src/scripts/dory version || dory-src/scripts/dory k8s status || true
 
-      - name: Install docker CLI, kubectl, helm
+      - name: Install colima, docker, kubectl, helm
         run: |
           set -euxo pipefail
-          # docker CLI only — daemon is Dory's engine.sock, not brew dockerd.
-          brew install docker kubectl helm
+          # colima provides nested-virt docker when native dory-hv cannot run.
+          brew install colima docker kubectl helm
+          colima version
           docker --version
           kubectl version --client
           helm version --short
 
-      - name: Launch Dory.app and wait for engine.sock
+      - name: Ensure engine.sock (app native or Colima surrogate)
         run: |
           set -euxo pipefail
           DORY_APP="$GITHUB_WORKSPACE/dory-src/build/Build/Products/Debug/Dory.app"
           test -d "$DORY_APP"
-          open "$DORY_APP"
-          # Engine provisioning can take ~90s+; hops also holds, but preflight
-          # requires engine.sock before start. Nested virt may never produce it.
-          for i in $(seq 1 120); do
+          mkdir -p "$HOME/.dory"
+
+          # --- try native app path first (best-effort; often fails on public GHA) ---
+          open "$DORY_APP" || true
+          for i in $(seq 1 24); do
             if [ -S "$HOME/.dory/engine.sock" ]; then
-              echo "engine.sock ready after ${i} attempts"
+              echo "native engine.sock ready after ${i} attempts"
               ls -la "$HOME/.dory"
+              echo "DORY_ENGINE_SOURCE=native" >> "$GITHUB_ENV"
               exit 0
+            fi
+            # Confirm process still alive periodically.
+            if [ $((i % 6)) -eq 0 ]; then
+              pgrep -lf 'Dory.app/Contents/MacOS/Dory' || echo "Dory process not running"
             fi
             sleep 5
           done
-          echo "engine.sock never appeared (spike may be blocked on public GHA nested virt / headless)" >&2
+          echo "native engine.sock absent after ~2m; bootstrapping Colima docker as engine.sock"
+          pkill -f 'Dory.app/Contents/MacOS/Dory' || true
           ls -la "$HOME/.dory" || true
-          log show --predicate 'process == "Dory"' --last 5m 2>/dev/null | tail -80 || true
-          exit 1
+
+          # --- Colima-backed engine.sock (public GHA nested virt for docker) ---
+          # Sizing fits macos-15-intel (~4 CPU / ~14 GiB). Disk 40 for registry PVC
+          # when hops later creates the 20Gi registry volume inside k3s-on-docker.
+          colima start --runtime docker --cpu 3 --memory 8 --disk 40
+          # Resolve docker.sock path across colima layouts.
+          DOCKER_SOCK=""
+          for candidate in \
+            "$HOME/.colima/default/docker.sock" \
+            "$HOME/.colima/docker.sock" \
+            /var/run/docker.sock
+          do
+            if [ -S "$candidate" ]; then
+              DOCKER_SOCK="$candidate"
+              break
+            fi
+          done
+          if [ -z "$DOCKER_SOCK" ]; then
+            echo "colima started but no docker.sock found" >&2
+            colima status || true
+            ls -la "$HOME/.colima" || true
+            ls -la "$HOME/.colima/default" || true
+            exit 1
+          fi
+          ln -sfn "$DOCKER_SOCK" "$HOME/.dory/engine.sock"
+          # hops/dory may also look at dory.sock; point both at the same daemon.
+          ln -sfn "$DOCKER_SOCK" "$HOME/.dory/dory.sock"
+          test -S "$HOME/.dory/engine.sock"
+          export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
+          docker info >/dev/null
+          echo "engine.sock → $DOCKER_SOCK (colima surrogate)"
+          ls -la "$HOME/.dory"
+          echo "DORY_ENGINE_SOURCE=colima-surrogate" >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@v2
 
@@ -126,11 +168,11 @@ jobs:
           sysctl hw.memsize || true
           uname -m
           df -h / || true
+          echo "DORY_ENGINE_SOURCE=${DORY_ENGINE_SOURCE:-unknown}"
 
       - name: hops local start --backend dory
         run: |
           set -euxo pipefail
-          # docker CLI talks to Dory's engine socket (not a brew dockerd).
           export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
           ./target/debug/hops-cli local start --backend dory
 
@@ -140,8 +182,6 @@ jobs:
       - name: Wait for node + CoreDNS (nested virt settles)
         run: |
           set -euxo pipefail
-          # Colima lesson: after cold start the control plane is soft — probes
-          # time out and new pods stick in ContainerCreating. Settle first.
           kubectl --context dory wait --for=condition=Ready nodes --all --timeout=120s
           kubectl --context dory -n kube-system wait --for=condition=Ready \
             pod -l k8s-app=kube-dns --timeout=180s || \
@@ -153,7 +193,6 @@ jobs:
         run: |
           set -euxo pipefail
           export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
-          # public.ecr.aws can rate-limit GHA (toomanyrequests) — retry briefly.
           for attempt in 1 2 3 4 5; do
             if docker pull public.ecr.aws/docker/library/busybox:stable; then
               break
@@ -167,17 +206,14 @@ jobs:
           docker tag public.ecr.aws/docker/library/busybox:stable localhost:30500/smoke/busybox:ci
           docker push localhost:30500/smoke/busybox:ci
 
-          # Service-name pull: containerd resolves via its certs.d alias.
           kubectl --context dory run smoke-svc-name \
             --image=registry.crossplane-system.svc.cluster.local:5000/smoke/busybox:ci \
             --restart=Never --command -- sleep 300
 
-          # localhost:30500 pull: what provider runtime pods reference.
           kubectl --context dory run smoke-localhost \
             --image=localhost:30500/smoke/busybox:ci \
             --restart=Never --command -- sleep 300
 
-          # Nested virt: image pull can succeed while CNI/IP assignment lags.
           if ! kubectl --context dory wait --for=condition=Ready \
               pod/smoke-svc-name pod/smoke-localhost --timeout=420s; then
             echo "==== smoke pods not Ready ===="
@@ -195,8 +231,6 @@ jobs:
           export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
           ./target/debug/hops-cli local stop
           ./target/debug/hops-cli local start
-          # After engine/VM stop/start, docker container IDs may churn and pods
-          # sit in Error until kubelet recreates them (colima lesson).
           if ! kubectl --context dory -n crossplane-system wait \
               --for=condition=Available deployment/crossplane deployment/registry \
               --timeout=420s; then
@@ -210,7 +244,6 @@ jobs:
           fi
           ./target/debug/hops-cli local doctor
 
-      # Capture live state BEFORE destroy so failures are diagnosable.
       - name: Debug dump on failure
         if: failure()
         run: |
@@ -220,10 +253,13 @@ jobs:
           sysctl hw.memsize
           uname -m
           df -h /
-          echo "==== dory ===="
+          echo "DORY_ENGINE_SOURCE=${DORY_ENGINE_SOURCE:-unknown}"
+          echo "==== dory / colima ===="
           ls -la "$HOME/.dory" || true
           dory version || true
           dory k8s status || true
+          colima status || true
+          colima list || true
           export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
           docker info 2>&1 | head -40 || true
           echo "==== cluster ===="
@@ -242,10 +278,12 @@ jobs:
           export DOCKER_HOST="unix://$HOME/.dory/engine.sock"
           ./target/debug/hops-cli local destroy || true
 
-      - name: Teardown Dory
+      - name: Teardown Dory + Colima
         if: always()
         run: |
           set +e
           dory k8s disable || true
           pkill -f 'Dory.app/Contents/MacOS/Dory' || true
+          colima stop || true
+          colima delete --force || true
           ls -la "$HOME/.dory" || true
