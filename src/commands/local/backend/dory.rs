@@ -329,13 +329,29 @@ fn run_dory_enable(recreate: bool) -> Result<(), Box<dyn Error>> {
     let args = dory_enable_args(recreate);
     match run_cmd("dory", &args) {
         Ok(()) => hold_through_engine_launch_window(),
-        Err(err) if !recreate && err.to_string().contains("exit status: 3") => Err(format!(
-            "{}\nhint: run `hops local reset --backend dory` to recreate the dory cluster and apply create-time config drift",
-            err
-        )
-        .into()),
+        // Exit 3 = create-time config drift (ports / registries bind). hops just
+        // wrote the desired ports+registries files; applying them requires
+        // recreate. Auto-retry once so `local start` is not a dead end after
+        // hops updates publish config (reset remains available explicitly).
+        //
+        // Exit 1 after "did not become Ready" is common on stop→start: docker
+        // start of the existing k3s container can leave the node stuck past
+        // dory's wait window. Recreate once (same as `dory k8s disable && enable`).
+        Err(err) if !recreate && should_recreate_on_enable_error(&err.to_string()) => {
+            log::warn!(
+                "dory k8s enable failed ({err}); recreating cluster once..."
+            );
+            let _ = run_cmd("dory", &["k8s", "disable"]);
+            run_dory_enable(true)
+        }
         Err(err) => Err(err),
     }
+}
+
+fn should_recreate_on_enable_error(msg: &str) -> bool {
+    // run_cmd only surfaces exit status (stderr is inherited), so match codes.
+    // 3 = create-time config drift; 1 = dory k8s_wait_ready / generic enable fail.
+    msg.contains("exit status: 3") || msg.contains("exit status: 1")
 }
 
 fn dory_enable_args(recreate: bool) -> Vec<&'static str> {
@@ -723,6 +739,20 @@ mod tests {
                 REGISTRY_PORT_PUBLISH
             ]
         );
+    }
+
+    #[test]
+    fn recreate_on_enable_matches_dory_exit_codes() {
+        assert!(should_recreate_on_enable_error(
+            "dory exited with exit status: 3"
+        ));
+        assert!(should_recreate_on_enable_error(
+            "dory exited with exit status: 1"
+        ));
+        assert!(!should_recreate_on_enable_error(
+            "dory exited with exit status: 2"
+        ));
+        assert!(!should_recreate_on_enable_error("connection refused"));
     }
 
     #[test]
