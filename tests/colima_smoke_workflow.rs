@@ -24,6 +24,15 @@ fn workflow_text() -> String {
 fn colima_smoke_workflow_exists_and_pins_nested_virt_runner() {
     let text = workflow_text();
     assert!(
+        text.contains("labeled") && text.contains("test-colima"),
+        "PR smoke must start only when opted in with the test-colima label"
+    );
+    assert!(
+        text.contains("github.event_name == 'workflow_dispatch'")
+            && text.contains("github.event.pull_request.labels.*.name"),
+        "manual dispatch must remain available while PR runs are label-gated"
+    );
+    assert!(
         text.contains("runs-on: macos-15-intel"),
         "must pin nested-virt-capable Intel runner"
     );

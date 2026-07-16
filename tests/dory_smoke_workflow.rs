@@ -51,6 +51,15 @@ fn dory_smoke_workflow_clone_build_install_contract() {
         text.contains("workflow_dispatch") && text.contains("pull_request:"),
         "must support pull_request (PR-branch runs) and workflow_dispatch"
     );
+    assert!(
+        text.contains("labeled") && text.contains("test-dory"),
+        "PR smoke must start only when opted in with the test-dory label"
+    );
+    assert!(
+        text.contains("github.event_name == 'workflow_dispatch'")
+            && text.contains("github.event.pull_request.labels.*.name"),
+        "manual dispatch must remain available while PR runs are label-gated"
+    );
     // Nested-virt pin for Colima-backed engine.sock on public GHA.
     assert!(
         text.lines()

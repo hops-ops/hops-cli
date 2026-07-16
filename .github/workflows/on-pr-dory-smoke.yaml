@@ -28,13 +28,17 @@ name: dory backend smoke
 # Ready timeouts + stop/start rollout restart (colima nested-virt lessons).
 
 on:
-  # PR trigger so the workflow runs from the PR branch (workflow_dispatch only
-  # works once the file exists on the default branch).
+  # Opt in with the test-dory label. Keep synchronize so later commits rerun
+  # while labeled; labeled starts the first run on an existing PR.
   pull_request:
+    types: [opened, reopened, synchronize, labeled]
   workflow_dispatch:
 
 jobs:
   dory-smoke:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'test-dory')
     # Nested-virt-capable Intel pin (not bare macos-latest / not arm-only).
     # Native dory-hv wants Apple silicon, but public GHA cannot run it; this
     # job uses Colima as the docker daemon behind engine.sock when needed.
