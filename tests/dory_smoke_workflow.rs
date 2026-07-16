@@ -36,6 +36,25 @@ fn dory_smoke_workflow_clone_build_install_contract() {
         "must build in-pipeline with deterministic derivedDataPath"
     );
     assert!(
+        text.contains("dtolnay/rust-toolchain") && text.contains("brew install protobuf"),
+        "must install the Rust and protoc prerequisites used by Dory's FFI builder"
+    );
+    let ffi_build = text
+        .find("scripts/build-dory-ffi-xcframework.sh --if-needed")
+        .expect("must materialize DoryFFI from a clean checkout");
+    let app_build = text
+        .find("xcodebuild -project Dory.xcodeproj")
+        .expect("must build the Dory app");
+    assert!(
+        ffi_build < app_build,
+        "must generate DoryFFI before SwiftPM resolves the Dory app"
+    );
+    assert!(
+        text.contains("DoryFFI.xcframework/macos-arm64_x86_64/libdory_ffi.a")
+            && text.contains("Sources/DoryCore/generated/dory_ffi.swift"),
+        "must verify both generated Dory FFI artifacts before xcodebuild"
+    );
+    assert!(
         text.contains("GITHUB_PATH") && text.contains("scripts"),
         "must put scripts/dory on PATH"
     );
