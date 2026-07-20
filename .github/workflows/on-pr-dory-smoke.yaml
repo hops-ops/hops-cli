@@ -63,12 +63,27 @@ jobs:
           echo "DEVELOPER_DIR=$newest/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$newest/Contents/Developer"
 
+      # Dory's rebased upstream builds its Swift package against a generated
+      # Rust UniFFI XCFramework. A clean checkout has no binary artifact, so
+      # raw xcodebuild cannot resolve DoryFFI until this preparation runs.
+      - name: Install Rust toolchain for Dory FFI
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install Dory FFI build prerequisites
+        run: brew install protobuf
+
       - name: Build Dory from source
         working-directory: dory-src
         run: |
           set -euxo pipefail
           # Match dory CI: Metal toolchain download can be flaky; best-effort.
           xcodebuild -downloadComponent MetalToolchain || true
+          # Match dory's scripts/build.sh + scripts/test.sh clean-checkout
+          # contract: materialize the ignored DoryFFI binary and generated
+          # Swift bindings before SwiftPM resolves the app dependencies.
+          scripts/build-dory-ffi-xcframework.sh --if-needed
+          test -f dory-core-swift/artifacts/DoryFFI.xcframework/macos-arm64_x86_64/libdory_ffi.a
+          test -f dory-core-swift/Sources/DoryCore/generated/dory_ffi.swift
           # Prefer deterministic product path via -derivedDataPath (not scripts/build.sh
           # alone, which may use a user-local DerivedData path).
           xcodebuild -project Dory.xcodeproj -scheme Dory \
