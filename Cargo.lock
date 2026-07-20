@@ -340,9 +340,9 @@ dependencies = [
 
 [[package]]
 name = "distributed_cli"
-version = "1.9.0"
+version = "3.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e606d031b6e0f4e3151212a715835dc1a036954bbfb5cb6e5c079f54389a1f"
+checksum = "af7a4fdbd3a54f46be005a1f2dc5c7c02b590bd5a16365ed9967e771699bc000"
 dependencies = [
  "clap",
  "serde",
