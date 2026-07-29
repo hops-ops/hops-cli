@@ -4,7 +4,7 @@ use crate::commands::local::package_install::{
     docker_arch, ensure_cached_repo_checkout, ensure_registry, image_config_name,
     parse_docker_push_digest, parse_repo_spec, resolve_repo_install_target, rewrite_registry,
     rewrite_registry_with_tag, sanitize_name_component, short_hash, split_ref, strip_registry,
-    unique_suffix, RepoInstallTarget, RepoSpec, REGISTRY_PULL, REGISTRY_PUSH,
+    unique_suffix, RepoInstallTarget, RepoSpec, registry_pull, REGISTRY_PUSH,
 };
 use crate::commands::local::{kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output};
 use clap::Args;
@@ -339,7 +339,7 @@ fn run_local_path(path: &str, skip_dependency_resolution: bool) -> Result<(), Bo
 
         if tag == arch {
             let digest = docker_push_and_get_digest(&push_ref)?;
-            let target_prefix = format!("{}/{}", REGISTRY_PULL, strip_registry(img_path));
+            let target_prefix = format!("{}/{}", registry_pull(), strip_registry(img_path));
             render_rewrites.insert(
                 img_path.to_string(),
                 RenderRewrite {
@@ -388,7 +388,7 @@ spec:
 
         let dev_tag = dev_tag_for_uppkg(&img.uppkg_path)?;
         let push_ref = rewrite_registry_with_tag(&img.source, REGISTRY_PUSH, &dev_tag);
-        let pull_ref = rewrite_registry_with_tag(&img.source, REGISTRY_PULL, &dev_tag);
+        let pull_ref = rewrite_registry_with_tag(&img.source, registry_pull(), &dev_tag);
         log::info!(
             "Using local build version '{}' for {}...",
             dev_tag,
@@ -969,7 +969,7 @@ fn delete_local_registry_config_revisions(config_name: &str) -> Result<(), Box<d
         if !rev_name.starts_with(config_name) {
             continue;
         }
-        if package.contains(REGISTRY_PULL) && state == "Inactive" {
+        if package.contains(registry_pull()) && state == "Inactive" {
             run_cmd(
                 "kubectl",
                 &[
@@ -1010,7 +1010,7 @@ fn delete_remote_registry_config_revisions(config_name: &str) -> Result<(), Box<
         if !rev_name.starts_with(config_name) {
             continue;
         }
-        if !package.contains(REGISTRY_PULL) && state == "Inactive" {
+        if !package.contains(registry_pull()) && state == "Inactive" {
             run_cmd(
                 "kubectl",
                 &[

@@ -222,13 +222,13 @@ hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
   daemon: Docker Desktop, colima's dockerd, or CI runners. No VM of its own,
   so sizing flags don't apply (size the docker daemon instead); requires
   kind >= v0.27.
-- **dory** — [dory](https://augani.github.io/dory)'s built-in k3s, driven
-  headlessly through the `dory` CLI (`dory k8s enable/disable/status`).
-  Requires the Dory app running (it provides the engine and forwards
-  published ports to localhost) and a `dory` CLI with headless k8s support.
-  hops writes `~/.dory/k8s/registries.yaml` (k3s' native registry trust) and
-  publishes the registry NodePort at cluster create. The VM is sized in the
-  Dory app, so hops sizing flags don't apply.
+- **dory** — [dory](https://augani.github.io/dory)'s product k3s on the shared
+  Apple Silicon engine, driven headlessly through `dory k8s enable/disable/status`.
+  Requires the Dory app (engine + localhost port forward) and a CLI with
+  scriptable k8s. Package installs use an **engine-side** `registry:2` container
+  (host push `localhost:30500`, cluster pull `host.dory.internal:30500`) — not
+  an in-cluster NodePort registry. The VM is sized in the Dory app, so hops
+  sizing flags don't apply.
 
 Select with the global `--backend` flag:
 
@@ -249,19 +249,23 @@ dory keeps its kubeconfig) to `KUBECONFIG` for its own kubectl/helm calls.
 
 #### Using dory
 
-With a `dory` CLI that supports `dory k8s enable` (headless Kubernetes),
-use the native backend:
+On Apple Silicon with Dory installed and the app running:
 
 ```bash
+# CLI with `dory k8s enable` (scriptable k8s surface)
 hops local start --backend dory
+kubectl --context dory get nodes
 ```
 
-For `hops provider install` / `hops config install` builds, point your docker
-CLI at dory's engine (`export DOCKER_HOST=unix://$HOME/.dory/engine.sock`) so
-image builds/pushes land on the daemon that reaches the registry.
+hops enables product k3s, installs Crossplane, and starts a package registry
+on Dory's docker engine. Point docker at that engine for source builds:
 
-Without the headless CLI, dory still exposes a real docker socket, so the
-kind backend works against it:
+```bash
+export DOCKER_HOST=unix://$HOME/.dory/engine.sock
+hops provider install …   # push localhost:30500; cluster pulls host.dory.internal:30500
+```
+
+Without scriptable k8s, use kind on Dory's docker socket instead:
 
 ```bash
 docker context use dory   # or: export DOCKER_HOST=unix://$HOME/.dory/dory.sock

@@ -161,22 +161,29 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
     wait_for_provider_healthy("crossplane-contrib-provider-kubernetes")?;
     wait_for_provider_healthy("crossplane-contrib-provider-helm")?;
 
-    // 12. Deploy local OCI registry for Crossplane packages
+    // 12. Local package registry bridge (backend-specific).
     //
-    // Provider install can leave the apiserver briefly unresponsive; re-wait
-    // and best-effort pre-pull registry:2 so the pod is not cold-started.
+    // colima/kind: in-cluster NodePort registry + node trust wiring.
+    // dory: engine docker registry + host.dory.internal mirrors (no NodePort).
     wait_for_kubernetes()?;
-    log::info!("Pre-pulling registry:2 (best effort)...");
-    let _ = run_cmd("docker", &["pull", "registry:2"]);
-    log::info!("Deploying local package registry...");
-    kubectl_apply_stdin(REGISTRY)?;
-    // Nested virt: image pull + schedule for the registry can exceed the
-    // default ~5m wait used for lighter resources.
-    wait_for_deployment_with_diagnostics("crossplane-system", "registry")?;
-
-    // 13. Point the node at the registry Service's ClusterIP so pulls of the
-    //     cluster-internal registry names resolve.
-    backend::wire_local_registry(backend)?;
+    match backend {
+        backend::Backend::Dory => {
+            log::info!("Ensuring dory engine package bridge...");
+            backend.ensure_package_registry()?;
+        }
+        backend::Backend::Colima | backend::Backend::Kind => {
+            log::info!("Pre-pulling registry:2 (best effort)...");
+            let _ = run_cmd("docker", &["pull", "registry:2"]);
+            log::info!("Deploying local package registry...");
+            kubectl_apply_stdin(REGISTRY)?;
+            // Nested virt: image pull + schedule for the registry can exceed the
+            // default ~5m wait used for lighter resources.
+            wait_for_deployment_with_diagnostics("crossplane-system", "registry")?;
+            // Point the node at the registry Service's ClusterIP so pulls of the
+            // cluster-internal registry names resolve.
+            backend::wire_local_registry(backend)?;
+        }
+    }
 
     log::info!("Local environment is ready");
     Ok(())

@@ -62,16 +62,38 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     );
 
     d.section("Registry");
-    let reg = deployment_available("crossplane-system", "registry");
-    d.check(
-        "local package registry Available",
-        reg,
-        if reg {
-            String::new()
-        } else {
-            "registry deployment not Available in crossplane-system".into()
-        },
-    );
+    match super::backend::resolve(None) {
+        super::backend::Backend::Dory => {
+            // Engine-side registry (not an in-cluster Deployment).
+            let ok = super::run_cmd_output(
+                "curl",
+                &["-sf", "http://127.0.0.1:30500/v2/"],
+            )
+            .is_ok();
+            d.check(
+                "engine package registry reachable (localhost:30500)",
+                ok,
+                if ok {
+                    String::new()
+                } else {
+                    "expected hops engine registry on localhost:30500 (host.dory.internal pull path)"
+                        .into()
+                },
+            );
+        }
+        _ => {
+            let reg = deployment_available("crossplane-system", "registry");
+            d.check(
+                "local package registry Available",
+                reg,
+                if reg {
+                    String::new()
+                } else {
+                    "registry deployment not Available in crossplane-system".into()
+                },
+            );
+        }
+    }
 
     d.print();
 

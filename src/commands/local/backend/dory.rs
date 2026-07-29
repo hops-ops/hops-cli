@@ -1,32 +1,33 @@
-//! dory backend: k3s in a container on dory's shared-VM dockerd
-//! (https://augani.github.io/dory), driven headlessly through the `dory` CLI
-//! (`dory k8s enable|disable|status`) and the engine docker socket.
+//! dory backend: product k3s in Dory's shared Apple Silicon engine
+//! (https://augani.github.io/dory), driven headlessly through `dory k8s
+//! enable|disable|status` and the engine docker socket.
 //!
-//! Registry plumbing differs from colima/kind because the cluster container
-//! has create-time config shared with the Dory app:
-//! - published NodePorts are static config: hops writes `~/.dory/k8s/ports`
-//!   BEFORE `dory k8s enable`, so GUI-side recreates keep the same port.
-//! - trust is static config: hops writes `~/.dory/k8s/registries.yaml`
-//!   BEFORE `dory k8s enable`; dory bind-mounts it and k3s reads it at boot,
-//!   aliasing both pull names to the registry Service hostname over HTTP.
-//! - name resolution is dynamic: `wire_registry` syncs the hostname ->
-//!   ClusterIP in the node container's /etc/hosts on every start (same
-//!   re-wire-on-start model as the other backends).
-//! - the host reaches `localhost:30500` because `dory k8s enable --publish
-//!   30500:30500` publishes the NodePort and the Dory app's port forwarder
-//!   maps published ports to host loopback.
+//! Design (first principles):
+//! - Dory owns the VM, dockerd, networking, and k3s lifecycle.
+//! - hops owns Crossplane + the package bridge.
+//! - Packages do **not** use an in-cluster NodePort registry (kind/colima
+//!   shape). Instead hops runs a normal `registry:2` container on the engine
+//!   and teaches k3s to pull via `host.dory.internal` (Dory's host path).
+//! - No hops-managed `~/.dory/k8s/ports` or registries files at cluster
+//!   create — create shape matches stock Dory (API on 6443 only).
 
 use super::SizeArgs;
-use crate::commands::local::package_install::{REGISTRY_HOSTNAME, REGISTRY_PULL, REGISTRY_PUSH};
 use crate::commands::local::{command_exists, run_cmd, run_cmd_output};
 use std::error::Error;
 use std::path::PathBuf;
 
 const NODE_CONTAINER: &str = "dory-k8s";
-/// hops' registry NodePort, published on the cluster container at create.
-const REGISTRY_PORT_PUBLISH: &str = "30500:30500";
-const REGISTRIES_BEGIN: &str = "# BEGIN hops-managed (do not edit inside)";
-const REGISTRIES_END: &str = "# END hops-managed";
+/// Engine-side package registry container (sibling of k3s, not in-cluster).
+const PACKAGE_REGISTRY_NAME: &str = "hops-local-registry";
+/// Host publish for `docker` / `crossplane xpkg` push (same port as other backends).
+const PACKAGE_REGISTRY_HOST_PORT: &str = "30500";
+/// How the k3s node (and pods that can resolve Dory host DNS) reach the engine registry.
+pub const PACKAGE_REGISTRY_PULL: &str = "host.dory.internal:30500";
+
+/// Seconds after the Dory app (re)creates its engine socket during which it is
+/// still provisioning. A dockerd restart at the end SIGTERMs containers —
+/// including a k3s node enabled in that window.
+const ENGINE_LAUNCH_WINDOW_SECS: u64 = 180;
 
 fn home() -> Result<PathBuf, Box<dyn Error>> {
     Ok(PathBuf::from(std::env::var("HOME").map_err(|_| {
@@ -40,68 +41,11 @@ fn engine_socket() -> Result<PathBuf, Box<dyn Error>> {
 
 /// dory's side-file kubeconfig (context name `dory`). Current dory also
 /// merges the context into ~/.kube/config at enable time; the side file is
-/// the pre-merge fallback and dory's own `--kubeconfig` input.
+/// the pre-merge fallback.
 pub fn kubeconfig_path() -> Option<String> {
     home()
         .ok()
         .map(|h| h.join(".kube/dory-config").to_string_lossy().into_owned())
-}
-
-fn registries_yaml_path() -> Result<PathBuf, Box<dyn Error>> {
-    Ok(home()?.join(".dory/k8s/registries.yaml"))
-}
-
-fn ports_file_path() -> Result<PathBuf, Box<dyn Error>> {
-    Ok(home()?.join(".dory/k8s/ports"))
-}
-
-/// k3s' native registry config: alias both pull names to the registry
-/// Service hostname over plain HTTP. The hostname resolves through the
-/// node's /etc/hosts, which `wire_registry` keeps pointed at the ClusterIP.
-fn registries_yaml() -> String {
-    format!(
-        "# Written by `hops local start --backend dory`.\n\
-         # k3s reads this at boot; edits require `hops local reset`.\n\
-         # Hops manages only the marked block; keep user mirrors outside it.\n\
-         mirrors:\n\
-         {block}",
-        block = registries_yaml_block(),
-    )
-}
-
-fn registries_yaml_block() -> String {
-    format!(
-        "  {begin}\n\
-         \x20\x20# hops: mirror {pull}\n\
-         \x20\x20\"{pull}\":\n\
-         \x20\x20  endpoint:\n\
-         \x20\x20    - \"http://{pull}\"\n\
-         \x20\x20# hops: mirror {push}\n\
-         \x20\x20\"{push}\":\n\
-         \x20\x20  endpoint:\n\
-         \x20\x20    - \"http://{pull}\"\n\
-         \x20\x20{end}\n",
-        begin = REGISTRIES_BEGIN,
-        end = REGISTRIES_END,
-        pull = REGISTRY_PULL,
-        push = REGISTRY_PUSH,
-    )
-}
-
-fn legacy_registries_yaml() -> String {
-    format!(
-        "# Written by `hops local start --backend dory`.\n\
-         # k3s reads this at boot; edits require `hops local reset`.\n\
-         mirrors:\n\
-         \x20 \"{pull}\":\n\
-         \x20   endpoint:\n\
-         \x20     - \"http://{pull}\"\n\
-         \x20 \"{push}\":\n\
-         \x20   endpoint:\n\
-         \x20     - \"http://{pull}\"\n",
-        pull = REGISTRY_PULL,
-        push = REGISTRY_PUSH,
-    )
 }
 
 /// Run docker against dory's engine socket (the daemon the Dory app manages).
@@ -143,13 +87,8 @@ pub fn start(size: &SizeArgs) -> Result<(), Box<dyn Error>> {
     }
 
     preflight()?;
-    write_ports_file()?;
-    write_registries_yaml()?;
-
-    // Creates, restarts, or reuses the dory-k8s container as needed. If the
-    // running container has create-time config drift, dory exits 3 rather than
-    // destroying state; surface that plus the hops reset path.
-    run_dory_enable(false)
+    run_dory_enable(false)?;
+    Ok(())
 }
 
 pub fn stop() -> Result<(), Box<dyn Error>> {
@@ -162,6 +101,8 @@ pub fn stop() -> Result<(), Box<dyn Error>> {
 pub fn destroy() -> Result<(), Box<dyn Error>> {
     log::info!("Deleting dory k8s cluster...");
     run_cmd("dory", &["k8s", "disable"])?;
+    // Best-effort: drop the package registry container with the cluster.
+    let _ = engine_docker(&["rm", "-f", PACKAGE_REGISTRY_NAME]);
     log::info!("dory cluster deleted");
     Ok(())
 }
@@ -170,8 +111,6 @@ pub fn destroy() -> Result<(), Box<dyn Error>> {
 pub fn reset() -> Result<(), Box<dyn Error>> {
     preflight()?;
     run_cmd("dory", &["k8s", "disable"])?;
-    write_ports_file()?;
-    write_registries_yaml()?;
     run_dory_enable(true)
 }
 
@@ -182,7 +121,6 @@ pub fn resize(_size: &SizeArgs) -> Result<(), Box<dyn Error>> {
 }
 
 /// Whether the hops-relevant dory cluster exists (running or stopped).
-/// Missing app/engine/CLI reads as "no cluster".
 pub fn cluster_exists() -> bool {
     let Ok(sock) = engine_socket() else {
         return false;
@@ -195,9 +133,22 @@ pub fn cluster_exists() -> bool {
 
 fn preflight() -> Result<(), Box<dyn Error>> {
     if !command_exists("dory") {
-        return Err("the `dory` CLI is not on PATH; link it from the dory repo \
+        return Err(
+            "the `dory` CLI is not on PATH; install Dory (`brew install --cask Augani/dory/dory`) \
+             or link a build that supports `dory k8s enable` \
              (`ln -sf <dory>/scripts/dory /opt/homebrew/bin/dory`)"
-            .into());
+                .into(),
+        );
+    }
+    // Require the headless lifecycle subcommand (stock cask without the scriptable
+    // k8s surface only offers kubectl passthrough).
+    if !dory_supports_k8s_enable() {
+        return Err(
+            "`dory k8s enable` is not available on this CLI. Install a Dory build with \
+             scriptable Kubernetes (feat/scriptable-k8s), or use `--backend kind` against \
+             Dory's docker socket."
+                .into(),
+        );
     }
     let sock = engine_socket()?;
     if !sock.exists() {
@@ -213,67 +164,29 @@ fn preflight() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Write the static registry trust config read by k3s at boot. Must exist
-/// before `dory k8s enable` because dory binds it at container create.
-fn write_registries_yaml() -> Result<(), Box<dyn Error>> {
-    let path = registries_yaml_path()?;
-    let current = match std::fs::read_to_string(&path) {
-        Ok(content) => Some(content),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err.into()),
-    };
-    let desired = merge_registries_yaml(current.as_deref())?;
-    if current.as_deref() == Some(desired.as_str()) {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    log::info!("Writing k3s registry config: {}", path.display());
-    std::fs::write(&path, desired)?;
-    Ok(())
+fn dory_supports_k8s_enable() -> bool {
+    // Stock cask `dory k8s` is kubectl-only; scriptable builds reject unknown
+    // enable flags with a dedicated usage line.
+    std::process::Command::new("dory")
+        .args(["k8s", "enable", "--__hops_probe__"])
+        .output()
+        .map(|o| {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            combined.contains("usage: dory k8s enable")
+        })
+        .unwrap_or(false)
 }
 
-fn write_ports_file() -> Result<(), Box<dyn Error>> {
-    let path = ports_file_path()?;
-    let current = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(err.into()),
-    };
-    let desired = ports_file_with_publish(&current);
-    if current == desired {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    log::info!(
-        "Ensuring dory k8s port config includes {}: {}",
-        REGISTRY_PORT_PUBLISH,
-        path.display()
-    );
-    std::fs::write(&path, desired)?;
-    Ok(())
-}
-
-/// Seconds after the Dory app (re)creates its engine socket during which it is
-/// still provisioning the engine. A dockerd restart at the end of that window
-/// SIGTERMs every container — including a k3s node enabled meanwhile, which
-/// reports Ready and then dies under the bootstrap (observed ~90s on Dory
-/// 0.2.0; padded for slower machines).
-const ENGINE_LAUNCH_WINDOW_SECS: u64 = 180;
-
-/// Age of the current engine session: the app recreates the engine socket at
-/// launch, so its mtime marks when provisioning began. None when unreadable.
 fn engine_session_age() -> Option<std::time::Duration> {
     let sock = engine_socket().ok()?;
     let modified = std::fs::metadata(&sock).ok()?.modified().ok()?;
     std::time::SystemTime::now().duration_since(modified).ok()
 }
 
-/// Time left inside the app's provisioning window for a given engine session
-/// age; None once the window has passed.
 fn launch_window_remaining(age: std::time::Duration) -> Option<std::time::Duration> {
     std::time::Duration::from_secs(ENGINE_LAUNCH_WINDOW_SECS)
         .checked_sub(age)
@@ -286,10 +199,7 @@ fn node_running() -> bool {
         .unwrap_or(false)
 }
 
-/// Hold a freshly-enabled cluster under observation while the Dory app may
-/// still be provisioning its engine, re-enabling if the engine restart takes
-/// the node down. Immediate no-op when the window has already passed, so
-/// steady-state starts pay one container inspect and nothing more.
+/// Hold a freshly-enabled cluster while the Dory app may still be provisioning.
 fn hold_through_engine_launch_window() -> Result<(), Box<dyn Error>> {
     let in_window = |age: Option<std::time::Duration>| {
         age.map(|a| launch_window_remaining(a).is_some())
@@ -317,8 +227,7 @@ fn hold_through_engine_launch_window() -> Result<(), Box<dyn Error>> {
                     "dory engine restart stopped the k8s node; re-enabling ({}/3)...",
                     reenables
                 );
-                let args = dory_enable_args(false);
-                run_cmd("dory", &args)?;
+                run_cmd("dory", &dory_enable_args(false))?;
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(3));
@@ -329,18 +238,9 @@ fn run_dory_enable(recreate: bool) -> Result<(), Box<dyn Error>> {
     let args = dory_enable_args(recreate);
     match run_cmd("dory", &args) {
         Ok(()) => hold_through_engine_launch_window(),
-        // Exit 3 = create-time config drift (ports / registries bind). hops just
-        // wrote the desired ports+registries files; applying them requires
-        // recreate. Auto-retry once so `local start` is not a dead end after
-        // hops updates publish config (reset remains available explicitly).
-        //
-        // Exit 1 after "did not become Ready" is common on stop→start: docker
-        // start of the existing k3s container can leave the node stuck past
-        // dory's wait window. Recreate once (same as `dory k8s disable && enable`).
+        // Exit 1 after "did not become Ready" is common on stop→start.
         Err(err) if !recreate && should_recreate_on_enable_error(&err.to_string()) => {
-            log::warn!(
-                "dory k8s enable failed ({err}); recreating cluster once..."
-            );
+            log::warn!("dory k8s enable failed ({err}); recreating cluster once...");
             let _ = run_cmd("dory", &["k8s", "disable"]);
             run_dory_enable(true)
         }
@@ -349,200 +249,180 @@ fn run_dory_enable(recreate: bool) -> Result<(), Box<dyn Error>> {
 }
 
 fn should_recreate_on_enable_error(msg: &str) -> bool {
-    // run_cmd only surfaces exit status (stderr is inherited), so match codes.
-    // 3 = create-time config drift; 1 = dory k8s_wait_ready / generic enable fail.
-    msg.contains("exit status: 3") || msg.contains("exit status: 1")
+    msg.contains("exit status: 1")
 }
 
 fn dory_enable_args(recreate: bool) -> Vec<&'static str> {
-    let mut args = vec!["k8s", "enable"];
     if recreate {
-        args.push("--recreate");
+        vec!["k8s", "enable", "--recreate"]
+    } else {
+        vec!["k8s", "enable"]
     }
-    args.extend(["--publish", REGISTRY_PORT_PUBLISH]);
-    args
 }
 
-fn merge_registries_yaml(existing: Option<&str>) -> Result<String, Box<dyn Error>> {
-    let Some(existing) = existing else {
-        return Ok(registries_yaml());
-    };
-    if existing.trim().is_empty() || existing == legacy_registries_yaml() {
-        return Ok(registries_yaml());
+/// No create-time registry trust on dory — the package bridge configures the
+/// running node after enable (see `ensure_package_bridge`).
+pub fn ensure_registry_trust() -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+/// In-cluster NodePort wiring is unused on dory.
+pub fn wire_registry(_cluster_ip: &str) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+/// Engine-side package registry + k3s mirror config for host.dory.internal.
+///
+/// Host pushes to `localhost:30500`; the node pulls via `host.dory.internal:30500`
+/// (Dory's container→host path). No in-cluster registry Deployment.
+pub fn ensure_package_bridge() -> Result<(), Box<dyn Error>> {
+    preflight_engine_only()?;
+    ensure_engine_registry()?;
+    ensure_k3s_registry_mirrors()?;
+    Ok(())
+}
+
+fn preflight_engine_only() -> Result<(), Box<dyn Error>> {
+    let sock = engine_socket()?;
+    if !sock.exists() {
+        return Err(format!(
+            "dory's engine socket ({}) is missing; launch the Dory app",
+            sock.display()
+        )
+        .into());
+    }
+    if !command_exists("docker") {
+        return Err("docker CLI not found".into());
+    }
+    Ok(())
+}
+
+fn ensure_engine_registry() -> Result<(), Box<dyn Error>> {
+    let running = engine_docker_output(&[
+        "inspect",
+        "-f",
+        "{{.State.Running}}",
+        PACKAGE_REGISTRY_NAME,
+    ])
+    .unwrap_or_default();
+    if running.trim() == "true" {
+        return Ok(());
     }
 
-    match (
-        existing.find(REGISTRIES_BEGIN),
-        existing.find(REGISTRIES_END),
-    ) {
-        (Some(begin), Some(end)) if begin <= end => replace_registries_block(existing, begin, end),
-        (Some(_), Some(_)) | (Some(_), None) | (None, Some(_)) => {
-            Err(format!("malformed dory registries.yaml managed block; expected `{REGISTRIES_BEGIN}` before `{REGISTRIES_END}`").into())
+    // Reuse a stopped container if present.
+    if engine_docker_output(&["inspect", "-f", "{{.Id}}", PACKAGE_REGISTRY_NAME]).is_ok() {
+        log::info!("Starting engine package registry '{}'...", PACKAGE_REGISTRY_NAME);
+        engine_docker(&["start", PACKAGE_REGISTRY_NAME])?;
+        return wait_registry_http();
+    }
+
+    log::info!(
+        "Creating engine package registry on localhost:{} (pull via {})...",
+        PACKAGE_REGISTRY_HOST_PORT,
+        PACKAGE_REGISTRY_PULL
+    );
+    let _ = engine_docker(&["pull", "registry:2"]);
+    engine_docker(&[
+        "run",
+        "-d",
+        "--restart",
+        "unless-stopped",
+        "--name",
+        PACKAGE_REGISTRY_NAME,
+        "-p",
+        &format!("{PACKAGE_REGISTRY_HOST_PORT}:5000"),
+        "registry:2",
+    ])?;
+    wait_registry_http()
+}
+
+fn wait_registry_http() -> Result<(), Box<dyn Error>> {
+    for _ in 0..30 {
+        if run_cmd_output(
+            "curl",
+            &[
+                "-sf",
+                &format!("http://127.0.0.1:{PACKAGE_REGISTRY_HOST_PORT}/v2/"),
+            ],
+        )
+        .is_ok()
+        {
+            return Ok(());
         }
-        (None, None) => insert_registries_block(existing),
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
+    Err(format!(
+        "timed out waiting for engine registry on localhost:{PACKAGE_REGISTRY_HOST_PORT}"
+    )
+    .into())
 }
 
-fn replace_registries_block(
-    existing: &str,
-    begin: usize,
-    end: usize,
-) -> Result<String, Box<dyn Error>> {
-    let line_start = existing[..begin].rfind('\n').map_or(0, |idx| idx + 1);
-    let line_end = existing[end..]
-        .find('\n')
-        .map_or(existing.len(), |idx| end + idx + 1);
-    let mut merged = String::with_capacity(existing.len() + registries_yaml_block().len());
-    merged.push_str(&existing[..line_start]);
-    merged.push_str(&registries_yaml_block());
-    merged.push_str(&existing[line_end..]);
-    Ok(merged)
-}
-
-fn insert_registries_block(existing: &str) -> Result<String, Box<dyn Error>> {
-    if contains_hops_mirror_key(existing) {
-        return Err("dory registries.yaml already contains hops registry mirror entries without managed markers; remove those entries or wrap them in the hops-managed block"
-            .into());
+/// Write k3s registries.yaml inside the node so containerd can pull HTTP from
+/// host.dory.internal (and treat localhost:30500 the same for runtime images
+/// that still reference REGISTRY_PUSH). Restarts the node container once.
+fn ensure_k3s_registry_mirrors() -> Result<(), Box<dyn Error>> {
+    if !node_running() {
+        return Err("dory k8s node is not running; run `hops local start --backend dory` first".into());
     }
 
-    let mut merged = ensure_trailing_newline(existing);
-    if let Some(insert_at) = mirrors_line_insert_position(&merged) {
-        merged.insert_str(insert_at, &registries_yaml_block());
-        return Ok(merged);
-    }
+    let yaml = format!(
+        "mirrors:\n\
+         \x20 \"{pull}\":\n\
+         \x20   endpoint:\n\
+         \x20     - \"http://{pull}\"\n\
+         \x20 \"localhost:{port}\":\n\
+         \x20   endpoint:\n\
+         \x20     - \"http://{pull}\"\n",
+        pull = PACKAGE_REGISTRY_PULL,
+        port = PACKAGE_REGISTRY_HOST_PORT,
+    );
 
-    merged.push_str("mirrors:\n");
-    merged.push_str(&registries_yaml_block());
-    Ok(merged)
-}
-
-fn contains_hops_mirror_key(content: &str) -> bool {
-    content.contains(&format!("\"{}\":", REGISTRY_PULL))
-        || content.contains(&format!("\"{}\":", REGISTRY_PUSH))
-}
-
-fn mirrors_line_insert_position(content: &str) -> Option<usize> {
-    let mut offset = 0;
-    for line in content.split_inclusive('\n') {
-        let without_newline = line.trim_end_matches('\n').trim_end_matches('\r');
-        if is_top_level_mirrors_line(without_newline) {
-            return Some(offset + line.len());
-        }
-        offset += line.len();
-    }
-    None
-}
-
-fn is_top_level_mirrors_line(line: &str) -> bool {
-    line.starts_with("mirrors:") && line.split('#').next().unwrap_or("").trim_end() == "mirrors:"
-}
-
-fn ensure_trailing_newline(content: &str) -> String {
-    let mut out = content.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct PortPublish {
-    host: u16,
-    container: u16,
-    proto: String,
-}
-
-fn ports_file_with_publish(existing: &str) -> String {
-    if ports_file_contains_publish(existing, REGISTRY_PORT_PUBLISH) {
-        return existing.to_string();
-    }
-
-    let mut out = ensure_trailing_newline(existing);
-    out.push_str(REGISTRY_PORT_PUBLISH);
-    out.push('\n');
-    out
-}
-
-fn ports_file_contains_publish(existing: &str, desired: &str) -> bool {
-    let Some(desired) = parse_port_publish(desired) else {
-        return false;
-    };
-    existing
-        .lines()
-        .filter_map(parse_port_publish)
-        .any(|port| port == desired)
-}
-
-fn parse_port_publish(line: &str) -> Option<PortPublish> {
-    let cleaned: String = line
-        .split('#')
-        .next()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    if cleaned.is_empty() {
-        return None;
-    }
-    let (ports, proto) = cleaned
-        .split_once('/')
-        .map_or((cleaned.as_str(), "tcp"), |(ports, proto)| (ports, proto));
-    if proto != "tcp" && proto != "udp" {
-        return None;
-    }
-    let (host, container) = ports.split_once(':')?;
-    let host = host.parse().ok().filter(|port| *port > 0)?;
-    let container = container.parse().ok().filter(|port| *port > 0)?;
-    Some(PortPublish {
-        host,
-        container,
-        proto: proto.to_string(),
-    })
-}
-
-/// Keep the node container's /etc/hosts pointing the registry hostname at
-/// the current ClusterIP (docker regenerates /etc/hosts on restart, and the
-/// ClusterIP changes if the Service is recreated — hence re-run per start).
-pub fn wire_registry(cluster_ip: &str) -> Result<(), Box<dyn Error>> {
-    let hostname = REGISTRY_HOSTNAME;
-    let current_ip = engine_docker_output(&[
+    let current = engine_docker_output(&[
         "exec",
         NODE_CONTAINER,
         "sh",
         "-c",
-        &format!("awk '$2 == \"{}\" {{print $1; exit}}' /etc/hosts", hostname),
+        "cat /etc/rancher/k3s/registries.yaml 2>/dev/null || true",
     ])
     .unwrap_or_default();
-    if current_ip.trim() == cluster_ip {
+    if current.trim() == yaml.trim() {
         return Ok(());
     }
 
-    log::info!("Updating node hosts entry: {} -> {}", hostname, cluster_ip);
-
-    // /etc/hosts is a bind mount inside the container: `sed -i` fails with
-    // "Resource busy" (rename over a mount point), so rewrite it in place.
+    log::info!(
+        "Configuring k3s registry mirrors for {} (engine package bridge)...",
+        PACKAGE_REGISTRY_PULL
+    );
+    // Write in-place inside the node (no create-time bind required).
     engine_docker(&[
         "exec",
         NODE_CONTAINER,
         "sh",
         "-c",
         &format!(
-            "awk '$2 != \"{host}\"' /etc/hosts > /tmp/hosts.new && \
-             cat /tmp/hosts.new > /etc/hosts && rm -f /tmp/hosts.new && \
-             echo '{ip} {host}' >> /etc/hosts",
-            host = hostname,
-            ip = cluster_ip
+            "mkdir -p /etc/rancher/k3s && cat > /etc/rancher/k3s/registries.yaml <<'EOF'\n{yaml}EOF"
         ),
     ])?;
-
-    Ok(())
+    log::info!("Restarting dory k8s node so k3s reloads registries.yaml...");
+    engine_docker(&["restart", NODE_CONTAINER])?;
+    // Wait for API again.
+    for _ in 0..90 {
+        if run_cmd_output(
+            "kubectl",
+            &["get", "--raw", "/readyz"],
+        )
+        .map(|s| s.trim() == "ok" || s.contains("ok"))
+        .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    Err("timed out waiting for dory k8s after registries reload".into())
 }
 
-/// Make `--context dory` resolvable. Current dory merges the context into
-/// ~/.kube/config at enable time, so normally there is nothing to do —
-/// mutating KUBECONFIG for every child process is then pure noise. Older
-/// dory versions only write the side file; for those, prepend it to
-/// KUBECONFIG (preserving whatever the user already has).
+/// Make `--context dory` resolvable. Current dory merges into ~/.kube/config;
+/// older builds only write the side file.
 pub fn export_kubeconfig_env() {
     if effective_kubeconfig_has_dory_context() {
         return;
@@ -565,9 +445,6 @@ pub fn export_kubeconfig_env() {
     std::env::set_var("KUBECONFIG", format!("{}:{}", dory_cfg, rest));
 }
 
-/// Whether the kubeconfig(s) kubectl will read without our help — the
-/// $KUBECONFIG chain when set, else ~/.kube/config — already define a
-/// `dory` entry (i.e. dory's kubectl-merge ran against a file in scope).
 fn effective_kubeconfig_has_dory_context() -> bool {
     let paths: Vec<PathBuf> = match std::env::var("KUBECONFIG") {
         Ok(chain) if !chain.is_empty() => chain.split(':').map(PathBuf::from).collect(),
@@ -583,10 +460,6 @@ fn effective_kubeconfig_has_dory_context() -> bool {
     })
 }
 
-/// Line-anchored scan for a kubeconfig entry named `dory` — the mapping
-/// form (`name: dory`, as kubectl writes context/cluster names) or the
-/// sequence-item form (`- name: dory`, the users list). `name: dory-prod`
-/// or `username: dory` must not count.
 fn has_dory_entry(kubeconfig: &str) -> bool {
     kubeconfig.lines().any(|line| {
         let trimmed = line.trim();
@@ -630,122 +503,16 @@ mod tests {
     }
 
     #[test]
-    fn registries_yaml_aliases_both_pull_names_to_the_service_over_http() {
-        let yaml = registries_yaml();
-
-        assert!(yaml.contains(REGISTRIES_BEGIN));
-        assert!(yaml.contains(REGISTRIES_END));
-        assert!(yaml.contains("\"registry.crossplane-system.svc.cluster.local:5000\":"));
-        assert!(yaml.contains("\"localhost:30500\":"));
-        // Both mirrors resolve to the same HTTP endpoint on the Service name.
-        assert_eq!(
-            yaml.matches("- \"http://registry.crossplane-system.svc.cluster.local:5000\"")
-                .count(),
-            2
-        );
-        assert!(!yaml.contains("https://"));
-    }
-
-    #[test]
-    fn registries_yaml_replaces_only_hops_managed_block() {
-        let existing = format!(
-            "configs:\n  example: value\nmirrors:\n  {begin}\n  old: value\n  {end}\n  \"user.local:5000\":\n    endpoint:\n      - \"http://user.local:5000\"\n",
-            begin = REGISTRIES_BEGIN,
-            end = REGISTRIES_END,
-        );
-
-        let merged = merge_registries_yaml(Some(&existing)).unwrap();
-
-        assert!(merged.starts_with("configs:\n  example: value\nmirrors:\n"));
-        assert!(merged.contains("  \"user.local:5000\":\n"));
-        assert!(!merged.contains("old: value"));
-        assert!(merged.contains(&format!("  \"{}\":", REGISTRY_PULL)));
-        assert_eq!(merged.matches(REGISTRIES_BEGIN).count(), 1);
-        assert_eq!(merged.matches(REGISTRIES_END).count(), 1);
-    }
-
-    #[test]
-    fn registries_yaml_inserts_block_under_existing_mirrors_key() {
-        let existing = "mirrors:\n  \"user.local:5000\":\n    endpoint:\n      - \"http://user.local:5000\"\nconfigs:\n  another: value\n";
-
-        let merged = merge_registries_yaml(Some(existing)).unwrap();
-
-        let block_pos = merged.find(REGISTRIES_BEGIN).unwrap();
-        let user_pos = merged.find("\"user.local:5000\"").unwrap();
-        assert!(block_pos < user_pos);
-        assert!(merged.contains("configs:\n  another: value\n"));
-    }
-
-    #[test]
-    fn registries_yaml_appends_mirrors_section_when_missing() {
-        let existing = "configs:\n  example: value\n";
-
-        let merged = merge_registries_yaml(Some(existing)).unwrap();
-
-        assert!(merged.starts_with(existing));
-        assert!(merged.contains("\nmirrors:\n"));
-        assert!(merged.contains(REGISTRIES_BEGIN));
-    }
-
-    #[test]
-    fn registries_yaml_upgrades_legacy_hops_file_to_managed_block() {
-        let merged = merge_registries_yaml(Some(&legacy_registries_yaml())).unwrap();
-
-        assert_eq!(merged, registries_yaml());
-        assert_eq!(
-            merged.matches(&format!("\"{}\":", REGISTRY_PULL)).count(),
-            1
-        );
-        assert_eq!(
-            merged.matches(&format!("\"{}\":", REGISTRY_PUSH)).count(),
-            1
-        );
-    }
-
-    #[test]
-    fn ports_file_appends_registry_port_without_touching_existing_lines() {
-        let existing = "# user port\n8080:80/udp\n";
-
-        let merged = ports_file_with_publish(existing);
-
-        assert_eq!(merged, "# user port\n8080:80/udp\n30500:30500\n");
-    }
-
-    #[test]
-    fn ports_file_absent_writes_only_registry_port() {
-        assert_eq!(ports_file_with_publish(""), "30500:30500\n");
-    }
-
-    #[test]
-    fn ports_file_treats_tcp_variant_as_already_present() {
-        let existing = " 30500 : 30500 / tcp  # registry\n";
-
-        assert_eq!(ports_file_with_publish(existing), existing);
-    }
-
-    #[test]
     fn dory_enable_args_only_recreate_for_reset_path() {
-        assert_eq!(
-            dory_enable_args(false),
-            vec!["k8s", "enable", "--publish", REGISTRY_PORT_PUBLISH]
-        );
+        assert_eq!(dory_enable_args(false), vec!["k8s", "enable"]);
         assert_eq!(
             dory_enable_args(true),
-            vec![
-                "k8s",
-                "enable",
-                "--recreate",
-                "--publish",
-                REGISTRY_PORT_PUBLISH
-            ]
+            vec!["k8s", "enable", "--recreate"]
         );
     }
 
     #[test]
-    fn recreate_on_enable_matches_dory_exit_codes() {
-        assert!(should_recreate_on_enable_error(
-            "dory exited with exit status: 3"
-        ));
+    fn recreate_on_enable_matches_ready_timeout_exit() {
         assert!(should_recreate_on_enable_error(
             "dory exited with exit status: 1"
         ));
@@ -767,5 +534,11 @@ mod tests {
 
         assert!(err.to_string().contains("--cpus 4"));
         assert!(err.to_string().contains("Dory app"));
+    }
+
+    #[test]
+    fn package_registry_pull_uses_dory_host_gateway() {
+        assert_eq!(PACKAGE_REGISTRY_PULL, "host.dory.internal:30500");
+        assert!(!PACKAGE_REGISTRY_PULL.contains("cluster.local"));
     }
 }

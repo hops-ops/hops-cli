@@ -11,12 +11,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REGISTRY_YAML: &str = include_str!("../../../bootstrap/registry/registry.yaml");
 
-/// Host address for `docker push` (NodePort exposed by the in-cluster registry)
+/// Host address for `docker push` / `crossplane xpkg push`.
+/// Colima/kind: NodePort on the cluster. Dory: engine registry publish.
 pub const REGISTRY_PUSH: &str = "localhost:30500";
 
-/// Cluster-internal address used in Crossplane package references
-pub const REGISTRY_PULL: &str = "registry.crossplane-system.svc.cluster.local:5000";
+/// Cluster-internal address used in Crossplane package references (colima/kind).
+pub const REGISTRY_PULL_INCLUSTER: &str =
+    "registry.crossplane-system.svc.cluster.local:5000";
 pub const REGISTRY_HOSTNAME: &str = "registry.crossplane-system.svc.cluster.local";
+
+/// Back-compat alias — prefer [`registry_pull`] when the backend is known.
+pub const REGISTRY_PULL: &str = REGISTRY_PULL_INCLUSTER;
+
+/// Resolve the package pull address for the active local backend.
+pub fn registry_pull() -> &'static str {
+    super::backend::resolve(None).registry_pull()
+}
 
 #[derive(Clone, Debug)]
 pub struct RepoSpec {
@@ -169,8 +179,13 @@ pub fn image_config_name(source: &str) -> String {
     format!("{prefix}{body}-{hash}")
 }
 
-/// Ensure the in-cluster registry is deployed and available.
+/// Ensure the local package registry for the active backend is available.
 pub fn ensure_registry() -> Result<(), Box<dyn Error>> {
+    super::backend::resolve(None).ensure_package_registry()
+}
+
+/// Ensure the in-cluster NodePort registry is deployed (colima/kind).
+pub fn ensure_incluster_registry() -> Result<(), Box<dyn Error>> {
     let result = run_cmd_output(
         "kubectl",
         &[

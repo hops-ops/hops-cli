@@ -161,20 +161,44 @@ impl Backend {
             // containerd trust is per-name via certs.d, written in
             // wire_registry once the registry Service's ClusterIP is known.
             Backend::Kind => Ok(()),
-            // trust is static registries.yaml, written by dory::start before
-            // the cluster boots (k3s reads it at boot).
-            Backend::Dory => Ok(()),
+            // dory uses an engine-side registry + host.dory.internal mirrors
+            // configured after enable (see ensure_package_bridge).
+            Backend::Dory => dory::ensure_registry_trust(),
         }
     }
 
     /// Point the node at the registry Service's current ClusterIP so pulls of
     /// both registry names resolve. Idempotent; re-run on every start because
     /// the ClusterIP changes if the Service is recreated.
+    ///
+    /// No-op on dory (engine package bridge, not in-cluster NodePort registry).
     pub fn wire_registry(self, cluster_ip: &str) -> Result<(), Box<dyn Error>> {
         match self {
             Backend::Colima => colima::sync_hosts_entry(cluster_ip),
             Backend::Kind => kind::wire_registry(cluster_ip),
             Backend::Dory => dory::wire_registry(cluster_ip),
+        }
+    }
+
+    /// Backend-specific package registry for local provider/config installs.
+    /// Colima/kind deploy an in-cluster NodePort registry; dory uses an
+    /// engine docker registry + host.dory.internal pull path.
+    pub fn ensure_package_registry(self) -> Result<(), Box<dyn Error>> {
+        match self {
+            Backend::Dory => dory::ensure_package_bridge(),
+            Backend::Colima | Backend::Kind => {
+                crate::commands::local::package_install::ensure_incluster_registry()
+            }
+        }
+    }
+
+    /// Pull address used in Crossplane package / ImageConfig refs for this backend.
+    pub fn registry_pull(self) -> &'static str {
+        match self {
+            Backend::Dory => dory::PACKAGE_REGISTRY_PULL,
+            Backend::Colima | Backend::Kind => {
+                crate::commands::local::package_install::REGISTRY_PULL_INCLUSTER
+            }
         }
     }
 }
