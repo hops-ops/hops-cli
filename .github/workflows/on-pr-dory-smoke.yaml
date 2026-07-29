@@ -4,7 +4,9 @@ name: dory backend smoke
 # Mirrors on-pr-kind-smoke.yaml: start → doctor → dual registry → stop/start → destroy.
 #
 # Install contract (mandatory — not brew cask / official release):
-# 1. Clone patrickleet/dory @ feat/hops-local-integration
+# 1. Clone patrickleet/dory at a pinned commit of feat/hops-local-integration
+#    (SHA pin — the integration branch may never merge upstream; bump the ref
+#    intentionally when adopting a newer known-good tip)
 # 2. Build in-pipeline (xcodebuild with deterministic -derivedDataPath)
 # 3. Put scripts/dory on PATH
 # 4. Provide ~/.dory/engine.sock before hops start (see engine note below)
@@ -48,11 +50,13 @@ jobs:
       - name: Checkout hops-cli
         uses: actions/checkout@v4
 
-      - name: Checkout patrickleet/dory (hops integration branch)
+      - name: Checkout patrickleet/dory (pinned hops integration commit)
         uses: actions/checkout@v4
         with:
           repository: patrickleet/dory
-          ref: feat/hops-local-integration
+          # feat/hops-local-integration tip as of 2026-07-29
+          # (feat(k8s): headless lifecycle CLI, ports, registries, merged dory context)
+          ref: f8c61d2fd0fc4d528e5e0da36ffa09b9796b3871
           path: dory-src
 
       - name: Select Xcode

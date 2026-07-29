@@ -151,7 +151,17 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
     kubectl_apply_stdin(PC_HELM)?;
     kubectl_apply_stdin(PC_K8S)?;
 
-    // 11. Deploy local OCI registry for Crossplane packages
+    // 11. Wait for providers Healthy.
+    //
+    // CRDs can become Established while the provider runtime pods are still
+    // pulling images / rolling. `hops local doctor` requires Healthy=True, and
+    // the kind smoke path runs doctor immediately after start — without this
+    // wait, cold CI flakes with "Provider healthy — Healthy=False".
+    log::info!("Waiting for providers to become Healthy...");
+    wait_for_provider_healthy("crossplane-contrib-provider-kubernetes")?;
+    wait_for_provider_healthy("crossplane-contrib-provider-helm")?;
+
+    // 12. Deploy local OCI registry for Crossplane packages
     //
     // Provider install can leave the apiserver briefly unresponsive; re-wait
     // and best-effort pre-pull registry:2 so the pod is not cold-started.
@@ -164,17 +174,12 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
     // default ~5m wait used for lighter resources.
     wait_for_deployment_with_diagnostics("crossplane-system", "registry")?;
 
-    // 12. Point the node at the registry Service's ClusterIP so pulls of the
+    // 13. Point the node at the registry Service's ClusterIP so pulls of the
     //     cluster-internal registry names resolve.
     backend::wire_local_registry(backend)?;
 
     log::info!("Local environment is ready");
     Ok(())
-}
-
-/// Poll until a deployment's Available condition is True (~5 minutes).
-fn wait_for_deployment(namespace: &str, name: &str) -> Result<(), Box<dyn Error>> {
-    wait_for_deployment_attempts(namespace, name, 60)
 }
 
 /// Longer wait used for Crossplane on cold nested-virt runners (~15 minutes).
@@ -282,4 +287,79 @@ fn wait_for_crd(crd: &str) -> Result<(), Box<dyn Error>> {
         thread::sleep(Duration::from_secs(5));
     }
     Err(format!("Timed out waiting for CRD {} to be Established", crd).into())
+}
+
+/// Poll until a Crossplane Provider reports Healthy=True (~10 minutes).
+///
+/// Package install can establish CRDs before the runtime Deployment is Ready.
+/// Matching doctor's expectation here keeps `hops local start` from returning
+/// while the cluster still looks half-bootstrapped.
+fn wait_for_provider_healthy(provider: &str) -> Result<(), Box<dyn Error>> {
+    log::info!("Waiting for Provider {} Healthy...", provider);
+    for i in 0..120 {
+        let healthy = run_cmd_output(
+            "kubectl",
+            &[
+                "get",
+                "provider.pkg.crossplane.io",
+                provider,
+                "-o",
+                "jsonpath={.status.conditions[?(@.type==\"Healthy\")].status}",
+            ],
+        )
+        .unwrap_or_default();
+        if healthy.trim() == "True" {
+            return Ok(());
+        }
+
+        if i > 0 && i % 12 == 0 {
+            let installed = run_cmd_output(
+                "kubectl",
+                &[
+                    "get",
+                    "provider.pkg.crossplane.io",
+                    provider,
+                    "-o",
+                    "jsonpath={.status.conditions[?(@.type==\"Installed\")].status}",
+                ],
+            )
+            .unwrap_or_default();
+            log::info!(
+                "Still waiting for Provider {} Healthy ({}s elapsed; Installed={}, Healthy={})...",
+                provider,
+                i * 5,
+                if installed.trim().is_empty() {
+                    "<none>"
+                } else {
+                    installed.trim()
+                },
+                if healthy.trim().is_empty() {
+                    "<none>"
+                } else {
+                    healthy.trim()
+                }
+            );
+            let _ = run_cmd(
+                "kubectl",
+                &["get", "pods", "-n", "crossplane-system", "-o", "wide"],
+            );
+            let _ = run_cmd(
+                "kubectl",
+                &["get", "provider.pkg.crossplane.io", provider, "-o", "yaml"],
+            );
+        }
+
+        thread::sleep(Duration::from_secs(5));
+    }
+
+    let _ = run_cmd(
+        "kubectl",
+        &["get", "provider.pkg.crossplane.io", provider, "-o", "yaml"],
+    );
+    dump_namespace_diagnostics("crossplane-system");
+    Err(format!(
+        "Timed out waiting for Provider {} to become Healthy",
+        provider
+    )
+    .into())
 }

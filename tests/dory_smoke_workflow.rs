@@ -27,9 +27,17 @@ fn dory_smoke_workflow_clone_build_install_contract() {
         text.contains("patrickleet/dory"),
         "must clone patrickleet/dory"
     );
+    // Pin a known-good commit of the hops integration work (not a moving branch
+    // tip — the upstream branch may never merge). Bump intentionally with dory.
     assert!(
-        text.contains("feat/hops-local-integration"),
-        "must pin hops integration branch"
+        text.contains("f8c61d2fd0fc4d528e5e0da36ffa09b9796b3871"),
+        "must pin patrickleet/dory to a specific commit SHA"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.trim() == "ref: feat/hops-local-integration"),
+        "must not track the moving feat/hops-local-integration branch tip"
     );
     assert!(
         text.contains("xcodebuild") && text.contains("derivedDataPath"),
