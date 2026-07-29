@@ -222,13 +222,12 @@ hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
   daemon: Docker Desktop, colima's dockerd, or CI runners. No VM of its own,
   so sizing flags don't apply (size the docker daemon instead); requires
   kind >= v0.27.
-- **dory** — [dory](https://augani.github.io/dory)'s product k3s on the shared
-  Apple Silicon engine, driven headlessly through `dory k8s enable/disable/status`.
-  Requires the Dory app (engine + localhost port forward) and a CLI with
-  scriptable k8s. Package installs use an **engine-side** `registry:2` container
-  (host push `localhost:30500`, cluster pull `host.dory.internal:30500`) — not
-  an in-cluster NodePort registry. The VM is sized in the Dory app, so hops
-  sizing flags don't apply.
+- **dory** — [dory](https://augani.github.io/dory) stock app: shared Apple
+  Silicon engine + product k3s. Enable Kubernetes **in the Dory app** (hops
+  does not fork Dory or call `dory k8s enable`). Package installs use an
+  **engine-side** `registry:2` container (host push `localhost:30500`, cluster
+  pull `host.dory.internal:30500`) — not an in-cluster NodePort registry. The
+  VM is sized in the Dory app, so hops sizing flags don't apply.
 
 Select with the global `--backend` flag:
 
@@ -243,29 +242,30 @@ persisted choice > existing cluster detection (colima wins) > platform
 default (macOS: colima, otherwise kind).
 
 Unless `--context` is given, kubectl commands automatically use the backend's
-kubeconfig context (`colima`, `kind-hops`, or `dory`), regardless of your
-current-context. For dory, hops also prepends `~/.kube/dory-config` (where
-dory keeps its kubeconfig) to `KUBECONFIG` for its own kubectl/helm calls.
+kubeconfig context (`colima`, `kind-hops`, or stock Dory's `default` via
+`~/.kube/dory-config`), regardless of your current-context. For dory, hops
+prepends `~/.kube/dory-config` to `KUBECONFIG` for its own kubectl/helm calls.
 
 #### Using dory
 
-On Apple Silicon with Dory installed and the app running:
+Stock Dory only (brew cask). No hops fork of Dory required.
 
 ```bash
-# CLI with `dory k8s enable` (scriptable k8s surface)
+# 1. Open Dory.app — engine healthy (not "needs attention")
+# 2. Enable Kubernetes in the app; wait until the cluster is running
+# 3. Bootstrap Crossplane + package bridge
 hops local start --backend dory
-kubectl --context dory get nodes
+kubectl --kubeconfig ~/.kube/dory-config get nodes
 ```
 
-hops enables product k3s, installs Crossplane, and starts a package registry
-on Dory's docker engine. Point docker at that engine for source builds:
+Point docker at Dory's engine for source builds:
 
 ```bash
 export DOCKER_HOST=unix://$HOME/.dory/engine.sock
 hops provider install …   # push localhost:30500; cluster pulls host.dory.internal:30500
 ```
 
-Without scriptable k8s, use kind on Dory's docker socket instead:
+Alternatively, use kind on Dory's docker socket (no product k3s):
 
 ```bash
 docker context use dory   # or: export DOCKER_HOST=unix://$HOME/.dory/dory.sock

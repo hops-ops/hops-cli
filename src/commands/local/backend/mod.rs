@@ -82,7 +82,8 @@ impl Backend {
         match self {
             Backend::Colima => "colima",
             Backend::Kind => "kind-hops",
-            Backend::Dory => "dory",
+            // Stock Dory writes k3s' default context into ~/.kube/dory-config.
+            Backend::Dory => "default",
         }
     }
 

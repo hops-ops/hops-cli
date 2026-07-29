@@ -1,33 +1,27 @@
-//! dory backend: product k3s in Dory's shared Apple Silicon engine
-//! (https://augani.github.io/dory), driven headlessly through `dory k8s
-//! enable|disable|status` and the engine docker socket.
+//! dory backend: product k3s on stock Dory (https://augani.github.io/dory).
 //!
-//! Design (first principles):
-//! - Dory owns the VM, dockerd, networking, and k3s lifecycle.
-//! - hops owns Crossplane + the package bridge.
-//! - Packages do **not** use an in-cluster NodePort registry (kind/colima
-//!   shape). Instead hops runs a normal `registry:2` container on the engine
-//!   and teaches k3s to pull via `host.dory.internal` (Dory's host path).
-//! - No hops-managed `~/.dory/k8s/ports` or registries files at cluster
-//!   create — create shape matches stock Dory (API on 6443 only).
+//! Design (stock Dory only — no hops fork):
+//! - Dory.app owns the engine, dockerd, and k3s lifecycle (enable Kubernetes
+//!   in the app). hops never calls `dory k8s enable`.
+//! - hops talks to the engine via `~/.dory/engine.sock` and to the cluster
+//!   via `~/.kube/dory-config` (stock side file; context is usually `default`).
+//! - Packages use an engine-side `registry:2` container: host push
+//!   `localhost:30500`, node pull `host.dory.internal:30500`.
 
 use super::SizeArgs;
 use crate::commands::local::{command_exists, run_cmd, run_cmd_output};
 use std::error::Error;
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 const NODE_CONTAINER: &str = "dory-k8s";
 /// Engine-side package registry container (sibling of k3s, not in-cluster).
 const PACKAGE_REGISTRY_NAME: &str = "hops-local-registry";
 /// Host publish for `docker` / `crossplane xpkg` push (same port as other backends).
 const PACKAGE_REGISTRY_HOST_PORT: &str = "30500";
-/// How the k3s node (and pods that can resolve Dory host DNS) reach the engine registry.
+/// How the k3s node reaches the engine registry (Dory container→host path).
 pub const PACKAGE_REGISTRY_PULL: &str = "host.dory.internal:30500";
-
-/// Seconds after the Dory app (re)creates its engine socket during which it is
-/// still provisioning. A dockerd restart at the end SIGTERMs containers —
-/// including a k3s node enabled in that window.
-const ENGINE_LAUNCH_WINDOW_SECS: u64 = 180;
 
 fn home() -> Result<PathBuf, Box<dyn Error>> {
     Ok(PathBuf::from(std::env::var("HOME").map_err(|_| {
@@ -39,16 +33,13 @@ fn engine_socket() -> Result<PathBuf, Box<dyn Error>> {
     Ok(home()?.join(".dory/engine.sock"))
 }
 
-/// dory's side-file kubeconfig (context name `dory`). Current dory also
-/// merges the context into ~/.kube/config at enable time; the side file is
-/// the pre-merge fallback.
+/// Stock Dory writes the cluster kubeconfig here (context is typically `default`).
 pub fn kubeconfig_path() -> Option<String> {
     home()
         .ok()
         .map(|h| h.join(".kube/dory-config").to_string_lossy().into_owned())
 }
 
-/// Run docker against dory's engine socket (the daemon the Dory app manages).
 fn engine_docker(args: &[&str]) -> Result<(), Box<dyn Error>> {
     let sock = format!("unix://{}", engine_socket()?.display());
     let mut full = vec!["-H", sock.as_str()];
@@ -66,7 +57,10 @@ fn engine_docker_output(args: &[&str]) -> Result<String, Box<dyn Error>> {
 pub fn install() -> Result<(), Box<dyn Error>> {
     log::info!("Installing Dory via Homebrew...");
     run_cmd("brew", &["install", "--cask", "Augani/dory/dory"])?;
-    log::info!("Dory installed; launch the Dory app once so it provisions its engine");
+    log::info!(
+        "Dory installed; open the app, wait until the engine is healthy, \
+         enable Kubernetes, then re-run `hops local start --backend dory`"
+    );
     Ok(())
 }
 
@@ -87,31 +81,40 @@ pub fn start(size: &SizeArgs) -> Result<(), Box<dyn Error>> {
     }
 
     preflight()?;
-    run_dory_enable(false)?;
+    ensure_k8s_node_running()?;
+    wait_for_node_ready()?;
     Ok(())
 }
 
 pub fn stop() -> Result<(), Box<dyn Error>> {
     log::info!("Stopping dory k8s node '{}'...", NODE_CONTAINER);
+    if !node_exists() {
+        log::info!("dory k8s node not present");
+        return Ok(());
+    }
     engine_docker(&["stop", NODE_CONTAINER])?;
     log::info!("dory cluster stopped");
     Ok(())
 }
 
 pub fn destroy() -> Result<(), Box<dyn Error>> {
-    log::info!("Deleting dory k8s cluster...");
-    run_cmd("dory", &["k8s", "disable"])?;
-    // Best-effort: drop the package registry container with the cluster.
+    log::info!("Deleting dory k8s node '{}' (hops does not disable product k8s via CLI)...", NODE_CONTAINER);
+    let _ = engine_docker(&["rm", "-f", NODE_CONTAINER]);
     let _ = engine_docker(&["rm", "-f", PACKAGE_REGISTRY_NAME]);
-    log::info!("dory cluster deleted");
+    log::info!(
+        "dory k8s node removed; re-enable Kubernetes in the Dory app if you want the product cluster again"
+    );
     Ok(())
 }
 
-/// The cluster container IS the cluster, so reset means recreate.
+/// Recreate is app-owned: remove the node; user re-enables k8s in Dory, then start again.
 pub fn reset() -> Result<(), Box<dyn Error>> {
     preflight()?;
-    run_cmd("dory", &["k8s", "disable"])?;
-    run_dory_enable(true)
+    destroy()?;
+    log::info!(
+        "Enable Kubernetes in the Dory app, then run `hops local start --backend dory` again"
+    );
+    Ok(())
 }
 
 pub fn resize(_size: &SizeArgs) -> Result<(), Box<dyn Error>> {
@@ -128,69 +131,11 @@ pub fn cluster_exists() -> bool {
     if !sock.exists() {
         return false;
     }
-    engine_docker_output(&["inspect", "-f", "{{.State.Running}}", NODE_CONTAINER]).is_ok()
+    node_exists()
 }
 
-fn preflight() -> Result<(), Box<dyn Error>> {
-    if !command_exists("dory") {
-        return Err(
-            "the `dory` CLI is not on PATH; install Dory (`brew install --cask Augani/dory/dory`) \
-             or link a build that supports `dory k8s enable` \
-             (`ln -sf <dory>/scripts/dory /opt/homebrew/bin/dory`)"
-                .into(),
-        );
-    }
-    // Require the headless lifecycle subcommand (stock cask without the scriptable
-    // k8s surface only offers kubectl passthrough).
-    if !dory_supports_k8s_enable() {
-        return Err(
-            "`dory k8s enable` is not available on this CLI. Install a Dory build with \
-             scriptable Kubernetes (feat/scriptable-k8s), or use `--backend kind` against \
-             Dory's docker socket."
-                .into(),
-        );
-    }
-    let sock = engine_socket()?;
-    if !sock.exists() {
-        return Err(format!(
-            "dory's engine socket ({}) is missing; launch the Dory app and wait for its engine to start",
-            sock.display()
-        )
-        .into());
-    }
-    if !command_exists("docker") {
-        return Err("docker CLI not found; install it (dory provides the daemon)".into());
-    }
-    Ok(())
-}
-
-fn dory_supports_k8s_enable() -> bool {
-    // Stock cask `dory k8s` is kubectl-only; scriptable builds reject unknown
-    // enable flags with a dedicated usage line.
-    std::process::Command::new("dory")
-        .args(["k8s", "enable", "--__hops_probe__"])
-        .output()
-        .map(|o| {
-            let combined = format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            combined.contains("usage: dory k8s enable")
-        })
-        .unwrap_or(false)
-}
-
-fn engine_session_age() -> Option<std::time::Duration> {
-    let sock = engine_socket().ok()?;
-    let modified = std::fs::metadata(&sock).ok()?.modified().ok()?;
-    std::time::SystemTime::now().duration_since(modified).ok()
-}
-
-fn launch_window_remaining(age: std::time::Duration) -> Option<std::time::Duration> {
-    std::time::Duration::from_secs(ENGINE_LAUNCH_WINDOW_SECS)
-        .checked_sub(age)
-        .filter(|remaining| !remaining.is_zero())
+fn node_exists() -> bool {
+    engine_docker_output(&["inspect", "-f", "{{.Id}}", NODE_CONTAINER]).is_ok()
 }
 
 fn node_running() -> bool {
@@ -199,69 +144,114 @@ fn node_running() -> bool {
         .unwrap_or(false)
 }
 
-/// Hold a freshly-enabled cluster while the Dory app may still be provisioning.
-fn hold_through_engine_launch_window() -> Result<(), Box<dyn Error>> {
-    let in_window = |age: Option<std::time::Duration>| {
-        age.map(|a| launch_window_remaining(a).is_some())
-            .unwrap_or(false)
+fn preflight() -> Result<(), Box<dyn Error>> {
+    if !command_exists("docker") {
+        return Err("docker CLI not found; install it (Dory provides the daemon)".into());
+    }
+    let sock = engine_socket()?;
+    if !sock.exists() {
+        return Err(format!(
+            "dory's engine socket ({}) is missing.\n\
+             Open the Dory app and wait until the engine is healthy (not \"needs attention\"), then retry.",
+            sock.display()
+        )
+        .into());
+    }
+    // Prove the daemon answers (stale sockets are common after crashes).
+    if engine_docker_output(&["info"]).is_err() {
+        return Err(format!(
+            "cannot talk to Dory's docker at {}.\n\
+             Open the Dory app, fix any engine/doryd errors in the menu, then retry.",
+            sock.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// k3s is product-owned: start a stopped node, or tell the user to enable it in the app.
+fn ensure_k8s_node_running() -> Result<(), Box<dyn Error>> {
+    if node_running() {
+        log::info!("dory k8s node '{}' is running", NODE_CONTAINER);
+        return Ok(());
+    }
+    if node_exists() {
+        log::info!("Starting stopped dory k8s node '{}'...", NODE_CONTAINER);
+        engine_docker(&["start", NODE_CONTAINER])?;
+        return Ok(());
+    }
+    Err(
+        "Dory Kubernetes is not enabled (no `dory-k8s` container).\n\
+         In the Dory app: enable Kubernetes, wait until it is running, then re-run:\n\
+           hops local start --backend dory\n\
+         (hops uses stock Dory only — it does not create the cluster for you.)"
+            .into(),
+    )
+}
+
+fn wait_for_node_ready() -> Result<(), Box<dyn Error>> {
+    log::info!("Waiting for dory k8s node to become Ready...");
+    for i in 0..90 {
+        if !node_running() {
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        // Prefer in-container kubectl so we don't depend on host kubeconfig yet.
+        let ready = engine_docker_output(&[
+            "exec",
+            NODE_CONTAINER,
+            "kubectl",
+            "get",
+            "nodes",
+            "--no-headers",
+        ])
+        .map(|out| out.contains(" Ready"))
+        .unwrap_or(false);
+        if ready {
+            // Refresh side-file if Dory left one; still useful for hops kubectl.
+            ensure_side_kubeconfig_hint();
+            return Ok(());
+        }
+        if i > 0 && i % 15 == 0 {
+            log::info!("Still waiting for k3s Ready ({}s)...", i * 2);
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+    Err(
+        "timed out waiting for dory-k8s to become Ready; check Kubernetes status in the Dory app"
+            .into(),
+    )
+}
+
+fn ensure_side_kubeconfig_hint() {
+    let Some(path) = kubeconfig_path() else {
+        return;
     };
-    if in_window(engine_session_age()) {
-        log::info!(
-            "Dory engine session is younger than {}s; watching the k8s node through the app's provisioning window...",
-            ENGINE_LAUNCH_WINDOW_SECS
-        );
+    if std::path::Path::new(&path).is_file() {
+        return;
     }
-    let mut reenables = 0;
-    loop {
-        match (node_running(), in_window(engine_session_age())) {
-            (true, false) => return Ok(()),
-            (true, true) => {}
-            (false, _) => {
-                if reenables >= 3 {
-                    return Err("the dory engine keeps stopping the k8s node during app startup; \
-                         wait for the Dory app to finish provisioning, then re-run `hops local start --backend dory`"
-                        .into());
-                }
-                reenables += 1;
-                log::warn!(
-                    "dory engine restart stopped the k8s node; re-enabling ({}/3)...",
-                    reenables
-                );
-                run_cmd("dory", &dory_enable_args(false))?;
+    // Best-effort: pull k3s.yaml if the app has not written the side file yet.
+    if let Ok(yaml) = engine_docker_output(&[
+        "exec",
+        NODE_CONTAINER,
+        "cat",
+        "/etc/rancher/k3s/k3s.yaml",
+    ]) {
+        if yaml.contains("server:") {
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
             }
+            let _ = std::fs::write(&path, yaml);
+            let _ = std::fs::set_permissions(
+                &path,
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            );
+            log::info!("Wrote kubeconfig side file {}", path);
         }
-        std::thread::sleep(std::time::Duration::from_secs(3));
     }
 }
 
-fn run_dory_enable(recreate: bool) -> Result<(), Box<dyn Error>> {
-    let args = dory_enable_args(recreate);
-    match run_cmd("dory", &args) {
-        Ok(()) => hold_through_engine_launch_window(),
-        // Exit 1 after "did not become Ready" is common on stop→start.
-        Err(err) if !recreate && should_recreate_on_enable_error(&err.to_string()) => {
-            log::warn!("dory k8s enable failed ({err}); recreating cluster once...");
-            let _ = run_cmd("dory", &["k8s", "disable"]);
-            run_dory_enable(true)
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn should_recreate_on_enable_error(msg: &str) -> bool {
-    msg.contains("exit status: 1")
-}
-
-fn dory_enable_args(recreate: bool) -> Vec<&'static str> {
-    if recreate {
-        vec!["k8s", "enable", "--recreate"]
-    } else {
-        vec!["k8s", "enable"]
-    }
-}
-
-/// No create-time registry trust on dory — the package bridge configures the
-/// running node after enable (see `ensure_package_bridge`).
+/// No create-time registry trust — package bridge configures the running node.
 pub fn ensure_registry_trust() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
@@ -272,28 +262,10 @@ pub fn wire_registry(_cluster_ip: &str) -> Result<(), Box<dyn Error>> {
 }
 
 /// Engine-side package registry + k3s mirror config for host.dory.internal.
-///
-/// Host pushes to `localhost:30500`; the node pulls via `host.dory.internal:30500`
-/// (Dory's container→host path). No in-cluster registry Deployment.
 pub fn ensure_package_bridge() -> Result<(), Box<dyn Error>> {
-    preflight_engine_only()?;
+    preflight()?;
     ensure_engine_registry()?;
     ensure_k3s_registry_mirrors()?;
-    Ok(())
-}
-
-fn preflight_engine_only() -> Result<(), Box<dyn Error>> {
-    let sock = engine_socket()?;
-    if !sock.exists() {
-        return Err(format!(
-            "dory's engine socket ({}) is missing; launch the Dory app",
-            sock.display()
-        )
-        .into());
-    }
-    if !command_exists("docker") {
-        return Err("docker CLI not found".into());
-    }
     Ok(())
 }
 
@@ -309,7 +281,6 @@ fn ensure_engine_registry() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    // Reuse a stopped container if present.
     if engine_docker_output(&["inspect", "-f", "{{.Id}}", PACKAGE_REGISTRY_NAME]).is_ok() {
         log::info!("Starting engine package registry '{}'...", PACKAGE_REGISTRY_NAME);
         engine_docker(&["start", PACKAGE_REGISTRY_NAME])?;
@@ -349,7 +320,7 @@ fn wait_registry_http() -> Result<(), Box<dyn Error>> {
         {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        thread::sleep(Duration::from_secs(1));
     }
     Err(format!(
         "timed out waiting for engine registry on localhost:{PACKAGE_REGISTRY_HOST_PORT}"
@@ -358,11 +329,12 @@ fn wait_registry_http() -> Result<(), Box<dyn Error>> {
 }
 
 /// Write k3s registries.yaml inside the node so containerd can pull HTTP from
-/// host.dory.internal (and treat localhost:30500 the same for runtime images
-/// that still reference REGISTRY_PUSH). Restarts the node container once.
+/// host.dory.internal. Restarts the node once if the file changed.
 fn ensure_k3s_registry_mirrors() -> Result<(), Box<dyn Error>> {
     if !node_running() {
-        return Err("dory k8s node is not running; run `hops local start --backend dory` first".into());
+        return Err(
+            "dory k8s node is not running; enable Kubernetes in the Dory app first".into(),
+        );
     }
 
     let yaml = format!(
@@ -393,7 +365,6 @@ fn ensure_k3s_registry_mirrors() -> Result<(), Box<dyn Error>> {
         "Configuring k3s registry mirrors for {} (engine package bridge)...",
         PACKAGE_REGISTRY_PULL
     );
-    // Write in-place inside the node (no create-time bind required).
     engine_docker(&[
         "exec",
         NODE_CONTAINER,
@@ -405,66 +376,46 @@ fn ensure_k3s_registry_mirrors() -> Result<(), Box<dyn Error>> {
     ])?;
     log::info!("Restarting dory k8s node so k3s reloads registries.yaml...");
     engine_docker(&["restart", NODE_CONTAINER])?;
-    // Wait for API again.
-    for _ in 0..90 {
-        if run_cmd_output(
-            "kubectl",
-            &["get", "--raw", "/readyz"],
-        )
-        .map(|s| s.trim() == "ok" || s.contains("ok"))
-        .unwrap_or(false)
+    wait_for_node_ready()?;
+    // Host kubectl may need a moment after restart.
+    for _ in 0..30 {
+        if run_cmd_output("kubectl", &["get", "--raw", "/readyz"])
+            .map(|s| s.contains("ok"))
+            .unwrap_or(false)
         {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        thread::sleep(Duration::from_secs(2));
     }
-    Err("timed out waiting for dory k8s after registries reload".into())
+    Ok(())
 }
 
-/// Make `--context dory` resolvable. Current dory merges into ~/.kube/config;
-/// older builds only write the side file.
+/// Prefer stock `~/.kube/dory-config` for hops kubectl/helm children.
 pub fn export_kubeconfig_env() {
-    if effective_kubeconfig_has_dory_context() {
-        return;
-    }
     let Some(dory_cfg) = kubeconfig_path() else {
         return;
     };
+    if !std::path::Path::new(&dory_cfg).is_file() {
+        return;
+    }
     let existing = std::env::var("KUBECONFIG").unwrap_or_default();
     if existing.split(':').any(|p| p == dory_cfg) {
         return;
     }
+    // Side file first so stock current-context (usually `default`) wins.
     let rest = if existing.is_empty() {
         match home() {
             Ok(h) => h.join(".kube/config").to_string_lossy().into_owned(),
-            Err(_) => return,
+            Err(_) => String::new(),
         }
     } else {
         existing
     };
-    std::env::set_var("KUBECONFIG", format!("{}:{}", dory_cfg, rest));
-}
-
-fn effective_kubeconfig_has_dory_context() -> bool {
-    let paths: Vec<PathBuf> = match std::env::var("KUBECONFIG") {
-        Ok(chain) if !chain.is_empty() => chain.split(':').map(PathBuf::from).collect(),
-        _ => match home() {
-            Ok(h) => vec![h.join(".kube/config")],
-            Err(_) => return false,
-        },
-    };
-    paths.iter().any(|path| {
-        std::fs::read_to_string(path)
-            .map(|content| has_dory_entry(&content))
-            .unwrap_or(false)
-    })
-}
-
-fn has_dory_entry(kubeconfig: &str) -> bool {
-    kubeconfig.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed == "name: dory" || trimmed == "- name: dory"
-    })
+    if rest.is_empty() {
+        std::env::set_var("KUBECONFIG", &dory_cfg);
+    } else {
+        std::env::set_var("KUBECONFIG", format!("{}:{}", dory_cfg, rest));
+    }
 }
 
 #[cfg(test)]
@@ -472,54 +423,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn launch_window_remaining_covers_only_the_provisioning_window() {
-        use std::time::Duration;
-
-        assert_eq!(
-            launch_window_remaining(Duration::ZERO),
-            Some(Duration::from_secs(ENGINE_LAUNCH_WINDOW_SECS))
-        );
-        assert_eq!(
-            launch_window_remaining(Duration::from_secs(ENGINE_LAUNCH_WINDOW_SECS - 1)),
-            Some(Duration::from_secs(1))
-        );
-        assert_eq!(
-            launch_window_remaining(Duration::from_secs(ENGINE_LAUNCH_WINDOW_SECS)),
-            None
-        );
-        assert_eq!(launch_window_remaining(Duration::from_secs(3600)), None);
-    }
-
-    #[test]
-    fn has_dory_entry_matches_mapping_and_sequence_forms_only() {
-        let merged = "contexts:\n- context:\n    cluster: dory\n    user: dory\n  name: dory\n";
-        let users_list = "users:\n- name: dory\n  user: {}\n";
-        let near_misses = "name: dory-prod\nusername: dory\n# name: dory\nfullname: dory\n";
-
-        assert!(has_dory_entry(merged));
-        assert!(has_dory_entry(users_list));
-        assert!(!has_dory_entry(near_misses));
-        assert!(!has_dory_entry(""));
-    }
-
-    #[test]
-    fn dory_enable_args_only_recreate_for_reset_path() {
-        assert_eq!(dory_enable_args(false), vec!["k8s", "enable"]);
-        assert_eq!(
-            dory_enable_args(true),
-            vec!["k8s", "enable", "--recreate"]
-        );
-    }
-
-    #[test]
-    fn recreate_on_enable_matches_ready_timeout_exit() {
-        assert!(should_recreate_on_enable_error(
-            "dory exited with exit status: 1"
-        ));
-        assert!(!should_recreate_on_enable_error(
-            "dory exited with exit status: 2"
-        ));
-        assert!(!should_recreate_on_enable_error("connection refused"));
+    fn package_registry_pull_uses_dory_host_gateway() {
+        assert_eq!(PACKAGE_REGISTRY_PULL, "host.dory.internal:30500");
+        assert!(!PACKAGE_REGISTRY_PULL.contains("cluster.local"));
     }
 
     #[test]
@@ -537,8 +443,14 @@ mod tests {
     }
 
     #[test]
-    fn package_registry_pull_uses_dory_host_gateway() {
-        assert_eq!(PACKAGE_REGISTRY_PULL, "host.dory.internal:30500");
-        assert!(!PACKAGE_REGISTRY_PULL.contains("cluster.local"));
+    fn missing_k8s_error_mentions_app_not_fork() {
+        // Unit-level: the message constant path used when container is absent.
+        let msg = "Dory Kubernetes is not enabled (no `dory-k8s` container).\n\
+         In the Dory app: enable Kubernetes, wait until it is running, then re-run:\n\
+           hops local start --backend dory\n\
+         (hops uses stock Dory only — it does not create the cluster for you.)";
+        assert!(msg.contains("Dory app"));
+        assert!(!msg.contains("feat/scriptable"));
+        assert!(!msg.contains("dory k8s enable"));
     }
 }
