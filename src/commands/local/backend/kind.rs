@@ -278,12 +278,14 @@ mod tests {
     }
 
     #[test]
-    fn hosts_toml_aliases_to_cluster_ip_over_http() {
+    fn hosts_toml_aliases_to_cluster_ip_over_https() {
+        // Local package registry is HTTPS (self-signed); containerd must use
+        // https:// + skip_verify, not plain http://.
         let toml = hosts_toml("10.43.12.7");
 
         assert_eq!(
             toml,
-            "[host.\"http://10.43.12.7:5000\"]\n  capabilities = [\"pull\", \"resolve\"]\n  skip_verify = true\n"
+            "[host.\"https://10.43.12.7:5000\"]\n  capabilities = [\"pull\", \"resolve\"]\n  skip_verify = true\n"
         );
     }
 
