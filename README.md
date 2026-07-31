@@ -576,12 +576,13 @@ Notes:
   - Runs `brew install colima`.
 - `local reset`
   - Runs `colima kubernetes reset`.
-- `local start`
-  - Runs `colima start --kubernetes --cpu 8 --memory 16 --disk 60`
-  - Installs Crossplane from `crossplane-stable/crossplane`
-  - Applies manifests from `bootstrap/` for runtime config, providers, provider configs, and registry (embedded in the binary at build time)
-  - Configures Docker in Colima for insecure pulls from `registry.crossplane-system.svc.cluster.local:5000`
-  - Adds host mapping in Colima VM for the registry service DNS name
+- `local start [--bootstrap]`
+  - Brings up the selected backend cluster (colima / kind / dory)
+  - If Crossplane, k8s+helm providers, and the package registry are already
+    Healthy/Available, skips helm repo update/upgrade and bootstrap reapply
+    (fast resume). Pass `--bootstrap` to force a full helm upgrade + reapply.
+  - Cold path: installs Crossplane, applies `bootstrap/` DRCs/providers/PCs,
+    deploys the local HTTPS package registry, wires node/engine registry trust
 - `local stop`
   - Runs `colima stop`.
 - `local destroy`

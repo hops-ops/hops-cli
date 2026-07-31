@@ -121,7 +121,7 @@ pub enum LocalCommands {
     Install,
     /// Reset local Kubernetes state (colima: k8s reset; kind: recreate cluster)
     Reset,
-    /// Start local k8s cluster with Crossplane and providers
+    /// Start local k8s and ensure Crossplane control plane (skips helm when already healthy)
     Start(start::StartArgs),
     /// Resize the local cluster VM without destroying cluster state (colima only)
     Resize(resize::ResizeArgs),

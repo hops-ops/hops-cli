@@ -13,6 +13,10 @@ const PROVIDER_HELM: &str = include_str!("../../../bootstrap/providers/provider-
 const PROVIDER_K8S: &str = include_str!("../../../bootstrap/providers/provider-kubernetes.yaml");
 const PC_HELM: &str = include_str!("../../../bootstrap/helm/pc.yaml");
 const PC_K8S: &str = include_str!("../../../bootstrap/k8s/pc.yaml");
+
+const PROVIDER_K8S_NAME: &str = "crossplane-contrib-provider-kubernetes";
+const PROVIDER_HELM_NAME: &str = "crossplane-contrib-provider-helm";
+
 #[derive(Args, Debug, Clone)]
 pub struct StartArgs {
     #[command(flatten)]
@@ -21,6 +25,11 @@ pub struct StartArgs {
     /// Stop and restart a running cluster VM without prompting when requested size differs.
     #[arg(long)]
     pub yes: bool,
+
+    /// Force helm upgrade and full bootstrap even when the control plane is
+    /// already healthy. Default is to skip expensive helm/repo work on resume.
+    #[arg(long)]
+    pub bootstrap: bool,
 }
 
 pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Error>> {
@@ -53,6 +62,73 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
         ],
     )?;
 
+    // Fast path: cluster already has a healthy hops control plane.
+    // Skip helm repo update / upgrade and long provider waits — those dominate
+    // resume latency (CI stop/start, laptop reopen with dory-k8s still up).
+    if !args.bootstrap && control_plane_healthy() {
+        log::info!(
+            "Control plane already healthy; skipping helm upgrade and bootstrap reapply \
+             (pass --bootstrap to force)"
+        );
+        ensure_registry_ready(backend)?;
+        log::info!("Local environment is ready");
+        return Ok(());
+    }
+
+    if args.bootstrap {
+        log::info!("--bootstrap: forcing helm upgrade and full control-plane reapply");
+    }
+
+    bootstrap_control_plane()?;
+    ensure_registry_ready(backend)?;
+
+    log::info!("Local environment is ready");
+    Ok(())
+}
+
+/// True when Crossplane core, both default providers, and the package registry
+/// are already Available/Healthy — the expensive bootstrap steps can be skipped.
+fn control_plane_healthy() -> bool {
+    deployment_available("crossplane-system", "crossplane")
+        && deployment_available("crossplane-system", "registry")
+        && provider_healthy(PROVIDER_K8S_NAME)
+        && provider_healthy(PROVIDER_HELM_NAME)
+}
+
+fn deployment_available(namespace: &str, name: &str) -> bool {
+    run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "deployment",
+            name,
+            "-n",
+            namespace,
+            "-o",
+            "jsonpath={.status.conditions[?(@.type==\"Available\")].status}",
+        ],
+    )
+    .map(|s| s.trim() == "True")
+    .unwrap_or(false)
+}
+
+fn provider_healthy(provider: &str) -> bool {
+    run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "provider.pkg.crossplane.io",
+            provider,
+            "-o",
+            "jsonpath={.status.conditions[?(@.type==\"Healthy\")].status}",
+        ],
+    )
+    .map(|s| s.trim() == "True")
+    .unwrap_or(false)
+}
+
+/// Helm + Crossplane + providers + ProviderConfigs (the slow cold-start path).
+fn bootstrap_control_plane() -> Result<(), Box<dyn Error>> {
     // 4. Add Crossplane Helm repo
     log::info!("Adding Crossplane Helm repo...");
     run_cmd(
@@ -156,11 +232,14 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
     // the kind smoke path runs doctor immediately after start — without this
     // wait, cold CI flakes with "Provider healthy — Healthy=False".
     log::info!("Waiting for providers to become Healthy...");
-    wait_for_provider_healthy("crossplane-contrib-provider-kubernetes")?;
-    wait_for_provider_healthy("crossplane-contrib-provider-helm")?;
+    wait_for_provider_healthy(PROVIDER_K8S_NAME)?;
+    wait_for_provider_healthy(PROVIDER_HELM_NAME)?;
 
-    // 12. In-cluster package registry (all backends).
-    //
+    Ok(())
+}
+
+/// In-cluster package registry + backend node/engine wiring.
+fn ensure_registry_ready(backend: backend::Backend) -> Result<(), Box<dyn Error>> {
     // Crossplane package pulls run in the pod network → Service DNS + ClusterIP.
     // Docker push: colima/kind → localhost:30500 (host NodePort); dory →
     // {dory-k8s-ip}:30500 on the engine docker bridge (daemon is in-engine).
@@ -172,8 +251,6 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
     backend.ensure_package_registry()?;
     wait_for_deployment_with_diagnostics("crossplane-system", "registry")?;
     backend::wire_local_registry(backend)?;
-
-    log::info!("Local environment is ready");
     Ok(())
 }
 
@@ -357,4 +434,34 @@ fn wait_for_provider_healthy(provider: &str) -> Result<(), Box<dyn Error>> {
         provider
     )
     .into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_args_bootstrap_defaults_false() {
+        // clap default: bootstrap only when --bootstrap is passed
+        assert!(!StartArgs {
+            size: SizeArgs {
+                cpus: None,
+                memory: None,
+                disk: None,
+            },
+            yes: false,
+            bootstrap: false,
+        }
+        .bootstrap);
+        assert!(StartArgs {
+            size: SizeArgs {
+                cpus: None,
+                memory: None,
+                disk: None,
+            },
+            yes: false,
+            bootstrap: true,
+        }
+        .bootstrap);
+    }
 }
