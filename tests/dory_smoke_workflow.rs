@@ -141,6 +141,15 @@ fn dory_smoke_workflow_hops_integration_core() {
         text.contains("NODE_IP") || text.contains("NetworkSettings"),
         "must push via engine-plane dory-k8s IP"
     );
+    // Single-platform pull/build avoids multiplatform push warnings.
+    assert!(
+        text.contains("docker pull --platform") || text.contains("--platform \"$PLATFORM\""),
+        "registry smoke must pull busybox with an explicit --platform"
+    );
+    assert!(
+        text.contains("multiplatform") || text.contains("single-platform"),
+        "must document why single-platform materialization is used"
+    );
 }
 
 #[test]

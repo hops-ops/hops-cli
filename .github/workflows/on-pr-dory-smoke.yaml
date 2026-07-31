@@ -217,8 +217,19 @@ jobs:
           PUSH="${NODE_IP}:30500"
           echo "engine push endpoint: $PUSH"
 
+          # Pull + re-materialize as a *single-platform* image for this host.
+          # A plain `docker pull` of busybox:stable keeps multi-arch index
+          # metadata; `docker push` then warns:
+          #   Not all multiplatform-content is present and only the available
+          #   single-platform image was pushed
+          case "$(uname -m)" in
+            arm64|arm64e|aarch64) PLATFORM=linux/arm64 ;;
+            x86_64|amd64) PLATFORM=linux/amd64 ;;
+            *) PLATFORM="linux/$(uname -m)" ;;
+          esac
+          SRC=public.ecr.aws/docker/library/busybox:stable
           for attempt in 1 2 3 4 5; do
-            if docker pull public.ecr.aws/docker/library/busybox:stable; then
+            if docker pull --platform "$PLATFORM" "$SRC"; then
               break
             fi
             echo "docker pull failed (attempt $attempt); sleeping..."
@@ -227,7 +238,11 @@ jobs:
               exit 1
             fi
           done
-          docker tag public.ecr.aws/docker/library/busybox:stable "${PUSH}/smoke/busybox:ci"
+          # Fresh single-platform tag (no incomplete multi-arch index).
+          docker build --platform "$PLATFORM" --provenance=false --sbom=false \
+            -t "${PUSH}/smoke/busybox:ci" - <<EOF
+          FROM ${SRC}
+          EOF
           docker push "${PUSH}/smoke/busybox:ci"
 
           kubectl run smoke-svc-name \
