@@ -70,7 +70,8 @@ jobs:
 
       - name: Env-only Dory session (private KUBECONFIG + DOCKER_HOST)
         run: |
-          set -euxo pipefail
+          # No set -x: avoid dumping full PATH / home internals into Actions logs.
+          set -euo pipefail
           sock="$HOME/.dory/dory.sock"
           export PATH="$HOME/.dory/bin:/Applications/Dory.app/Contents/Helpers:$PATH"
           echo "$HOME/.dory/bin" >> "$GITHUB_PATH"
@@ -83,9 +84,7 @@ jobs:
           command -v helm >/dev/null || { echo "helm missing (brew install helm)" >&2; exit 1; }
           command -v up >/dev/null || { echo "up CLI missing (needed for hops config install --path)" >&2; exit 1; }
 
-          # cargo: ~/.cargo/bin/cargo is often a rustup shim; if rustup is broken
-          # or the shim is a dangling symlink, `command -v cargo` still succeeds
-          # but the binary does not run. Prefer a toolchain cargo that works.
+          # Prefer a toolchain cargo that actually runs (shim may be broken).
           resolve_cargo_bin() {
             if command -v cargo >/dev/null 2>&1 && cargo --version >/dev/null 2>&1; then
               command -v cargo
@@ -105,18 +104,16 @@ jobs:
             return 1
           }
           CARGO_BIN="$(resolve_cargo_bin)" || {
-            echo "cargo missing or broken (check rustup toolchains under ~/.rustup/toolchains)" >&2
-            ls -la "$HOME/.cargo/bin" 2>/dev/null || true
-            ls "$HOME/.rustup/toolchains" 2>/dev/null || true
+            echo "cargo missing or broken (install rustup stable toolchain)" >&2
             exit 1
           }
-          echo "using cargo: $CARGO_BIN ($("$CARGO_BIN" --version))"
+          echo "cargo ok ($("$CARGO_BIN" --version))"
           echo "$(dirname "$CARGO_BIN")" >> "$GITHUB_PATH"
           export PATH="$(dirname "$CARGO_BIN"):$PATH"
 
           if [ ! -S "$sock" ] || ! docker -H "unix://$sock" info >/dev/null 2>&1; then
-            echo "dory.sock not healthy; engine wake only (no desktop mutation)"
-            command -v dory >/dev/null 2>&1 && { dory engine wake || dory engine start || true; }
+            echo "waking Dory engine..."
+            command -v dory >/dev/null 2>&1 && { dory engine wake || dory engine start || true; } >/dev/null 2>&1 || true
             if [ ! -S "$sock" ]; then
               open -g -j -a Dory 2>/dev/null || true
             fi
@@ -125,16 +122,14 @@ jobs:
           ready=0
           for i in $(seq 1 36); do
             if [ -S "$sock" ] && docker -H "unix://$sock" info >/dev/null 2>&1; then
-              echo "dory.sock ready after ${i} attempts"
+              echo "dory engine ready"
               ready=1
               break
             fi
             sleep 5
           done
           if [ "$ready" -ne 1 ]; then
-            echo "Stock Dory engine not reachable at $sock" >&2
-            ls -la "$HOME/.dory" || true
-            dory readiness 2>/dev/null || true
+            echo "Dory engine not ready (is Dory.app running?)" >&2
             exit 1
           fi
 
@@ -142,7 +137,7 @@ jobs:
             target="$(readlink "$sock" || true)"
             case "$target" in
               *colima*)
-                echo "refusing Colima-backed dory.sock ($target)" >&2
+                echo "refusing Colima-backed dory.sock" >&2
                 exit 1
                 ;;
             esac
@@ -151,11 +146,10 @@ jobs:
           export DOCKER_HOST="unix://$sock"
           echo "DOCKER_HOST=unix://$sock" >> "$GITHUB_ENV"
 
-          # Product k8s must already be enabled; never create/rm it.
           if ! docker inspect -f '{{.State.Running}}' dory-k8s 2>/dev/null | grep -q true; then
             if docker inspect dory-k8s >/dev/null 2>&1; then
-              echo "starting stopped dory-k8s (no recreate)"
-              docker start dory-k8s
+              echo "starting dory-k8s..."
+              docker start dory-k8s >/dev/null
             else
               echo "dory-k8s missing — enable Kubernetes in the Dory app" >&2
               exit 1
@@ -168,7 +162,7 @@ jobs:
               break
             fi
             if [ "$i" -eq 60 ]; then
-              docker logs dory-k8s 2>&1 | tail -80 || true
+              echo "dory-k8s did not become Ready" >&2
               exit 1
             fi
             sleep 2
@@ -180,7 +174,6 @@ jobs:
             cp "$HOME/.kube/dory-config" "$kube"
           else
             docker exec dory-k8s cat /etc/rancher/k3s/k3s.yaml >"$kube"
-            # Prefer host-published API when the Mac can reach it.
             if curl -sk --connect-timeout 2 https://127.0.0.1:6443/ >/dev/null 2>&1; then
               sed -i.bak 's#server:.*#server: https://127.0.0.1:6443#' "$kube" || true
               rm -f "${kube}.bak"
@@ -190,11 +183,9 @@ jobs:
           echo "KUBECONFIG=$kube" >> "$GITHUB_ENV"
           export KUBECONFIG="$kube"
 
-          # Prove we talk to the cluster without switching global contexts.
-          kubectl config current-context || true
-          kubectl get nodes -o wide
-          docker info | head -20
-          dory version || true
+          # Minimal proof (no docker info / full node dump — personal Mac).
+          kubectl get nodes --no-headers | awk '{print "node", $1, $2}'
+          echo "env session ready (DOCKER_HOST + private KUBECONFIG)"
 
       # No Swatinem/rust-cache: on a personal Mac runner the post-job save
       # tars ~100MB+ of target/ and can hang (slow upload, or a password prompt
