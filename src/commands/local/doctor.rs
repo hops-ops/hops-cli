@@ -306,14 +306,21 @@ fn provider_package(provider: &str) -> String {
 /// not reachable from the Mac, so host curl is the wrong plane and can hang on
 /// TCP timeout (~75s) before the engine probe runs.
 fn push_host_is_loopback(push: &str) -> bool {
-    let host = push.split(':').next().unwrap_or(push);
-    host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1"
+    // host:port — IPv6 may be bracketed as [::1]:30500
+    let host = if let Some(rest) = push.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        push.split(':').next().unwrap_or(push)
+    };
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 /// Probe the package push registry on the plane docker will use.
 ///
 /// - Loopback (`localhost:30500`): short host curl (kind/colima).
-/// - Otherwise (dory bridge IP): engine-network `docker run` only.
+/// - Otherwise (dory bridge IP): engine-network probe only — never host curl
+///   (wrong plane; TCP hang ~75s) and never default docker.sock (can block on
+///   password / missing daemon on a personal Mac).
 fn package_push_registry_reachable(push: &str) -> bool {
     let url = format!("https://{push}/v2/");
     if push_host_is_loopback(push) {
@@ -323,10 +330,23 @@ fn package_push_registry_reachable(push: &str) -> bool {
         )
         .is_ok();
     }
-    // Engine dockerd can reach the k3s NodePort on the docker bridge.
-    super::run_cmd_output(
-        "docker",
-        &[
+
+    // Prefer Dory's engine socket explicitly so we don't touch host Docker.
+    let dory_sock = std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join(".dory/dory.sock"))
+        .filter(|p| p.exists());
+
+    let mut args: Vec<String> = Vec::new();
+    if let Some(sock) = dory_sock {
+        args.push("-H".into());
+        args.push(format!("unix://{}", sock.display()));
+    } else if std::env::var_os("DOCKER_HOST").is_none() {
+        // No engine socket and no DOCKER_HOST: skip rather than hang on host sock.
+        return false;
+    }
+    args.extend(
+        [
             "run",
             "--rm",
             "alpine:latest",
@@ -335,9 +355,12 @@ fn package_push_registry_reachable(push: &str) -> bool {
             "--no-check-certificate",
             "--timeout=5",
             &url,
-        ],
-    )
-    .is_ok()
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    super::run_cmd_output("docker", &arg_refs).is_ok()
 }
 
 /// True when `kubectl get <args>` finds the resource. Uses `--ignore-not-found`
