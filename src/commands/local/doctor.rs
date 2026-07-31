@@ -62,38 +62,46 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     );
 
     d.section("Registry");
-    match super::backend::resolve(None) {
-        super::backend::Backend::Dory => {
-            // Engine-side registry (not an in-cluster Deployment).
-            let ok = super::run_cmd_output(
-                "curl",
-                &["-sf", "http://127.0.0.1:30500/v2/"],
-            )
-            .is_ok();
-            d.check(
-                "engine package registry reachable (localhost:30500)",
-                ok,
-                if ok {
-                    String::new()
-                } else {
-                    "expected hops engine registry on localhost:30500 (host.dory.internal pull path)"
-                        .into()
-                },
-            );
-        }
-        _ => {
-            let reg = deployment_available("crossplane-system", "registry");
-            d.check(
-                "local package registry Available",
-                reg,
-                if reg {
-                    String::new()
-                } else {
-                    "registry deployment not Available in crossplane-system".into()
-                },
-            );
-        }
-    }
+    let reg = deployment_available("crossplane-system", "registry");
+    d.check(
+        "local package registry Available",
+        reg,
+        if reg {
+            String::new()
+        } else {
+            "registry deployment not Available in crossplane-system".into()
+        },
+    );
+    let push = super::package_install::registry_push();
+    let host_push = super::run_cmd_output(
+        "curl",
+        &["-skf", &format!("https://{push}/v2/")],
+    )
+    .is_ok()
+        // Dory push is on the engine bridge; curl from Mac may not reach it —
+        // fall back to probing via the engine docker network.
+        || super::run_cmd_output(
+            "docker",
+            &[
+                "run",
+                "--rm",
+                "alpine:latest",
+                "wget",
+                "-qO-",
+                "--no-check-certificate",
+                &format!("https://{push}/v2/"),
+            ],
+        )
+        .is_ok();
+    d.check(
+        &format!("package push registry reachable ({push})"),
+        host_push,
+        if host_push {
+            String::new()
+        } else {
+            format!("expected HTTP registry at {push} for docker push")
+        },
+    );
 
     d.print();
 

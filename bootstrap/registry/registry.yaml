@@ -1,3 +1,6 @@
+# In-cluster package registry for local source installs.
+# TLS is required: Crossplane's package manager always uses HTTPS.
+# Cert material lives in Secret hops-local-registry-tls (created by hops).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -10,8 +13,6 @@ spec:
     requests:
       storage: 20Gi
   # Uses the default StorageClass (local-path in colima/k3s).
-  # Data lives on the colima VM disk, which persists across computer restarts
-  # (as long as the colima instance/VM itself is not deleted).
 
 ---
 apiVersion: apps/v1
@@ -34,13 +35,40 @@ spec:
           image: registry:2
           ports:
             - containerPort: 5000
+              name: https
+          env:
+            # registry:2 serves HTTPS when both are set (still on :5000).
+            - name: REGISTRY_HTTP_TLS_CERTIFICATE
+              value: /certs/tls.crt
+            - name: REGISTRY_HTTP_TLS_KEY
+              value: /certs/tls.key
           volumeMounts:
             - name: registry-data
               mountPath: /var/lib/registry
+            - name: tls
+              mountPath: /certs
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /v2/
+              port: 5000
+              scheme: HTTPS
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /v2/
+              port: 5000
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
       volumes:
         - name: registry-data
           persistentVolumeClaim:
             claimName: registry-pvc
+        - name: tls
+          secret:
+            secretName: hops-local-registry-tls
 ---
 apiVersion: v1
 kind: Service
@@ -52,6 +80,7 @@ spec:
   selector:
     app: registry
   ports:
-    - port: 5000
+    - name: https
+      port: 5000
       targetPort: 5000
       nodePort: 30500

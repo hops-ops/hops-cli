@@ -2,7 +2,7 @@ use crate::commands::local::backend::{self, Backend};
 use crate::commands::local::package_install::{
     docker_arch, ensure_cached_repo_checkout_at, ensure_registry, parse_repo_spec,
     resolve_repo_install_target, run_watch, sanitize_name_component, RepoInstallTarget, RepoSpec,
-    registry_pull, REGISTRY_PUSH,
+    registry_pull, registry_push,
 };
 use crate::commands::local::{
     kubectl_apply_stdin, run_cmd, run_cmd_output, MANAGED_BY_LABEL, PROVIDER_INSTALL_MANAGED_BY,
@@ -240,7 +240,7 @@ fn run_local_path(
         &local_image_path_for_tag,
     )?;
 
-    let push_xpkg_ref = format!("{}/hops-ops/{}:{}", REGISTRY_PUSH, provider_name, dev_tag);
+    let push_xpkg_ref = format!("{}/hops-ops/{}:{}", registry_push(), provider_name, dev_tag);
     let local_pull_xpkg_path = format!("{}/hops-ops/{}", registry_pull(), provider_name);
     log::info!("Pushing xpkg to {}...", push_xpkg_ref);
     crossplane_xpkg_push(&xpkg_path, &push_xpkg_ref)?;
@@ -394,7 +394,10 @@ fn local_runtime_image_ref(provider_name: &str, arch: &str, tag: &str) -> String
     // package manager, so they need the node-pullable local registry address.
     format!(
         "{}/hops-ops/{}-{}:{}",
-        REGISTRY_PUSH, provider_name, arch, tag
+        registry_push(),
+        provider_name,
+        arch,
+        tag
     )
 }
 
@@ -499,9 +502,10 @@ fn next_local_patch_for_major(image_path: &str, major: u64) -> Result<u32, Box<d
         .split_once('/')
         .map(|(_, rest)| rest)
         .unwrap_or(image_path);
-    let url = format!("http://{}/v2/{}/tags/list", REGISTRY_PUSH, path);
+    let url = format!("https://{}/v2/{}/tags/list", registry_push(), path);
+    // Local registry uses a hops-managed self-signed cert; skip TLS verify for tag listing.
     let output = Command::new("curl")
-        .args(["-sf", "-o", "-", &url])
+        .args(["-skf", "-o", "-", &url])
         .output()?;
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);

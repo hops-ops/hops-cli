@@ -1,0 +1,8 @@
+# code: language=yaml
+{{- $xr := getCompositeResource . }}
+---
+apiVersion: {{ $xr.apiVersion }}
+kind: {{ $xr.kind }}
+status:
+  ready: {{ $state.status.ready }}
+  configMapName: {{ $state.status.configMapName | quote }}

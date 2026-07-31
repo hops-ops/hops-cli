@@ -207,8 +207,9 @@ pub fn wire_registry(cluster_ip: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn hosts_toml(cluster_ip: &str) -> String {
+    // Local registry serves HTTPS with a hops-managed self-signed cert.
     format!(
-        "[host.\"http://{}:5000\"]\n  capabilities = [\"pull\", \"resolve\"]\n  skip_verify = true\n",
+        "[host.\"https://{}:5000\"]\n  capabilities = [\"pull\", \"resolve\"]\n  skip_verify = true\n",
         cluster_ip
     )
 }

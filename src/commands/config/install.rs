@@ -4,7 +4,7 @@ use crate::commands::local::package_install::{
     docker_arch, ensure_cached_repo_checkout, ensure_registry, image_config_name,
     parse_docker_push_digest, parse_repo_spec, resolve_repo_install_target, rewrite_registry,
     rewrite_registry_with_tag, sanitize_name_component, short_hash, split_ref, strip_registry,
-    unique_suffix, RepoInstallTarget, RepoSpec, registry_pull, REGISTRY_PUSH,
+    unique_suffix, RepoInstallTarget, RepoSpec, registry_pull, registry_push,
 };
 use crate::commands::local::{kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output};
 use clap::Args;
@@ -326,7 +326,7 @@ fn run_local_path(path: &str, skip_dependency_resolution: bool) -> Result<(), Bo
             continue;
         }
 
-        let push_ref = rewrite_registry(&img.source, REGISTRY_PUSH);
+        let push_ref = rewrite_registry(&img.source, &registry_push());
         let (img_path, tag) = split_ref(&img.source);
 
         // All non-configuration images are Crossplane Function packages (the
@@ -387,7 +387,7 @@ spec:
         }
 
         let dev_tag = dev_tag_for_uppkg(&img.uppkg_path)?;
-        let push_ref = rewrite_registry_with_tag(&img.source, REGISTRY_PUSH, &dev_tag);
+        let push_ref = rewrite_registry_with_tag(&img.source, &registry_push(), &dev_tag);
         let pull_ref = rewrite_registry_with_tag(&img.source, registry_pull(), &dev_tag);
         log::info!(
             "Using local build version '{}' for {}...",

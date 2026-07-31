@@ -1,0 +1,17 @@
+# code: language=yaml
+{{- $raw := $.observed.resources | default dict }}
+{{- $entry := get $raw "configmap" | default dict }}
+{{- $resource := $entry.resource | default dict }}
+{{- $status := $resource.status | default dict }}
+
+{{- $ready := false }}
+{{- range ($status.conditions | default list) }}
+  {{- if and (eq .type "Ready") (eq .status "True") }}
+    {{- $ready = true }}
+  {{- end }}
+{{- end }}
+
+{{- $state = set $state "status" (dict
+  "ready" $ready
+  "configMapName" $state.configMapName
+) }}

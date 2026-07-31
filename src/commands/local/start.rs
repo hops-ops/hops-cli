@@ -13,8 +13,6 @@ const PROVIDER_HELM: &str = include_str!("../../../bootstrap/providers/provider-
 const PROVIDER_K8S: &str = include_str!("../../../bootstrap/providers/provider-kubernetes.yaml");
 const PC_HELM: &str = include_str!("../../../bootstrap/helm/pc.yaml");
 const PC_K8S: &str = include_str!("../../../bootstrap/k8s/pc.yaml");
-const REGISTRY: &str = include_str!("../../../bootstrap/registry/registry.yaml");
-
 #[derive(Args, Debug, Clone)]
 pub struct StartArgs {
     #[command(flatten)]
@@ -161,29 +159,19 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
     wait_for_provider_healthy("crossplane-contrib-provider-kubernetes")?;
     wait_for_provider_healthy("crossplane-contrib-provider-helm")?;
 
-    // 12. Local package registry bridge (backend-specific).
+    // 12. In-cluster package registry (all backends).
     //
-    // colima/kind: in-cluster NodePort registry + node trust wiring.
-    // dory: engine docker registry + host.dory.internal mirrors (no NodePort).
+    // Crossplane package pulls run in the pod network → Service DNS + ClusterIP.
+    // Docker push: colima/kind → localhost:30500 (host NodePort); dory →
+    // {dory-k8s-ip}:30500 on the engine docker bridge (daemon is in-engine).
     wait_for_kubernetes()?;
-    match backend {
-        backend::Backend::Dory => {
-            log::info!("Ensuring dory engine package bridge...");
-            backend.ensure_package_registry()?;
-        }
-        backend::Backend::Colima | backend::Backend::Kind => {
-            log::info!("Pre-pulling registry:2 (best effort)...");
-            let _ = run_cmd("docker", &["pull", "registry:2"]);
-            log::info!("Deploying local package registry...");
-            kubectl_apply_stdin(REGISTRY)?;
-            // Nested virt: image pull + schedule for the registry can exceed the
-            // default ~5m wait used for lighter resources.
-            wait_for_deployment_with_diagnostics("crossplane-system", "registry")?;
-            // Point the node at the registry Service's ClusterIP so pulls of the
-            // cluster-internal registry names resolve.
-            backend::wire_local_registry(backend)?;
-        }
-    }
+    log::info!("Pre-pulling registry:2 (best effort)...");
+    let _ = run_cmd("docker", &["pull", "registry:2"]);
+    // TLS secret + registry Deployment + Crossplane CA trust (package manager is HTTPS-only).
+    log::info!("Deploying local package registry (HTTPS)...");
+    backend.ensure_package_registry()?;
+    wait_for_deployment_with_diagnostics("crossplane-system", "registry")?;
+    backend::wire_local_registry(backend)?;
 
     log::info!("Local environment is ready");
     Ok(())

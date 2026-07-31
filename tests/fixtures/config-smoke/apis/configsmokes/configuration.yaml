@@ -1,0 +1,14 @@
+apiVersion: meta.pkg.crossplane.io/v1alpha1
+kind: Configuration
+metadata:
+  name: config-smoke
+  annotations:
+    meta.crossplane.io/maintainer: hops-ops CI
+    meta.crossplane.io/source: github.com/hops-ops/hops-cli
+    meta.crossplane.io/description: Minimal CI fixture ConfigMap composition for hops path-based config install.
+spec:
+  dependsOn:
+  - function: xpkg.crossplane.io/crossplane-contrib/function-auto-ready
+    version: '>=v0.6.0'
+  - provider: xpkg.crossplane.io/crossplane-contrib/provider-kubernetes
+    version: '>=v0.15.0'

@@ -1,0 +1,27 @@
+apiVersion: meta.dev.upbound.io/v2alpha1
+kind: Project
+metadata:
+  name: config-smoke
+spec:
+  dependsOn:
+  - apiVersion: pkg.crossplane.io/v1
+    kind: Function
+    package: xpkg.crossplane.io/crossplane-contrib/function-auto-ready
+    version: '>=v0.6.0'
+  - apiVersion: pkg.crossplane.io/v1
+    kind: Provider
+    package: xpkg.crossplane.io/crossplane-contrib/provider-kubernetes
+    version: '>=v0.15.0'
+  description: |
+    Minimal hops CI fixture. Builds from source via `hops config install --path`
+    and composes a single Kubernetes ConfigMap through provider-kubernetes.
+    Safe to install on a shared local control plane (namespaced resources only).
+  license: Apache-2.0
+  maintainer: hops-ops CI <ci@hops.ops.com.ai>
+  readme: |
+    # config-smoke
+
+    Test-only configuration for hops local integration. Creates a ConfigMap via
+    the Kubernetes provider. Not a real platform stack.
+  repository: ghcr.io/hops-ops/config-smoke
+  source: github.com/hops-ops/hops-cli

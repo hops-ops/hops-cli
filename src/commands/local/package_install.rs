@@ -11,11 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REGISTRY_YAML: &str = include_str!("../../../bootstrap/registry/registry.yaml");
 
-/// Host address for `docker push` / `crossplane xpkg push`.
-/// Colima/kind: NodePort on the cluster. Dory: engine registry publish.
+/// Default docker push host for colima/kind (NodePort on localhost).
+/// On Dory use [`registry_push`] — engine dockerd is not the Mac.
 pub const REGISTRY_PUSH: &str = "localhost:30500";
 
-/// Cluster-internal address used in Crossplane package references (colima/kind).
+/// Cluster-internal address used in Crossplane package references (all backends).
 pub const REGISTRY_PULL_INCLUSTER: &str =
     "registry.crossplane-system.svc.cluster.local:5000";
 pub const REGISTRY_HOSTNAME: &str = "registry.crossplane-system.svc.cluster.local";
@@ -26,6 +26,12 @@ pub const REGISTRY_PULL: &str = REGISTRY_PULL_INCLUSTER;
 /// Resolve the package pull address for the active local backend.
 pub fn registry_pull() -> &'static str {
     super::backend::resolve(None).registry_pull()
+}
+
+/// Docker push registry host:port for the active backend.
+/// Colima/kind → `localhost:30500`. Dory → `{dory-k8s-ip}:30500` on the engine bridge.
+pub fn registry_push() -> String {
+    super::backend::resolve(None).registry_push()
 }
 
 #[derive(Clone, Debug)]
@@ -179,36 +185,25 @@ pub fn image_config_name(source: &str) -> String {
     format!("{prefix}{body}-{hash}")
 }
 
+/// TLS Secret for the local package registry (server cert + CA).
+pub const REGISTRY_TLS_SECRET: &str = "hops-local-registry-tls";
+const REGISTRY_TLS_SECRET_NS: &str = "crossplane-system";
+
 /// Ensure the local package registry for the active backend is available.
 pub fn ensure_registry() -> Result<(), Box<dyn Error>> {
     super::backend::resolve(None).ensure_package_registry()
 }
 
-/// Ensure the in-cluster NodePort registry is deployed (colima/kind).
+/// Ensure the in-cluster HTTPS NodePort registry is deployed and Crossplane
+/// trusts its CA. Crossplane's package manager always uses HTTPS.
 pub fn ensure_incluster_registry() -> Result<(), Box<dyn Error>> {
-    let result = run_cmd_output(
-        "kubectl",
-        &[
-            "get",
-            "deployment",
-            "registry",
-            "-n",
-            "crossplane-system",
-            "-o",
-            "jsonpath={.status.availableReplicas}",
-        ],
-    );
+    ensure_namespace(REGISTRY_TLS_SECRET_NS)?;
+    ensure_registry_tls_secret()?;
 
-    if let Ok(replicas) = result {
-        if replicas.trim() == "1" {
-            return Ok(());
-        }
-    }
-
-    log::info!("Deploying local package registry...");
+    log::info!("Deploying local package registry (HTTPS)...");
     kubectl_apply_stdin(REGISTRY_YAML)?;
 
-    for _ in 0..60 {
+    for _ in 0..90 {
         let out = run_cmd_output(
             "kubectl",
             &[
@@ -216,13 +211,14 @@ pub fn ensure_incluster_registry() -> Result<(), Box<dyn Error>> {
                 "deployment",
                 "registry",
                 "-n",
-                "crossplane-system",
+                REGISTRY_TLS_SECRET_NS,
                 "-o",
                 "jsonpath={.status.availableReplicas}",
             ],
         );
         if let Ok(r) = out {
             if r.trim() == "1" {
+                ensure_crossplane_trusts_local_registry_ca()?;
                 return Ok(());
             }
         }
@@ -230,6 +226,260 @@ pub fn ensure_incluster_registry() -> Result<(), Box<dyn Error>> {
     }
 
     Err("Timed out waiting for registry deployment".into())
+}
+
+fn ensure_namespace(ns: &str) -> Result<(), Box<dyn Error>> {
+    let exists = run_cmd_output("kubectl", &["get", "ns", ns, "-o", "name"]).is_ok();
+    if exists {
+        return Ok(());
+    }
+    run_cmd("kubectl", &["create", "namespace", ns])
+}
+
+/// Create (or reuse) a self-signed CA + server cert for the registry Service DNS.
+fn ensure_registry_tls_secret() -> Result<(), Box<dyn Error>> {
+    let exists = run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "secret",
+            REGISTRY_TLS_SECRET,
+            "-n",
+            REGISTRY_TLS_SECRET_NS,
+            "-o",
+            "name",
+        ],
+    )
+    .is_ok();
+    if exists {
+        return Ok(());
+    }
+
+    log::info!("Generating self-signed TLS for local package registry...");
+    let dir = std::env::temp_dir().join(format!(
+        "hops-registry-tls-{}",
+        unique_suffix()
+    ));
+    fs::create_dir_all(&dir)?;
+    let ca_key = dir.join("ca.key");
+    let ca_crt = dir.join("ca.crt");
+    let tls_key = dir.join("tls.key");
+    let tls_csr = dir.join("tls.csr");
+    let tls_crt = dir.join("tls.crt");
+    let san = dir.join("san.cnf");
+
+    fs::write(
+        &san,
+        "[req]\n\
+         distinguished_name = dn\n\
+         req_extensions = ext\n\
+         prompt = no\n\
+         [dn]\n\
+         CN = registry.crossplane-system.svc.cluster.local\n\
+         [ext]\n\
+         subjectAltName = @alt\n\
+         basicConstraints = CA:FALSE\n\
+         keyUsage = digitalSignature, keyEncipherment\n\
+         extendedKeyUsage = serverAuth\n\
+         [alt]\n\
+         DNS.1 = registry\n\
+         DNS.2 = registry.crossplane-system\n\
+         DNS.3 = registry.crossplane-system.svc\n\
+         DNS.4 = registry.crossplane-system.svc.cluster.local\n\
+         DNS.5 = localhost\n\
+         IP.1 = 127.0.0.1\n",
+    )?;
+
+    run_cmd(
+        "openssl",
+        &[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            ca_key.to_str().unwrap(),
+            "-out",
+            ca_crt.to_str().unwrap(),
+            "-days",
+            "3650",
+            "-subj",
+            "/CN=hops-local-registry-ca",
+        ],
+    )?;
+    run_cmd(
+        "openssl",
+        &[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            tls_key.to_str().unwrap(),
+            "-out",
+            tls_csr.to_str().unwrap(),
+            "-config",
+            san.to_str().unwrap(),
+        ],
+    )?;
+    run_cmd(
+        "openssl",
+        &[
+            "x509",
+            "-req",
+            "-in",
+            tls_csr.to_str().unwrap(),
+            "-CA",
+            ca_crt.to_str().unwrap(),
+            "-CAkey",
+            ca_key.to_str().unwrap(),
+            "-CAcreateserial",
+            "-out",
+            tls_crt.to_str().unwrap(),
+            "-days",
+            "3650",
+            "-extfile",
+            san.to_str().unwrap(),
+            "-extensions",
+            "ext",
+        ],
+    )?;
+
+    run_cmd(
+        "kubectl",
+        &[
+            "create",
+            "secret",
+            "generic",
+            REGISTRY_TLS_SECRET,
+            "-n",
+            REGISTRY_TLS_SECRET_NS,
+            &format!("--from-file=ca.crt={}", ca_crt.display()),
+            &format!("--from-file=tls.crt={}", tls_crt.display()),
+            &format!("--from-file=tls.key={}", tls_key.display()),
+        ],
+    )?;
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// Merge the local registry CA into Crossplane's trust store so package pulls
+/// over HTTPS succeed without replacing public CAs (xpkg.crossplane.io).
+pub fn ensure_crossplane_trusts_local_registry_ca() -> Result<(), Box<dyn Error>> {
+    let xp_ready = run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "deploy",
+            "crossplane",
+            "-n",
+            REGISTRY_TLS_SECRET_NS,
+            "-o",
+            "name",
+        ],
+    )
+    .is_ok();
+    if !xp_ready {
+        log::warn!("crossplane deployment not found yet; skip CA trust patch");
+        return Ok(());
+    }
+
+    // Already patched?
+    let has_init = run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "deploy",
+            "crossplane",
+            "-n",
+            REGISTRY_TLS_SECRET_NS,
+            "-o",
+            "jsonpath={.spec.template.spec.initContainers[*].name}",
+        ],
+    )
+    .unwrap_or_default();
+    if has_init.split_whitespace().any(|n| n == "hops-merge-registry-ca") {
+        return Ok(());
+    }
+
+    log::info!("Patching Crossplane to trust local registry CA...");
+    // Strategic merge: initContainer concatenates system CAs + hops CA; SSL_CERT_FILE points at it.
+    let patch = r#"{
+  "spec": {
+    "template": {
+      "spec": {
+        "initContainers": [
+          {
+            "name": "hops-merge-registry-ca",
+            "image": "alpine:3.20",
+            "command": ["sh", "-c"],
+            "args": [
+              "set -e; cat /etc/ssl/certs/ca-certificates.crt /hops-ca/ca.crt > /combined/ca-bundle.crt"
+            ],
+            "volumeMounts": [
+              {"name": "hops-local-registry-ca", "mountPath": "/hops-ca", "readOnly": true},
+              {"name": "hops-combined-ca", "mountPath": "/combined"}
+            ]
+          }
+        ],
+        "containers": [
+          {
+            "name": "crossplane",
+            "env": [
+              {"name": "SSL_CERT_FILE", "value": "/combined/ca-bundle.crt"}
+            ],
+            "volumeMounts": [
+              {"name": "hops-combined-ca", "mountPath": "/combined", "readOnly": true}
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "hops-local-registry-ca",
+            "secret": {
+              "secretName": "hops-local-registry-tls",
+              "items": [{"key": "ca.crt", "path": "ca.crt"}]
+            }
+          },
+          {
+            "name": "hops-combined-ca",
+            "emptyDir": {}
+          }
+        ]
+      }
+    }
+  }
+}"#;
+
+    run_cmd(
+        "kubectl",
+        &[
+            "patch",
+            "deploy",
+            "crossplane",
+            "-n",
+            REGISTRY_TLS_SECRET_NS,
+            "--type",
+            "strategic",
+            "-p",
+            patch,
+        ],
+    )?;
+
+    // Wait for rollout so package installs see the new trust store.
+    let _ = run_cmd(
+        "kubectl",
+        &[
+            "rollout",
+            "status",
+            "deploy/crossplane",
+            "-n",
+            REGISTRY_TLS_SECRET_NS,
+            "--timeout=180s",
+        ],
+    );
+    Ok(())
 }
 
 pub fn interactive_stdio_available() -> bool {

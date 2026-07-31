@@ -3,25 +3,29 @@
 //! Design (stock Dory only — no hops fork):
 //! - Dory.app owns the engine, dockerd, and k3s lifecycle (enable Kubernetes
 //!   in the app). hops never calls `dory k8s enable`.
-//! - hops talks to the engine via `~/.dory/engine.sock` and to the cluster
-//!   via `~/.kube/dory-config` (stock side file; context is usually `default`).
-//! - Packages use an engine-side `registry:2` container: host push
-//!   `localhost:30500`, node pull `host.dory.internal:30500`.
+//! - hops talks to the engine via `~/.dory/dory.sock` and to the cluster via
+//!   `~/.kube/dory-config` (context is usually `default`).
+//!
+//! Package registry (two network planes on Dory):
+//! - **Pull (Crossplane pods):** in-cluster Service DNS
+//!   `registry.crossplane-system.svc.cluster.local:5000`.
+//! - **Push (docker via `~/.dory/dory.sock`):** engine dockerd pushes to the
+//!   k3s NodePort on the docker bridge (`{dory-k8s-ip}:30500`), with that
+//!   bridge marked insecure (HTTP). Mac localhost is the wrong plane.
+//! - **Node image pulls:** k3s `registries.yaml` mirrors → Service ClusterIP.
 
 use super::SizeArgs;
 use crate::commands::local::{command_exists, run_cmd, run_cmd_output};
+use crate::commands::local::package_install::{
+    REGISTRY_HOSTNAME, REGISTRY_PULL_INCLUSTER, REGISTRY_PUSH,
+};
 use std::error::Error;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
 const NODE_CONTAINER: &str = "dory-k8s";
-/// Engine-side package registry container (sibling of k3s, not in-cluster).
-const PACKAGE_REGISTRY_NAME: &str = "hops-local-registry";
-/// Host publish for `docker` / `crossplane xpkg` push (same port as other backends).
-const PACKAGE_REGISTRY_HOST_PORT: &str = "30500";
-/// How the k3s node reaches the engine registry (Dory container→host path).
-pub const PACKAGE_REGISTRY_PULL: &str = "host.dory.internal:30500";
+const REGISTRY_NODE_PORT: &str = "30500";
 
 fn home() -> Result<PathBuf, Box<dyn Error>> {
     Ok(PathBuf::from(std::env::var("HOME").map_err(|_| {
@@ -29,8 +33,9 @@ fn home() -> Result<PathBuf, Box<dyn Error>> {
     })?))
 }
 
+/// Stock Dory's host-facing Docker API socket (`~/.dory/dory.sock`).
 fn engine_socket() -> Result<PathBuf, Box<dyn Error>> {
-    Ok(home()?.join(".dory/engine.sock"))
+    Ok(home()?.join(".dory/dory.sock"))
 }
 
 /// Stock Dory writes the cluster kubeconfig here (context is typically `default`).
@@ -98,9 +103,14 @@ pub fn stop() -> Result<(), Box<dyn Error>> {
 }
 
 pub fn destroy() -> Result<(), Box<dyn Error>> {
-    log::info!("Deleting dory k8s node '{}' (hops does not disable product k8s via CLI)...", NODE_CONTAINER);
+    log::info!(
+        "Deleting dory k8s node '{}' (hops does not disable product k8s via CLI)...",
+        NODE_CONTAINER
+    );
+    // Legacy leftovers from earlier registry experiments.
+    let _ = engine_docker(&["rm", "-f", "hops-local-registry"]);
+    let _ = engine_docker(&["rm", "-f", "hops-registry-publish"]);
     let _ = engine_docker(&["rm", "-f", NODE_CONTAINER]);
-    let _ = engine_docker(&["rm", "-f", PACKAGE_REGISTRY_NAME]);
     log::info!(
         "dory k8s node removed; re-enable Kubernetes in the Dory app if you want the product cluster again"
     );
@@ -157,7 +167,6 @@ fn preflight() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    // Prove the daemon answers (stale sockets are common after crashes).
     if engine_docker_output(&["info"]).is_err() {
         return Err(format!(
             "cannot talk to Dory's docker at {}.\n\
@@ -196,7 +205,6 @@ fn wait_for_node_ready() -> Result<(), Box<dyn Error>> {
             thread::sleep(Duration::from_secs(2));
             continue;
         }
-        // Prefer in-container kubectl so we don't depend on host kubeconfig yet.
         let ready = engine_docker_output(&[
             "exec",
             NODE_CONTAINER,
@@ -208,8 +216,9 @@ fn wait_for_node_ready() -> Result<(), Box<dyn Error>> {
         .map(|out| out.contains(" Ready"))
         .unwrap_or(false);
         if ready {
-            // Refresh side-file if Dory left one; still useful for hops kubectl.
             ensure_side_kubeconfig_hint();
+            // Best-effort: merge context "dory" + docker context (also run on activate).
+            let _ = ensure_desktop_integration();
             return Ok(());
         }
         if i > 0 && i % 15 == 0 {
@@ -230,7 +239,6 @@ fn ensure_side_kubeconfig_hint() {
     if std::path::Path::new(&path).is_file() {
         return;
     }
-    // Best-effort: pull k3s.yaml if the app has not written the side file yet.
     if let Ok(yaml) = engine_docker_output(&[
         "exec",
         NODE_CONTAINER,
@@ -251,102 +259,74 @@ fn ensure_side_kubeconfig_hint() {
     }
 }
 
-/// No create-time registry trust — package bridge configures the running node.
+/// No create-time trust: k3s registries.yaml is written in [`wire_registry`].
 pub fn ensure_registry_trust() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// In-cluster NodePort wiring is unused on dory.
-pub fn wire_registry(_cluster_ip: &str) -> Result<(), Box<dyn Error>> {
+/// After the in-cluster registry Service exists:
+/// 1. Point k3s/containerd at the Service ClusterIP over HTTP (function images).
+/// 2. Allow engine dockerd to push HTTP to the k3s NodePort on the docker bridge.
+pub fn wire_registry(cluster_ip: &str) -> Result<(), Box<dyn Error>> {
+    ensure_k3s_registry_mirrors(cluster_ip)?;
+    ensure_engine_push_path()?;
     Ok(())
 }
 
-/// Engine-side package registry + k3s mirror config for host.dory.internal.
-pub fn ensure_package_bridge() -> Result<(), Box<dyn Error>> {
-    preflight()?;
-    ensure_engine_registry()?;
-    ensure_k3s_registry_mirrors()?;
-    Ok(())
+/// Docker push address for package installs when `DOCKER_HOST` is the Dory engine.
+/// Reachable on the engine docker bridge (not Mac localhost).
+pub fn registry_push_addr() -> Result<String, Box<dyn Error>> {
+    Ok(format!("{}:{}", node_ip()?, REGISTRY_NODE_PORT))
 }
 
-fn ensure_engine_registry() -> Result<(), Box<dyn Error>> {
-    let running = engine_docker_output(&[
+fn node_ip() -> Result<String, Box<dyn Error>> {
+    let ip = engine_docker_output(&[
         "inspect",
         "-f",
-        "{{.State.Running}}",
-        PACKAGE_REGISTRY_NAME,
-    ])
-    .unwrap_or_default();
-    if running.trim() == "true" {
-        return Ok(());
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+        NODE_CONTAINER,
+    ])?
+    .trim()
+    .to_string();
+    if ip.is_empty() {
+        return Err("dory-k8s has no docker network IP".into());
     }
-
-    if engine_docker_output(&["inspect", "-f", "{{.Id}}", PACKAGE_REGISTRY_NAME]).is_ok() {
-        log::info!("Starting engine package registry '{}'...", PACKAGE_REGISTRY_NAME);
-        engine_docker(&["start", PACKAGE_REGISTRY_NAME])?;
-        return wait_registry_http();
-    }
-
-    log::info!(
-        "Creating engine package registry on localhost:{} (pull via {})...",
-        PACKAGE_REGISTRY_HOST_PORT,
-        PACKAGE_REGISTRY_PULL
-    );
-    let _ = engine_docker(&["pull", "registry:2"]);
-    engine_docker(&[
-        "run",
-        "-d",
-        "--restart",
-        "unless-stopped",
-        "--name",
-        PACKAGE_REGISTRY_NAME,
-        "-p",
-        &format!("{PACKAGE_REGISTRY_HOST_PORT}:5000"),
-        "registry:2",
-    ])?;
-    wait_registry_http()
+    Ok(ip)
 }
 
-fn wait_registry_http() -> Result<(), Box<dyn Error>> {
-    for _ in 0..30 {
-        if run_cmd_output(
-            "curl",
-            &[
-                "-sf",
-                &format!("http://127.0.0.1:{PACKAGE_REGISTRY_HOST_PORT}/v2/"),
-            ],
-        )
-        .is_ok()
-        {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    Err(format!(
-        "timed out waiting for engine registry on localhost:{PACKAGE_REGISTRY_HOST_PORT}"
-    )
-    .into())
-}
-
-/// Write k3s registries.yaml inside the node so containerd can pull HTTP from
-/// host.dory.internal. Restarts the node once if the file changed.
-fn ensure_k3s_registry_mirrors() -> Result<(), Box<dyn Error>> {
+/// k3s `registries.yaml` so containerd pulls HTTP from the in-cluster registry.
+/// Restarts the node only when the file content changes.
+fn ensure_k3s_registry_mirrors(cluster_ip: &str) -> Result<(), Box<dyn Error>> {
     if !node_running() {
         return Err(
             "dory k8s node is not running; enable Kubernetes in the Dory app first".into(),
         );
     }
 
+    let push = registry_push_addr()?;
+    // Registry serves HTTPS (self-signed); skip verify on the node for function image pulls.
     let yaml = format!(
         "mirrors:\n\
-         \x20 \"{pull}\":\n\
+         \x20 \"{svc}\":\n\
          \x20   endpoint:\n\
-         \x20     - \"http://{pull}\"\n\
-         \x20 \"localhost:{port}\":\n\
+         \x20     - \"https://{ip}:5000\"\n\
+         \x20 \"{push}\":\n\
          \x20   endpoint:\n\
-         \x20     - \"http://{pull}\"\n",
-        pull = PACKAGE_REGISTRY_PULL,
-        port = PACKAGE_REGISTRY_HOST_PORT,
+         \x20     - \"https://{ip}:5000\"\n\
+         \x20 \"{default_push}\":\n\
+         \x20   endpoint:\n\
+         \x20     - \"https://{ip}:5000\"\n\
+         configs:\n\
+         \x20 \"{ip}:5000\":\n\
+         \x20   tls:\n\
+         \x20     insecure_skip_verify: true\n\
+         \x20 \"{svc}\":\n\
+         \x20   tls:\n\
+         \x20     insecure_skip_verify: true\n",
+        svc = REGISTRY_PULL_INCLUSTER,
+        push = push,
+        default_push = REGISTRY_PUSH,
+        ip = cluster_ip,
     );
 
     let current = engine_docker_output(&[
@@ -362,8 +342,9 @@ fn ensure_k3s_registry_mirrors() -> Result<(), Box<dyn Error>> {
     }
 
     log::info!(
-        "Configuring k3s registry mirrors for {} (engine package bridge)...",
-        PACKAGE_REGISTRY_PULL
+        "Configuring k3s registry mirrors for {} -> {}:5000...",
+        REGISTRY_HOSTNAME,
+        cluster_ip
     );
     engine_docker(&[
         "exec",
@@ -377,20 +358,233 @@ fn ensure_k3s_registry_mirrors() -> Result<(), Box<dyn Error>> {
     log::info!("Restarting dory k8s node so k3s reloads registries.yaml...");
     engine_docker(&["restart", NODE_CONTAINER])?;
     wait_for_node_ready()?;
-    // Host kubectl may need a moment after restart.
     for _ in 0..30 {
         if run_cmd_output("kubectl", &["get", "--raw", "/readyz"])
             .map(|s| s.contains("ok"))
             .unwrap_or(false)
         {
-            return Ok(());
+            break;
         }
         thread::sleep(Duration::from_secs(2));
     }
     Ok(())
 }
 
-/// Prefer stock `~/.kube/dory-config` for hops kubectl/helm children.
+/// Engine dockerd must treat the k3s NodePort as an HTTP registry. Push address
+/// is `{dory-k8s-ip}:30500` on the docker bridge (see [`registry_push_addr`]).
+fn ensure_engine_push_path() -> Result<(), Box<dyn Error>> {
+    // Best-effort cleanup of earlier experiments (ignore missing).
+    let _ = engine_docker_output(&["rm", "-f", "hops-local-registry"]);
+    let _ = engine_docker_output(&["rm", "-f", "hops-registry-publish"]);
+
+    let push = registry_push_addr()?;
+    ensure_dockerd_insecure_for_push(&push)?;
+
+    // Prove NodePort answers HTTPS from the engine network (self-signed → no-check).
+    for _ in 0..30 {
+        if engine_docker_output(&[
+            "run",
+            "--rm",
+            "alpine:latest",
+            "wget",
+            "-qO-",
+            "--no-check-certificate",
+            &format!("https://{push}/v2/"),
+        ])
+        .is_ok()
+        {
+            log::info!("Engine package push endpoint ready at {} (HTTPS)", push);
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    Err(format!(
+        "timed out waiting for registry NodePort at https://{push}/v2/ \
+         (in-cluster TLS registry Service type NodePort on dory-k8s)"
+    )
+    .into())
+}
+
+fn ensure_dockerd_insecure_for_push(push_hostport: &str) -> Result<(), Box<dyn Error>> {
+    // Already configured?
+    if let Ok(info) = engine_docker_output(&["info", "-f", "{{json .RegistryConfig.InsecureRegistryCIDRs}}{{json .RegistryConfig.IndexConfigs}}"])
+    {
+        if info.contains(push_hostport) || info.contains("192.168.215.0/24") {
+            return Ok(());
+        }
+    }
+
+    log::info!(
+        "Configuring Dory dockerd insecure-registries for HTTP push to {}...",
+        push_hostport
+    );
+
+    // Persist under the engine's /etc/docker (bind-mounted into a helper).
+    let daemon_json = format!(
+        r#"{{
+  "builder": {{"gc": {{"enabled": true, "defaultKeepStorage": "2GB"}}}},
+  "insecure-registries": [
+    "127.0.0.0/8",
+    "localhost:30500",
+    "192.168.215.0/24",
+    "{push}"
+  ]
+}}
+"#,
+        push = push_hostport
+    );
+
+    engine_docker(&[
+        "run",
+        "--rm",
+        "-v",
+        "/etc/docker:/etc/docker",
+        "alpine:latest",
+        "sh",
+        "-c",
+        &format!("cat > /etc/docker/daemon.json <<'EOF'\n{daemon_json}EOF"),
+    ])?;
+
+    // Prefer Dory's repair path (live-restore) over raw kill.
+    if command_exists("dory") {
+        let _ = run_cmd("dory", &["repair", "dockerd", "--apply"]);
+    }
+
+    // If dockerd did not pick up the file, force a live-restore restart.
+    let info = engine_docker_output(&["info"]).unwrap_or_default();
+    if !info.contains("192.168.215.0/24") && !info.contains(push_hostport) {
+        log::info!("Forcing dockerd restart so insecure-registries take effect...");
+        let _ = engine_docker(&[
+            "run",
+            "--rm",
+            "--privileged",
+            "--pid=host",
+            "alpine:latest",
+            "sh",
+            "-c",
+            "kill -TERM $(pidof dockerd) 2>/dev/null || true",
+        ]);
+        if command_exists("dory") {
+            let _ = run_cmd("dory", &["repair", "dockerd", "--apply"]);
+        }
+        for _ in 0..40 {
+            if engine_docker_output(&["info"]).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    Ok(())
+}
+
+/// Default kube + docker context name for Dory desktop integration.
+pub const DEFAULT_CONTEXT_NAME: &str = "hops-dory";
+const NAME_FILE: &str = "dory-name";
+const NAME_ENV: &str = "HOPS_DORY_NAME";
+
+/// Resolved context name: `--name` (persisted) > `HOPS_DORY_NAME` > file > `hops-dory`.
+pub fn context_name() -> String {
+    if let Ok(v) = std::env::var(NAME_ENV) {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    if let Ok(path) = crate::commands::local::local_state_dir() {
+        if let Ok(raw) = std::fs::read_to_string(path.join(NAME_FILE)) {
+            let t = raw.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    DEFAULT_CONTEXT_NAME.to_string()
+}
+
+/// Persist a user-chosen name for kube/docker context integration.
+pub fn persist_context_name(name: &str) -> Result<(), Box<dyn Error>> {
+    let name = validate_context_name(name)?;
+    let dir = crate::commands::local::local_state_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(NAME_FILE), format!("{name}\n"))?;
+    log::info!("Dory desktop name set to '{name}' (kube + docker context)");
+    Ok(())
+}
+
+fn validate_context_name(name: &str) -> Result<String, Box<dyn Error>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("--name must not be empty".into());
+    }
+    // kubectl context names: keep it simple (no path separators / whitespace).
+    if name.contains(['/', '\\', ' ', '\t', '\n', ':']) {
+        return Err(format!(
+            "invalid --name '{name}': use a simple token (e.g. hops-dory)"
+        )
+        .into());
+    }
+    Ok(name.to_string())
+}
+
+/// Env: set `HOPS_DORY_DESKTOP=0` (or `false`/`off`/`no`) to skip mutating the
+/// machine's default kube/docker contexts. Callers must drive the session with
+/// `DOCKER_HOST` and `KUBECONFIG` (or pass `--context`) instead.
+pub const DESKTOP_INTEGRATION_ENV: &str = "HOPS_DORY_DESKTOP";
+
+/// Whether hops may rewrite `~/.kube/config` / switch docker contexts.
+pub fn desktop_integration_enabled() -> bool {
+    match std::env::var(DESKTOP_INTEGRATION_ENV) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
+}
+
+/// Wire Dory into the normal developer desktop:
+/// - merge stock `~/.kube/dory-config` into `~/.kube/config` as context **`hops-dory`**
+///   (or `--name` / `HOPS_DORY_NAME`)
+/// - `kubectl config use-context <name>`
+/// - ensure/use a docker context of the same name pointing at `~/.dory/dory.sock`
+///
+/// Called from backend activate and after local start so you don't need
+/// `export KUBECONFIG=...` / `export DOCKER_HOST=...`.
+///
+/// No-op for host defaults when [`desktop_integration_enabled`] is false: only
+/// fills missing `DOCKER_HOST` / `KUBECONFIG` env for this process tree.
+pub fn ensure_desktop_integration() -> Result<(), Box<dyn Error>> {
+    ensure_side_kubeconfig_hint();
+    if !desktop_integration_enabled() {
+        ensure_engine_env_only();
+        log::info!(
+            "Dory desktop integration disabled ({DESKTOP_INTEGRATION_ENV}=0); \
+             using DOCKER_HOST / KUBECONFIG only (no use-context, no docker context switch)"
+        );
+        return Ok(());
+    }
+    let name = context_name();
+    ensure_user_kubeconfig_context(&name)?;
+    ensure_docker_context_default(&name)?;
+    Ok(())
+}
+
+/// Point this process at the engine without touching desktop defaults.
+fn ensure_engine_env_only() {
+    if std::env::var_os("DOCKER_HOST").is_none() {
+        if let Ok(sock) = engine_socket() {
+            if sock.exists() {
+                std::env::set_var("DOCKER_HOST", format!("unix://{}", sock.display()));
+            }
+        }
+    }
+    if std::env::var_os("KUBECONFIG").is_none() {
+        export_kubeconfig_env();
+    }
+}
+
+/// Fallback when merge fails: point hops child processes at the side file.
 pub fn export_kubeconfig_env() {
     let Some(dory_cfg) = kubeconfig_path() else {
         return;
@@ -402,7 +596,6 @@ pub fn export_kubeconfig_env() {
     if existing.split(':').any(|p| p == dory_cfg) {
         return;
     }
-    // Side file first so stock current-context (usually `default`) wins.
     let rest = if existing.is_empty() {
         match home() {
             Ok(h) => h.join(".kube/config").to_string_lossy().into_owned(),
@@ -418,14 +611,166 @@ pub fn export_kubeconfig_env() {
     }
 }
 
+/// Merge the stock Dory kubeconfig into `~/.kube/config` as the given context name.
+fn ensure_user_kubeconfig_context(name: &str) -> Result<(), Box<dyn Error>> {
+    let side = kubeconfig_path().ok_or("HOME unset")?;
+    if !std::path::Path::new(&side).is_file() {
+        return Err(format!(
+            "missing {}; enable Kubernetes in the Dory app (or let hops start write it)",
+            side
+        )
+        .into());
+    }
+
+    let home = home()?;
+    let kube_dir = home.join(".kube");
+    std::fs::create_dir_all(&kube_dir)?;
+    let main = kube_dir.join("config");
+
+    // Work on a temp copy so we can rename stock contexts without mutating
+    // the product side file.
+    let tmp = kube_dir.join(format!(".dory-merge-{}.yaml", std::process::id()));
+    std::fs::copy(&side, &tmp)?;
+    let names = run_cmd_output(
+        "kubectl",
+        &[
+            "config",
+            "--kubeconfig",
+            tmp.to_str().unwrap(),
+            "get-contexts",
+            "-o",
+            "name",
+        ],
+    )
+    .unwrap_or_default();
+    for old in names.lines().map(str::trim).filter(|n| !n.is_empty()) {
+        if old != name {
+            let _ = run_cmd(
+                "kubectl",
+                &[
+                    "config",
+                    "--kubeconfig",
+                    tmp.to_str().unwrap(),
+                    "rename-context",
+                    old,
+                    name,
+                ],
+            );
+        }
+    }
+
+    if main.is_file() {
+        let merged = {
+            let mut child = std::process::Command::new("kubectl")
+                .args(["config", "view", "--flatten", "--raw"])
+                .env(
+                    "KUBECONFIG",
+                    format!("{}:{}", main.display(), tmp.display()),
+                )
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
+            let mut out = String::new();
+            use std::io::Read;
+            if let Some(mut s) = child.stdout.take() {
+                s.read_to_string(&mut out)?;
+            }
+            let status = child.wait()?;
+            if !status.success() {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(
+                    "kubectl config view --flatten failed while merging dory kubeconfig".into(),
+                );
+            }
+            out
+        };
+        let backup = kube_dir.join("config.hops-dory-backup");
+        let _ = std::fs::copy(&main, &backup);
+        std::fs::write(&main, merged)?;
+        let _ = std::fs::set_permissions(
+            &main,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        );
+    } else {
+        std::fs::copy(&tmp, &main)?;
+        let _ = std::fs::set_permissions(
+            &main,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        );
+    }
+    let _ = std::fs::remove_file(&tmp);
+
+    // Drop the short-lived "dory" name from an earlier hops revision if present
+    // and distinct from the configured name.
+    if name != "dory" {
+        let _ = run_cmd("kubectl", &["config", "delete-context", "dory"]);
+    }
+
+    let _ = run_cmd("kubectl", &["config", "use-context", name]);
+    log::info!(
+        "Kubernetes context '{}' is ready in ~/.kube/config (also: ~/.kube/dory-config)",
+        name
+    );
+    Ok(())
+}
+
+/// Docker context of the same name, pointing at Dory's engine socket.
+fn ensure_docker_context_default(name: &str) -> Result<(), Box<dyn Error>> {
+    if !command_exists("docker") {
+        return Ok(());
+    }
+    let sock = engine_socket()?;
+    if !sock.exists() {
+        log::warn!(
+            "Dory engine socket {} missing; skip docker context '{}'",
+            sock.display(),
+            name
+        );
+        return Ok(());
+    }
+    let host = format!("host=unix://{}", sock.display());
+    let contexts = run_cmd_output("docker", &["context", "ls", "--format", "{{.Name}}"])
+        .unwrap_or_default();
+    if !contexts.lines().any(|n| n.trim() == name) {
+        log::info!(
+            "Creating docker context '{}' → unix://{}",
+            name,
+            sock.display()
+        );
+        // Ignore failure if a stale context exists with different metadata.
+        let create = run_cmd(
+            "docker",
+            &["context", "create", name, "--docker", &host],
+        );
+        if create.is_err() {
+            // Update in place when possible.
+            let _ = run_cmd(
+                "docker",
+                &["context", "update", name, "--docker", &host],
+            );
+        }
+    }
+    run_cmd("docker", &["context", "use", name])?;
+    log::info!(
+        "Docker context set to '{}' (unix://{})",
+        name,
+        sock.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn package_registry_pull_uses_dory_host_gateway() {
-        assert_eq!(PACKAGE_REGISTRY_PULL, "host.dory.internal:30500");
-        assert!(!PACKAGE_REGISTRY_PULL.contains("cluster.local"));
+    fn package_pull_is_in_cluster_service_not_host_gateway() {
+        assert_eq!(
+            crate::commands::local::package_install::REGISTRY_PULL_INCLUSTER,
+            "registry.crossplane-system.svc.cluster.local:5000"
+        );
+        assert!(!REGISTRY_PULL_INCLUSTER.contains("dory.internal"));
+        assert_eq!(REGISTRY_PUSH, "localhost:30500");
     }
 
     #[test]
@@ -444,7 +789,6 @@ mod tests {
 
     #[test]
     fn missing_k8s_error_mentions_app_not_fork() {
-        // Unit-level: the message constant path used when container is absent.
         let msg = "Dory Kubernetes is not enabled (no `dory-k8s` container).\n\
          In the Dory app: enable Kubernetes, wait until it is running, then re-run:\n\
            hops local start --backend dory\n\
@@ -452,5 +796,19 @@ mod tests {
         assert!(msg.contains("Dory app"));
         assert!(!msg.contains("feat/scriptable"));
         assert!(!msg.contains("dory k8s enable"));
+    }
+
+    #[test]
+    fn desktop_integration_env_off_values() {
+        for off in ["0", "false", "FALSE", "no", "off", " Off "] {
+            std::env::set_var(DESKTOP_INTEGRATION_ENV, off);
+            assert!(
+                !desktop_integration_enabled(),
+                "expected desktop off for {off:?}"
+            );
+        }
+        std::env::set_var(DESKTOP_INTEGRATION_ENV, "1");
+        assert!(desktop_integration_enabled());
+        std::env::remove_var(DESKTOP_INTEGRATION_ENV);
     }
 }

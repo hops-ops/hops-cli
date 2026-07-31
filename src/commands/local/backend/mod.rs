@@ -78,12 +78,12 @@ impl Backend {
     }
 
     /// kubeconfig context name this backend's cluster registers under.
-    pub fn kube_context(self) -> &'static str {
+    pub fn kube_context(self) -> String {
         match self {
-            Backend::Colima => "colima",
-            Backend::Kind => "kind-hops",
-            // Stock Dory writes k3s' default context into ~/.kube/dory-config.
-            Backend::Dory => "default",
+            Backend::Colima => "colima".to_string(),
+            Backend::Kind => "kind-hops".to_string(),
+            // Merged into ~/.kube/config (default name hops-dory; see dory::context_name).
+            Backend::Dory => dory::context_name(),
         }
     }
 
@@ -162,8 +162,7 @@ impl Backend {
             // containerd trust is per-name via certs.d, written in
             // wire_registry once the registry Service's ClusterIP is known.
             Backend::Kind => Ok(()),
-            // dory uses an engine-side registry + host.dory.internal mirrors
-            // configured after enable (see ensure_package_bridge).
+            // k3s registries.yaml is written in wire_registry once ClusterIP is known.
             Backend::Dory => dory::ensure_registry_trust(),
         }
     }
@@ -172,7 +171,7 @@ impl Backend {
     /// both registry names resolve. Idempotent; re-run on every start because
     /// the ClusterIP changes if the Service is recreated.
     ///
-    /// No-op on dory (engine package bridge, not in-cluster NodePort registry).
+    /// Dory also publishes host localhost:30500 → node NodePort (engine proxy).
     pub fn wire_registry(self, cluster_ip: &str) -> Result<(), Box<dyn Error>> {
         match self {
             Backend::Colima => colima::sync_hosts_entry(cluster_ip),
@@ -182,23 +181,26 @@ impl Backend {
     }
 
     /// Backend-specific package registry for local provider/config installs.
-    /// Colima/kind deploy an in-cluster NodePort registry; dory uses an
-    /// engine docker registry + host.dory.internal pull path.
+    /// All backends use an in-cluster NodePort registry for Crossplane package
+    /// pulls (pod network). Host push is always localhost:30500.
     pub fn ensure_package_registry(self) -> Result<(), Box<dyn Error>> {
-        match self {
-            Backend::Dory => dory::ensure_package_bridge(),
-            Backend::Colima | Backend::Kind => {
-                crate::commands::local::package_install::ensure_incluster_registry()
-            }
-        }
+        crate::commands::local::package_install::ensure_incluster_registry()
     }
 
     /// Pull address used in Crossplane package / ImageConfig refs for this backend.
+    /// Always the in-cluster Service — Crossplane runs in the pod network.
     pub fn registry_pull(self) -> &'static str {
+        crate::commands::local::package_install::REGISTRY_PULL_INCLUSTER
+    }
+
+    /// Docker push host:port for package installs on this backend.
+    pub fn registry_push(self) -> String {
         match self {
-            Backend::Dory => dory::PACKAGE_REGISTRY_PULL,
+            Backend::Dory => dory::registry_push_addr().unwrap_or_else(|_| {
+                crate::commands::local::package_install::REGISTRY_PUSH.to_string()
+            }),
             Backend::Colima | Backend::Kind => {
-                crate::commands::local::package_install::REGISTRY_PULL_INCLUSTER
+                crate::commands::local::package_install::REGISTRY_PUSH.to_string()
             }
         }
     }
@@ -228,6 +230,11 @@ impl FromStr for Backend {
 
 const BACKEND_FILE: &str = "backend";
 
+/// Persist the Dory desktop context name (`--name`, default hops-dory).
+pub fn persist_dory_context_name(name: &str) -> Result<(), Box<dyn Error>> {
+    dory::persist_context_name(name)
+}
+
 pub fn platform_default() -> Backend {
     if cfg!(target_os = "macos") {
         Backend::Colima
@@ -256,17 +263,22 @@ pub fn activate(flag: Option<Backend>, context: Option<&str>) -> Backend {
     let backend = resolve(flag);
 
     if backend == Backend::Dory {
-        dory::export_kubeconfig_env();
+        // Merge ~/.kube/dory-config → named context and prefer matching docker context.
+        if let Err(e) = dory::ensure_desktop_integration() {
+            log::warn!("dory desktop integration incomplete: {e}");
+            dory::export_kubeconfig_env();
+        }
     }
 
     let explicit_context = context.filter(|ctx| !ctx.is_empty());
+    let backend_context = backend.kube_context();
     let backend_context_exists = if explicit_context.is_none() {
-        kube_context_exists(backend.kube_context())
+        kube_context_exists(&backend_context)
     } else {
         false
     };
 
-    match kube_context_export(backend, explicit_context, backend_context_exists) {
+    match kube_context_export(explicit_context, &backend_context, backend_context_exists) {
         KubeContextExport::Set(ctx) => std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx),
         KubeContextExport::Unset { missing_context } => {
             std::env::remove_var(HOPS_KUBE_CONTEXT_ENV);
@@ -356,7 +368,7 @@ fn registry_cluster_ip() -> Result<String, Box<dyn Error>> {
 }
 
 /// Wire node-level registry pulls for a backend: fetch the registry Service
-/// ClusterIP and apply the backend-specific trust/aliasing.
+/// ClusterIP and apply the backend-specific trust/aliasing (and Dory host publish).
 pub fn wire_local_registry(backend: Backend) -> Result<(), Box<dyn Error>> {
     backend.wire_registry(&registry_cluster_ip()?)
 }
@@ -394,19 +406,18 @@ pub fn wire_local_registry_for_target(
 #[derive(Debug, PartialEq, Eq)]
 enum KubeContextExport<'a> {
     Set(&'a str),
-    Unset { missing_context: &'static str },
+    Unset { missing_context: &'a str },
 }
 
 fn kube_context_export<'a>(
-    backend: Backend,
     explicit_context: Option<&'a str>,
+    backend_context: &'a str,
     backend_context_exists: bool,
 ) -> KubeContextExport<'a> {
     if let Some(ctx) = explicit_context {
         return KubeContextExport::Set(ctx);
     }
 
-    let backend_context = backend.kube_context();
     if backend_context_exists {
         KubeContextExport::Set(backend_context)
     } else {
@@ -513,7 +524,7 @@ mod tests {
     #[test]
     fn explicit_context_is_exported_even_when_backend_context_is_absent() {
         assert_eq!(
-            kube_context_export(Backend::Colima, Some("foreign"), false),
+            kube_context_export(Some("foreign"), "colima", false),
             KubeContextExport::Set("foreign")
         );
     }
@@ -521,11 +532,11 @@ mod tests {
     #[test]
     fn backend_context_is_exported_only_when_present() {
         assert_eq!(
-            kube_context_export(Backend::Kind, None, true),
+            kube_context_export(None, "kind-hops", true),
             KubeContextExport::Set("kind-hops")
         );
         assert_eq!(
-            kube_context_export(Backend::Kind, None, false),
+            kube_context_export(None, "kind-hops", false),
             KubeContextExport::Unset {
                 missing_context: "kind-hops"
             }
