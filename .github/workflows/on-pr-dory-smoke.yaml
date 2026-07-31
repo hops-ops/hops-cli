@@ -307,22 +307,6 @@ jobs:
             -o jsonpath='{.data.smoke}')"
           test "$smoke_val" = "ok"
 
-      - name: Debug dump on failure
-        if: failure()
-        run: |
-          set +e
-          sysctl -n hw.ncpu; sysctl hw.memsize; uname -m; uptime
-          ls -la "$HOME/.dory" || true
-          dory readiness || true
-          docker ps -a || true
-          kubectl get nodes,pods -A -o wide || true
-          kubectl describe pod smoke-svc-name smoke-nodeport 2>/dev/null || true
-          kubectl -n crossplane-system get pods -o wide || true
-          kubectl get configuration.pkg.crossplane.io,function.pkg.crossplane.io -o wide || true
-          kubectl -n hops-ci get all,configmap,configsmoke,object 2>/dev/null || true
-          kubectl -n hops-ci describe configsmoke hops-ci-smoke 2>/dev/null || true
-          ./target/debug/hops-cli local doctor || true
-
       - name: Soft cleanup (CI fixture only)
         if: always()
         run: |
