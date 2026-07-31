@@ -1,0 +1,53 @@
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  name: configsmokes.ci.hops.ops.com.ai
+spec:
+  group: ci.hops.ops.com.ai
+  names:
+    kind: ConfigSmoke
+    plural: configsmokes
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    referenceable: true
+    schema:
+      openAPIV3Schema:
+        description: CI-only composite that materializes a ConfigMap.
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              managementPolicies:
+                type: array
+                items:
+                  type: string
+                default: ["*"]
+              data:
+                description: ConfigMap data key/values.
+                type: object
+                additionalProperties:
+                  type: string
+                x-kubernetes-preserve-unknown-fields: true
+              configMapName:
+                description: Name of the ConfigMap to create. Defaults to metadata.name.
+                type: string
+              providerConfigRef:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  kind:
+                    type: string
+                    enum: [ProviderConfig, ClusterProviderConfig]
+            required: []
+          status:
+            type: object
+            properties:
+              ready:
+                type: boolean
+              configMapName:
+                type: string
+        required: [spec]

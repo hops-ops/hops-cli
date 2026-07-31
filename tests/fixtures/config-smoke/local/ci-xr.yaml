@@ -1,0 +1,36 @@
+# Applied by dory smoke after `hops config install --path tests/fixtures/config-smoke`.
+# Lives in the hops-ci namespace only — safe alongside real workloads.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hops-ci
+  labels:
+    hops.ops.com.ai/ci-fixture: "true"
+---
+# Namespaced k8s provider config (mirrors bootstrap/k8s/pc.yaml for default/).
+apiVersion: kubernetes.m.crossplane.io/v1alpha1
+kind: ProviderConfig
+metadata:
+  name: default
+  namespace: hops-ci
+  labels:
+    hops.ops.com.ai/ci-fixture: "true"
+spec:
+  credentials:
+    source: InjectedIdentity
+---
+apiVersion: ci.hops.ops.com.ai/v1alpha1
+kind: ConfigSmoke
+metadata:
+  name: hops-ci-smoke
+  namespace: hops-ci
+  labels:
+    hops.ops.com.ai/ci-fixture: "true"
+spec:
+  configMapName: hops-ci-smoke
+  data:
+    source: path-based-config-install
+    smoke: "ok"
+  providerConfigRef:
+    name: default
+    kind: ProviderConfig

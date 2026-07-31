@@ -1,0 +1,26 @@
+# code: language=yaml
+{{- $xr := getCompositeResource . }}
+{{- $metadata := $xr.metadata | default dict }}
+{{- $spec := $xr.spec | default dict }}
+
+{{- $name := $metadata.name | default "config-smoke" }}
+{{- $namespace := $metadata.namespace | default "default" }}
+{{- $configMapName := $spec.configMapName | default $name }}
+{{- $managementPolicies := $spec.managementPolicies | default (list "*") }}
+{{- $data := $spec.data | default (dict "smoke" "ok") }}
+{{- $pc := $spec.providerConfigRef | default dict }}
+{{- $providerConfigRef := dict
+  "name" ($pc.name | default "default")
+  "kind" ($pc.kind | default "ProviderConfig")
+}}
+
+{{- $state := dict
+  "name" $name
+  "namespace" $namespace
+  "configMapName" $configMapName
+  "managementPolicies" $managementPolicies
+  "data" $data
+  "providerConfigRef" $providerConfigRef
+  "observed" (dict)
+  "status" (dict "ready" false "configMapName" $configMapName)
+}}

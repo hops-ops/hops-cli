@@ -222,13 +222,14 @@ hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
   daemon: Docker Desktop, colima's dockerd, or CI runners. No VM of its own,
   so sizing flags don't apply (size the docker daemon instead); requires
   kind >= v0.27.
-- **dory** — [dory](https://augani.github.io/dory)'s built-in k3s, driven
-  headlessly through the `dory` CLI (`dory k8s enable/disable/status`).
-  Requires the Dory app running (it provides the engine and forwards
-  published ports to localhost) and a `dory` CLI with headless k8s support.
-  hops writes `~/.dory/k8s/registries.yaml` (k3s' native registry trust) and
-  publishes the registry NodePort at cluster create. The VM is sized in the
-  Dory app, so hops sizing flags don't apply.
+- **dory** — [dory](https://augani.github.io/dory) stock app: shared Apple
+  Silicon engine + product k3s. Enable Kubernetes **in the Dory app** (hops
+  does not fork Dory or call `dory k8s enable`). Package installs use the same
+  **in-cluster** `registry:2` as other backends (Crossplane pulls
+  `registry.crossplane-system.svc.cluster.local:5000`). Docker push uses the
+  k3s **NodePort** on the engine docker bridge (`{dory-k8s-ip}:30500`) because
+  dockerd runs *inside* the engine — Mac `localhost` is the wrong plane. The
+  VM is sized in the Dory app, so hops sizing flags don't apply.
 
 Select with the global `--backend` flag:
 
@@ -243,29 +244,205 @@ persisted choice > existing cluster detection (colima wins) > platform
 default (macOS: colima, otherwise kind).
 
 Unless `--context` is given, kubectl commands automatically use the backend's
-kubeconfig context (`colima`, `kind-hops`, or `dory`), regardless of your
-current-context. For dory, hops also prepends `~/.kube/dory-config` (where
-dory keeps its kubeconfig) to `KUBECONFIG` for its own kubectl/helm calls.
+kubeconfig context (`colima`, `kind-hops`, or `hops-dory`), regardless of your
+current-context.
 
 #### Using dory
 
-With a `dory` CLI that supports `dory k8s enable` (headless Kubernetes),
-use the native backend:
+Stock Dory only (brew cask / [Dory.app](https://augani.github.io/dory)). No hops
+fork of Dory required.
 
 ```bash
+# 1. Open Dory.app — engine healthy (not "needs attention")
+# 2. Enable Kubernetes in the app; wait until the cluster is running
+#    (product container is usually named dory-k8s)
+# 3. Bootstrap Crossplane + local package registry
 hops local start --backend dory
 ```
 
-For `hops provider install` / `hops config install` builds, point your docker
-CLI at dory's engine (`export DOCKER_HOST=unix://$HOME/.dory/engine.sock`) so
-image builds/pushes land on the daemon that reaches the registry.
+On start/activate, hops:
 
-Without the headless CLI, dory still exposes a real docker socket, so the
-kind backend works against it:
+- merges stock `~/.kube/dory-config` into `~/.kube/config` as context **`hops-dory`**
+  (override with `--name <name>` or `HOPS_DORY_NAME`; persisted in `~/.hops/local/dory-name`)
+- runs `kubectl config use-context hops-dory`
+- creates/uses a docker context of the same name → `unix://$HOME/.dory/dory.sock`
+
+So you should **not** need:
 
 ```bash
-docker context use dory   # or: export DOCKER_HOST=unix://$HOME/.dory/dory.sock
+export KUBECONFIG=$HOME/.kube/dory-config
+export DOCKER_HOST=unix://$HOME/.dory/dory.sock
+```
+
+```bash
+hops local start --backend dory              # name defaults to hops-dory
+hops local start --backend dory --name mine  # custom kube+docker context name
+
+kubectl get nodes          # context hops-dory
+docker info                # context hops-dory
+hops local doctor
+hops local github -o hops-ops
+hops config install --path … --backend dory
+```
+
+Alternatively, use kind on Dory's docker socket (no product k3s):
+
+```bash
+docker context use dory   # product context from Dory.app
 hops local start --backend kind
+```
+
+**CI:** `.github/workflows/on-pr-dory-smoke.yaml` runs on a **self-hosted**
+Apple Silicon Mac labeled `hops-dory` (opt-in with PR label `test-dory` or
+`workflow_dispatch`). Stock Dory only — no fork build, no Colima sock.
+Offline runner → job waits. The session is **env-only** so your desktop
+defaults never change: `DOCKER_HOST=unix://$HOME/.dory/dory.sock`, a
+job-private `KUBECONFIG`, and `HOPS_DORY_DESKTOP=0` (hops skips
+`use-context` / docker context switching). No `destroy`/`stop` of
+`dory-k8s`. After start/doctor/registry, it path-installs the in-repo
+fixture `tests/fixtures/config-smoke` (`hops config install --path …`) and
+applies a namespaced ConfigMap XR under `hops-ci`. See the workflow header
+for runner setup.
+
+#### Dory architecture (why troubleshooting is different)
+
+Two network planes matter. Mixing them up is the usual failure mode.
+
+| Plane | Who | Where | Role |
+|-------|-----|--------|------|
+| **Engine Docker** | `docker` CLI via `~/.dory/dory.sock` | Linux VM (dockerd) | build/push images |
+| **Cluster** | kubectl / Crossplane pods | k3s inside `dory-k8s` | run control plane + pull packages |
+
+Package registry model (same idea as colima/kind, adapted to Dory):
+
+- **Pull (Crossplane):** in-cluster Service  
+  `registry.crossplane-system.svc.cluster.local:5000` over **HTTPS**
+- **Push (docker on the engine):** k3s **NodePort** on the docker bridge  
+  `{dory-k8s-ip}:30500` (not Mac `localhost:30500`)
+- **TLS:** hops generates a self-signed CA/server cert (`Secret hops-local-registry-tls`)
+  and patches Crossplane to trust that CA. Plain HTTP fails package unpack
+  (`http: server gave HTTP response to HTTPS client`).
+
+Do **not** put `host.dory.internal` in Crossplane package refs. That name exists
+on the **node** `/etc/hosts`, not in pod CoreDNS, and is the wrong plane for
+Crossplane's package manager.
+
+#### Dory troubleshooting
+
+**Engine won't start / thrash / `HV_BAD_ARGUMENT` (big Macs)**
+
+The failure we hit in practice: on a **large laptop** (e.g. **128 GB** host
+RAM), Dory's UI **Recommended** / host-scaled default for guest engine memory
+was **~half of host RAM → 64 GB** (`DORYD_MEMORY_MB=65536`). That is not
+"you need 64 GB of containers" — it is an aggressive ceiling. On Apple Silicon,
+Hypervisor.framework often rejects creating a VM that large
+(`HV_BAD_ARGUMENT`), so the engine never stays healthy and the UI looks broken
+even though a **4 GB** engine works fine.
+
+```bash
+# Pin sane resources (4 GiB / 4 CPUs is enough for hops local)
+defaults write com.pythonxi.Dory dory.engineMemoryMB -int 4096
+defaults write com.pythonxi.Dory dory.engineCPUCount -int 4
+
+# Confirm the LaunchAgent is not still on 65536:
+launchctl print "gui/$(id -u)/dev.dory.doryd" 2>/dev/null | grep DORYD_MEMORY
+# Live engine cmdline should show --mem-mb 4096, not 65536:
+ps aux | grep 'dory-hv engine' | grep -v grep
+```
+
+In the Dory app **Resources** panel: set memory to **~4 GB** (8 GB is usually
+fine too). **Do not apply Recommended** if it offers tens of GB on a high-RAM
+Mac.
+
+Then fully restart the engine (quit Dory, ensure no thrashing `doryd`/`dory-hv`,
+reopen or `dory engine wake`). Once guest RAM is modest, the rest of hops local
+is ordinary.
+
+**Docker socket path**
+
+Stock Docker API socket is:
+
+```text
+unix://$HOME/.dory/dory.sock
+```
+
+There is no `~/.dory/engine.sock` for the host Docker API. hops uses `dory.sock`
+only. Prefer the docker context hops creates (`hops-dory`) over manual
+`DOCKER_HOST`.
+
+**Kubernetes missing / `no dory-k8s container`**
+
+k3s is product-owned. hops does not run `dory k8s enable`.
+
+1. Install the Kubernetes component if needed: `dory component install kubernetes`
+2. Enable Kubernetes in the Dory app UI
+3. Wait until a `dory-k8s` container is running: `docker ps` (with context hops-dory)
+4. Re-run `hops local start --backend dory`
+
+**`k ctx` has no dory / hops-dory entry**
+
+Stock Dory writes `~/.kube/dory-config` (context often named `default`). hops
+merges that into `~/.kube/config` as **`hops-dory`** on activate/start. If the
+merge is missing:
+
+```bash
+hops local doctor --backend dory
+kubectl config get-contexts   # expect hops-dory
+kubectl config use-context hops-dory
+```
+
+**Configuration Installed=False / HTTPS error**
+
+```text
+http: server gave HTTP response to HTTPS client
+```
+
+Crossplane always pulls packages with HTTPS. The local registry must be TLS
+(hops sets this up). If you have an old HTTP-only registry Deployment:
+
+```bash
+kubectl -n crossplane-system delete deploy registry
+kubectl -n crossplane-system delete secret hops-local-registry-tls
+hops local start --backend dory    # recreates TLS secret + registry + CA patch
+```
+
+**docker push to localhost:30500 fails (connection refused / HTTPS to HTTP)**
+
+With the docker context pointed at Dory, **`localhost` is the engine VM**, not
+the Mac. hops pushes to `{dory-k8s container IP}:30500` and marks the engine
+docker bridge as an insecure registry for that self-signed TLS endpoint.
+Check:
+
+```bash
+docker context show          # hops-dory
+hops local doctor            # "package push registry reachable (…:30500)"
+```
+
+Do not rely on Mac `kubectl port-forward` for engine-side `docker push`.
+
+**Engine docker broken after daemon.json / dockerd kill**
+
+Prefer Dory's own recovery:
+
+```bash
+dory repair dockerd --apply
+dory engine wake
+dory readiness
+```
+
+Avoid raw `kill` of dockerd inside the guest unless you are prepared to wait for
+`dory repair` / LaunchAgent recovery (`live-restore` helps but is not magic).
+
+**Useful diagnostics**
+
+```bash
+dory doctor
+dory readiness
+hops local doctor --backend dory
+docker context show
+kubectl config current-context
+kubectl get configuration,provider -A
+kubectl -n crossplane-system get deploy,svc,secret | grep -E 'registry|crossplane|hops-local'
 ```
 
 ### Local provider setup and auth
@@ -399,12 +576,13 @@ Notes:
   - Runs `brew install colima`.
 - `local reset`
   - Runs `colima kubernetes reset`.
-- `local start`
-  - Runs `colima start --kubernetes --cpu 8 --memory 16 --disk 60`
-  - Installs Crossplane from `crossplane-stable/crossplane`
-  - Applies manifests from `bootstrap/` for runtime config, providers, provider configs, and registry (embedded in the binary at build time)
-  - Configures Docker in Colima for insecure pulls from `registry.crossplane-system.svc.cluster.local:5000`
-  - Adds host mapping in Colima VM for the registry service DNS name
+- `local start [--bootstrap]`
+  - Brings up the selected backend cluster (colima / kind / dory)
+  - If Crossplane, k8s+helm providers, and the package registry are already
+    Healthy/Available, skips helm repo update/upgrade and bootstrap reapply
+    (fast resume). Pass `--bootstrap` to force a full helm upgrade + reapply.
+  - Cold path: installs Crossplane, applies `bootstrap/` DRCs/providers/PCs,
+    deploys the local HTTPS package registry, wires node/engine registry trust
 - `local stop`
   - Runs `colima stop`.
 - `local destroy`

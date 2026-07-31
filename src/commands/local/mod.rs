@@ -107,6 +107,12 @@ pub struct LocalArgs {
     /// kind).
     #[arg(long, global = true, value_enum)]
     pub backend: Option<backend::Backend>,
+
+    /// Name for Dory desktop integration (kube context + docker context).
+    /// Defaults to `hops-dory`. Persisted under `~/.hops/local/dory-name`.
+    /// Only used with `--backend dory` (or a persisted dory backend).
+    #[arg(long, global = true, value_name = "NAME")]
+    pub name: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -115,7 +121,7 @@ pub enum LocalCommands {
     Install,
     /// Reset local Kubernetes state (colima: k8s reset; kind: recreate cluster)
     Reset,
-    /// Start local k8s cluster with Crossplane and providers
+    /// Start local k8s and ensure Crossplane control plane (skips helm when already healthy)
     Start(start::StartArgs),
     /// Resize the local cluster VM without destroying cluster state (colima only)
     Resize(resize::ResizeArgs),
@@ -140,12 +146,16 @@ pub enum LocalCommands {
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
+    if let Some(name) = args.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        backend::persist_dory_context_name(name)?;
+    }
+
     let explicit_context = args.context.as_deref().filter(|ctx| !ctx.is_empty());
     let install_backend = matches!(&args.command, LocalCommands::Install)
         .then(|| args.backend.unwrap_or_else(backend::platform_default));
     let activation_flag = install_backend.or(args.backend);
-    let install_context = install_backend.map(backend::Backend::kube_context);
-    let activation_context = explicit_context.or(install_context);
+    let install_context = install_backend.map(|b| b.kube_context());
+    let activation_context = explicit_context.or(install_context.as_deref());
     let backend = backend::activate(activation_flag, activation_context);
 
     match &args.command {

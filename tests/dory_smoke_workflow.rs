@@ -1,7 +1,6 @@
 //! Structural checks for the shipped dory macOS smoke workflow.
 //!
-//! Drives the real `.github/workflows/on-pr-dory-smoke.yaml` so the clone+build
-//! install contract and kind-parity smoke steps cannot silently regress.
+//! Self-hosted stock Dory, env-only session (no desktop context mutation).
 
 use std::fs;
 use std::path::PathBuf;
@@ -21,155 +20,163 @@ fn workflow_text() -> String {
 }
 
 #[test]
-fn dory_smoke_workflow_clone_build_install_contract() {
+fn dory_smoke_workflow_self_hosted_stock_contract() {
     let text = workflow_text();
+
     assert!(
-        text.contains("patrickleet/dory"),
-        "must clone patrickleet/dory"
-    );
-    // Pin a known-good commit of the hops integration work (not a moving branch
-    // tip — the upstream branch may never merge). Bump intentionally with dory.
-    assert!(
-        text.contains("f8c61d2fd0fc4d528e5e0da36ffa09b9796b3871"),
-        "must pin patrickleet/dory to a specific commit SHA"
+        !text.contains("patrickleet/dory"),
+        "must not clone a hops fork of dory"
     );
     assert!(
-        !text
-            .lines()
-            .any(|l| l.trim() == "ref: feat/hops-local-integration"),
-        "must not track the moving feat/hops-local-integration branch tip"
+        !text.contains("xcodebuild") && !text.contains("build-dory-ffi"),
+        "must not build Dory from source"
     );
     assert!(
-        text.contains("xcodebuild") && text.contains("derivedDataPath"),
-        "must build in-pipeline with deterministic derivedDataPath"
+        !text.contains("colima start")
+            && !text.contains("brew install colima")
+            && !text.contains("colima-surrogate"),
+        "must not use Colima as a dory.sock surrogate"
     );
     assert!(
-        text.contains("dtolnay/rust-toolchain") && text.contains("brew install protobuf"),
-        "must install the Rust and protoc prerequisites used by Dory's FFI builder"
-    );
-    let ffi_build = text
-        .find("scripts/build-dory-ffi-xcframework.sh --if-needed")
-        .expect("must materialize DoryFFI from a clean checkout");
-    let app_build = text
-        .find("xcodebuild -project Dory.xcodeproj")
-        .expect("must build the Dory app");
-    assert!(
-        ffi_build < app_build,
-        "must generate DoryFFI before SwiftPM resolves the Dory app"
+        text.contains("dory.sock"),
+        "must require real ~/.dory/dory.sock"
     );
     assert!(
-        text.contains("DoryFFI.xcframework/macos-arm64_x86_64/libdory_ffi.a")
-            && text.contains("Sources/DoryCore/generated/dory_ffi.swift"),
-        "must verify both generated Dory FFI artifacts before xcodebuild"
+        text.contains("refusing Colima-backed") || text.contains("Colima-backed dory.sock"),
+        "must refuse a Colima-symlinked dory.sock"
     );
     assert!(
-        text.contains("GITHUB_PATH") && text.contains("scripts"),
-        "must put scripts/dory on PATH"
+        text.contains("self-hosted") && text.contains("hops-dory"),
+        "must target self-hosted runner labeled hops-dory"
     );
     assert!(
-        text.contains("engine.sock"),
-        "must ensure ~/.dory/engine.sock before hops start"
-    );
-    assert!(
-        !text.contains("brew install --cask") && !text.contains("homebrew/cask"),
-        "must not use brew cask as primary install"
-    );
-    assert!(
-        text.contains("workflow_dispatch") && text.contains("pull_request:"),
-        "must support pull_request (PR-branch runs) and workflow_dispatch"
+        !text.lines().any(|l| {
+            let t = l.trim();
+            t == "runs-on: macos-15"
+                || t == "runs-on: macos-latest"
+                || t == "runs-on: macos-15-intel"
+        }),
+        "must not use GitHub-hosted macOS"
     );
     assert!(
         text.contains("labeled") && text.contains("test-dory"),
-        "PR smoke must start only when opted in with the test-dory label"
-    );
-    assert!(
-        text.contains("github.event_name == 'workflow_dispatch'")
-            && text.contains("github.event.pull_request.labels.*.name"),
-        "manual dispatch must remain available while PR runs are label-gated"
-    );
-    // Nested-virt pin for Colima-backed engine.sock on public GHA.
-    assert!(
-        text.lines()
-            .any(|l| l.trim() == "runs-on: macos-15-intel"),
-        "must pin macos-15-intel for nested virt (not bare macos-latest alone)"
+        "PR smoke must be opt-in via test-dory label"
     );
 }
 
 #[test]
-fn dory_smoke_workflow_kind_parity_when_engine_boots() {
+fn dory_smoke_workflow_env_only_no_desktop_mutation() {
+    let text = workflow_text();
+
+    // Session entirely via env vars.
+    assert!(
+        text.contains("HOPS_DORY_DESKTOP") && text.contains("\"0\""),
+        "must set HOPS_DORY_DESKTOP=0 so hops does not rewrite desktop defaults"
+    );
+    assert!(
+        text.contains("DOCKER_HOST") && text.contains("dory.sock"),
+        "must drive docker via DOCKER_HOST → dory.sock"
+    );
+    assert!(
+        text.contains("KUBECONFIG") && text.contains("RUNNER_TEMP"),
+        "must use a job-private KUBECONFIG under RUNNER_TEMP"
+    );
+
+    // Never switch/restore machine defaults.
+    assert!(
+        !text.contains("kubectl config use-context"),
+        "must not kubectl config use-context"
+    );
+    assert!(
+        !text.contains("docker context use"),
+        "must not docker context use"
+    );
+    assert!(
+        !text.contains("Restore desktop contexts") && !text.contains("Snapshot desktop"),
+        "must not snapshot/restore contexts — env-only session needs no restore"
+    );
+
+    // Do not destroy product plane.
+    assert!(
+        !text.contains("hops-cli local destroy"),
+        "must not hops local destroy"
+    );
+    assert!(
+        !text.contains("docker rm -f dory-k8s"),
+        "must not docker rm dory-k8s"
+    );
+    assert!(
+        !text.contains("dory engine sleep") && !text.contains("pkill -f"),
+        "must not sleep engine or kill Dory"
+    );
+    assert!(
+        !text.contains("hops-cli local stop"),
+        "must not hops local stop"
+    );
+
+    assert!(
+        text.contains("CARGO_BUILD_JOBS") && text.contains("nice"),
+        "must limit cargo parallelism and nice the build"
+    );
+}
+
+#[test]
+fn dory_smoke_workflow_hops_integration_core() {
     let text = workflow_text();
     for needle in [
         "cargo build",
         "start --backend dory",
         "local doctor",
-        "localhost:30500",
         "registry.crossplane-system.svc.cluster.local:5000",
-        "--context dory",
-        "local stop",
-        "local destroy",
+        "30500",
+        "smoke-svc-name",
+        "smoke-nodeport",
     ] {
         assert!(
             text.contains(needle),
-            "dory smoke missing kind-parity fragment: {needle}"
+            "dory smoke missing hops integration fragment: {needle}"
         );
     }
-    // stop/start resume: start without --backend after stop
     assert!(
-        text.contains("local start\n")
-            || text
-                .lines()
-                .any(|l| l.trim() == "./target/debug/hops-cli local start"),
-        "must start again without --backend after stop"
+        text.contains("NODE_IP") || text.contains("NetworkSettings"),
+        "must push via engine-plane dory-k8s IP"
+    );
+    // Single-platform pull/build avoids multiplatform push warnings.
+    assert!(
+        text.contains("docker pull --platform") || text.contains("--platform \"$PLATFORM\""),
+        "registry smoke must pull busybox with an explicit --platform"
+    );
+    assert!(
+        text.contains("multiplatform") || text.contains("single-platform"),
+        "must document why single-platform materialization is used"
     );
 }
 
 #[test]
-fn dory_smoke_workflow_carries_colima_lessons() {
+fn dory_smoke_workflow_path_based_config_install() {
     let text = workflow_text();
     assert!(
-        text.contains("kube-dns") || text.contains("coredns"),
-        "must wait for CoreDNS/kube-dns before registry round-trip"
+        text.contains("tests/fixtures/config-smoke"),
+        "must path-install the in-repo config-smoke fixture"
     );
     assert!(
-        text.contains("--timeout=420s"),
-        "must use a long Ready/Available timeout for nested-virt lag"
+        text.contains("config install --path") || text.contains("config install --path "),
+        "must use hops config install --path (no clone)"
     );
     assert!(
-        text.contains("rollout restart"),
-        "stop/start resume must rollout-restart stalled deployments"
+        !text.contains("config install --repo"),
+        "must not clone a remote config repo for the smoke"
     );
     assert!(
-        text.contains("Debug dump on failure") && text.contains("engine.sock"),
-        "failure dump must capture dory/engine diagnostics"
+        text.contains("local/ci-xr.yaml") || text.contains("ci-xr.yaml"),
+        "must apply the fixture XR"
     );
     assert!(
-        text.contains("describe pod smoke-svc-name")
-            || text.contains("describe pod smoke-svc-name smoke-localhost"),
-        "failure dump must describe smoke pods in default ns"
+        text.contains("hops-ci") && text.contains("configmap"),
+        "must verify ConfigMap in hops-ci namespace"
     );
     assert!(
-        text.to_lowercase().contains("localhost:30500"),
-        "must exercise localhost:30500 registry path"
-    );
-}
-
-#[test]
-fn dory_smoke_workflow_public_gha_engine_fallback() {
-    let text = workflow_text();
-    // Public GHA cannot run dory-hv; workflow must document and implement a
-    // Colima-backed engine.sock so hops --backend dory remains testable.
-    assert!(
-        text.contains("colima start") && text.contains("engine.sock"),
-        "must bootstrap Colima docker as engine.sock when native sock is absent"
-    );
-    assert!(
-        text.to_lowercase().contains("surrogate")
-            || text.contains("colima-surrogate")
-            || text.contains("Colima-backed"),
-        "must document Colima engine.sock surrogate for public GHA"
-    );
-    assert!(
-        text.contains("xattr") || text.contains("codesign"),
-        "must clear quarantine/sign Debug Dory.app before open"
+        text.contains("command -v up") || text.contains("up CLI"),
+        "must require Upbound up CLI for path builds"
     );
 }

@@ -72,6 +72,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             "registry deployment not Available in crossplane-system".into()
         },
     );
+    let push = super::package_install::registry_push();
+    let push_ok = package_push_registry_reachable(&push);
+    d.check(
+        &format!("package push registry reachable ({push})"),
+        push_ok,
+        if push_ok {
+            String::new()
+        } else {
+            format!("expected HTTPS registry at {push} for docker push")
+        },
+    );
 
     d.print();
 
@@ -289,6 +300,69 @@ fn provider_package(provider: &str) -> String {
     .unwrap_or_default()
 }
 
+/// Whether `push` is a host-loopback address (kind/colima NodePort).
+///
+/// Dory pushes via the engine docker bridge (`{dory-k8s-ip}:30500`); that IP is
+/// not reachable from the Mac, so host curl is the wrong plane and can hang on
+/// TCP timeout (~75s) before the engine probe runs.
+fn push_host_is_loopback(push: &str) -> bool {
+    // host:port — IPv6 may be bracketed as [::1]:30500
+    let host = if let Some(rest) = push.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        push.split(':').next().unwrap_or(push)
+    };
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+/// Probe the package push registry on the plane docker will use.
+///
+/// - Loopback (`localhost:30500`): short host curl (kind/colima).
+/// - Otherwise (dory bridge IP): engine-network probe only — never host curl
+///   (wrong plane; TCP hang ~75s) and never default docker.sock (can block on
+///   password / missing daemon on a personal Mac).
+fn package_push_registry_reachable(push: &str) -> bool {
+    let url = format!("https://{push}/v2/");
+    if push_host_is_loopback(push) {
+        return super::run_cmd_output(
+            "curl",
+            &["-skf", "--connect-timeout", "2", "--max-time", "3", &url],
+        )
+        .is_ok();
+    }
+
+    // Prefer Dory's engine socket explicitly so we don't touch host Docker.
+    let dory_sock = std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join(".dory/dory.sock"))
+        .filter(|p| p.exists());
+
+    let mut args: Vec<String> = Vec::new();
+    if let Some(sock) = dory_sock {
+        args.push("-H".into());
+        args.push(format!("unix://{}", sock.display()));
+    } else if std::env::var_os("DOCKER_HOST").is_none() {
+        // No engine socket and no DOCKER_HOST: skip rather than hang on host sock.
+        return false;
+    }
+    args.extend(
+        [
+            "run",
+            "--rm",
+            "alpine:latest",
+            "wget",
+            "-qO-",
+            "--no-check-certificate",
+            "--timeout=5",
+            &url,
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    super::run_cmd_output("docker", &arg_refs).is_ok()
+}
+
 /// True when `kubectl get <args>` finds the resource. Uses `--ignore-not-found`
 /// so a missing resource is `false` rather than an error.
 fn exists(get_args: &[&str]) -> bool {
@@ -383,5 +457,23 @@ impl Doctor {
         } else {
             println!("\n{} issue(s) found.", self.failed_count());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_host_loopback_for_kind_colima() {
+        assert!(push_host_is_loopback("localhost:30500"));
+        assert!(push_host_is_loopback("127.0.0.1:30500"));
+        assert!(push_host_is_loopback("[::1]:30500"));
+    }
+
+    #[test]
+    fn push_host_not_loopback_for_dory_bridge() {
+        assert!(!push_host_is_loopback("192.168.215.2:30500"));
+        assert!(!push_host_is_loopback("10.43.0.1:30500"));
     }
 }

@@ -1,0 +1,13 @@
+apiVersion: ci.hops.ops.com.ai/v1alpha1
+kind: ConfigSmoke
+metadata:
+  name: hops-ci-smoke
+  namespace: hops-ci
+spec:
+  configMapName: hops-ci-smoke
+  data:
+    source: path-based-config-install
+    smoke: "ok"
+  providerConfigRef:
+    name: default
+    kind: ProviderConfig

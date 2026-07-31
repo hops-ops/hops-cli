@@ -4,7 +4,7 @@ use crate::commands::local::package_install::{
     docker_arch, ensure_cached_repo_checkout, ensure_registry, image_config_name,
     parse_docker_push_digest, parse_repo_spec, resolve_repo_install_target, rewrite_registry,
     rewrite_registry_with_tag, sanitize_name_component, short_hash, split_ref, strip_registry,
-    unique_suffix, RepoInstallTarget, RepoSpec, REGISTRY_PULL, REGISTRY_PUSH,
+    unique_suffix, RepoInstallTarget, RepoSpec, registry_pull, registry_push,
 };
 use crate::commands::local::{kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output};
 use clap::Args;
@@ -326,7 +326,7 @@ fn run_local_path(path: &str, skip_dependency_resolution: bool) -> Result<(), Bo
             continue;
         }
 
-        let push_ref = rewrite_registry(&img.source, REGISTRY_PUSH);
+        let push_ref = rewrite_registry(&img.source, &registry_push());
         let (img_path, tag) = split_ref(&img.source);
 
         // All non-configuration images are Crossplane Function packages (the
@@ -339,7 +339,7 @@ fn run_local_path(path: &str, skip_dependency_resolution: bool) -> Result<(), Bo
 
         if tag == arch {
             let digest = docker_push_and_get_digest(&push_ref)?;
-            let target_prefix = format!("{}/{}", REGISTRY_PULL, strip_registry(img_path));
+            let target_prefix = format!("{}/{}", registry_pull(), strip_registry(img_path));
             render_rewrites.insert(
                 img_path.to_string(),
                 RenderRewrite {
@@ -387,8 +387,8 @@ spec:
         }
 
         let dev_tag = dev_tag_for_uppkg(&img.uppkg_path)?;
-        let push_ref = rewrite_registry_with_tag(&img.source, REGISTRY_PUSH, &dev_tag);
-        let pull_ref = rewrite_registry_with_tag(&img.source, REGISTRY_PULL, &dev_tag);
+        let push_ref = rewrite_registry_with_tag(&img.source, &registry_push(), &dev_tag);
+        let pull_ref = rewrite_registry_with_tag(&img.source, registry_pull(), &dev_tag);
         log::info!(
             "Using local build version '{}' for {}...",
             dev_tag,
@@ -909,6 +909,28 @@ fn dev_tag_for_uppkg(uppkg_path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(format!("dev-{}", &hex[..12]))
 }
 
+/// Map an image reference's arch tag (e.g. `:amd64` / `:arm64` from
+/// `up project build`) to a Docker `--platform` value.
+///
+/// Without an explicit platform, buildx on Apple Silicon warns
+/// `InvalidBaseImagePlatform` when rebuilding the non-host arch variant
+/// (`FROM …:amd64` on arm64, and the reverse on Intel).
+fn platform_for_image_ref(src: &str) -> Option<&'static str> {
+    let (_, tag) = split_ref(src);
+    // Prefer the trailing path segment when the tag is a digest (rare for
+    // function images from up, which use :amd64 / :arm64).
+    let arch = if tag.starts_with("sha256:") {
+        src.rsplit('/').next().unwrap_or(tag)
+    } else {
+        tag
+    };
+    match arch {
+        "amd64" | "linux/amd64" => Some("linux/amd64"),
+        "arm64" | "linux/arm64" | "aarch64" => Some("linux/arm64"),
+        _ => None,
+    }
+}
+
 /// Rebuild a Docker image with just `FROM <src>` to produce a valid OCI config.
 /// This fixes images where rootfs.type is empty (a known issue with `up project build`
 /// render function images).
@@ -918,15 +940,21 @@ fn docker_build_from(src: &str, tag: &str) -> Result<(), Box<dyn Error>> {
     // `build_patched_configuration_image`: without these, buildx wraps the
     // output in a single-arch manifest list that Crossplane (which fetches
     // package layers as linux/amd64 regardless of host) cannot navigate.
+    let mut args: Vec<String> = vec![
+        "build".into(),
+        "--provenance=false".into(),
+        "--sbom=false".into(),
+    ];
+    if let Some(platform) = platform_for_image_ref(src) {
+        args.push("--platform".into());
+        args.push(platform.into());
+    }
+    args.push("-t".into());
+    args.push(tag.into());
+    args.push("-".into());
+
     let mut child = Command::new("docker")
-        .args([
-            "build",
-            "--provenance=false",
-            "--sbom=false",
-            "-t",
-            tag,
-            "-",
-        ])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -969,7 +997,7 @@ fn delete_local_registry_config_revisions(config_name: &str) -> Result<(), Box<d
         if !rev_name.starts_with(config_name) {
             continue;
         }
-        if package.contains(REGISTRY_PULL) && state == "Inactive" {
+        if package.contains(registry_pull()) && state == "Inactive" {
             run_cmd(
                 "kubectl",
                 &[
@@ -1010,7 +1038,7 @@ fn delete_remote_registry_config_revisions(config_name: &str) -> Result<(), Box<
         if !rev_name.starts_with(config_name) {
             continue;
         }
-        if !package.contains(REGISTRY_PULL) && state == "Inactive" {
+        if !package.contains(registry_pull()) && state == "Inactive" {
             run_cmd(
                 "kubectl",
                 &[
@@ -1102,6 +1130,22 @@ spec:
         assert_eq!(
             package_tag("ghcr.io/hops-ops/test@sha256:abcdef"),
             Some("sha256:abcdef")
+        );
+    }
+
+    #[test]
+    fn platform_for_image_ref_from_up_arch_tags() {
+        assert_eq!(
+            platform_for_image_ref("ghcr.io/hops-ops/config-smoke_render:amd64"),
+            Some("linux/amd64")
+        );
+        assert_eq!(
+            platform_for_image_ref("ghcr.io/hops-ops/config-smoke_render:arm64"),
+            Some("linux/arm64")
+        );
+        assert_eq!(
+            platform_for_image_ref("ghcr.io/hops-ops/config-smoke:configuration"),
+            None
         );
     }
 }
