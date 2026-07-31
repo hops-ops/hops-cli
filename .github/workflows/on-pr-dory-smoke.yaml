@@ -81,8 +81,38 @@ jobs:
             exit 1
           fi
           command -v helm >/dev/null || { echo "helm missing (brew install helm)" >&2; exit 1; }
-          command -v cargo >/dev/null || { echo "cargo missing" >&2; exit 1; }
           command -v up >/dev/null || { echo "up CLI missing (needed for hops config install --path)" >&2; exit 1; }
+
+          # cargo: ~/.cargo/bin/cargo is often a rustup shim; if rustup is broken
+          # or the shim is a dangling symlink, `command -v cargo` still succeeds
+          # but the binary does not run. Prefer a toolchain cargo that works.
+          resolve_cargo_bin() {
+            if command -v cargo >/dev/null 2>&1 && cargo --version >/dev/null 2>&1; then
+              command -v cargo
+              return 0
+            fi
+            local c
+            for c in \
+              "$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo" \
+              "$HOME/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo" \
+              "$HOME/.rustup/toolchains/"*/bin/cargo
+            do
+              if [ -x "$c" ] && "$c" --version >/dev/null 2>&1; then
+                printf '%s\n' "$c"
+                return 0
+              fi
+            done
+            return 1
+          }
+          CARGO_BIN="$(resolve_cargo_bin)" || {
+            echo "cargo missing or broken (check rustup toolchains under ~/.rustup/toolchains)" >&2
+            ls -la "$HOME/.cargo/bin" 2>/dev/null || true
+            ls "$HOME/.rustup/toolchains" 2>/dev/null || true
+            exit 1
+          }
+          echo "using cargo: $CARGO_BIN ($("$CARGO_BIN" --version))"
+          echo "$(dirname "$CARGO_BIN")" >> "$GITHUB_PATH"
+          export PATH="$(dirname "$CARGO_BIN"):$PATH"
 
           if [ ! -S "$sock" ] || ! docker -H "unix://$sock" info >/dev/null 2>&1; then
             echo "dory.sock not healthy; engine wake only (no desktop mutation)"
