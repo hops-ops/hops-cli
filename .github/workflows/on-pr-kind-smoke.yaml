@@ -19,21 +19,16 @@ jobs:
         run: |
           set -euxo pipefail
           # Required for `hops config install --path` (up project build).
-          curl -sL "https://cli.upbound.io" | sh
+          # Shell installer (curl | sh) only downloads to CWD and prints
+          # "sudo mv up /usr/local/bin/" — not usable on GHA runners.
+          # URL must include /bin/ (see install.sh from https://cli.upbound.io).
+          # export PATH so verification works in this step; GITHUB_PATH is for
+          # subsequent steps only.
+          mkdir -p "$HOME/bin"
+          curl -fsSL "https://cli.upbound.io/stable/current/bin/linux_amd64/up" -o "$HOME/bin/up"
+          chmod +x "$HOME/bin/up"
           echo "$HOME/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.up/bin" >> "$GITHUB_PATH"
-          # Installer may place the binary in different locations.
-          if [ -x "$HOME/bin/up" ]; then
-            echo "$HOME/bin" >> "$GITHUB_PATH"
-          elif [ -x /usr/local/bin/up ]; then
-            true
-          else
-            # Fall back: download latest release asset if shell installer differs.
-            mkdir -p "$HOME/bin"
-            curl -sL "https://cli.upbound.io/stable/current/linux_amd64/up" -o "$HOME/bin/up"
-            chmod +x "$HOME/bin/up"
-            echo "$HOME/bin" >> "$GITHUB_PATH"
-          fi
+          export PATH="$HOME/bin:$PATH"
           up version
 
       - name: Build hops
