@@ -46,7 +46,17 @@ jobs:
           # Single-platform materialization — avoid multiplatform push warnings.
           PLATFORM=linux/amd64
           SRC=public.ecr.aws/docker/library/busybox:stable
-          docker pull --platform "$PLATFORM" "$SRC"
+          # public.ecr.aws anonymous pulls rate-limit; same retry as dory smoke.
+          for attempt in 1 2 3 4 5; do
+            if docker pull --platform "$PLATFORM" "$SRC"; then
+              break
+            fi
+            echo "docker pull failed (attempt $attempt); sleeping..."
+            sleep $((attempt * 15))
+            if [ "$attempt" -eq 5 ]; then
+              exit 1
+            fi
+          done
           docker build --platform "$PLATFORM" --provenance=false --sbom=false \
             -t localhost:30500/smoke/busybox:ci - <<EOF
           FROM ${SRC}
