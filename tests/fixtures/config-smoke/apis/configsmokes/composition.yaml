@@ -1,0 +1,19 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: configsmokes.ci.hops.ops.com.ai
+spec:
+  compositeTypeRef:
+    apiVersion: ci.hops.ops.com.ai/v1alpha1
+    kind: ConfigSmoke
+  mode: Pipeline
+  pipeline:
+  - functionRef:
+      # Crossplane names the installed Function from the package path
+      # ghcr.io/hops-ops/config-smoke_render → hops-ops-config-smokerender
+      # (same convention as gateway-api-stackrender, etc.).
+      name: hops-ops-config-smokerender
+    step: render
+  - functionRef:
+      name: crossplane-contrib-function-auto-ready
+    step: crossplane-contrib-function-auto-ready

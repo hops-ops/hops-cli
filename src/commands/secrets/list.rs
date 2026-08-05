@@ -41,7 +41,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 pushed_rows.push(PushedSecretRow {
                     name: secret.name.clone(),
                     owner: owner_label(&secret),
-                    cluster: tag_value(&secret, "hops.ops.com.ai/cluster").unwrap_or("-".to_string()),
+                    cluster: tag_value(&secret, "hops.ops.com.ai/cluster")
+                        .unwrap_or("-".to_string()),
                     namespace: tag_value(&secret, "hops.ops.com.ai/namespace")
                         .unwrap_or("-".to_string()),
                     kms_key: shorten_kms_key(&kms),

@@ -1,11 +1,11 @@
+use crate::commands::local::backend::{self, Backend};
 use crate::commands::local::package_install::{
     docker_arch, ensure_cached_repo_checkout_at, ensure_registry, parse_repo_spec,
     resolve_repo_install_target, run_watch, sanitize_name_component, RepoInstallTarget, RepoSpec,
-    REGISTRY_HOSTNAME, REGISTRY_PULL, REGISTRY_PUSH,
+    registry_pull, registry_push,
 };
 use crate::commands::local::{
-    kubectl_apply_stdin, run_cmd, run_cmd_output, sync_registry_hosts_entry,
-    HOPS_KUBE_CONTEXT_ENV, MANAGED_BY_LABEL, PROVIDER_INSTALL_MANAGED_BY,
+    kubectl_apply_stdin, run_cmd, run_cmd_output, MANAGED_BY_LABEL, PROVIDER_INSTALL_MANAGED_BY,
 };
 use clap::Args;
 use serde::Deserialize;
@@ -53,6 +53,10 @@ pub struct ProviderInstallArgs {
     #[arg(long)]
     pub context: Option<String>,
 
+    /// Local cluster backend whose node should be wired for local package pulls.
+    #[arg(long, value_enum)]
+    pub backend: Option<Backend>,
+
     /// Watch the project directory for changes and re-run install automatically
     #[arg(long, conflicts_with = "repo")]
     pub watch: bool,
@@ -73,9 +77,7 @@ struct PackageMetadata {
 }
 
 pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
-    if let Some(ctx) = &args.context {
-        std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx);
-    }
+    let backend = backend::activate(args.backend, args.context.as_deref());
 
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => {
@@ -86,10 +88,14 @@ pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
             args.skip_dependency_resolution,
             args.version_prefix.as_deref(),
             args.branch.as_deref(),
+            backend,
+            args.backend,
+            args.context.as_deref(),
         ),
         (None, _) => {
             let path = args.path.as_deref().unwrap_or(".");
             let prefix = args.version_prefix.clone();
+            prepare_local_registry(backend, args.backend, args.context.as_deref())?;
             run_local_path(path, args.skip_dependency_resolution, prefix.as_deref())?;
 
             if args.watch {
@@ -111,11 +117,15 @@ fn run_repo_install(
     skip_dependency_resolution: bool,
     version_prefix: Option<&str>,
     branch: Option<&str>,
+    backend: Backend,
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
     match resolve_repo_install_target(&spec)? {
         RepoInstallTarget::SourceBuild => {
             let cache_path = ensure_cached_repo_checkout_at(&spec, branch)?;
+            prepare_local_registry(backend, backend_flag, context)?;
             run_local_path(
                 &cache_path.to_string_lossy(),
                 skip_dependency_resolution,
@@ -126,6 +136,15 @@ fn run_repo_install(
             apply_repo_version_spec(&spec, &version, skip_dependency_resolution)
         }
     }
+}
+
+fn prepare_local_registry(
+    backend: Backend,
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    ensure_registry()?;
+    backend::wire_local_registry_for_target(backend, backend_flag, context)
 }
 
 fn apply_repo_version(
@@ -154,16 +173,12 @@ fn apply_repo_version_spec(
         sanitize_name_component(&spec.repo)
     );
 
-    log::info!(
-        "Applying Provider '{}' from {}",
-        provider_name,
-        package_ref
-    );
+    log::info!("Applying Provider '{}' from {}", provider_name, package_ref);
     let providers_json = run_cmd_output(
         "kubectl",
         &["get", "providers.pkg.crossplane.io", "-o", "json"],
     )?;
-    let resolved = resolve_provider_target(&provider_name, &providers_json, REGISTRY_PULL)?;
+    let resolved = resolve_provider_target(&provider_name, &providers_json, registry_pull())?;
     // Published install pulls directly from ghcr.io — no ImageConfig rewrite,
     // no local registry push, no runtime-image override.
     apply_provider_resources(
@@ -189,9 +204,6 @@ fn run_local_path(
     let provider_name = read_provider_name(dir)?;
     log::info!("Provider package name: {}", provider_name);
 
-    ensure_registry()?;
-    sync_registry_hosts_entry("crossplane-system", "registry", REGISTRY_HOSTNAME)?;
-
     // Resolve the existing upstream Provider before building so we can:
     //   1. carry the upstream package URL into the new `spec.package` (Crossplane
     //      records the URL-without-tag as the Lock Source; deps declared as
@@ -204,8 +216,8 @@ fn run_local_path(
         "kubectl",
         &["get", "providers.pkg.crossplane.io", "-o", "json"],
     )?;
-    let resolved = resolve_provider_target(&provider_name, &providers_json, REGISTRY_PULL)?;
-    let upstream_url_prefix = recover_upstream_url_prefix(&resolved, REGISTRY_PULL)?;
+    let resolved = resolve_provider_target(&provider_name, &providers_json, registry_pull())?;
+    let upstream_url_prefix = recover_upstream_url_prefix(&resolved, registry_pull())?;
     let upstream_major = parse_major_version(&resolved.existing_package);
 
     ensure_build_submodule(dir)?;
@@ -220,7 +232,7 @@ fn run_local_path(
     let xpkg_path = find_xpkg_for_provider(dir, &provider_name, arch)?;
     log::info!("Located xpkg: {}", xpkg_path.display());
 
-    let local_image_path_for_tag = format!("{}/hops-ops/{}", REGISTRY_PULL, provider_name);
+    let local_image_path_for_tag = format!("{}/hops-ops/{}", registry_pull(), provider_name);
     let dev_tag = dev_tag_for_file(
         &xpkg_path,
         version_prefix,
@@ -228,11 +240,8 @@ fn run_local_path(
         &local_image_path_for_tag,
     )?;
 
-    let push_xpkg_ref = format!(
-        "{}/hops-ops/{}:{}",
-        REGISTRY_PUSH, provider_name, dev_tag
-    );
-    let local_pull_xpkg_path = format!("{}/hops-ops/{}", REGISTRY_PULL, provider_name);
+    let push_xpkg_ref = format!("{}/hops-ops/{}:{}", registry_push(), provider_name, dev_tag);
+    let local_pull_xpkg_path = format!("{}/hops-ops/{}", registry_pull(), provider_name);
     log::info!("Pushing xpkg to {}...", push_xpkg_ref);
     crossplane_xpkg_push(&xpkg_path, &push_xpkg_ref)?;
 
@@ -277,11 +286,7 @@ fn read_provider_name(dir: &Path) -> Result<String, Box<dyn Error>> {
 
     let name = parsed.metadata.name.trim().to_string();
     if name.is_empty() {
-        return Err(format!(
-            "{} has no metadata.name",
-            crossplane_yaml.display()
-        )
-        .into());
+        return Err(format!("{} has no metadata.name", crossplane_yaml.display()).into());
     }
     Ok(name)
 }
@@ -293,7 +298,10 @@ fn ensure_build_submodule(dir: &Path) -> Result<(), Box<dyn Error>> {
     }
 
     if !dir.join(".gitmodules").is_file() {
-        log::debug!("No .gitmodules in {}; skipping submodule init", dir.display());
+        log::debug!(
+            "No .gitmodules in {}; skipping submodule init",
+            dir.display()
+        );
         return Ok(());
     }
 
@@ -344,28 +352,19 @@ fn find_xpkg_for_provider(
         .filter_map(|e| e.ok())
         .filter(|e| {
             let p = e.path();
-            p.extension().map_or(false, |ext| ext == "xpkg")
+            p.extension().is_some_and(|ext| ext == "xpkg")
                 && p.file_name()
                     .and_then(|n| n.to_str())
-                    .map_or(false, |n| n.starts_with(&prefix))
+                    .is_some_and(|n| n.starts_with(&prefix))
         })
         .map(|e| e.path())
         .collect();
 
     if candidates.is_empty() {
-        return Err(format!(
-            "no {}*.xpkg found in {}",
-            prefix,
-            xpkg_dir.display()
-        )
-        .into());
+        return Err(format!("no {}*.xpkg found in {}", prefix, xpkg_dir.display()).into());
     }
 
-    candidates.sort_by_key(|p| {
-        fs::metadata(p)
-            .and_then(|m| m.modified())
-            .ok()
-    });
+    candidates.sort_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
     Ok(candidates.pop().unwrap())
 }
 
@@ -395,7 +394,10 @@ fn local_runtime_image_ref(provider_name: &str, arch: &str, tag: &str) -> String
     // package manager, so they need the node-pullable local registry address.
     format!(
         "{}/hops-ops/{}-{}:{}",
-        REGISTRY_PUSH, provider_name, arch, tag
+        registry_push(),
+        provider_name,
+        arch,
+        tag
     )
 }
 
@@ -500,9 +502,10 @@ fn next_local_patch_for_major(image_path: &str, major: u64) -> Result<u32, Box<d
         .split_once('/')
         .map(|(_, rest)| rest)
         .unwrap_or(image_path);
-    let url = format!("http://{}/v2/{}/tags/list", REGISTRY_PUSH, path);
+    let url = format!("https://{}/v2/{}/tags/list", registry_push(), path);
+    // Local registry uses a hops-managed self-signed cert; skip TLS verify for tag listing.
     let output = Command::new("curl")
-        .args(["-sf", "-o", "-", &url])
+        .args(["-skf", "-o", "-", &url])
         .output()?;
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);
@@ -544,7 +547,10 @@ struct TagsListResponse {
 fn is_full_semver(s: &str) -> bool {
     let trimmed = s.strip_prefix('v').unwrap_or(s);
     let parts: Vec<&str> = trimmed.splitn(3, '.').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Parse a `vN` (or `N`) bare-major version string, e.g. `v1` -> `Some(1)`.
@@ -1104,11 +1110,8 @@ mod tests {
 
     #[test]
     fn build_runtime_config_yaml_overrides_image_when_provided() {
-        let with_image = build_runtime_config_yaml(
-            "p-runtime",
-            "p",
-            Some("registry.example/p-arm64:dev-abc"),
-        );
+        let with_image =
+            build_runtime_config_yaml("p-runtime", "p", Some("registry.example/p-arm64:dev-abc"));
         assert!(with_image.contains("name: package-runtime"));
         assert!(with_image.contains("image: registry.example/p-arm64:dev-abc"));
 
@@ -1119,7 +1122,6 @@ mod tests {
         assert!(without.contains("app.kubernetes.io/managed-by: hops-provider-install"));
     }
 
-
     #[test]
     fn local_runtime_image_ref_uses_nodeport_registry() {
         let image = local_runtime_image_ref("provider-helm", "arm64", "v1.999.3");
@@ -1127,7 +1129,16 @@ mod tests {
             image,
             "localhost:30500/hops-ops/provider-helm-arm64:v1.999.3"
         );
-        assert!(!image.contains(REGISTRY_PULL));
+        assert!(!image.contains(registry_pull()));
+    }
+
+    #[test]
+    fn local_registry_wiring_skips_foreign_context_without_backend_flag() {
+        assert!(!backend::should_wire_local_registry(
+            None,
+            Some("kind-hops"),
+            Backend::Colima
+        ));
     }
 
     #[test]
@@ -1165,7 +1176,10 @@ mod tests {
     fn assert_no_existing_provider_error(err: Box<dyn Error>, provider_name: &str) {
         let msg = err.to_string();
         assert!(
-            msg.contains(&format!("no existing Provider matching '{}'", provider_name)),
+            msg.contains(&format!(
+                "no existing Provider matching '{}'",
+                provider_name
+            )),
             "missing 'no existing Provider matching' phrase: {}",
             msg
         );
@@ -1183,9 +1197,8 @@ mod tests {
 
     #[test]
     fn resolve_provider_target_errors_when_list_is_empty() {
-        let err =
-            resolve_provider_target("provider-helm", "{\"items\":[]}", TEST_LOCAL_REGISTRY)
-                .expect_err("expected no-existing-Provider error");
+        let err = resolve_provider_target("provider-helm", "{\"items\":[]}", TEST_LOCAL_REGISTRY)
+            .expect_err("expected no-existing-Provider error");
         assert_no_existing_provider_error(err, "provider-helm");
     }
 
@@ -1245,10 +1258,7 @@ mod tests {
         // "already_patched" bucket. We must still find it instead of erroring.
         let json = provider_json(&[(
             "crossplane-contrib-provider-helm",
-            &format!(
-                "{}/hops-ops/provider-helm:dev-abc123",
-                TEST_LOCAL_REGISTRY
-            ),
+            &format!("{}/hops-ops/provider-helm:dev-abc123", TEST_LOCAL_REGISTRY),
             Some("crossplane-contrib-provider-helm-drc"),
         )]);
 
@@ -1333,7 +1343,8 @@ mod tests {
     fn resolve_provider_target_returns_clear_error_on_invalid_json() {
         let err = resolve_provider_target("provider-helm", "not-json", TEST_LOCAL_REGISTRY)
             .expect_err("expected parse error");
-        assert!(err.to_string().contains("failed to parse providers list JSON"));
+        assert!(err
+            .to_string()
+            .contains("failed to parse providers list JSON"));
     }
 }
-

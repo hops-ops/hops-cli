@@ -1,0 +1,131 @@
+name: kind backend smoke
+
+# End-to-end check of `hops local` on the kind backend (ubuntu runners).
+# Registry round-trip + path-based config install (same fixture as dory smoke).
+
+on:
+  pull_request:
+
+jobs:
+  kind-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install up CLI
+        run: |
+          set -euxo pipefail
+          # Required for `hops config install --path` (up project build).
+          # Shell installer (curl | sh) only downloads to CWD and prints
+          # "sudo mv up /usr/local/bin/" — not usable on GHA runners.
+          # URL must include /bin/ (see install.sh from https://cli.upbound.io).
+          # export PATH so verification works in this step; GITHUB_PATH is for
+          # subsequent steps only.
+          mkdir -p "$HOME/bin"
+          curl -fsSL "https://cli.upbound.io/stable/current/bin/linux_amd64/up" -o "$HOME/bin/up"
+          chmod +x "$HOME/bin/up"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/bin:$PATH"
+          up version
+
+      - name: Build hops
+        run: cargo build
+
+      - name: hops local start --backend kind
+        run: ./target/debug/hops-cli local start --backend kind
+
+      - name: hops local doctor
+        run: ./target/debug/hops-cli local doctor
+
+      - name: Registry round-trip through both pull names
+        run: |
+          set -euxo pipefail
+          # Single-platform materialization — avoid multiplatform push warnings.
+          PLATFORM=linux/amd64
+          SRC=public.ecr.aws/docker/library/busybox:stable
+          # public.ecr.aws anonymous pulls rate-limit; same retry as dory smoke.
+          for attempt in 1 2 3 4 5; do
+            if docker pull --platform "$PLATFORM" "$SRC"; then
+              break
+            fi
+            echo "docker pull failed (attempt $attempt); sleeping..."
+            sleep $((attempt * 15))
+            if [ "$attempt" -eq 5 ]; then
+              exit 1
+            fi
+          done
+          docker build --platform "$PLATFORM" --provenance=false --sbom=false \
+            -t localhost:30500/smoke/busybox:ci - <<EOF
+          FROM ${SRC}
+          EOF
+          docker push localhost:30500/smoke/busybox:ci
+
+          # Service-name pull: containerd resolves via its certs.d alias.
+          kubectl --context kind-hops run smoke-svc-name \
+            --image=registry.crossplane-system.svc.cluster.local:5000/smoke/busybox:ci \
+            --restart=Never --command -- sleep 300
+
+          # localhost:30500 pull: what provider runtime pods reference.
+          kubectl --context kind-hops run smoke-localhost \
+            --image=localhost:30500/smoke/busybox:ci \
+            --restart=Never --command -- sleep 300
+
+          kubectl --context kind-hops wait --for=condition=Ready \
+            pod/smoke-svc-name pod/smoke-localhost --timeout=180s
+          kubectl --context kind-hops delete pod smoke-svc-name smoke-localhost --wait=false
+
+      - name: Path-based config install (fixture ConfigMap)
+        run: |
+          set -euxo pipefail
+          FIXTURE=tests/fixtures/config-smoke
+          test -d "$FIXTURE"
+          test -f "$FIXTURE/upbound.yaml"
+
+          ./target/debug/hops-cli config install --path "$FIXTURE" --backend kind
+
+          for i in $(seq 1 90); do
+            healthy="$(kubectl --context kind-hops get configuration.pkg.crossplane.io hops-ops-config-smoke \
+              -o jsonpath='{.status.conditions[?(@.type=="Healthy")].status}' 2>/dev/null || true)"
+            installed="$(kubectl --context kind-hops get configuration.pkg.crossplane.io hops-ops-config-smoke \
+              -o jsonpath='{.status.conditions[?(@.type=="Installed")].status}' 2>/dev/null || true)"
+            if [ "$healthy" = "True" ] && [ "$installed" = "True" ]; then
+              echo "Configuration hops-ops-config-smoke Healthy after ${i} attempts"
+              break
+            fi
+            if [ "$i" -eq 90 ]; then
+              kubectl --context kind-hops get configuration.pkg.crossplane.io hops-ops-config-smoke -o yaml || true
+              kubectl --context kind-hops get configurationrevisions.pkg.crossplane.io -o wide || true
+              kubectl --context kind-hops get functions.pkg.crossplane.io -o wide || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          kubectl --context kind-hops wait --for=condition=Established \
+            crd/configsmokes.ci.hops.ops.com.ai --timeout=180s
+
+          kubectl --context kind-hops apply -f "$FIXTURE/local/ci-xr.yaml"
+
+          kubectl --context kind-hops -n hops-ci wait --for=condition=Ready \
+            configsmoke.ci.hops.ops.com.ai/hops-ci-smoke --timeout=300s
+
+          kubectl --context kind-hops -n hops-ci get configmap hops-ci-smoke -o yaml
+          smoke_val="$(kubectl --context kind-hops -n hops-ci get configmap hops-ci-smoke \
+            -o jsonpath='{.data.smoke}')"
+          test "$smoke_val" = "ok"
+
+      - name: Soft cleanup (CI fixture only)
+        if: always()
+        run: |
+          set +e
+          kubectl --context kind-hops delete pod smoke-svc-name smoke-localhost --wait=false 2>/dev/null || true
+          kubectl --context kind-hops -n hops-ci delete configsmoke hops-ci-smoke --wait=false 2>/dev/null || true
+          kubectl --context kind-hops -n hops-ci delete configmap hops-ci-smoke --wait=false 2>/dev/null || true
+          kubectl --context kind-hops -n hops-ci delete object hops-ci-smoke --wait=false 2>/dev/null || true
+
+      - name: hops local destroy
+        if: always()
+        run: ./target/debug/hops-cli local destroy || true

@@ -1,0 +1,341 @@
+name: dory backend smoke
+
+# Real stock-Dory + hops integration on a self-hosted Apple Silicon Mac.
+#
+# Why self-hosted (not macos-15 / Colima):
+# - Stock Dory needs dory-hv (Hypervisor.framework). Public GHA VMs cannot nest it.
+# - An earlier "green" dory-smoke spent ~10m building a fork, then used Colima as
+#   ~/.dory/*.sock — that was not product Dory. This workflow refuses that lie.
+#
+# Trigger: label `test-dory` on the PR, or workflow_dispatch.
+# Offline Mac: the job stays queued until the runner is online.
+#
+# Do-not-interrupt contract (personal Mac while you work):
+# - Reuses your already-running Dory engine + dory-k8s
+# - Never mutates desktop defaults (no global context switching, no merge into
+#   ~/.kube/config). Session is entirely env-driven:
+#     DOCKER_HOST=unix://$HOME/.dory/dory.sock
+#     KUBECONFIG=<job-private file>
+#     HOPS_DORY_DESKTOP=0
+# - Never destroy / stop dory-k8s, never kill Dory
+# - Caps cargo parallelism and runs the build under nice(1)
+#
+# Runner setup (one-time on the Mac):
+#   mkdir -p ~/actions-runners/hops-cli && cd ~/actions-runners/hops-cli
+#   # download latest macOS arm64 runner from actions/runner releases
+#   ./config.sh --url https://github.com/hops-ops/hops-cli \
+#     --token <registration-token> \
+#     --name "$(hostname -s)-dory" \
+#     --labels macOS,ARM64,hops-dory \
+#     --work _work
+#   ./run.sh   # on-demand; omit svc install so jobs only run when you start it
+#
+# Prerequisites: Dory engine healthy, Kubernetes enabled (dory-k8s), helm + cargo
+# + `up` (Upbound CLI) on the runner user's PATH (path-based config install).
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled]
+  workflow_dispatch:
+
+concurrency:
+  group: dory-smoke-self-hosted
+  cancel-in-progress: false
+
+jobs:
+  dory-smoke:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'test-dory')
+    runs-on: [self-hosted, macOS, ARM64, hops-dory]
+    timeout-minutes: 90
+    env:
+      # Do not rewrite ~/.kube/config or change the machine docker default.
+      HOPS_DORY_DESKTOP: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout hops-cli
+        uses: actions/checkout@v4
+
+      - name: Require Apple Silicon
+        run: |
+          set -euxo pipefail
+          arch="$(uname -m)"
+          echo "arch=$arch host=$(hostname -s)"
+          if [ "$arch" != "arm64" ] && [ "$arch" != "arm64e" ]; then
+            echo "Stock Dory requires Apple Silicon (got $arch)." >&2
+            exit 1
+          fi
+
+      - name: Env-only Dory session (private KUBECONFIG + DOCKER_HOST)
+        run: |
+          # No set -x: avoid dumping full PATH / home internals into Actions logs.
+          set -euo pipefail
+          sock="$HOME/.dory/dory.sock"
+          export PATH="$HOME/.dory/bin:/Applications/Dory.app/Contents/Helpers:$PATH"
+          echo "$HOME/.dory/bin" >> "$GITHUB_PATH"
+          echo "/Applications/Dory.app/Contents/Helpers" >> "$GITHUB_PATH"
+
+          if [ ! -d /Applications/Dory.app ]; then
+            echo "Dory.app missing. Once: brew install --cask Augani/dory/dory" >&2
+            exit 1
+          fi
+          command -v helm >/dev/null || { echo "helm missing (brew install helm)" >&2; exit 1; }
+          command -v up >/dev/null || { echo "up CLI missing (needed for hops config install --path)" >&2; exit 1; }
+
+          # Prefer a toolchain cargo that actually runs (shim may be broken).
+          resolve_cargo_bin() {
+            if command -v cargo >/dev/null 2>&1 && cargo --version >/dev/null 2>&1; then
+              command -v cargo
+              return 0
+            fi
+            local c
+            for c in \
+              "$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo" \
+              "$HOME/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo" \
+              "$HOME/.rustup/toolchains/"*/bin/cargo
+            do
+              if [ -x "$c" ] && "$c" --version >/dev/null 2>&1; then
+                printf '%s\n' "$c"
+                return 0
+              fi
+            done
+            return 1
+          }
+          CARGO_BIN="$(resolve_cargo_bin)" || {
+            echo "cargo missing or broken (install rustup stable toolchain)" >&2
+            exit 1
+          }
+          echo "cargo ok ($("$CARGO_BIN" --version))"
+          echo "$(dirname "$CARGO_BIN")" >> "$GITHUB_PATH"
+          export PATH="$(dirname "$CARGO_BIN"):$PATH"
+
+          if [ ! -S "$sock" ] || ! docker -H "unix://$sock" info >/dev/null 2>&1; then
+            echo "waking Dory engine..."
+            command -v dory >/dev/null 2>&1 && { dory engine wake || dory engine start || true; } >/dev/null 2>&1 || true
+            if [ ! -S "$sock" ]; then
+              open -g -j -a Dory 2>/dev/null || true
+            fi
+          fi
+
+          ready=0
+          for i in $(seq 1 36); do
+            if [ -S "$sock" ] && docker -H "unix://$sock" info >/dev/null 2>&1; then
+              echo "dory engine ready"
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "Dory engine not ready (is Dory.app running?)" >&2
+            exit 1
+          fi
+
+          if [ -L "$sock" ]; then
+            target="$(readlink "$sock" || true)"
+            case "$target" in
+              *colima*)
+                echo "refusing Colima-backed dory.sock" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          export DOCKER_HOST="unix://$sock"
+          echo "DOCKER_HOST=unix://$sock" >> "$GITHUB_ENV"
+
+          if ! docker inspect -f '{{.State.Running}}' dory-k8s 2>/dev/null | grep -q true; then
+            if docker inspect dory-k8s >/dev/null 2>&1; then
+              echo "starting dory-k8s..."
+              docker start dory-k8s >/dev/null
+            else
+              echo "dory-k8s missing — enable Kubernetes in the Dory app" >&2
+              exit 1
+            fi
+          fi
+
+          for i in $(seq 1 60); do
+            if docker exec dory-k8s kubectl get nodes --no-headers 2>/dev/null | grep -q ' Ready'; then
+              echo "dory-k8s Ready"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "dory-k8s did not become Ready" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+          # Job-private kubeconfig only — never touch ~/.kube/config.
+          kube="$RUNNER_TEMP/hops-dory-ci.kubeconfig"
+          if [ -f "$HOME/.kube/dory-config" ]; then
+            cp "$HOME/.kube/dory-config" "$kube"
+          else
+            docker exec dory-k8s cat /etc/rancher/k3s/k3s.yaml >"$kube"
+            if curl -sk --connect-timeout 2 https://127.0.0.1:6443/ >/dev/null 2>&1; then
+              sed -i.bak 's#server:.*#server: https://127.0.0.1:6443#' "$kube" || true
+              rm -f "${kube}.bak"
+            fi
+          fi
+          chmod 600 "$kube"
+          echo "KUBECONFIG=$kube" >> "$GITHUB_ENV"
+          export KUBECONFIG="$kube"
+
+          # Minimal proof (no docker info / full node dump — personal Mac).
+          kubectl get nodes --no-headers | awk '{print "node", $1, $2}'
+          echo "env session ready (DOCKER_HOST + private KUBECONFIG)"
+
+      # No Swatinem/rust-cache: on a personal Mac runner the post-job save
+      # tars ~100MB+ of target/ and can hang (slow upload, or a password prompt
+      # with no TTY). Local cargo builds here in ~20s without it.
+
+      - name: Build hops (nice, limited jobs)
+        run: |
+          set -euxo pipefail
+          nice -n 10 cargo build -j "${CARGO_BUILD_JOBS}"
+
+      - name: Host resources
+        run: |
+          set -euxo pipefail
+          sysctl -n hw.ncpu || true
+          sysctl hw.memsize || true
+          uname -m
+          uptime || true
+          # DOCKER_HOST + KUBECONFIG already in env from prior step
+          dory readiness || true
+
+      - name: hops local start --backend dory
+        run: |
+          set -euxo pipefail
+          # HOPS_DORY_DESKTOP=0 → env session only (no global context changes)
+          ./target/debug/hops-cli local start --backend dory
+
+      - name: hops local doctor
+        run: |
+          set -euxo pipefail
+          ./target/debug/hops-cli local doctor
+
+      - name: Wait for node + CoreDNS
+        run: |
+          set -euxo pipefail
+          # Uses job KUBECONFIG only (current-context inside that file).
+          kubectl wait --for=condition=Ready nodes --all --timeout=120s
+          kubectl -n kube-system wait --for=condition=Ready \
+            pod -l k8s-app=kube-dns --timeout=180s || \
+            kubectl -n kube-system wait --for=condition=Ready \
+              pod -l k8s-app=coredns --timeout=180s || true
+          kubectl -n kube-system get pods -o wide || true
+          kubectl -n crossplane-system get pods -o wide || true
+
+      - name: Registry round-trip (engine push + in-cluster pull)
+        run: |
+          set -euxo pipefail
+
+          NODE_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' dory-k8s)"
+          test -n "$NODE_IP"
+          PUSH="${NODE_IP}:30500"
+          echo "engine push endpoint: $PUSH"
+
+          # Pull + re-materialize as a *single-platform* image for this host.
+          # A plain `docker pull` of busybox:stable keeps multi-arch index
+          # metadata; `docker push` then warns:
+          #   Not all multiplatform-content is present and only the available
+          #   single-platform image was pushed
+          case "$(uname -m)" in
+            arm64|arm64e|aarch64) PLATFORM=linux/arm64 ;;
+            x86_64|amd64) PLATFORM=linux/amd64 ;;
+            *) PLATFORM="linux/$(uname -m)" ;;
+          esac
+          SRC=public.ecr.aws/docker/library/busybox:stable
+          for attempt in 1 2 3 4 5; do
+            if docker pull --platform "$PLATFORM" "$SRC"; then
+              break
+            fi
+            echo "docker pull failed (attempt $attempt); sleeping..."
+            sleep $((attempt * 15))
+            if [ "$attempt" -eq 5 ]; then
+              exit 1
+            fi
+          done
+          # Fresh single-platform tag (no incomplete multi-arch index).
+          docker build --platform "$PLATFORM" --provenance=false --sbom=false \
+            -t "${PUSH}/smoke/busybox:ci" - <<EOF
+          FROM ${SRC}
+          EOF
+          docker push "${PUSH}/smoke/busybox:ci"
+
+          kubectl run smoke-svc-name \
+            --image=registry.crossplane-system.svc.cluster.local:5000/smoke/busybox:ci \
+            --restart=Never --command -- sleep 300
+
+          kubectl run smoke-nodeport \
+            --image="${PUSH}/smoke/busybox:ci" \
+            --restart=Never --command -- sleep 300
+
+          if ! kubectl wait --for=condition=Ready \
+              pod/smoke-svc-name pod/smoke-nodeport --timeout=420s; then
+            kubectl get pods smoke-svc-name smoke-nodeport -o wide || true
+            kubectl describe pod smoke-svc-name smoke-nodeport || true
+            exit 1
+          fi
+          kubectl delete pod smoke-svc-name smoke-nodeport --wait=false
+
+      - name: Path-based config install (fixture ConfigMap)
+        run: |
+          set -euxo pipefail
+          # In-repo fixture only — no clone of real stacks.
+          FIXTURE=tests/fixtures/config-smoke
+          test -d "$FIXTURE"
+          test -f "$FIXTURE/upbound.yaml"
+
+          ./target/debug/hops-cli config install --path "$FIXTURE" --backend dory
+
+          # Wait for Configuration package Healthy.
+          for i in $(seq 1 90); do
+            healthy="$(kubectl get configuration.pkg.crossplane.io hops-ops-config-smoke \
+              -o jsonpath='{.status.conditions[?(@.type=="Healthy")].status}' 2>/dev/null || true)"
+            installed="$(kubectl get configuration.pkg.crossplane.io hops-ops-config-smoke \
+              -o jsonpath='{.status.conditions[?(@.type=="Installed")].status}' 2>/dev/null || true)"
+            if [ "$healthy" = "True" ] && [ "$installed" = "True" ]; then
+              echo "Configuration hops-ops-config-smoke Healthy after ${i} attempts"
+              break
+            fi
+            if [ "$i" -eq 90 ]; then
+              kubectl get configuration.pkg.crossplane.io hops-ops-config-smoke -o yaml || true
+              kubectl get configurationrevisions.pkg.crossplane.io -o wide || true
+              kubectl get functions.pkg.crossplane.io -o wide || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          # Wait for XRD to be established.
+          kubectl wait --for=condition=Established \
+            crd/configsmokes.ci.hops.ops.com.ai --timeout=180s
+
+          # Apply CI XR into hops-ci only (namespaced ConfigMap).
+          kubectl apply -f "$FIXTURE/local/ci-xr.yaml"
+
+          # XR Ready (namespaced composite).
+          kubectl -n hops-ci wait --for=condition=Ready \
+            configsmoke.ci.hops.ops.com.ai/hops-ci-smoke --timeout=300s
+
+          # Prove the ConfigMap exists with expected data.
+          kubectl -n hops-ci get configmap hops-ci-smoke -o yaml
+          smoke_val="$(kubectl -n hops-ci get configmap hops-ci-smoke \
+            -o jsonpath='{.data.smoke}')"
+          test "$smoke_val" = "ok"
+
+      - name: Soft cleanup (CI fixture only)
+        if: always()
+        run: |
+          set +e
+          kubectl delete pod smoke-svc-name smoke-nodeport --wait=false 2>/dev/null || true
+          # Remove only hops-ci smoke resources — leave Dory / dory-k8s / Crossplane.
+          kubectl -n hops-ci delete configsmoke hops-ci-smoke --wait=false 2>/dev/null || true
+          kubectl -n hops-ci delete configmap hops-ci-smoke --wait=false 2>/dev/null || true
+          kubectl -n hops-ci delete object hops-ci-smoke --wait=false 2>/dev/null || true
+          # Leave Configuration package installed (idempotent next run) or drop it:
+          # kubectl delete configuration.pkg.crossplane.io hops-ops-config-smoke --wait=false

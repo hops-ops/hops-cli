@@ -1,14 +1,12 @@
+use crate::commands::local::backend::{self, Backend};
+use crate::commands::local::package_install::run_watch;
 use crate::commands::local::package_install::{
     docker_arch, ensure_cached_repo_checkout, ensure_registry, image_config_name,
     parse_docker_push_digest, parse_repo_spec, resolve_repo_install_target, rewrite_registry,
     rewrite_registry_with_tag, sanitize_name_component, short_hash, split_ref, strip_registry,
-    unique_suffix, RepoInstallTarget, RepoSpec, REGISTRY_HOSTNAME, REGISTRY_PULL, REGISTRY_PUSH,
+    unique_suffix, RepoInstallTarget, RepoSpec, registry_pull, registry_push,
 };
-use crate::commands::local::package_install::run_watch;
-use crate::commands::local::{
-    kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output, sync_registry_hosts_entry,
-    HOPS_KUBE_CONTEXT_ENV,
-};
+use crate::commands::local::{kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output};
 use clap::Args;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
@@ -42,6 +40,10 @@ pub struct ConfigArgs {
     /// Kubernetes context to use for all kubectl commands (e.g. "colima")
     #[arg(long)]
     pub context: Option<String>,
+
+    /// Local cluster backend whose node should be wired for local package pulls.
+    #[arg(long, value_enum)]
+    pub backend: Option<Backend>,
 
     /// Watch the project directory for changes and re-run install automatically
     #[arg(long, conflicts_with = "repo")]
@@ -108,17 +110,22 @@ struct PackageResource {
 }
 
 pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
-    if let Some(ctx) = &args.context {
-        std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx);
-    }
+    let backend = backend::activate(args.backend, args.context.as_deref());
 
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => {
             apply_repo_version(repo, version, args.skip_dependency_resolution)
         }
-        (Some(repo), None) => run_repo_install(repo, args.skip_dependency_resolution),
+        (Some(repo), None) => run_repo_install(
+            repo,
+            args.skip_dependency_resolution,
+            backend,
+            args.backend,
+            args.context.as_deref(),
+        ),
         (None, _) => {
             let path = args.path.as_deref().unwrap_or(".");
+            prepare_local_registry(backend, args.backend, args.context.as_deref())?;
             run_local_path(path, args.skip_dependency_resolution)?;
 
             if args.watch {
@@ -137,10 +144,19 @@ pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
 fn run_repo_install(
     repo: &str,
     skip_dependency_resolution: bool,
+    backend: Backend,
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
     match resolve_repo_install_target(&spec)? {
-        RepoInstallTarget::SourceBuild => run_repo_clone(&spec, skip_dependency_resolution),
+        RepoInstallTarget::SourceBuild => run_repo_clone(
+            &spec,
+            skip_dependency_resolution,
+            backend,
+            backend_flag,
+            context,
+        ),
         RepoInstallTarget::PublishedVersion(version) => {
             apply_repo_version_spec(&spec, &version, skip_dependency_resolution)
         }
@@ -150,9 +166,22 @@ fn run_repo_install(
 fn run_repo_clone(
     spec: &RepoSpec,
     skip_dependency_resolution: bool,
+    backend: Backend,
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    let cache_path = ensure_cached_repo_checkout(&spec)?;
+    let cache_path = ensure_cached_repo_checkout(spec)?;
+    prepare_local_registry(backend, backend_flag, context)?;
     run_local_path(&cache_path.to_string_lossy(), skip_dependency_resolution)
+}
+
+fn prepare_local_registry(
+    backend: Backend,
+    backend_flag: Option<Backend>,
+    context: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    ensure_registry()?;
+    backend::wire_local_registry_for_target(backend, backend_flag, context)
 }
 
 fn apply_repo_version_spec(
@@ -216,17 +245,11 @@ fn apply_repo_version(
     apply_repo_version_spec(&spec, version, skip_dependency_resolution)
 }
 
-fn run_local_path(
-    path: &str,
-    skip_dependency_resolution: bool,
-) -> Result<(), Box<dyn Error>> {
+fn run_local_path(path: &str, skip_dependency_resolution: bool) -> Result<(), Box<dyn Error>> {
     let dir = Path::new(path);
     if !dir.is_dir() {
         return Err(format!("{} is not a directory", path).into());
     }
-
-    ensure_registry()?;
-    sync_registry_hosts_entry("crossplane-system", "registry", REGISTRY_HOSTNAME)?;
 
     // Build the Crossplane package
     log::info!("Building Crossplane package in {}...", path);
@@ -246,7 +269,7 @@ fn run_local_path(
     let packages: Vec<_> = fs::read_dir(&output_dir)
         .map_err(|e| format!("Failed to read {}: {}", output_dir.display(), e))?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "uppkg"))
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "uppkg"))
         .collect();
 
     if packages.is_empty() {
@@ -303,7 +326,7 @@ fn run_local_path(
             continue;
         }
 
-        let push_ref = rewrite_registry(&img.source, REGISTRY_PUSH);
+        let push_ref = rewrite_registry(&img.source, &registry_push());
         let (img_path, tag) = split_ref(&img.source);
 
         // All non-configuration images are Crossplane Function packages (the
@@ -316,7 +339,7 @@ fn run_local_path(
 
         if tag == arch {
             let digest = docker_push_and_get_digest(&push_ref)?;
-            let target_prefix = format!("{}/{}", REGISTRY_PULL, strip_registry(img_path));
+            let target_prefix = format!("{}/{}", registry_pull(), strip_registry(img_path));
             render_rewrites.insert(
                 img_path.to_string(),
                 RenderRewrite {
@@ -364,8 +387,8 @@ spec:
         }
 
         let dev_tag = dev_tag_for_uppkg(&img.uppkg_path)?;
-        let push_ref = rewrite_registry_with_tag(&img.source, REGISTRY_PUSH, &dev_tag);
-        let pull_ref = rewrite_registry_with_tag(&img.source, REGISTRY_PULL, &dev_tag);
+        let push_ref = rewrite_registry_with_tag(&img.source, &registry_push(), &dev_tag);
+        let pull_ref = rewrite_registry_with_tag(&img.source, registry_pull(), &dev_tag);
         log::info!(
             "Using local build version '{}' for {}...",
             dev_tag,
@@ -886,6 +909,28 @@ fn dev_tag_for_uppkg(uppkg_path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(format!("dev-{}", &hex[..12]))
 }
 
+/// Map an image reference's arch tag (e.g. `:amd64` / `:arm64` from
+/// `up project build`) to a Docker `--platform` value.
+///
+/// Without an explicit platform, buildx on Apple Silicon warns
+/// `InvalidBaseImagePlatform` when rebuilding the non-host arch variant
+/// (`FROM …:amd64` on arm64, and the reverse on Intel).
+fn platform_for_image_ref(src: &str) -> Option<&'static str> {
+    let (_, tag) = split_ref(src);
+    // Prefer the trailing path segment when the tag is a digest (rare for
+    // function images from up, which use :amd64 / :arm64).
+    let arch = if tag.starts_with("sha256:") {
+        src.rsplit('/').next().unwrap_or(tag)
+    } else {
+        tag
+    };
+    match arch {
+        "amd64" | "linux/amd64" => Some("linux/amd64"),
+        "arm64" | "linux/arm64" | "aarch64" => Some("linux/arm64"),
+        _ => None,
+    }
+}
+
 /// Rebuild a Docker image with just `FROM <src>` to produce a valid OCI config.
 /// This fixes images where rootfs.type is empty (a known issue with `up project build`
 /// render function images).
@@ -895,15 +940,21 @@ fn docker_build_from(src: &str, tag: &str) -> Result<(), Box<dyn Error>> {
     // `build_patched_configuration_image`: without these, buildx wraps the
     // output in a single-arch manifest list that Crossplane (which fetches
     // package layers as linux/amd64 regardless of host) cannot navigate.
+    let mut args: Vec<String> = vec![
+        "build".into(),
+        "--provenance=false".into(),
+        "--sbom=false".into(),
+    ];
+    if let Some(platform) = platform_for_image_ref(src) {
+        args.push("--platform".into());
+        args.push(platform.into());
+    }
+    args.push("-t".into());
+    args.push(tag.into());
+    args.push("-".into());
+
     let mut child = Command::new("docker")
-        .args([
-            "build",
-            "--provenance=false",
-            "--sbom=false",
-            "-t",
-            tag,
-            "-",
-        ])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -946,7 +997,7 @@ fn delete_local_registry_config_revisions(config_name: &str) -> Result<(), Box<d
         if !rev_name.starts_with(config_name) {
             continue;
         }
-        if package.contains(REGISTRY_PULL) && state == "Inactive" {
+        if package.contains(registry_pull()) && state == "Inactive" {
             run_cmd(
                 "kubectl",
                 &[
@@ -987,7 +1038,7 @@ fn delete_remote_registry_config_revisions(config_name: &str) -> Result<(), Box<
         if !rev_name.starts_with(config_name) {
             continue;
         }
-        if !package.contains(REGISTRY_PULL) && state == "Inactive" {
+        if !package.contains(registry_pull()) && state == "Inactive" {
             run_cmd(
                 "kubectl",
                 &[
@@ -1048,6 +1099,15 @@ spec:
     }
 
     #[test]
+    fn local_registry_wiring_skips_foreign_context_without_backend_flag() {
+        assert!(!backend::should_wire_local_registry(
+            None,
+            Some("kind-hops"),
+            Backend::Colima
+        ));
+    }
+
+    #[test]
     fn package_source_strips_tag_and_digest() {
         assert_eq!(
             package_source("ghcr.io/hops-ops/helm-airflow_render:arm64"),
@@ -1070,6 +1130,22 @@ spec:
         assert_eq!(
             package_tag("ghcr.io/hops-ops/test@sha256:abcdef"),
             Some("sha256:abcdef")
+        );
+    }
+
+    #[test]
+    fn platform_for_image_ref_from_up_arch_tags() {
+        assert_eq!(
+            platform_for_image_ref("ghcr.io/hops-ops/config-smoke_render:amd64"),
+            Some("linux/amd64")
+        );
+        assert_eq!(
+            platform_for_image_ref("ghcr.io/hops-ops/config-smoke_render:arm64"),
+            Some("linux/arm64")
+        );
+        assert_eq!(
+            platform_for_image_ref("ghcr.io/hops-ops/config-smoke:configuration"),
+            None
         );
     }
 }

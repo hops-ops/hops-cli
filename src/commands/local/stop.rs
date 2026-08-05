@@ -1,9 +1,6 @@
-use super::run_cmd;
+use super::backend::Backend;
 use std::error::Error;
 
-pub fn run() -> Result<(), Box<dyn Error>> {
-    log::info!("Stopping Colima...");
-    run_cmd("colima", &["stop"])?;
-    log::info!("Colima stopped");
-    Ok(())
+pub fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
+    backend.stop()
 }

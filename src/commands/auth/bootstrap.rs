@@ -66,7 +66,10 @@ pub fn run(args: &BootstrapArgs) -> Result<(), Box<dyn Error>> {
 
 fn write_secret(path: &PathBuf, value: &str, force: bool) -> Result<(), Box<dyn Error>> {
     if path.exists() && !force {
-        log::info!("  skip   {}: already present (use --force to overwrite)", path.display());
+        log::info!(
+            "  skip   {}: already present (use --force to overwrite)",
+            path.display()
+        );
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -151,11 +154,7 @@ mod tests {
                 "no lowercase: {}",
                 pwd
             );
-            assert!(
-                pwd.chars().any(|c| c.is_ascii_digit()),
-                "no digit: {}",
-                pwd
-            );
+            assert!(pwd.chars().any(|c| c.is_ascii_digit()), "no digit: {}", pwd);
             assert!(
                 pwd.chars().any(|c| !c.is_ascii_alphanumeric()),
                 "no symbol: {}",

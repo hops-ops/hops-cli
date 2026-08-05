@@ -1,15 +1,15 @@
-use super::start::{resize_colima, ColimaSizeArgs};
+use super::backend::{Backend, SizeArgs};
 use clap::Args;
 use std::error::Error;
 
 #[derive(Args, Debug, Clone)]
 pub struct ResizeArgs {
     #[command(flatten)]
-    pub size: ColimaSizeArgs,
+    pub size: SizeArgs,
 }
 
-pub fn run(args: &ResizeArgs) -> Result<(), Box<dyn Error>> {
-    resize_colima(&args.size)?;
-    log::info!("Colima resize complete");
+pub fn run(backend: Backend, args: &ResizeArgs) -> Result<(), Box<dyn Error>> {
+    backend.resize(&args.size)?;
+    log::info!("Resize complete");
     Ok(())
 }

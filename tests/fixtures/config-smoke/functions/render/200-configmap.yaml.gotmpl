@@ -1,0 +1,28 @@
+# code: language=yaml
+{{- $s := $state }}
+---
+apiVersion: kubernetes.m.crossplane.io/v1alpha1
+kind: Object
+metadata:
+  name: {{ $s.configMapName }}
+  annotations:
+    {{ setResourceNameAnnotation "configmap" }}
+  labels:
+    hops.ops.com.ai/ci-fixture: "true"
+    hops.ops.com.ai/config-smoke: {{ $s.name | quote }}
+spec:
+  managementPolicies: {{ $s.managementPolicies | toJson }}
+  forProvider:
+    manifest:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ $s.configMapName }}
+        namespace: {{ $s.namespace }}
+        labels:
+          hops.ops.com.ai/ci-fixture: "true"
+          hops.ops.com.ai/config-smoke: {{ $s.name | quote }}
+      data: {{ $s.data | toJson }}
+  providerConfigRef:
+    name: {{ $s.providerConfigRef.name }}
+    kind: {{ $s.providerConfigRef.kind }}

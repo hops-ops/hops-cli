@@ -132,10 +132,7 @@ pub(crate) fn require_command(program: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
-pub(crate) fn run_command_output(
-    program: &str,
-    args: &[&str],
-) -> Result<Vec<u8>, Box<dyn Error>> {
+pub(crate) fn run_command_output(program: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn Error>> {
     log::debug!("Running: {} {}", program, args.join(" "));
     let output = Command::new(program).args(args).output()?;
     if !output.status.success() {

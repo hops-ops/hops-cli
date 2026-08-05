@@ -1,10 +1,7 @@
-use super::{kubectl_apply_stdin, run_cmd, run_cmd_output, sync_registry_hosts_entry};
+use super::backend::{self, SizeArgs};
+use super::{kubectl_apply_stdin, run_cmd, run_cmd_output, wait_for_kubernetes};
 use clap::Args;
-use dialoguer::Confirm;
-use serde::Deserialize;
 use std::error::Error;
-use std::io::{IsTerminal, Write};
-use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -16,110 +13,122 @@ const PROVIDER_HELM: &str = include_str!("../../../bootstrap/providers/provider-
 const PROVIDER_K8S: &str = include_str!("../../../bootstrap/providers/provider-kubernetes.yaml");
 const PC_HELM: &str = include_str!("../../../bootstrap/helm/pc.yaml");
 const PC_K8S: &str = include_str!("../../../bootstrap/k8s/pc.yaml");
-const REGISTRY: &str = include_str!("../../../bootstrap/registry/registry.yaml");
 
-/// Cluster-internal hostname for the package registry.
-const REGISTRY_HOST: &str = "registry.crossplane-system.svc.cluster.local:5000";
-const REGISTRY_HOSTNAME: &str = "registry.crossplane-system.svc.cluster.local";
-
-const DEFAULT_CPUS: u32 = 8;
-const DEFAULT_MEMORY_GIB: u32 = 16;
-const DEFAULT_DISK_GIB: u32 = 60;
-const GIB: u64 = 1024 * 1024 * 1024;
+const PROVIDER_K8S_NAME: &str = "crossplane-contrib-provider-kubernetes";
+const PROVIDER_HELM_NAME: &str = "crossplane-contrib-provider-helm";
 
 #[derive(Args, Debug, Clone)]
 pub struct StartArgs {
     #[command(flatten)]
-    pub size: ColimaSizeArgs,
+    pub size: SizeArgs,
 
-    /// Stop and restart a running Colima VM without prompting when requested size differs.
+    /// Stop and restart a running cluster VM without prompting when requested size differs.
     #[arg(long)]
     pub yes: bool,
+
+    /// Force helm upgrade and full bootstrap even when the control plane is
+    /// already healthy. Default is to skip expensive helm/repo work on resume.
+    #[arg(long)]
+    pub bootstrap: bool,
 }
 
-#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
-pub struct ColimaSizeArgs {
-    /// Number of CPUs to allocate to the Colima VM.
-    #[arg(long = "cpus", visible_alias = "cpu", value_name = "N")]
-    pub cpus: Option<u32>,
+pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Error>> {
+    // 1. Bring the backend cluster up
+    backend.start(&args.size, args.yes)?;
 
-    /// Memory to allocate to the Colima VM, in GiB.
-    #[arg(long, value_name = "GIB")]
-    pub memory: Option<u32>,
-
-    /// Disk size to allocate to the Colima VM, in GiB.
-    #[arg(long, value_name = "GIB")]
-    pub disk: Option<u32>,
-}
-
-impl ColimaSizeArgs {
-    pub fn any_set(&self) -> bool {
-        self.cpus.is_some() || self.memory.is_some() || self.disk.is_some()
-    }
-
-    pub fn command_suffix(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(cpus) = self.cpus {
-            parts.push(format!("--cpus {}", cpus));
-        }
-        if let Some(memory) = self.memory {
-            parts.push(format!("--memory {}", memory));
-        }
-        if let Some(disk) = self.disk {
-            parts.push(format!("--disk {}", disk));
-        }
-
-        if parts.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", parts.join(" "))
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub(crate) struct ColimaInstance {
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    cpus: Option<u32>,
-    #[serde(default)]
-    memory: Option<u64>,
-    #[serde(default)]
-    disk: Option<u64>,
-}
-
-impl ColimaInstance {
-    fn is_running(&self) -> bool {
-        self.status.eq_ignore_ascii_case("running")
-    }
-
-    fn memory_gib(&self) -> Option<u32> {
-        self.memory.map(bytes_to_gib)
-    }
-
-    fn disk_gib(&self) -> Option<u32> {
-        self.disk.map(bytes_to_gib)
-    }
-}
-
-pub fn run(args: &StartArgs) -> Result<(), Box<dyn Error>> {
-    let instance = colima_instance()?;
-    validate_requested_size(&args.size, instance.as_ref())?;
-
-    // 1. Start Colima with Kubernetes
-    start_or_resize_colima(args, instance.as_ref())?;
+    // Remember the choice so stop/destroy/doctor and package installs target
+    // this backend without needing the flag again.
+    backend::persist(backend)?;
 
     // 2. Wait for the Kubernetes API to become reachable.
-    //    Colima may return immediately ("already running") before the
+    //    The backend may return immediately ("already running") before the
     //    API server is ready, or a fresh start needs time to initialise.
     wait_for_kubernetes()?;
 
-    // 3. Configure Docker in the VM to allow HTTP pulls from the
-    //    cluster-internal registry. Without this the kubelet's Docker
-    //    daemon defaults to HTTPS and fails.
-    configure_docker_insecure_registry()?;
+    // 3. Make the node runtime trust the cluster-internal registry over HTTP.
+    backend.ensure_registry_trust()?;
 
+    // After a docker daemon restart (colima path), re-confirm the node is Ready
+    // so Crossplane pods are not stuck Pending on NotReady.
+    log::info!("Waiting for Kubernetes nodes to be Ready...");
+    run_cmd(
+        "kubectl",
+        &[
+            "wait",
+            "--for=condition=Ready",
+            "nodes",
+            "--all",
+            "--timeout=300s",
+        ],
+    )?;
+
+    // Fast path: cluster already has a healthy hops control plane.
+    // Skip helm repo update / upgrade and long provider waits — those dominate
+    // resume latency (CI stop/start, laptop reopen with dory-k8s still up).
+    if !args.bootstrap && control_plane_healthy() {
+        log::info!(
+            "Control plane already healthy; skipping helm upgrade and bootstrap reapply \
+             (pass --bootstrap to force)"
+        );
+        ensure_registry_ready(backend)?;
+        log::info!("Local environment is ready");
+        return Ok(());
+    }
+
+    if args.bootstrap {
+        log::info!("--bootstrap: forcing helm upgrade and full control-plane reapply");
+    }
+
+    bootstrap_control_plane()?;
+    ensure_registry_ready(backend)?;
+
+    log::info!("Local environment is ready");
+    Ok(())
+}
+
+/// True when Crossplane core, both default providers, and the package registry
+/// are already Available/Healthy — the expensive bootstrap steps can be skipped.
+fn control_plane_healthy() -> bool {
+    deployment_available("crossplane-system", "crossplane")
+        && deployment_available("crossplane-system", "registry")
+        && provider_healthy(PROVIDER_K8S_NAME)
+        && provider_healthy(PROVIDER_HELM_NAME)
+}
+
+fn deployment_available(namespace: &str, name: &str) -> bool {
+    run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "deployment",
+            name,
+            "-n",
+            namespace,
+            "-o",
+            "jsonpath={.status.conditions[?(@.type==\"Available\")].status}",
+        ],
+    )
+    .map(|s| s.trim() == "True")
+    .unwrap_or(false)
+}
+
+fn provider_healthy(provider: &str) -> bool {
+    run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "provider.pkg.crossplane.io",
+            provider,
+            "-o",
+            "jsonpath={.status.conditions[?(@.type==\"Healthy\")].status}",
+        ],
+    )
+    .map(|s| s.trim() == "True")
+    .unwrap_or(false)
+}
+
+/// Helm + Crossplane + providers + ProviderConfigs (the slow cold-start path).
+fn bootstrap_control_plane() -> Result<(), Box<dyn Error>> {
     // 4. Add Crossplane Helm repo
     log::info!("Adding Crossplane Helm repo...");
     run_cmd(
@@ -131,13 +140,22 @@ pub fn run(args: &StartArgs) -> Result<(), Box<dyn Error>> {
             "https://charts.crossplane.io/stable",
         ],
     )?;
-    run_cmd("helm", &["repo", "update"])?;
+    // Update only our repo — a bare `helm repo update` fails outright when any
+    // unrelated repo in the user's helm config has gone stale.
+    run_cmd("helm", &["repo", "update", "crossplane-stable"])?;
 
     // 5. Install Crossplane
+    //
+    // Do not use helm --wait: on nested-virt CI (colima/GHA) image pulls and
+    // scheduling can exceed helm's single wait window, and a failed --wait
+    // leaves us without structured kubectl diagnostics. Apply the chart, then
+    // poll deployments ourselves with a longer budget + failure dumps.
+    //
+    // After stop/start the k3s API can report nodes Ready while openapi/v2 is
+    // still timing out (helm validate fails). Retry helm with API re-probes.
     log::info!("Installing Crossplane...");
-    run_cmd(
-        "helm",
-        &[
+    {
+        let helm_args = [
             "upgrade",
             "--install",
             "crossplane",
@@ -145,15 +163,43 @@ pub fn run(args: &StartArgs) -> Result<(), Box<dyn Error>> {
             "-n",
             "crossplane-system",
             "--create-namespace",
-            "--wait",
             "--timeout",
             "5m",
-        ],
-    )?;
+        ];
+        let mut last_err: Option<Box<dyn Error>> = None;
+        for attempt in 1..=6 {
+            wait_for_kubernetes()?;
+            match run_cmd("helm", &helm_args) {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("helm install attempt {attempt}/6 failed: {e}");
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
 
-    // 6. Wait for Crossplane deployment
+    // 6. Wait for Crossplane core deployment.
+    // rbac-manager can flap under nested-virt resource pressure; the core
+    // controller is what providers need. Best-effort wait for rbac-manager.
     log::info!("Waiting for Crossplane to be ready...");
-    wait_for_deployment("crossplane-system", "crossplane")?;
+    wait_for_deployment_with_diagnostics("crossplane-system", "crossplane")?;
+    if let Err(e) = wait_for_deployment_attempts("crossplane-system", "crossplane-rbac-manager", 36)
+    {
+        log::warn!(
+            "crossplane-rbac-manager not Available yet ({e}); continuing — core Crossplane is ready"
+        );
+    }
+
+    // API can be briefly overloaded right after Crossplane becomes leader.
+    wait_for_kubernetes()?;
 
     // 7. Deploy per-provider DRCs (each pins its own cluster-admin SA)
     log::info!("Applying DeploymentRuntimeConfigs (per-provider)...");
@@ -170,297 +216,64 @@ pub fn run(args: &StartArgs) -> Result<(), Box<dyn Error>> {
     wait_for_crd("providerconfigs.helm.m.crossplane.io")?;
     wait_for_crd("providerconfigs.kubernetes.m.crossplane.io")?;
 
+    // Re-check API before ProviderConfigs (openapi validation can time out if
+    // the apiserver is still busy — apply also uses --validate=false).
+    wait_for_kubernetes()?;
+
     // 10. Apply ProviderConfigs
     log::info!("Applying ProviderConfigs...");
     kubectl_apply_stdin(PC_HELM)?;
     kubectl_apply_stdin(PC_K8S)?;
 
-    // 11. Deploy local OCI registry for Crossplane packages
-    log::info!("Deploying local package registry...");
-    kubectl_apply_stdin(REGISTRY)?;
-    wait_for_deployment("crossplane-system", "registry")?;
-
-    // 12. Map the registry's cluster-internal hostname to its ClusterIP
-    //     inside the VM so the kubelet can resolve it.
-    sync_registry_hosts_entry("crossplane-system", "registry", REGISTRY_HOSTNAME)?;
-
-    log::info!("Local environment is ready");
-    Ok(())
-}
-
-fn start_or_resize_colima(
-    args: &StartArgs,
-    instance: Option<&ColimaInstance>,
-) -> Result<(), Box<dyn Error>> {
-    let is_running = instance.map(ColimaInstance::is_running).unwrap_or(false);
-
-    if is_running && args.size.any_set() {
-        let changes = requested_size_changes(&args.size, instance.expect("checked is_running"));
-        if !changes.is_empty() {
-            confirm_running_resize(args, &changes)?;
-            resize_existing_colima(&args.size, instance)?;
-            return Ok(());
-        }
-
-        log::info!("Requested Colima size already matches the running VM");
-    }
-
-    log::info!("Starting Colima with Kubernetes...");
-
-    let size = if is_running {
-        ColimaSizeArgs::default()
-    } else {
-        args.size.clone()
-    };
-    let include_defaults = instance.is_none();
-    start_colima(&size, include_defaults)
-}
-
-pub(crate) fn resize_colima(size: &ColimaSizeArgs) -> Result<(), Box<dyn Error>> {
-    if !size.any_set() {
-        return Err("Specify at least one of --cpus, --memory, or --disk".into());
-    }
-
-    let instance = colima_instance()?;
-    let instance = instance
-        .as_ref()
-        .ok_or("No Colima instance exists yet; use `hops local start` to create one")?;
-
-    validate_requested_size(size, Some(instance))?;
-    resize_existing_colima(size, Some(instance))
-}
-
-fn resize_existing_colima(
-    size: &ColimaSizeArgs,
-    instance: Option<&ColimaInstance>,
-) -> Result<(), Box<dyn Error>> {
-    if instance.map(ColimaInstance::is_running).unwrap_or(false) {
-        log::info!("Stopping Colima to apply requested size...");
-        run_cmd("colima", &["stop"])?;
-    }
-
-    log::info!("Starting Colima with requested size...");
-    start_colima(size, false)
-}
-
-fn start_colima(size: &ColimaSizeArgs, include_defaults: bool) -> Result<(), Box<dyn Error>> {
-    let args = colima_start_args(size, include_defaults);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_cmd("colima", &refs)
-}
-
-fn colima_start_args(size: &ColimaSizeArgs, include_defaults: bool) -> Vec<String> {
-    let mut args = vec!["start".to_string(), "--kubernetes".to_string()];
-
-    if let Some(cpus) = size.cpus.or(include_defaults.then_some(DEFAULT_CPUS)) {
-        args.push("--cpus".to_string());
-        args.push(cpus.to_string());
-    }
-    if let Some(memory) = size
-        .memory
-        .or(include_defaults.then_some(DEFAULT_MEMORY_GIB))
-    {
-        args.push("--memory".to_string());
-        args.push(memory.to_string());
-    }
-    if let Some(disk) = size.disk.or(include_defaults.then_some(DEFAULT_DISK_GIB)) {
-        args.push("--disk".to_string());
-        args.push(disk.to_string());
-    }
-
-    args
-}
-
-fn confirm_running_resize(args: &StartArgs, changes: &[String]) -> Result<(), Box<dyn Error>> {
-    if args.yes {
-        return Ok(());
-    }
-
-    let change_text = changes.join(", ");
-    let resize_command = format!("hops local resize{}", args.size.command_suffix());
-    let start_command = format!("hops local start{} --yes", args.size.command_suffix());
-
-    if !std::io::stdin().is_terminal() {
-        return Err(format!(
-            "Colima is already running with different size ({change_text}). Run `{resize_command}` first, or rerun `{start_command}` to stop and resize automatically."
-        )
-        .into());
-    }
-
-    let confirmed = Confirm::new()
-        .with_prompt(format!(
-            "Colima is already running with different size ({change_text}). Stop and restart it now?"
-        ))
-        .default(false)
-        .interact()?;
-
-    if confirmed {
-        Ok(())
-    } else {
-        Err(format!(
-            "Colima size was not changed. Run `{resize_command}` first, then rerun `hops local start`."
-        )
-        .into())
-    }
-}
-
-fn validate_requested_size(
-    size: &ColimaSizeArgs,
-    instance: Option<&ColimaInstance>,
-) -> Result<(), Box<dyn Error>> {
-    if let (Some(requested), Some(current)) =
-        (size.disk, instance.and_then(ColimaInstance::disk_gib))
-    {
-        if requested < current {
-            return Err(format!(
-                "Colima disk cannot be shrunk from {current}GiB to {requested}GiB. Use --disk {current} or larger, or destroy and recreate the VM."
-            )
-            .into());
-        }
-    }
+    // 11. Wait for providers Healthy.
+    //
+    // CRDs can become Established while the provider runtime pods are still
+    // pulling images / rolling. `hops local doctor` requires Healthy=True, and
+    // the kind smoke path runs doctor immediately after start — without this
+    // wait, cold CI flakes with "Provider healthy — Healthy=False".
+    log::info!("Waiting for providers to become Healthy...");
+    wait_for_provider_healthy(PROVIDER_K8S_NAME)?;
+    wait_for_provider_healthy(PROVIDER_HELM_NAME)?;
 
     Ok(())
 }
 
-fn requested_size_changes(size: &ColimaSizeArgs, instance: &ColimaInstance) -> Vec<String> {
-    let mut changes = Vec::new();
-
-    if let Some(requested) = size.cpus {
-        match instance.cpus {
-            Some(current) if requested == current => {}
-            Some(current) => changes.push(format!("cpus {current} -> {requested}")),
-            None => changes.push(format!("cpus unknown -> {requested}")),
-        }
-    }
-    if let Some(requested) = size.memory {
-        match instance.memory_gib() {
-            Some(current) if requested == current => {}
-            Some(current) => changes.push(format!("memory {current}GiB -> {requested}GiB")),
-            None => changes.push(format!("memory unknown -> {requested}GiB")),
-        }
-    }
-    if let Some(requested) = size.disk {
-        match instance.disk_gib() {
-            Some(current) if requested == current => {}
-            Some(current) => changes.push(format!("disk {current}GiB -> {requested}GiB")),
-            None => changes.push(format!("disk unknown -> {requested}GiB")),
-        }
-    }
-
-    changes
+/// In-cluster package registry + backend node/engine wiring.
+fn ensure_registry_ready(backend: backend::Backend) -> Result<(), Box<dyn Error>> {
+    // Crossplane package pulls run in the pod network → Service DNS + ClusterIP.
+    // Docker push: colima/kind → localhost:30500 (host NodePort); dory →
+    // {dory-k8s-ip}:30500 on the engine docker bridge (daemon is in-engine).
+    wait_for_kubernetes()?;
+    log::info!("Pre-pulling registry:2 (best effort)...");
+    let _ = run_cmd("docker", &["pull", "registry:2"]);
+    // TLS secret + registry Deployment + Crossplane CA trust (package manager is HTTPS-only).
+    log::info!("Deploying local package registry (HTTPS)...");
+    backend.ensure_package_registry()?;
+    wait_for_deployment_with_diagnostics("crossplane-system", "registry")?;
+    backend::wire_local_registry(backend)?;
+    Ok(())
 }
 
-pub(crate) fn colima_instance() -> Result<Option<ColimaInstance>, Box<dyn Error>> {
-    let output = match run_cmd_output("colima", &["list", "--json"]) {
-        Ok(output) => output,
-        Err(_) => return Ok(None),
-    };
-
-    parse_colima_list(&output)
-}
-
-fn parse_colima_list(output: &str) -> Result<Option<ColimaInstance>, Box<dyn Error>> {
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    if let Ok(instance) = serde_json::from_str::<ColimaInstance>(trimmed) {
-        return Ok(Some(instance));
-    }
-
-    if let Ok(instances) = serde_json::from_str::<Vec<ColimaInstance>>(trimmed) {
-        return Ok(instances.into_iter().next());
-    }
-
-    for line in trimmed
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        if let Ok(instance) = serde_json::from_str::<ColimaInstance>(line) {
-            return Ok(Some(instance));
+/// Longer wait used for Crossplane on cold nested-virt runners (~15 minutes).
+fn wait_for_deployment_with_diagnostics(
+    namespace: &str,
+    name: &str,
+) -> Result<(), Box<dyn Error>> {
+    match wait_for_deployment_attempts(namespace, name, 180) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            dump_namespace_diagnostics(namespace);
+            Err(e)
         }
     }
-
-    Err("Unable to parse `colima list --json` output".into())
 }
 
-fn bytes_to_gib(bytes: u64) -> u32 {
-    (bytes / GIB) as u32
-}
-
-/// Add the cluster-internal registry to Docker's insecure-registries list
-/// inside the Colima VM. Docker defaults to HTTPS for non-localhost registries;
-/// our in-cluster registry speaks plain HTTP.
-fn configure_docker_insecure_registry() -> Result<(), Box<dyn Error>> {
-    let config = run_cmd_output("colima", &["ssh", "--", "cat", "/etc/docker/daemon.json"])?;
-
-    if config.contains("insecure-registries") {
-        return Ok(());
-    }
-
-    log::info!("Configuring Docker for insecure local registry...");
-
-    // Insert the insecure-registries key before the final closing brace.
-    let new_config = if let Some(pos) = config.rfind('}') {
-        let prefix = config[..pos].trim_end();
-        format!(
-            "{},\n  \"insecure-registries\": [\"{}\"]\n}}\n",
-            prefix, REGISTRY_HOST
-        )
-    } else {
-        return Err("Invalid daemon.json: no closing brace".into());
-    };
-
-    let mut child = Command::new("colima")
-        .args(["ssh", "--", "sudo", "tee", "/etc/docker/daemon.json"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    if let Some(ref mut stdin) = child.stdin {
-        stdin.write_all(new_config.as_bytes())?;
-    }
-    let status = child.wait()?;
-    if !status.success() {
-        return Err("Failed to write Docker daemon.json".into());
-    }
-
-    log::info!("Restarting Docker daemon...");
-    run_cmd(
-        "colima",
-        &["ssh", "--", "sudo", "systemctl", "restart", "docker"],
-    )?;
-
-    // Wait for Docker to come back.
-    for _ in 0..30 {
-        if run_cmd_output("docker", &["info"]).is_ok() {
-            // Docker restart can temporarily disrupt the Kubernetes API.
-            wait_for_kubernetes()?;
-            return Ok(());
-        }
-        thread::sleep(Duration::from_secs(2));
-    }
-    Err("Docker did not come back after restart".into())
-}
-
-/// Poll until the Kubernetes API server is reachable.
-fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
-    log::info!("Waiting for Kubernetes API...");
-    for _ in 0..60 {
-        let result = run_cmd_output("kubectl", &["cluster-info"]);
-        if result.is_ok() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_secs(5));
-    }
-    Err("Timed out waiting for Kubernetes API".into())
-}
-
-/// Poll until a deployment's Available condition is True.
-fn wait_for_deployment(namespace: &str, name: &str) -> Result<(), Box<dyn Error>> {
-    for _ in 0..60 {
+fn wait_for_deployment_attempts(
+    namespace: &str,
+    name: &str,
+    attempts: u32,
+) -> Result<(), Box<dyn Error>> {
+    for i in 0..attempts {
         let output = run_cmd_output(
             "kubectl",
             &[
@@ -480,142 +293,175 @@ fn wait_for_deployment(namespace: &str, name: &str) -> Result<(), Box<dyn Error>
             }
         }
 
+        // Periodic progress so CI logs show the wait is alive.
+        if i > 0 && i % 12 == 0 {
+            log::info!(
+                "Still waiting for deployment {}/{} ({}s elapsed)...",
+                namespace,
+                name,
+                i * 5
+            );
+            let _ = run_cmd(
+                "kubectl",
+                &["get", "pods", "-n", namespace, "-o", "wide"],
+            );
+        }
+
         thread::sleep(Duration::from_secs(5));
     }
     Err(format!("Timed out waiting for deployment {}/{}", namespace, name).into())
 }
 
-/// Poll until a CRD exists in the cluster.
+fn dump_namespace_diagnostics(namespace: &str) {
+    log::error!("Diagnostics for namespace {} after readiness timeout:", namespace);
+    let _ = run_cmd("kubectl", &["get", "pods", "-n", namespace, "-o", "wide"]);
+    let _ = run_cmd("kubectl", &["describe", "pods", "-n", namespace]);
+    let _ = run_cmd(
+        "kubectl",
+        &[
+            "get",
+            "events",
+            "-n",
+            namespace,
+            "--sort-by=.lastTimestamp",
+        ],
+    );
+    let _ = run_cmd("kubectl", &["get", "nodes", "-o", "wide"]);
+}
+
+/// Poll until a CRD exists **and** is Established (API serves the kind).
+///
+/// Merely creating the CRD object is not enough: under load the apiserver can
+/// return the CRD while discovery still lacks the kind, causing
+/// `no matches for kind "ProviderConfig"` on the next apply.
 fn wait_for_crd(crd: &str) -> Result<(), Box<dyn Error>> {
     log::info!("Waiting for CRD {}...", crd);
-    for _ in 0..60 {
-        let result = run_cmd_output("kubectl", &["get", "crd", crd]);
-        if result.is_ok() {
-            return Ok(());
+    for _ in 0..120 {
+        let exists = run_cmd_output("kubectl", &["get", "crd", crd]).is_ok();
+        if exists {
+            let established = run_cmd_output(
+                "kubectl",
+                &[
+                    "get",
+                    "crd",
+                    crd,
+                    "-o",
+                    "jsonpath={.status.conditions[?(@.type==\"Established\")].status}",
+                ],
+            )
+            .unwrap_or_default();
+            if established.trim() == "True" {
+                // Brief settle so discovery caches pick up the new kind.
+                thread::sleep(Duration::from_secs(2));
+                return Ok(());
+            }
         }
         thread::sleep(Duration::from_secs(5));
     }
-    Err(format!("Timed out waiting for CRD {}", crd).into())
+    Err(format!("Timed out waiting for CRD {} to be Established", crd).into())
+}
+
+/// Poll until a Crossplane Provider reports Healthy=True (~10 minutes).
+///
+/// Package install can establish CRDs before the runtime Deployment is Ready.
+/// Matching doctor's expectation here keeps `hops local start` from returning
+/// while the cluster still looks half-bootstrapped.
+fn wait_for_provider_healthy(provider: &str) -> Result<(), Box<dyn Error>> {
+    log::info!("Waiting for Provider {} Healthy...", provider);
+    for i in 0..120 {
+        let healthy = run_cmd_output(
+            "kubectl",
+            &[
+                "get",
+                "provider.pkg.crossplane.io",
+                provider,
+                "-o",
+                "jsonpath={.status.conditions[?(@.type==\"Healthy\")].status}",
+            ],
+        )
+        .unwrap_or_default();
+        if healthy.trim() == "True" {
+            return Ok(());
+        }
+
+        if i > 0 && i % 12 == 0 {
+            let installed = run_cmd_output(
+                "kubectl",
+                &[
+                    "get",
+                    "provider.pkg.crossplane.io",
+                    provider,
+                    "-o",
+                    "jsonpath={.status.conditions[?(@.type==\"Installed\")].status}",
+                ],
+            )
+            .unwrap_or_default();
+            log::info!(
+                "Still waiting for Provider {} Healthy ({}s elapsed; Installed={}, Healthy={})...",
+                provider,
+                i * 5,
+                if installed.trim().is_empty() {
+                    "<none>"
+                } else {
+                    installed.trim()
+                },
+                if healthy.trim().is_empty() {
+                    "<none>"
+                } else {
+                    healthy.trim()
+                }
+            );
+            let _ = run_cmd(
+                "kubectl",
+                &["get", "pods", "-n", "crossplane-system", "-o", "wide"],
+            );
+            let _ = run_cmd(
+                "kubectl",
+                &["get", "provider.pkg.crossplane.io", provider, "-o", "yaml"],
+            );
+        }
+
+        thread::sleep(Duration::from_secs(5));
+    }
+
+    let _ = run_cmd(
+        "kubectl",
+        &["get", "provider.pkg.crossplane.io", provider, "-o", "yaml"],
+    );
+    dump_namespace_diagnostics("crossplane-system");
+    Err(format!(
+        "Timed out waiting for Provider {} to become Healthy",
+        provider
+    )
+    .into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn instance(status: &str, cpus: u32, memory_gib: u32, disk_gib: u32) -> ColimaInstance {
-        ColimaInstance {
-            status: status.to_string(),
-            cpus: Some(cpus),
-            memory: Some(memory_gib as u64 * GIB),
-            disk: Some(disk_gib as u64 * GIB),
+    #[test]
+    fn start_args_bootstrap_defaults_false() {
+        // clap default: bootstrap only when --bootstrap is passed
+        assert!(!StartArgs {
+            size: SizeArgs {
+                cpus: None,
+                memory: None,
+                disk: None,
+            },
+            yes: false,
+            bootstrap: false,
         }
-    }
-
-    #[test]
-    fn colima_start_args_use_hops_defaults_for_new_profiles() {
-        let args = colima_start_args(&ColimaSizeArgs::default(), true);
-
-        assert_eq!(
-            args,
-            vec![
-                "start",
-                "--kubernetes",
-                "--cpus",
-                "8",
-                "--memory",
-                "16",
-                "--disk",
-                "60"
-            ]
-        );
-    }
-
-    #[test]
-    fn colima_start_args_pass_only_requested_size_for_existing_profiles() {
-        let size = ColimaSizeArgs {
-            cpus: Some(12),
-            memory: Some(32),
-            disk: None,
-        };
-
-        let args = colima_start_args(&size, false);
-
-        assert_eq!(
-            args,
-            vec!["start", "--kubernetes", "--cpus", "12", "--memory", "32"]
-        );
-    }
-
-    #[test]
-    fn requested_size_changes_compare_only_explicit_fields() {
-        let current = instance("Running", 8, 16, 60);
-        let size = ColimaSizeArgs {
-            cpus: None,
-            memory: Some(32),
-            disk: None,
-        };
-
-        assert_eq!(
-            requested_size_changes(&size, &current),
-            vec!["memory 16GiB -> 32GiB"]
-        );
-    }
-
-    #[test]
-    fn requested_size_changes_treat_missing_current_value_as_change() {
-        let current = ColimaInstance {
-            status: "Running".to_string(),
-            cpus: None,
-            memory: None,
-            disk: None,
-        };
-        let size = ColimaSizeArgs {
-            cpus: Some(12),
-            memory: None,
-            disk: None,
-        };
-
-        assert_eq!(
-            requested_size_changes(&size, &current),
-            vec!["cpus unknown -> 12"]
-        );
-    }
-
-    #[test]
-    fn parse_colima_list_accepts_single_object() {
-        let output = r#"{"name":"default","status":"Stopped","arch":"aarch64","cpus":8,"memory":17179869184,"disk":64424509440,"runtime":"docker+k3s"}"#;
-
-        let parsed = parse_colima_list(output).expect("parse").expect("instance");
-
-        assert_eq!(parsed.status, "Stopped");
-        assert_eq!(parsed.cpus, Some(8));
-        assert_eq!(parsed.memory_gib(), Some(16));
-        assert_eq!(parsed.disk_gib(), Some(60));
-    }
-
-    #[test]
-    fn parse_colima_list_accepts_array_output() {
-        let output = r#"[{"status":"Running","cpus":12,"memory":34359738368,"disk":107374182400}]"#;
-
-        let parsed = parse_colima_list(output).expect("parse").expect("instance");
-
-        assert!(parsed.is_running());
-        assert_eq!(parsed.cpus, Some(12));
-        assert_eq!(parsed.memory_gib(), Some(32));
-        assert_eq!(parsed.disk_gib(), Some(100));
-    }
-
-    #[test]
-    fn validate_requested_size_rejects_disk_shrink() {
-        let current = instance("Stopped", 8, 16, 100);
-        let size = ColimaSizeArgs {
-            cpus: None,
-            memory: None,
-            disk: Some(60),
-        };
-
-        let err = validate_requested_size(&size, Some(&current)).expect_err("disk shrink");
-
-        assert!(err.to_string().contains("cannot be shrunk"));
+        .bootstrap);
+        assert!(StartArgs {
+            size: SizeArgs {
+                cpus: None,
+                memory: None,
+                disk: None,
+            },
+            yes: false,
+            bootstrap: true,
+        }
+        .bootstrap);
     }
 }

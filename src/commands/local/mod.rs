@@ -1,4 +1,5 @@
 mod aws;
+pub mod backend;
 mod cloudflare;
 mod destroy;
 mod doctor;
@@ -33,19 +34,50 @@ pub const PROVIDER_INSTALL_MANAGED_BY: &str = "hops-provider-install";
 /// Env var checked by kubectl helpers to inject `--context <name>`.
 pub const HOPS_KUBE_CONTEXT_ENV: &str = "HOPS_KUBE_CONTEXT";
 
-/// Build the kubectl args prefix. Returns `["--context", ctx]` when the env var
-/// is set, or an empty vec otherwise.
-fn kubectl_context_args() -> Vec<String> {
-    match std::env::var(HOPS_KUBE_CONTEXT_ENV) {
-        Ok(ctx) if !ctx.is_empty() => vec!["--context".to_string(), ctx],
-        _ => vec![],
-    }
+fn kube_context_from_env() -> Option<String> {
+    std::env::var(HOPS_KUBE_CONTEXT_ENV)
+        .ok()
+        .filter(|ctx| !ctx.is_empty())
 }
 
 /// Prepend `--context` to a kubectl arg slice when configured.
 fn with_kube_context(args: &[&str]) -> Vec<String> {
-    let mut out = kubectl_context_args();
+    let ctx = kube_context_from_env();
+    with_kube_context_value(args, ctx.as_deref())
+}
+
+fn with_kube_context_value(args: &[&str], context: Option<&str>) -> Vec<String> {
+    let mut out = match context {
+        Some(ctx) if !ctx.is_empty() => vec!["--context".to_string(), ctx.to_string()],
+        _ => vec![],
+    };
     out.extend(args.iter().map(|s| s.to_string()));
+    out
+}
+
+fn with_helm_kube_context(args: &[&str]) -> Vec<String> {
+    let ctx = kube_context_from_env();
+    with_helm_kube_context_value(args, ctx.as_deref())
+}
+
+fn with_helm_kube_context_value(args: &[&str], context: Option<&str>) -> Vec<String> {
+    let Some(ctx) = context.filter(|ctx| !ctx.is_empty()) else {
+        return args.iter().map(|s| s.to_string()).collect();
+    };
+    if args.first() == Some(&"repo") {
+        return args.iter().map(|s| s.to_string()).collect();
+    }
+
+    let mut out = Vec::with_capacity(args.len() + 2);
+    if let Some((command, rest)) = args.split_first() {
+        out.push((*command).to_string());
+        out.push("--kube-context".to_string());
+        out.push(ctx.to_string());
+        out.extend(rest.iter().map(|s| s.to_string()));
+    } else {
+        out.push("--kube-context".to_string());
+        out.push(ctx.to_string());
+    }
     out
 }
 
@@ -63,21 +95,35 @@ pub struct LocalArgs {
     pub command: LocalCommands,
 
     /// Kubernetes context to use for all kubectl commands (e.g. "colima").
-    /// Global: applies to every `hops local` subcommand and may be given before
-    /// or after the subcommand.
+    /// Defaults to the resolved backend's own context. Global: applies to
+    /// every `hops local` subcommand and may be given before or after the
+    /// subcommand.
     #[arg(long, global = true)]
     pub context: Option<String>,
+
+    /// Local cluster backend to target. Defaults to the backend persisted by
+    /// the last successful `hops local start`, else an existing cluster if
+    /// one is detected, else the platform default (macOS: colima, otherwise
+    /// kind).
+    #[arg(long, global = true, value_enum)]
+    pub backend: Option<backend::Backend>,
+
+    /// Name for Dory desktop integration (kube context + docker context).
+    /// Defaults to `hops-dory`. Persisted under `~/.hops/local/dory-name`.
+    /// Only used with `--backend dory` (or a persisted dory backend).
+    #[arg(long, global = true, value_name = "NAME")]
+    pub name: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum LocalCommands {
-    /// Install Colima via Homebrew
+    /// Install the local cluster backend (colima or kind) via Homebrew
     Install,
-    /// Reset local Colima Kubernetes state
+    /// Reset local Kubernetes state (colima: k8s reset; kind: recreate cluster)
     Reset,
-    /// Start local k8s cluster with Crossplane and providers
+    /// Start local k8s and ensure Crossplane control plane (skips helm when already healthy)
     Start(start::StartArgs),
-    /// Resize the local Colima VM without destroying cluster state
+    /// Resize the local cluster VM without destroying cluster state (colima only)
     Resize(resize::ResizeArgs),
     /// Check what `hops local start` set up and report drift
     Doctor,
@@ -93,34 +139,39 @@ pub enum LocalCommands {
     Listmonk(listmonk::ListmonkArgs),
     /// Stop the local cluster
     Stop,
-    /// Destroy the local cluster VM
+    /// Destroy the local cluster
     Destroy,
-    /// Uninstall Colima
-    Uninstall,
+    /// Uninstall the local cluster backend
+    Uninstall(uninstall::UninstallArgs),
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
-    // Plumb --context through the same env channel the kubectl helpers read, so
-    // every subcommand's kubectl calls target the chosen context.
-    if let Some(ctx) = &args.context {
-        if !ctx.is_empty() {
-            std::env::set_var(HOPS_KUBE_CONTEXT_ENV, ctx);
-        }
+    if let Some(name) = args.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        backend::persist_dory_context_name(name)?;
     }
+
+    let explicit_context = args.context.as_deref().filter(|ctx| !ctx.is_empty());
+    let install_backend = matches!(&args.command, LocalCommands::Install)
+        .then(|| args.backend.unwrap_or_else(backend::platform_default));
+    let activation_flag = install_backend.or(args.backend);
+    let install_context = install_backend.map(|b| b.kube_context());
+    let activation_context = explicit_context.or(install_context.as_deref());
+    let backend = backend::activate(activation_flag, activation_context);
+
     match &args.command {
-        LocalCommands::Install => install::run(),
-        LocalCommands::Reset => reset::run(),
-        LocalCommands::Start(start_args) => start::run(start_args),
-        LocalCommands::Resize(resize_args) => resize::run(resize_args),
+        LocalCommands::Install => install::run(backend),
+        LocalCommands::Reset => reset::run(backend),
+        LocalCommands::Start(start_args) => start::run(backend, start_args),
+        LocalCommands::Resize(resize_args) => resize::run(backend, resize_args),
         LocalCommands::Doctor => doctor::run(),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Cloudflare(cloudflare_args) => cloudflare::run(cloudflare_args),
         LocalCommands::Github(github_args) => github::run(github_args),
         LocalCommands::Zitadel(zitadel_args) => zitadel::run(zitadel_args),
         LocalCommands::Listmonk(listmonk_args) => listmonk::run(listmonk_args),
-        LocalCommands::Stop => stop::run(),
-        LocalCommands::Destroy => destroy::run(),
-        LocalCommands::Uninstall => uninstall::run(),
+        LocalCommands::Stop => stop::run(backend),
+        LocalCommands::Destroy => destroy::run(backend),
+        LocalCommands::Uninstall(uninstall_args) => uninstall::run(backend, uninstall_args),
     }
 }
 
@@ -132,14 +183,30 @@ pub fn run_cmd(program: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
         let refs: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
         return run_cmd_with_logged_args(program, &refs, &refs);
     }
+    if program == "helm" {
+        let full = with_helm_kube_context(args);
+        let refs: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
+        return run_cmd_with_logged_args(program, &refs, &refs);
+    }
     run_cmd_with_logged_args(program, args, args)
 }
 
 /// Run an external command and capture stdout.
-/// For kubectl commands, automatically injects `--context` when configured.
+/// For kubectl/helm commands, automatically injects the active context when
+/// configured.
 pub fn run_cmd_output(program: &str, args: &[&str]) -> Result<String, Box<dyn Error>> {
     if program == "kubectl" {
         let full = with_kube_context(args);
+        log::debug!("Running: {} {}", program, full.join(" "));
+        let output = Command::new(program).args(&full).output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("{} exited with {}: {}", program, output.status, stderr).into());
+        }
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    if program == "helm" {
+        let full = with_helm_kube_context(args);
         log::debug!("Running: {} {}", program, full.join(" "));
         let output = Command::new(program).args(&full).output()?;
         if !output.status.success() {
@@ -181,13 +248,13 @@ pub fn repo_cache_path(org: &str, repo: &str) -> Result<PathBuf, Box<dyn Error>>
     Ok(local_state_dir()?.join(REPO_CACHE_DIR).join(org).join(repo))
 }
 
-fn local_state_dir() -> Result<PathBuf, Box<dyn Error>> {
+pub(crate) fn local_state_dir() -> Result<PathBuf, Box<dyn Error>> {
     let home = std::env::var("HOME")
         .map_err(|_| "HOME is not set; unable to determine local state directory")?;
     Ok(Path::new(&home).join(LOCAL_STATE_DIR))
 }
 
-fn command_exists(program: &str) -> bool {
+pub(crate) fn command_exists(program: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {} >/dev/null 2>&1", program)])
         .status()
@@ -195,94 +262,74 @@ fn command_exists(program: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Ensure Colima's /etc/hosts maps a service hostname to the current ClusterIP.
-pub fn sync_registry_hosts_entry(
-    namespace: &str,
-    service: &str,
-    hostname: &str,
-) -> Result<(), Box<dyn Error>> {
-    let cluster_ip = run_cmd_output(
-        "kubectl",
-        &[
-            "get",
-            "svc",
-            service,
-            "-n",
-            namespace,
-            "-o",
-            "jsonpath={.spec.clusterIP}",
-        ],
-    )?;
-    let cluster_ip = cluster_ip.trim();
-    if cluster_ip.is_empty() {
-        return Err(format!("Service {}/{} has no ClusterIP", namespace, service).into());
+/// Poll until the Kubernetes API server is reachable.
+pub(crate) fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
+    log::info!("Waiting for Kubernetes API...");
+    // ~10 minutes — nested-virt apiserver can stay overloaded after package install.
+    for _ in 0..120 {
+        let result = run_cmd_output("kubectl", &["get", "--raw", "/readyz"]);
+        if result.is_ok() {
+            return Ok(());
+        }
+        // Fall back to a cheap list if /readyz is denied on some setups.
+        if run_cmd_output("kubectl", &["get", "ns", "default"]).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
-
-    let current_ip = run_cmd_output(
-        "colima",
-        &[
-            "ssh",
-            "--",
-            "sh",
-            "-c",
-            &format!("awk '$2 == \"{}\" {{print $1; exit}}' /etc/hosts", hostname),
-        ],
-    )
-    .unwrap_or_default();
-    if current_ip.trim() == cluster_ip {
-        return Ok(());
-    }
-
-    log::info!("Updating hosts entry: {} -> {}", hostname, cluster_ip);
-
-    let escaped_host = hostname.replace('.', "\\.");
-    run_cmd(
-        "colima",
-        &[
-            "ssh",
-            "--",
-            "sudo",
-            "sed",
-            "-i",
-            &format!("/{}/d", escaped_host),
-            "/etc/hosts",
-        ],
-    )?;
-    run_cmd(
-        "colima",
-        &[
-            "ssh",
-            "--",
-            "sudo",
-            "sh",
-            "-c",
-            &format!("echo '{} {}' >> /etc/hosts", cluster_ip, hostname),
-        ],
-    )?;
-
-    Ok(())
+    Err("Timed out waiting for Kubernetes API".into())
 }
 
 /// Pipe a YAML string into `kubectl apply -f -`.
 /// Automatically injects `--context` when configured.
+///
+/// Uses `--validate=false` so a slow/overloaded API server (common on nested
+/// virt CI while Crossplane is warming) does not fail the apply solely because
+/// OpenAPI schema download timed out. Retries a few times for transient
+/// connection errors.
 pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
-    let full = with_kube_context(&["apply", "-f", "-"]);
-    let mut child = Command::new("kubectl")
-        .args(&full)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+    let full = with_kube_context(&["apply", "--validate=false", "-f", "-"]);
+    let mut last_status = None;
+    // Nested-virt CI (colima/GHA) can lose the apiserver for minutes after
+    // Crossplane/provider install (TLS handshake timeouts). Retry with backoff
+    // and re-probe the API between attempts.
+    const ATTEMPTS: u32 = 12;
 
-    if let Some(ref mut stdin) = child.stdin {
-        stdin.write_all(yaml.as_bytes())?;
+    for attempt in 1..=ATTEMPTS {
+        let mut child = Command::new("kubectl")
+            .args(&full)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        if let Some(ref mut stdin) = child.stdin {
+            stdin.write_all(yaml.as_bytes())?;
+        }
+
+        let status = child.wait()?;
+        if status.success() {
+            return Ok(());
+        }
+        last_status = Some(status);
+        log::warn!(
+            "kubectl apply failed (attempt {}/{}, status {}); waiting for API...",
+            attempt,
+            ATTEMPTS,
+            status
+        );
+        // Best-effort API recovery before the next apply.
+        let _ = wait_for_kubernetes();
+        std::thread::sleep(std::time::Duration::from_secs(10));
     }
 
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("kubectl apply exited with {}", status).into());
-    }
-    Ok(())
+    Err(format!(
+        "kubectl apply exited with {} after retries",
+        last_status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    )
+    .into())
 }
 
 /// Apply a JSON merge patch with `kubectl patch --type merge`.
@@ -312,4 +359,49 @@ pub fn kubectl_patch_merge(
     let args_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
     let logged_refs: Vec<&str> = full_logged.iter().map(|s| s.as_str()).collect();
     run_cmd_with_logged_args("kubectl", &args_refs, &logged_refs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(args: Vec<String>) -> Vec<String> {
+        args
+    }
+
+    #[test]
+    fn kubectl_args_prepend_context() {
+        assert_eq!(
+            strings(with_kube_context_value(&["get", "pods"], Some("kind-hops"))),
+            vec!["--context", "kind-hops", "get", "pods"]
+        );
+    }
+
+    #[test]
+    fn helm_upgrade_injects_kube_context_after_subcommand() {
+        assert_eq!(
+            strings(with_helm_kube_context_value(
+                &["upgrade", "--install", "crossplane"],
+                Some("kind-hops")
+            )),
+            vec![
+                "upgrade",
+                "--kube-context",
+                "kind-hops",
+                "--install",
+                "crossplane"
+            ]
+        );
+    }
+
+    #[test]
+    fn helm_repo_commands_skip_kube_context() {
+        assert_eq!(
+            strings(with_helm_kube_context_value(
+                &["repo", "update", "crossplane-stable"],
+                Some("kind-hops")
+            )),
+            vec!["repo", "update", "crossplane-stable"]
+        );
+    }
 }
