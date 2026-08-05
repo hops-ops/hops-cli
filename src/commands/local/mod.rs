@@ -117,7 +117,7 @@ pub struct LocalArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum LocalCommands {
-    /// Install the local cluster backend (colima or kind) via Homebrew
+    /// Install the local cluster backend (colima, kind, dory, or kiac) via Homebrew
     Install,
     /// Reset local Kubernetes state (colima: k8s reset; kind: recreate cluster)
     Reset,

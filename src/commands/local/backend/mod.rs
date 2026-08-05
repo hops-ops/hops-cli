@@ -6,6 +6,7 @@
 
 mod colima;
 mod dory;
+mod kiac;
 mod kind;
 
 use super::{local_state_dir, run_cmd_output, HOPS_KUBE_CONTEXT_ENV};
@@ -65,6 +66,8 @@ pub enum Backend {
     Kind,
     /// k3s on dory's shared-VM engine, via the `dory` CLI
     Dory,
+    /// Kubernetes on Apple's container runtime (each node a lightweight VM)
+    Kiac,
 }
 
 impl Backend {
@@ -74,6 +77,7 @@ impl Backend {
             Backend::Colima => "colima",
             Backend::Kind => "kind",
             Backend::Dory => "dory",
+            Backend::Kiac => "kiac",
         }
     }
 
@@ -84,6 +88,8 @@ impl Backend {
             Backend::Kind => "kind-hops".to_string(),
             // Merged into ~/.kube/config (default name hops-dory; see dory::context_name).
             Backend::Dory => dory::context_name(),
+            // kiac merges as kiac-<name>; hops cluster name is always `hops`.
+            Backend::Kiac => format!("kiac-{}", kiac::CLUSTER_NAME),
         }
     }
 
@@ -92,6 +98,7 @@ impl Backend {
             Backend::Colima => colima::install(),
             Backend::Kind => kind::install(),
             Backend::Dory => dory::install(),
+            Backend::Kiac => kiac::install(),
         }
     }
 
@@ -100,6 +107,7 @@ impl Backend {
             Backend::Colima => colima::uninstall(),
             Backend::Kind => kind::uninstall(),
             Backend::Dory => dory::uninstall(),
+            Backend::Kiac => kiac::uninstall(),
         }
     }
 
@@ -109,6 +117,7 @@ impl Backend {
             Backend::Colima => colima::instance_exists(),
             Backend::Kind => kind::cluster_exists(),
             Backend::Dory => dory::cluster_exists(),
+            Backend::Kiac => kiac::cluster_exists(),
         }
     }
 
@@ -119,6 +128,7 @@ impl Backend {
             Backend::Colima => colima::start(size, assume_yes),
             Backend::Kind => kind::start(size),
             Backend::Dory => dory::start(size),
+            Backend::Kiac => kiac::start(size),
         }
     }
 
@@ -127,6 +137,7 @@ impl Backend {
             Backend::Colima => colima::stop(),
             Backend::Kind => kind::stop(),
             Backend::Dory => dory::stop(),
+            Backend::Kiac => kiac::stop(),
         }
     }
 
@@ -135,6 +146,7 @@ impl Backend {
             Backend::Colima => colima::destroy(),
             Backend::Kind => kind::destroy(),
             Backend::Dory => dory::destroy(),
+            Backend::Kiac => kiac::destroy(),
         }
     }
 
@@ -143,6 +155,7 @@ impl Backend {
             Backend::Colima => colima::reset(),
             Backend::Kind => kind::reset(),
             Backend::Dory => dory::reset(),
+            Backend::Kiac => kiac::reset(),
         }
     }
 
@@ -151,6 +164,7 @@ impl Backend {
             Backend::Colima => colima::resize(size),
             Backend::Kind => kind::resize(size),
             Backend::Dory => dory::resize(size),
+            Backend::Kiac => kiac::resize(size),
         }
     }
 
@@ -164,6 +178,7 @@ impl Backend {
             Backend::Kind => Ok(()),
             // k3s registries.yaml is written in wire_registry once ClusterIP is known.
             Backend::Dory => dory::ensure_registry_trust(),
+            Backend::Kiac => kiac::ensure_registry_trust(),
         }
     }
 
@@ -177,6 +192,7 @@ impl Backend {
             Backend::Colima => colima::sync_hosts_entry(cluster_ip),
             Backend::Kind => kind::wire_registry(cluster_ip),
             Backend::Dory => dory::wire_registry(cluster_ip),
+            Backend::Kiac => kiac::wire_registry(cluster_ip),
         }
     }
 
@@ -197,6 +213,9 @@ impl Backend {
     pub fn registry_push(self) -> String {
         match self {
             Backend::Dory => dory::registry_push_addr().unwrap_or_else(|_| {
+                crate::commands::local::package_install::REGISTRY_PUSH.to_string()
+            }),
+            Backend::Kiac => kiac::registry_push_addr().unwrap_or_else(|_| {
                 crate::commands::local::package_install::REGISTRY_PUSH.to_string()
             }),
             Backend::Colima | Backend::Kind => {
@@ -220,8 +239,9 @@ impl FromStr for Backend {
             "colima" => Ok(Backend::Colima),
             "kind" => Ok(Backend::Kind),
             "dory" => Ok(Backend::Dory),
+            "kiac" => Ok(Backend::Kiac),
             other => Err(format!(
-                "unknown backend '{}' (expected colima, kind, or dory)",
+                "unknown backend '{}' (expected colima, kind, dory, or kiac)",
                 other
             )),
         }
@@ -253,6 +273,7 @@ pub fn resolve(flag: Option<Backend>) -> Backend {
         colima::instance_exists,
         kind::cluster_exists,
         dory::cluster_exists,
+        kiac::cluster_exists,
         platform_default() == Backend::Colima,
     )
 }
@@ -299,6 +320,7 @@ fn resolve_from(
     colima_detected: impl FnOnce() -> bool,
     kind_detected: impl FnOnce() -> bool,
     dory_detected: impl FnOnce() -> bool,
+    kiac_detected: impl FnOnce() -> bool,
     macos: bool,
 ) -> Backend {
     if let Some(backend) = flag {
@@ -315,6 +337,9 @@ fn resolve_from(
     }
     if dory_detected() {
         return Backend::Dory;
+    }
+    if kiac_detected() {
+        return Backend::Kiac;
     }
     if macos {
         Backend::Colima
@@ -460,6 +485,7 @@ mod tests {
             || true,
             no_detect,
             no_detect,
+            no_detect,
             true,
         );
 
@@ -474,6 +500,7 @@ mod tests {
             || true,
             no_detect,
             no_detect,
+            no_detect,
             true,
         );
 
@@ -482,21 +509,28 @@ mod tests {
 
     #[test]
     fn colima_detection_beats_kind_detection() {
-        let resolved = resolve_from(None, None, || true, || true, || true, false);
+        let resolved = resolve_from(None, None, || true, || true, || true, || true, false);
 
         assert_eq!(resolved, Backend::Colima);
     }
 
     #[test]
     fn dory_detection_used_when_no_colima_or_kind() {
-        let resolved = resolve_from(None, None, no_detect, no_detect, || true, true);
+        let resolved = resolve_from(None, None, no_detect, no_detect, || true, no_detect, true);
 
         assert_eq!(resolved, Backend::Dory);
     }
 
     #[test]
+    fn kiac_detection_used_when_no_other_cluster() {
+        let resolved = resolve_from(None, None, no_detect, no_detect, no_detect, || true, true);
+
+        assert_eq!(resolved, Backend::Kiac);
+    }
+
+    #[test]
     fn kind_detection_used_when_no_colima() {
-        let resolved = resolve_from(None, None, no_detect, || true, no_detect, true);
+        let resolved = resolve_from(None, None, no_detect, || true, no_detect, no_detect, true);
 
         assert_eq!(resolved, Backend::Kind);
     }
@@ -504,18 +538,18 @@ mod tests {
     #[test]
     fn platform_default_when_nothing_detected() {
         assert_eq!(
-            resolve_from(None, None, no_detect, no_detect, no_detect, true),
+            resolve_from(None, None, no_detect, no_detect, no_detect, no_detect, true),
             Backend::Colima
         );
         assert_eq!(
-            resolve_from(None, None, no_detect, no_detect, no_detect, false),
+            resolve_from(None, None, no_detect, no_detect, no_detect, no_detect, false),
             Backend::Kind
         );
     }
 
     #[test]
     fn backend_name_round_trips_through_from_str() {
-        for backend in [Backend::Colima, Backend::Kind, Backend::Dory] {
+        for backend in [Backend::Colima, Backend::Kind, Backend::Dory, Backend::Kiac] {
             assert_eq!(backend.name().parse::<Backend>().unwrap(), backend);
         }
         assert!("podman".parse::<Backend>().is_err());

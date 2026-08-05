@@ -6,13 +6,13 @@
 
 This tool supports three related workflows:
 
-- Local cluster setup on colima or kind
+- Local cluster setup on colima, kind, dory, or kiac
 - Configuration package install/uninstall against the connected cluster
 - XR observe/manage/adopt/orphan workflows for existing infrastructure
 
 For local development, it can also:
 
-- Install and manage a local cluster backend (colima or kind)
+- Install and manage a local cluster backend (colima, kind, dory, or kiac)
 - Start a local k8s cluster with Crossplane installed via Helm
 - Install the Kubernetes and Helm Crossplane providers
 - Deploy an in-cluster OCI registry (`crossplane-system/registry`)
@@ -56,7 +56,7 @@ See "Releases" for available versions and changenotes.
 - `up` (Upbound CLI, used by `up project build`)
 - `aws` CLI v2 (used by `local aws` to export profile credentials)
 
-Note: `hops-cli local install` installs the selected backend (`colima` or `kind`) through Homebrew.
+Note: `hops-cli local install` installs the selected backend (`colima`, `kind`, `dory`, or `kiac`) through Homebrew.
 
 ## Build
 
@@ -213,7 +213,7 @@ hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
 
 ### Cluster backends
 
-`hops local` supports three backends behind the same commands:
+`hops local` supports four backends behind the same commands:
 
 - **colima** — a VM running dockerd + k3s. macOS/Linux; supports `--cpus`,
   `--memory`, `--disk`, and `hops local resize`.
@@ -229,6 +229,14 @@ hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
   k3s **NodePort** on the engine docker bridge (`{dory-k8s-ip}:30500`) because
   dockerd runs *inside* the engine — Mac `localhost` is the wrong plane. The
   VM is sized in the Dory app, so hops sizing flags don't apply.
+- **kiac** — [kiac](https://github.com/saiyam1814/kiac) on Apple silicon:
+  each node is a lightweight VM via [apple/container](https://github.com/apple/container)
+  (think kind, but VM-isolated nodes). hops creates a single-node **kubeadm**
+  cluster named `hops` (kube context `kiac-hops`). Package registry is the same
+  in-cluster `registry:2`; host docker push uses the control-plane node IP
+  NodePort (`{node-ip}:30500`) when that IP is host-reachable. If Mac→node IP
+  is blocked, hops proxies the apiserver on `127.0.0.1:16443`. `--cpus` /
+  `--memory` apply at create time only (recreate to resize).
 
 Select with the global `--backend` flag:
 
@@ -243,8 +251,41 @@ persisted choice > existing cluster detection (colima wins) > platform
 default (macOS: colima, otherwise kind).
 
 Unless `--context` is given, kubectl commands automatically use the backend's
-kubeconfig context (`colima`, `kind-hops`, or `hops-dory`), regardless of your
-current-context.
+kubeconfig context (`colima`, `kind-hops`, `hops-dory`, or `kiac-hops`),
+regardless of your current-context.
+
+#### Using kiac
+
+Requires **macOS on Apple silicon**. Install via Homebrew (or
+`hops local install --backend kiac`):
+
+```bash
+brew tap saiyam1814/tap
+brew install saiyam1814/tap/kiac
+# apple/container — prefer **1.1.0** until kiac#14 is fixed
+# (1.2.x often fails node boot: sysctl net.ipv4.ip_forward permission denied)
+brew install container   # or install the 1.1.0 pkg from apple/container releases
+container system start   # or: kiac doctor --fix
+
+hops local start --backend kiac
+kubectl get nodes        # context kiac-hops
+```
+
+Cluster name is always `hops`. Resume after laptop sleep/reboot:
+
+```bash
+hops local start --backend kiac   # calls `kiac resume cluster` when present
+```
+
+**Host networking:** if your Mac cannot reach the node IP (Local Network
+permission, vmnet glitch), hops starts a `hops-kiac-api-proxy` container and
+points kubeconfig at `https://127.0.0.1:16443`. Approve Local Network access
+for your terminal when macOS prompts, or:
+`container system stop && container system start && kiac resume cluster --name hops`.
+
+Path-install package push uses `{control-plane InternalIP}:30500` when
+host-reachable. Crossplane still pulls
+`registry.crossplane-system.svc.cluster.local:5000` inside the cluster.
 
 #### Using dory
 
