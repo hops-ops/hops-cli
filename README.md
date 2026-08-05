@@ -79,7 +79,6 @@ hops config --help
 hops secrets --help
 hops validate --help
 hops xr --help
-hops service --help
 ```
 
 ## Command Areas
@@ -87,7 +86,7 @@ hops service --help
 `hops-cli` is organized into a few command groups:
 
 - `local`
-  - Manage a local control plane (colima or kind backend), install providers, and bootstrap AWS or GitHub provider auth.
+  - Manage a local control plane (colima, kind, or dory backend), install providers, and bootstrap AWS or GitHub provider auth.
 - `config`
   - Build, install, reload, and uninstall Crossplane configuration packages against the connected cluster.
 - `secrets`
@@ -96,8 +95,8 @@ hops service --help
   - Generate configuration manifests from Upbound-format XRD projects for validation workflows.
 - `xr`
   - Observe existing XR-backed infrastructure and render adoption, management, or orphaning manifests.
-- `service`
-  - Scaffold Distributed microservice crates, optional GitOps/Knative/GitHub workflow scaffolds, and inspect/render their project manifests.
+
+Microservice scaffolding previously available as `hops service` now lives in the standalone **distributed** CLI (`distributed` / `distributed_cli`).
 
 ## Secrets
 
