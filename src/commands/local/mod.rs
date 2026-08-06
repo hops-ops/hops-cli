@@ -3,15 +3,21 @@ pub mod backend;
 mod cloudflare;
 mod destroy;
 mod doctor;
+mod down;
 mod github;
+mod gitops;
 mod install;
 mod listmonk;
+mod open;
 pub mod package_install;
 mod reset;
 mod resize;
 mod start;
+mod status;
 mod stop;
 mod uninstall;
+pub mod workbench;
+mod up;
 mod zitadel;
 
 use clap::{Args, Subcommand};
@@ -127,6 +133,16 @@ pub enum LocalCommands {
     Resize(resize::ResizeArgs),
     /// Check what `hops local start` set up and report drift
     Doctor,
+    /// Bring up a local workbench workspace (env Applications + host access)
+    Up(up::UpArgs),
+    /// Bring down a local workbench workspace
+    Down(down::DownArgs),
+    /// Show local workbench workspace status and app URLs
+    Status(status::StatusArgs),
+    /// Open the workspace UI URL in a browser
+    Open(open::OpenArgs),
+    /// Reconcile env Application YAMLs (advanced; prefer `hops local up`)
+    Gitops(gitops::GitopsArgs),
     /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
     Aws(aws::AwsArgs),
     /// Configure Wildbit Cloudflare DNS provider and ProviderConfig
@@ -164,6 +180,11 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Start(start_args) => start::run(backend, start_args),
         LocalCommands::Resize(resize_args) => resize::run(backend, resize_args),
         LocalCommands::Doctor => doctor::run(),
+        LocalCommands::Up(up_args) => up::run(up_args),
+        LocalCommands::Down(down_args) => down::run(down_args),
+        LocalCommands::Status(status_args) => status::run(status_args),
+        LocalCommands::Open(open_args) => open::run(open_args),
+        LocalCommands::Gitops(gitops_args) => gitops::run(gitops_args),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Cloudflare(cloudflare_args) => cloudflare::run(cloudflare_args),
         LocalCommands::Github(github_args) => github::run(github_args),
@@ -286,50 +307,55 @@ pub(crate) fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
 /// Uses `--validate=false` so a slow/overloaded API server (common on nested
 /// virt CI while Crossplane is warming) does not fail the apply solely because
 /// OpenAPI schema download timed out. Retries a few times for transient
-/// connection errors.
+/// connection errors. Captures stderr on failure so callers can classify soft
+/// errors (missing CRDs).
 pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
     let full = with_kube_context(&["apply", "--validate=false", "-f", "-"]);
-    let mut last_status = None;
     // Nested-virt CI (colima/GHA) can lose the apiserver for minutes after
     // Crossplane/provider install (TLS handshake timeouts). Retry with backoff
     // and re-probe the API between attempts.
     const ATTEMPTS: u32 = 12;
+    let mut last_err = String::from("unknown");
 
     for attempt in 1..=ATTEMPTS {
         let mut child = Command::new("kubectl")
             .args(&full)
             .stdin(Stdio::piped())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?;
 
         if let Some(ref mut stdin) = child.stdin {
             stdin.write_all(yaml.as_bytes())?;
         }
 
-        let status = child.wait()?;
-        if status.success() {
+        let output = child.wait_with_output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stdout.trim().is_empty() {
+            print!("{stdout}");
+        }
+        if output.status.success() {
+            if !stderr.trim().is_empty() {
+                eprint!("{stderr}");
+            }
             return Ok(());
         }
-        last_status = Some(status);
+        last_err = format!("{}: {}", output.status, stderr.trim());
+        if !stderr.trim().is_empty() {
+            eprint!("{stderr}");
+        }
         log::warn!(
-            "kubectl apply failed (attempt {}/{}, status {}); waiting for API...",
+            "kubectl apply failed (attempt {}/{}, {}); waiting for API...",
             attempt,
             ATTEMPTS,
-            status
+            output.status
         );
-        // Best-effort API recovery before the next apply.
         let _ = wait_for_kubernetes();
         std::thread::sleep(std::time::Duration::from_secs(10));
     }
 
-    Err(format!(
-        "kubectl apply exited with {} after retries",
-        last_status
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "unknown".into())
-    )
-    .into())
+    Err(format!("kubectl apply exited with {last_err} after retries").into())
 }
 
 /// Apply a JSON merge patch with `kubectl patch --type merge`.

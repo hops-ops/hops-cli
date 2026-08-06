@@ -81,6 +81,23 @@ hops validate --help
 hops xr --help
 ```
 
+## Local workbench (happy path)
+
+Multi-workspace local GitOps on the laptop control plane:
+
+```bash
+# once
+hops local start
+
+# daily
+hops local up ./gitops/env/local
+hops local status
+hops local open
+hops local down
+```
+
+Use `--name` for concurrent worktrees (`hops-wt-<name>` namespaces). Full guide: [skills/claude/references/local-workbench.md](skills/claude/references/local-workbench.md).
+
 ## Command Areas
 
 `hops-cli` is organized into a few command groups:
