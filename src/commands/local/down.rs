@@ -1,6 +1,10 @@
-//! `hops local down` — stop workspace host access and optionally purge namespace.
+//! `hops local down` — stop workspace host access, delivery, and optionally purge namespace.
 
-use super::workbench::registry::{list_workspaces, load_workspace, remove_workspace, namespace_for_name};
+use super::up::stop_delivery_runtime;
+use super::workbench::net::stop_host_access;
+use super::workbench::registry::{
+    list_workspaces, load_workspace, namespace_for_name, remove_workspace,
+};
 use super::{local_state_dir, run_cmd};
 use clap::Args;
 use std::error::Error;
@@ -51,21 +55,20 @@ pub fn run(args: &DownArgs) -> Result<(), Box<dyn Error>> {
 
     log::info!("Bringing down workspace `{name}` (namespace {namespace})");
 
-    // Best-effort: stop any port-forwards / kubefwd for this namespace (pkill by ns).
-    let _ = run_cmd(
-        "sh",
-        &[
-            "-c",
-            &format!(
-                "pkill -f 'kubefwd.*{namespace}' 2>/dev/null || true; \
-                 pkill -f 'port-forward.*-n {namespace}' 2>/dev/null || true"
-            ),
-        ],
-    );
+    // Stop host access processes started by `up` (recorded PIDs + pkill safety net)
+    if let Err(e) = stop_host_access(&state_dir, &name) {
+        log::warn!("host access stop: {e}");
+    }
+
+    // Stop mutagen / tar sync watchers
+    stop_delivery_runtime(&state_dir, &name);
 
     if args.purge {
         log::info!("Purging namespace {namespace}...");
-        match run_cmd("kubectl", &["delete", "namespace", &namespace, "--wait=false"]) {
+        match run_cmd(
+            "kubectl",
+            &["delete", "namespace", &namespace, "--wait=false"],
+        ) {
             Ok(()) => log::info!("Namespace {namespace} delete requested."),
             Err(e) => log::warn!("Namespace delete: {e}"),
         }

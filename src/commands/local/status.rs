@@ -1,7 +1,8 @@
-//! `hops local status` — list workspaces and app URLs without kubectl literacy.
+//! `hops local status` — list workspaces, app URLs, and whether access processes are alive.
 
 use super::workbench::net::{
-    format_status_card, plan_host_access, HostAccessMode, ServiceEndpoint,
+    format_status_card, host_access_status_line, load_host_access_runtime, plan_host_access,
+    HostAccessMode, ServiceEndpoint,
 };
 use super::workbench::registry::{list_workspaces, load_workspace};
 use super::{command_exists, local_state_dir, run_cmd_output};
@@ -55,8 +56,12 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
             println!("delivery: {d}");
         }
         println!("env:      {}", ws.env_path);
-        if plan.mode == HostAccessMode::Map && services.is_empty() {
+        if let Some(rt) = load_host_access_runtime(&state_dir, &ws.name)? {
+            println!("{}", host_access_status_line(&rt));
+        } else if plan.mode == HostAccessMode::Map && services.is_empty() {
             println!("note:     no services listed yet — is the workspace up?");
+        } else {
+            println!("access processes: not recorded (re-run hops local up to start them)");
         }
     }
     Ok(())

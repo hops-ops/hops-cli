@@ -212,11 +212,40 @@ fn inject_labels_into_value(value: &mut Value, labels: &BTreeMap<String, String>
     let Some(root) = value.as_mapping_mut() else {
         return;
     };
-    let meta_key = Value::String("metadata".into());
-    if !root.contains_key(&meta_key) {
-        root.insert(meta_key.clone(), Value::Mapping(serde_yaml::Mapping::new()));
+    inject_labels_into_metadata_map(root, labels);
+
+    // Workload kinds: also stamp pod template labels so selectors/discovery work.
+    let kind = root
+        .get(Value::String("kind".into()))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if matches!(
+        kind,
+        "Deployment" | "StatefulSet" | "DaemonSet" | "Job" | "ReplicaSet"
+    ) {
+        if let Some(spec) = root
+            .get_mut(Value::String("spec".into()))
+            .and_then(|v| v.as_mapping_mut())
+        {
+            if let Some(template) = spec
+                .get_mut(Value::String("template".into()))
+                .and_then(|v| v.as_mapping_mut())
+            {
+                inject_labels_into_metadata_map(template, labels);
+            }
+        }
     }
-    let Some(meta) = root.get_mut(&meta_key).and_then(|v| v.as_mapping_mut()) else {
+}
+
+fn inject_labels_into_metadata_map(
+    obj: &mut serde_yaml::Mapping,
+    labels: &BTreeMap<String, String>,
+) {
+    let meta_key = Value::String("metadata".into());
+    if !obj.contains_key(&meta_key) {
+        obj.insert(meta_key.clone(), Value::Mapping(serde_yaml::Mapping::new()));
+    }
+    let Some(meta) = obj.get_mut(&meta_key).and_then(|v| v.as_mapping_mut()) else {
         return;
     };
     let labels_key = Value::String("labels".into());
@@ -470,6 +499,11 @@ metadata:
   name: dep
   labels:
     existing: keep
+spec:
+  template:
+    metadata:
+      labels:
+        app: dep
 "#;
         let labels = inject_labels("ws", "app");
         let out = render_labels_into_manifests(rendered, &labels).unwrap();
@@ -477,7 +511,15 @@ metadata:
         assert!(out.contains("hops.ops.com.ai/local-env: ws"));
         assert!(out.contains("hops.ops.com.ai/local-app: app"));
         assert!(out.contains("existing: keep"));
-        assert_eq!(out.matches("hops-local-gitops").count(), 2);
+        // Deployment top-level + pod template both labeled
+        assert!(out.matches("hops-local-gitops").count() >= 2);
+        // Pod template must carry workspace labels for kubectl -l discovery
+        let docs: Vec<&str> = out.split("---").collect();
+        let dep = docs.iter().find(|d| d.contains("kind: Deployment")).unwrap();
+        assert!(
+            dep.contains("local-env: ws"),
+            "deployment/pod template missing local-env: {dep}"
+        );
     }
 
     struct MockHelm {

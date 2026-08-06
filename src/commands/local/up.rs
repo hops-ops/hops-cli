@@ -1,10 +1,13 @@
 //! `hops local up` — front-door: register workspace, reconcile, delivery, host access.
 
 use super::workbench::delivery::{
-    probe_from_visibility, select_delivery_strategy, DeliveryStrategy,
+    attach_sync_delivery, discover_sync_targets, probe_node_path_visibility,
+    select_delivery_strategy, stop_mutagen_sessions, DeliveryStrategy, NodePathProber,
+    SystemNodeProber,
 };
 use super::workbench::net::{
-    allocate_port_base, format_status_card, plan_host_access, HostAccessMode, ServiceEndpoint,
+    allocate_port_base, format_status_card, host_access_status_line, plan_host_access,
+    start_host_access_auto, HostAccessMode, ServiceEndpoint,
 };
 use super::workbench::reconcile::{
     reconcile_applications, ReconcileOptions, SystemHelm, SystemKubectl,
@@ -17,7 +20,7 @@ use clap::Args;
 use serde_yaml::Value;
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Args, Debug)]
 pub struct UpArgs {
@@ -44,6 +47,10 @@ pub struct UpArgs {
     #[arg(long)]
     pub delivery: Option<String>,
 
+    /// Skip starting kubefwd / port-forward (plan URLs only).
+    #[arg(long, default_value_t = false)]
+    pub no_net: bool,
+
     /// Render only; do not apply.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
@@ -66,15 +73,12 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let env_path = args
-        .env_path
-        .canonicalize()
-        .map_err(|e| {
-            format!(
-                "env path {} not found ({e}). Pass a directory of Application YAMLs, e.g. ./gitops/env/local",
-                args.env_path.display()
-            )
-        })?;
+    let env_path = args.env_path.canonicalize().map_err(|e| {
+        format!(
+            "env path {} not found ({e}). Pass a directory of Application YAMLs, e.g. ./gitops/env/local",
+            args.env_path.display()
+        )
+    })?;
 
     let cwd = std::env::current_dir()?;
     let name = args
@@ -91,14 +95,14 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
         .and_then(|r| r.port_base)
         .unwrap_or_else(|| allocate_port_base(&existing));
 
-    // Project root: parent of gitops/ when path ends with gitops/env/...
     let project_root = infer_project_root(&env_path);
 
-    // Delivery probe + strategy
-    let (delivery_mode, runtime_values) = if args.no_delivery {
-        (None, BTreeMap::new())
+    // Delivery probe + strategy (real node visibility, not just host is_dir)
+    let (delivery_mode, runtime_values, probe_detail) = if args.no_delivery {
+        (None, BTreeMap::new(), None)
     } else {
-        let strategy = resolve_delivery(args.delivery.as_deref(), project_root.as_ref())?;
+        let (strategy, detail) =
+            resolve_delivery(args.delivery.as_deref(), project_root.as_ref(), &SystemNodeProber)?;
         let mut vals = BTreeMap::new();
         let mut sd = serde_yaml::Mapping::new();
         sd.insert(
@@ -114,11 +118,9 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
             }
         }
         vals.insert("sourceDelivery".into(), Value::Mapping(sd));
-        // cluster-dev is the north-star posture for up
-        vals
-            .entry("appRuntime".into())
+        vals.entry("appRuntime".into())
             .or_insert(Value::String("cluster-dev".into()));
-        (Some(strategy), vals)
+        (Some(strategy), vals, Some(detail))
     };
 
     let opts = ReconcileOptions {
@@ -129,6 +131,9 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
     };
 
     log::info!("Workspace `{name}` → namespace `{namespace}`");
+    if let Some(d) = &probe_detail {
+        log::info!("delivery probe: {d}");
+    }
     let results = reconcile_applications(&env_path, &opts, &SystemHelm, &SystemKubectl)?;
     for r in &results {
         log::info!(
@@ -138,14 +143,68 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
         );
     }
 
-    // Discover services for URL card (best-effort).
-    let services = discover_services(&namespace).unwrap_or_else(|e| {
-        log::debug!("service discovery deferred: {e}");
+    // Attach real sync delivery when strategy is Sync (mutagen or tar|kubectl)
+    let mut sync_pids: Vec<u32> = Vec::new();
+    let mut mutagen_sessions: Vec<String> = Vec::new();
+    if !args.dry_run && !args.no_delivery {
+        if let Some(DeliveryStrategy::Sync) = delivery_mode {
+            if let Some(root) = &project_root {
+                let targets = wait_for_sync_targets(&namespace, &name, "/workspace", 30);
+                match attach_sync_delivery(root, &targets, &name, args.watch) {
+                    Ok(attach) => {
+                        sync_pids = attach.sync_pids;
+                        mutagen_sessions = attach.mutagen_sessions;
+                        for m in attach.messages {
+                            log::info!("delivery: {m}");
+                        }
+                    }
+                    Err(e) => log::warn!("source delivery attach failed: {e}"),
+                }
+            }
+        } else if let Some(DeliveryStrategy::HostPath) = delivery_mode {
+            log::info!("source delivery: hostPath (node can see worktree; no sync session)");
+        }
+    }
+
+    // Discover services for URL card
+    let services = if args.dry_run {
         default_service_stubs(&results)
-    });
+    } else {
+        discover_services(&namespace).unwrap_or_else(|e| {
+            log::debug!("service discovery deferred: {e}");
+            default_service_stubs(&results)
+        })
+    };
 
     let kubefwd = command_exists("kubefwd");
-    let plan = plan_host_access(&namespace, &services, kubefwd, port_base);
+    // Plan first for dry-run / no-net; live path may rewrite plan via auto fallback.
+    let mut plan = plan_host_access(&namespace, &services, kubefwd, port_base);
+
+    // Start real host access (kubefwd if it stays up, else map port-forwards)
+    if !args.dry_run && !args.no_net && !services.is_empty() {
+        match start_host_access_auto(
+            &namespace,
+            &services,
+            kubefwd,
+            port_base,
+            &state_dir,
+            &name,
+        ) {
+            Ok((live_plan, rt)) => {
+                plan = live_plan;
+                log::info!("{}", host_access_status_line(&rt));
+            }
+            Err(e) => {
+                log::warn!("host access start failed: {e}");
+            }
+        }
+    } else if plan.mode == HostAccessMode::Map && services.is_empty() {
+        log::info!("host access: deferred until services exist");
+    }
+
+    // Persist delivery runtime pids alongside workspace record (in runtime dir via net helpers
+    // for host access; store sync info in a small sidecar file)
+    save_delivery_runtime(&state_dir, &name, &mutagen_sessions, &sync_pids)?;
 
     let record = WorkspaceRecord {
         name: name.clone(),
@@ -161,16 +220,13 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
         save_workspace(&state_dir, &record)?;
     }
 
-    // Print human card
     println!();
     println!("{}", format_status_card(&name, &plan));
     if let Some(d) = delivery_mode {
-        log::info!("source delivery: {} (auto)", d.as_str());
+        println!("delivery: {} ({})", d.as_str(), probe_detail.as_deref().unwrap_or("auto"));
     }
     if plan.mode == HostAccessMode::Map {
-        log::info!(
-            "host access: map mode (install kubefwd for cluster DNS-style URLs)"
-        );
+        log::info!("host access: map mode port-forwards (install kubefwd for cluster DNS URLs)");
     }
     println!();
     println!("Useful commands:");
@@ -199,43 +255,28 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
 fn resolve_delivery(
     override_mode: Option<&str>,
     project_root: Option<&PathBuf>,
-) -> Result<DeliveryStrategy, Box<dyn Error>> {
+    prober: &dyn NodePathProber,
+) -> Result<(DeliveryStrategy, String), Box<dyn Error>> {
     if let Some(m) = override_mode {
-        return match m {
-            "hostPath" | "hostpath" => Ok(DeliveryStrategy::HostPath),
-            "sync" | "mutagen" => Ok(DeliveryStrategy::Sync),
-            other => Err(format!("unknown --delivery {other} (use hostPath|sync)").into()),
+        let strategy = match m {
+            "hostPath" | "hostpath" => DeliveryStrategy::HostPath,
+            "sync" | "mutagen" => DeliveryStrategy::Sync,
+            other => {
+                return Err(format!("unknown --delivery {other} (use hostPath|sync)").into())
+            }
         };
+        return Ok((strategy, format!("forced via --delivery {m}")));
     }
     let root = project_root
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    // Best-effort probe: path exists on this host (node visibility is backend-specific;
-    // without a live node check we treat host path existence + dory/colima projects-root
-    // heuristics as partial — full node exec probe is best-effort).
-    let visible = probe_node_path_visible(&root);
-    let probe = probe_from_visibility(
-        &root,
-        visible,
-        if visible {
-            "host path present; assuming node visibility for local backends"
-        } else {
-            "host path missing or not visible; using sync fallback"
-        },
-    );
-    Ok(select_delivery_strategy(&probe))
+    let probe = prober.probe(&root)?;
+    let strategy = select_delivery_strategy(&probe);
+    Ok((strategy, probe.detail))
 }
 
-fn probe_node_path_visible(path: &PathBuf) -> bool {
-    // Prefer: if path exists and looks like a normal host worktree, claim hostPath.
-    // Live backends may refine this later via `dory`/`docker exec` node checks.
-    path.is_dir()
-}
-
-fn infer_project_root(env_path: &std::path::Path) -> Option<PathBuf> {
-    // .../gitops/env/local → project root three levels up from env, or parent of gitops
+fn infer_project_root(env_path: &Path) -> Option<PathBuf> {
     let mut p = env_path.to_path_buf();
-    // climb until we see gitops as a component, then take its parent
     loop {
         if p.file_name().and_then(|s| s.to_str()) == Some("gitops") {
             return p.parent().map(|x| x.to_path_buf());
@@ -247,18 +288,29 @@ fn infer_project_root(env_path: &std::path::Path) -> Option<PathBuf> {
     env_path.parent().map(|x| x.to_path_buf())
 }
 
+/// Poll for pods labeled for this workspace (any phase that can accept exec).
+fn wait_for_sync_targets(
+    namespace: &str,
+    workspace: &str,
+    mount_path: &str,
+    timeout_secs: u64,
+) -> Vec<super::workbench::delivery::SyncPodTarget> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match discover_sync_targets(namespace, workspace, mount_path) {
+            Ok(t) if !t.is_empty() => return t,
+            Ok(_) => {}
+            Err(e) => log::debug!("pod discovery: {e}"),
+        }
+        if std::time::Instant::now() >= deadline {
+            return discover_sync_targets(namespace, workspace, mount_path).unwrap_or_default();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 fn discover_services(namespace: &str) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
-    let json = run_cmd_output(
-        "kubectl",
-        &[
-            "get",
-            "svc",
-            "-n",
-            namespace,
-            "-o",
-            "json",
-        ],
-    )?;
+    let json = run_cmd_output("kubectl", &["get", "svc", "-n", namespace, "-o", "json"])?;
     let value: serde_json::Value = serde_json::from_str(&json)?;
     let mut out = Vec::new();
     if let Some(items) = value.get("items").and_then(|i| i.as_array()) {
@@ -268,7 +320,7 @@ fn discover_services(namespace: &str) -> Result<Vec<ServiceEndpoint>, Box<dyn Er
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if name.is_empty() {
+            if name.is_empty() || name == "kubernetes" {
                 continue;
             }
             let port = item
@@ -292,18 +344,74 @@ fn default_service_stubs(
         .iter()
         .map(|r| ServiceEndpoint {
             name: r.app_name.clone(),
-            port: if r.app_name.contains("ui") { 5180 } else { 8791 },
+            port: if r.app_name.contains("ui") {
+                5180
+            } else {
+                8791
+            },
             protocol: "TCP".into(),
         })
         .collect()
 }
 
 fn chrono_lite_now() -> String {
-    // Avoid extra dep: RFC3339-ish from system time
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("{secs}")
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryRuntime {
+    mutagen_sessions: Vec<String>,
+    sync_pids: Vec<u32>,
+}
+
+fn delivery_runtime_path(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir
+        .join("runtime")
+        .join(format!("{workspace}.delivery.json"))
+}
+
+fn save_delivery_runtime(
+    state_dir: &Path,
+    workspace: &str,
+    sessions: &[String],
+    pids: &[u32],
+) -> Result<(), Box<dyn Error>> {
+    let dir = state_dir.join("runtime");
+    std::fs::create_dir_all(&dir)?;
+    let rt = DeliveryRuntime {
+        mutagen_sessions: sessions.to_vec(),
+        sync_pids: pids.to_vec(),
+    };
+    std::fs::write(
+        delivery_runtime_path(state_dir, workspace),
+        serde_json::to_string_pretty(&rt)?,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn stop_delivery_runtime(state_dir: &Path, workspace: &str) {
+    let path = delivery_runtime_path(state_dir, workspace);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(rt) = serde_json::from_str::<DeliveryRuntime>(&text) {
+            stop_mutagen_sessions(&rt.mutagen_sessions);
+            for pid in rt.sync_pids {
+                let _ = std::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+// Re-export probe for tests that want the production path
+#[allow(dead_code)]
+pub fn probe_for_tests(path: &Path) -> Result<super::workbench::delivery::DeliveryProbe, Box<dyn Error>> {
+    probe_node_path_visibility(path)
 }
