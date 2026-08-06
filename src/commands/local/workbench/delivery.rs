@@ -152,6 +152,8 @@ pub struct SyncPodTarget {
     pub container: Option<String>,
     pub mount_path: String,
     pub app_name: String,
+    /// Per-app host directory to tar/sync (NOT a shared monorepo root for all apps).
+    pub host_source_path: PathBuf,
 }
 
 /// Result of attaching delivery after reconcile.
@@ -569,11 +571,14 @@ fn write_sync_marker(target: &SyncPodTarget) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Discover Running pods labeled for this workspace/app.
+/// Discover Running pods labeled for this workspace and attach per-app host paths.
+///
+/// `app_host_paths`: app name → absolute host directory to sync into that pod.
 pub fn discover_sync_targets(
     namespace: &str,
     workspace: &str,
     mount_path: &str,
+    app_host_paths: &std::collections::BTreeMap<String, PathBuf>,
 ) -> Result<Vec<SyncPodTarget>, Box<dyn Error>> {
     let json = Command::new("kubectl")
         .args([
@@ -627,12 +632,24 @@ pub fn discover_sync_targets(
                 .pointer("/spec/containers/0/name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let host_source_path = app_host_paths
+                .get(&app)
+                .cloned()
+                .or_else(|| {
+                    // Fuzzy: app name contains key
+                    app_host_paths
+                        .iter()
+                        .find(|(k, _)| app.contains(k.as_str()) || k.contains(&app))
+                        .map(|(_, p)| p.clone())
+                })
+                .unwrap_or_else(|| PathBuf::from("."));
             out.push(SyncPodTarget {
                 namespace: namespace.to_string(),
                 pod,
                 container,
                 mount_path: mount_path.to_string(),
                 app_name: app,
+                host_source_path,
             });
         }
     }
@@ -677,16 +694,15 @@ pub fn stop_mutagen_sessions(sessions: &[String]) {
     }
 }
 
-/// Attach sync delivery for all targets: mutagen preferred, else one-shot tar + optional watch.
+/// Attach sync delivery for all targets: each target uses its own `host_source_path`.
 ///
-/// `watch`: when true and mutagen unavailable, spawn a notify-based re-sync loop.
+/// `watch`: when true and mutagen unavailable, spawn a multi-target tar re-sync loop.
 pub fn attach_sync_delivery(
-    host_path: &Path,
     targets: &[SyncPodTarget],
     workspace: &str,
     watch: bool,
 ) -> Result<DeliveryAttachResult, Box<dyn Error>> {
-    let probe = probe_from_visibility(host_path, false, "sync attach");
+    let probe = probe_from_visibility(Path::new("."), false, "sync attach (per-app hosts)");
     let mut result = DeliveryAttachResult {
         strategy: DeliveryStrategy::Sync,
         probe,
@@ -699,58 +715,70 @@ pub fn attach_sync_delivery(
         result
             .messages
             .push("no Running pods to sync into yet; re-run up after pods are Ready".into());
-        // Still do nothing hard-fail: caller may retry
         return Ok(result);
     }
 
     let mutagen = command_exists("mutagen");
     for target in targets {
+        let host_path = &target.host_source_path;
         let session = sync_session_name(workspace, &target.app_name);
         if mutagen {
-            // mutagen docker:// requires container runtime access; use alpha/beta paths
-            // with kubectl-forwarded alpha via one-way and fallback to tar if create fails.
             let dest = format!(
-                // Use a pseudo URL recorded for terminate; actual create may fail without agent.
-                // Prefer tar path which always works with kubectl.
                 "kubectl://{}/{}{}",
-                target.namespace,
-                target.pod,
-                target.mount_path
+                target.namespace, target.pod, target.mount_path
             );
             match start_mutagen_session(&session, host_path, &dest) {
                 Ok(()) => {
                     result.mutagen_sessions.push(session);
-                    result
-                        .messages
-                        .push(format!("mutagen session for {}", target.pod));
+                    result.messages.push(format!(
+                        "mutagen session for {} ← {}",
+                        target.pod,
+                        host_path.display()
+                    ));
                     continue;
                 }
                 Err(e) => {
-                    result
-                        .messages
-                        .push(format!("mutagen unavailable for {}: {e}; using tar sync", target.pod));
+                    result.messages.push(format!(
+                        "mutagen unavailable for {}: {e}; using tar sync",
+                        target.pod
+                    ));
                 }
             }
         }
 
-        // Tar-based real sync (uses default_sync_ignores via tar_exclude_args)
-        sync_directory_to_pod(host_path, target)?;
-        result.messages.push(format!(
-            "tar sync → {}/{}:{}",
-            target.namespace, target.pod, target.mount_path
-        ));
+        // Tar-based real sync (per-app host path + default_sync_ignores).
+        // Per-target errors must not abort the other apps.
+        match sync_directory_to_pod(host_path, target) {
+            Ok(()) => result.messages.push(format!(
+                "tar sync {} → {}/{}:{}",
+                host_path.display(),
+                target.namespace,
+                target.pod,
+                target.mount_path
+            )),
+            Err(e) => result.messages.push(format!(
+                "tar sync FAILED for {} ← {}: {e}",
+                target.pod,
+                host_path.display()
+            )),
+        }
     }
 
-    if watch && result.mutagen_sessions.is_empty() && !targets.is_empty() {
-        // Continuous re-sync on host changes (ordinary source edits → pod FS only)
-        let host = host_path.to_path_buf();
-        let targets = targets.to_vec();
-        match spawn_tar_sync_watcher(host, targets) {
+    // Always keep a multi-app tar re-sync loop for Sync mode: emptyDir is wiped
+    // on container restart, so a one-shot tar is not durable without continuous
+    // delivery. `--watch` only controls gitops chart re-apply (caller).
+    let _ = watch;
+    if result.mutagen_sessions.is_empty() && !targets.is_empty() {
+        // Immediate second pass after a short delay (covers race with first start).
+        for target in targets {
+            let _ = sync_directory_to_pod(&target.host_source_path, target);
+        }
+        match spawn_tar_sync_watcher(targets.to_vec()) {
             Ok(pid) => {
                 result.sync_pids.push(pid);
                 result
                     .messages
-                    .push(format!("tar sync watcher pid={pid}"));
+                    .push(format!("tar sync watcher pid={pid} (all apps, continuous)"));
             }
             Err(e) => result
                 .messages
@@ -761,46 +789,24 @@ pub fn attach_sync_delivery(
     Ok(result)
 }
 
-fn spawn_tar_sync_watcher(
-    host_path: PathBuf,
-    targets: Vec<SyncPodTarget>,
-) -> Result<u32, Box<dyn Error>> {
-    // Spawn a detached thread in-process is not durable across CLI exit.
-    // Write a small shell helper state and spawn background process.
-    // For CLI durability: use std::process::Command with null stdio.
-    //
-    // We re-invoke hops? Not available as stable binary name. Use a loop in
-    // a background shell that runs tar|kubectl when files change via a simple
-    // polling approach (portable, no notify in shell).
-    //
-    // Better: fork a rustc-free shell loop with `find` mtime — crude but real.
-    // Or: use `setsid` + current binary isn't right.
-    //
-    // Implement as background thread only when `--watch` keeps process alive;
-    // for one-shot `up`, perform one-shot tar (already done) and record that
-    // continuous watch needs `up --watch` or mutagen.
-    //
-    // For process durability after `up` returns, spawn:
-    //   sh -c 'while true; do ...; sleep 2; done' &
-    // with tar excludes.
-
-    let excludes: Vec<String> = tar_exclude_args();
-    let host = host_path.display().to_string();
+/// Build the continuous multi-app tar re-sync shell script (testable pure builder).
+///
+/// Each target gets its **own** host path; every target is resynced on change
+/// (not a single `sync_one` redefined in a loop).
+pub fn build_multi_app_tar_watch_script(targets: &[SyncPodTarget]) -> String {
+    let excludes = tar_exclude_args().join(" ");
     let mut script = String::from("set -e\n");
-    for t in &targets {
+    script.push_str("sync_all() {\n");
+    for t in targets {
         let cont = t
             .container
             .as_ref()
-            .map(|c| format!("-c {c}"))
+            .map(|c| format!("-c {c} "))
             .unwrap_or_default();
-        let excl = excludes.join(" ");
+        let host = t.host_source_path.display();
         script.push_str(&format!(
-            r#"
-sync_one() {{
-  tar cf - {excl} -C "{host}" . | kubectl exec -i -n "{ns}" "{pod}" {cont} -- tar xf - -C "{mount}" 2>/dev/null || true
-}}
-"#,
-            excl = excl,
+            "  tar cf - {excl} -C \"{host}\" . | kubectl exec -i -n \"{ns}\" \"{pod}\" {cont}-- tar xf - -C \"{mount}\" 2>/dev/null || true\n",
+            excl = excludes,
             host = host,
             ns = t.namespace,
             pod = t.pod,
@@ -808,29 +814,39 @@ sync_one() {{
             mount = t.mount_path,
         ));
     }
-    script.push_str(
+    script.push_str("}\n");
+
+    // Fingerprint union of all host roots so any app source change triggers full resync.
+    let mut find_parts = Vec::new();
+    for t in targets {
+        find_parts.push(format!("\"{}\"", t.host_source_path.display()));
+    }
+    let roots = find_parts.join(" ");
+    script.push_str(&format!(
         r#"
-# Poll: re-sync when any non-ignored file mtime changes (simple fingerprint)
 prev=""
 while true; do
-  cur=$(find "$HOST_PATH" -type f \
+  cur=$(find {roots} -type f \
     ! -path '*/node_modules/*' ! -path '*/target/*' ! -path '*/.git/*' \
     ! -path '*/dist/*' ! -path '*/.svelte-kit/*' \
-    -print0 2>/dev/null | xargs -0 stat -f '%m' 2>/dev/null | cksum | awk '{print $1}')
+    -print0 2>/dev/null | xargs -0 stat -f '%m' 2>/dev/null | cksum | awk '{{print $1}}')
   if [ "$cur" != "$prev" ]; then
     prev="$cur"
-    sync_one
+    sync_all
   fi
   sleep 2
 done
 "#,
-    );
-    // Fix HOST_PATH in script - inject
-    let script = script.replace("$HOST_PATH", &format!("\"{host}\""));
-    // Actually the find uses HOST_PATH env
+        roots = roots
+    ));
+    script
+}
+
+fn spawn_tar_sync_watcher(targets: Vec<SyncPodTarget>) -> Result<u32, Box<dyn Error>> {
+    let script = build_multi_app_tar_watch_script(&targets);
     let child = Command::new("sh")
         .arg("-c")
-        .arg(format!("HOST_PATH={host:?}; {script}"))
+        .arg(script)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -923,6 +939,7 @@ mod tests {
             container: Some("ui".into()),
             mount_path: "/workspace".into(),
             app_name: "e2e-ui-ui".into(),
+            host_source_path: PathBuf::from("/proj/ui"),
         };
         let args = build_kubectl_tar_extract_args(&t);
         assert!(args.contains(&"exec".into()));
@@ -931,6 +948,42 @@ mod tests {
         assert!(args.contains(&"-c".into()));
         assert!(args.contains(&"ui".into()));
         assert!(args.contains(&"/workspace".into()));
+    }
+
+    #[test]
+    fn multi_app_watch_script_resyncs_every_target_with_own_host() {
+        let targets = vec![
+            SyncPodTarget {
+                namespace: "ns".into(),
+                pod: "api-pod".into(),
+                container: Some("api".into()),
+                mount_path: "/workspace".into(),
+                app_name: "e2e-ui-api".into(),
+                host_source_path: PathBuf::from("/proj"),
+            },
+            SyncPodTarget {
+                namespace: "ns".into(),
+                pod: "ui-pod".into(),
+                container: Some("ui".into()),
+                mount_path: "/workspace".into(),
+                app_name: "e2e-ui-ui".into(),
+                host_source_path: PathBuf::from("/proj/ui"),
+            },
+        ];
+        let script = build_multi_app_tar_watch_script(&targets);
+        // One function that syncs ALL apps — not a redefined single-target sync_one
+        assert!(script.contains("sync_all()"));
+        assert!(!script.contains("sync_one()"));
+        // Both host roots and both pods present
+        assert!(script.contains("-C \"/proj\""));
+        assert!(script.contains("-C \"/proj/ui\""));
+        assert!(script.contains("api-pod"));
+        assert!(script.contains("ui-pod"));
+        // Call site invokes sync_all (not last-only)
+        assert!(script.contains("sync_all\n") || script.contains("sync_all\r"));
+        let api_lines = script.matches("api-pod").count();
+        let ui_lines = script.matches("ui-pod").count();
+        assert!(api_lines >= 1 && ui_lines >= 1);
     }
 
     #[test]

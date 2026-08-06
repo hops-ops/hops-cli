@@ -41,6 +41,16 @@ pub struct ApplicationSpec {
 pub struct Source {
     /// Path to chart directory, relative to the Application YAML file.
     pub path: String,
+    /// Host path to sync/mount as the app worktree (relative to this YAML file).
+    ///
+    /// **Per-app** — not the monorepo root for every pod. Examples:
+    /// - UI: `../../../ui` (directory with package.json / vite)
+    /// - API monorepo: `../../..` (directory with Cargo.toml / workspace)
+    ///
+    /// When omitted, defaults to the service directory that owns `.gitops`
+    /// (parent of the `.gitops` component on the chart path).
+    #[serde(default)]
+    pub delivery_path: Option<String>,
     #[serde(default)]
     pub helm: HelmSource,
 }
@@ -107,6 +117,58 @@ pub fn resolve_source_path(app_file: &Path, source_path: &str) -> Result<PathBuf
     let joined = base.join(source_path);
     // Do not require canonicalize (charts may be created in tests before write completes).
     Ok(normalize_path(&joined))
+}
+
+/// Resolve the **per-app** host directory to mount/sync into the container.
+///
+/// Precedence:
+/// 1. `spec.source.deliveryPath` (relative to Application file)
+/// 2. Default: service root that owns the chart (directory containing `.gitops`)
+pub fn resolve_delivery_host_path(
+    app_file: &Path,
+    app: &Application,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(rel) = app
+        .spec
+        .source
+        .delivery_path
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let p = resolve_source_path(app_file, rel)?;
+        return Ok(p
+            .canonicalize()
+            .unwrap_or(p));
+    }
+    let chart = resolve_source_path(app_file, &app.spec.source.path)?;
+    Ok(service_root_from_chart_path(&chart)
+        .canonicalize()
+        .unwrap_or_else(|_| service_root_from_chart_path(&chart)))
+}
+
+/// Given `…/<service>/.gitops/deploy`, return `…/<service>`.
+/// If `.gitops` is not in the path, return the chart path itself.
+pub fn service_root_from_chart_path(chart_path: &Path) -> PathBuf {
+    let mut comps: Vec<_> = chart_path.components().collect();
+    // Find `.gitops` and drop it and everything after.
+    if let Some(idx) = comps
+        .iter()
+        .position(|c| c.as_os_str() == std::ffi::OsStr::new(".gitops"))
+    {
+        comps.truncate(idx);
+        let mut out = PathBuf::new();
+        for c in comps {
+            out.push(c.as_os_str());
+        }
+        if out.as_os_str().is_empty() {
+            chart_path.to_path_buf()
+        } else {
+            out
+        }
+    } else {
+        chart_path.to_path_buf()
+    }
 }
 
 /// Collapse `.` and `..` without requiring the path to exist.
@@ -213,6 +275,75 @@ spec:
         let app_file = Path::new("/proj/gitops/env/local/api.yaml");
         let resolved = resolve_source_path(app_file, "../../../api/.gitops/deploy").unwrap();
         assert_eq!(resolved, PathBuf::from("/proj/api/.gitops/deploy"));
+    }
+
+    #[test]
+    fn service_root_from_chart_is_parent_of_gitops() {
+        assert_eq!(
+            service_root_from_chart_path(Path::new("/proj/ui/.gitops/deploy")),
+            PathBuf::from("/proj/ui")
+        );
+        assert_eq!(
+            service_root_from_chart_path(Path::new("/proj/api/.gitops/deploy")),
+            PathBuf::from("/proj/api")
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_host_path_uses_delivery_path_not_shared_monorepo() {
+        let app_file = Path::new("/proj/gitops/env/local/ui.yaml");
+        let ui = parse_application_yaml(
+            r#"
+apiVersion: hops.local/v1alpha1
+kind: Application
+metadata:
+  name: e2e-ui-ui
+spec:
+  source:
+    path: ../../../ui/.gitops/deploy
+    deliveryPath: ../../../ui
+"#,
+        )
+        .unwrap();
+        let host = resolve_delivery_host_path(app_file, &ui).unwrap();
+        assert_eq!(host, PathBuf::from("/proj/ui"));
+
+        let api = parse_application_yaml(
+            r#"
+apiVersion: hops.local/v1alpha1
+kind: Application
+metadata:
+  name: e2e-ui-api
+spec:
+  source:
+    path: ../../../api/.gitops/deploy
+    deliveryPath: ../../..
+"#,
+        )
+        .unwrap();
+        let host_api = resolve_delivery_host_path(app_file, &api).unwrap();
+        assert_eq!(host_api, PathBuf::from("/proj"));
+        // UI and API host paths must differ in the dogfood layout
+        assert_ne!(host, host_api);
+    }
+
+    #[test]
+    fn resolve_delivery_host_path_defaults_to_service_root() {
+        let app_file = Path::new("/proj/gitops/env/local/ui.yaml");
+        let ui = parse_application_yaml(
+            r#"
+apiVersion: hops.local/v1alpha1
+kind: Application
+metadata:
+  name: e2e-ui-ui
+spec:
+  source:
+    path: ../../../ui/.gitops/deploy
+"#,
+        )
+        .unwrap();
+        let host = resolve_delivery_host_path(app_file, &ui).unwrap();
+        assert_eq!(host, PathBuf::from("/proj/ui"));
     }
 
     #[test]

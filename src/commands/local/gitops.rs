@@ -1,5 +1,6 @@
 //! `hops local gitops` — reconcile env Applications (advanced/internal).
 
+use super::workbench::application::{load_applications, resolve_delivery_host_path};
 use super::workbench::reconcile::{
     reconcile_applications, ReconcileOptions, SystemHelm, SystemKubectl,
 };
@@ -68,10 +69,21 @@ pub fn run(args: &GitopsArgs) -> Result<(), Box<dyn Error>> {
         .clone()
         .unwrap_or_else(|| namespace_for_name(&workspace_name));
 
+    let mut app_delivery_host_paths = BTreeMap::new();
+    if let Ok(apps) = load_applications(&env_path) {
+        for (app_file, app) in apps {
+            if let Ok(host) = resolve_delivery_host_path(&app_file, &app) {
+                app_delivery_host_paths.insert(app.metadata.name, host);
+            }
+        }
+    }
+
     let opts = ReconcileOptions {
         namespace: namespace.clone(),
         workspace_name: workspace_name.clone(),
         runtime_values: BTreeMap::new(),
+        app_delivery_host_paths,
+        delivery_mode: Some("sync".into()),
         dry_run: args.dry_run,
     };
 

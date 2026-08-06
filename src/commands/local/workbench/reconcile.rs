@@ -20,8 +20,13 @@ pub struct ReconcileOptions {
     pub namespace: String,
     /// Workspace name for labels.
     pub workspace_name: String,
-    /// Extra values merged last (runtime inject).
+    /// Extra values merged last (runtime inject) — shared across apps.
     pub runtime_values: BTreeMap<String, Value>,
+    /// Per-app hostPath for source delivery (app name → absolute host path).
+    /// Injected as `sourceDelivery.hostPath` for that app only.
+    pub app_delivery_host_paths: BTreeMap<String, PathBuf>,
+    /// Delivery mode string injected when set (`hostPath` | `sync` | `none`).
+    pub delivery_mode: Option<String>,
     /// When true, only render (no apply). Used by tests.
     pub dry_run: bool,
 }
@@ -286,12 +291,40 @@ fn values_to_yaml(values: &Value) -> Result<String, Box<dyn Error>> {
     Ok(serde_yaml::to_string(values)?)
 }
 
-fn build_runtime_values(opts: &ReconcileOptions) -> BTreeMap<String, Value> {
+fn build_runtime_values(opts: &ReconcileOptions, app_name: &str) -> BTreeMap<String, Value> {
     let mut runtime = opts.runtime_values.clone();
     runtime
         .entry("local".into())
         .or_insert(Value::Bool(true));
     runtime.insert("namespace".into(), Value::String(opts.namespace.clone()));
+
+    // Per-app sourceDelivery block (mode + hostPath). Never stamp a single
+    // monorepo root onto every chart.
+    let mut sd = serde_yaml::Mapping::new();
+    if let Some(mode) = &opts.delivery_mode {
+        sd.insert(
+            Value::String("mode".into()),
+            Value::String(mode.clone()),
+        );
+    }
+    if let Some(host) = opts.app_delivery_host_paths.get(app_name) {
+        sd.insert(
+            Value::String("hostPath".into()),
+            Value::String(host.display().to_string()),
+        );
+    }
+    if !sd.is_empty() {
+        // Merge into existing sourceDelivery mapping if runtime already has one.
+        if let Some(Value::Mapping(existing)) = runtime.get("sourceDelivery").cloned() {
+            let mut merged = existing;
+            for (k, v) in sd {
+                merged.insert(k, v);
+            }
+            runtime.insert("sourceDelivery".into(), Value::Mapping(merged));
+        } else {
+            runtime.insert("sourceDelivery".into(), Value::Mapping(sd));
+        }
+    }
     runtime
 }
 
@@ -368,7 +401,7 @@ fn reconcile_one<H: HelmRunner, K: KubectlApplier>(
         .into());
     }
 
-    let runtime = build_runtime_values(opts);
+    let runtime = build_runtime_values(opts, &app.metadata.name);
     let merged = merge_helm_values(app.spec.source.helm.values.as_ref(), &runtime);
     let values_yaml = values_to_yaml(&merged)?;
     let release = sanitize_release_name(&app.metadata.name);
@@ -609,6 +642,8 @@ spec:
             namespace: "hops-wt-alice".into(),
             workspace_name: "alice".into(),
             runtime_values: BTreeMap::new(),
+            app_delivery_host_paths: BTreeMap::new(),
+            delivery_mode: None,
             dry_run: false,
         };
         let results = reconcile_applications(&env, &opts, &helm, &kubectl).unwrap();
@@ -625,5 +660,38 @@ spec:
             &["hops-wt-alice".to_string()]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_runtime_values_injects_per_app_host_path() {
+        let mut hosts = BTreeMap::new();
+        hosts.insert("e2e-ui-ui".into(), PathBuf::from("/proj/ui"));
+        hosts.insert("e2e-ui-api".into(), PathBuf::from("/proj"));
+        let opts = ReconcileOptions {
+            namespace: "hops-wt-x".into(),
+            workspace_name: "x".into(),
+            runtime_values: BTreeMap::new(),
+            app_delivery_host_paths: hosts,
+            delivery_mode: Some("hostPath".into()),
+            dry_run: true,
+        };
+        let ui = build_runtime_values(&opts, "e2e-ui-ui");
+        let api = build_runtime_values(&opts, "e2e-ui-api");
+        assert_eq!(
+            ui["sourceDelivery"]["hostPath"],
+            Value::String("/proj/ui".into())
+        );
+        assert_eq!(
+            api["sourceDelivery"]["hostPath"],
+            Value::String("/proj".into())
+        );
+        assert_ne!(
+            ui["sourceDelivery"]["hostPath"],
+            api["sourceDelivery"]["hostPath"]
+        );
+        assert_eq!(
+            ui["sourceDelivery"]["mode"],
+            Value::String("hostPath".into())
+        );
     }
 }
