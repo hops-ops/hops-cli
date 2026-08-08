@@ -53,11 +53,28 @@ All XRs share these conventions:
 ## Package Installation
 
 ```bash
-# Published version
+# Published version (apply only)
 hops config install --repo hops-ops/<package> --version <tag>
 
+# Published + write into local cluster gitops (preferred for local CP dogfood)
+hops config install --repo hops-ops/psql-stack --version v0.9.1 \
+  --gitops ./gitops/cluster --local
+hops config install --repo hops-ops/auth-stack --version v1.6.0 \
+  --gitops ./gitops/cluster --local
+
 # Local source build
-hops config install --path xrs/aws/_stacks/observe
+hops config install --path xrs/stacks/k8s/psql --gitops ./gitops/cluster
 ```
 
 All packages are published to `ghcr.io/hops-ops/<package>`.
+
+`--gitops` writes `packages/<name>.yaml`. `--local` scaffolds XRs that pin
+Helm/Kubernetes ProviderConfigs to `default` (from `hops local start`). Then:
+
+```bash
+hops local gitops cluster ./gitops/cluster
+```
+
+See [config-install.md](./config-install.md) for the full local gitops flow, and
+[local-source-packages.md](./local-source-packages.md) when iterating from
+`--path` (source) instead of published tags.

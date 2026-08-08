@@ -610,7 +610,7 @@ Notes:
   - Source-build mode intended for a local control plane because it depends on the local registry flow
   - Runs `up project build` in `PATH` (defaults to current directory)
   - Loads generated `.uppkg` artifacts from `<PATH>/_output`
-  - Pushes package images to the registry exposed at `localhost:30500`
+  - Pushes package images to the registry exposed at `127.0.0.1:30500` (IPv4; avoids Docker's `localhost` → `[::1]` path)
   - Applies Crossplane `Configuration` resources pointing at `registry.crossplane-system.svc.cluster.local:5000/...`
   - Supports `--skip-dependency-resolution`
 - `config install --repo <org/repo> [--reload]`

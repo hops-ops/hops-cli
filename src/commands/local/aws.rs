@@ -1,8 +1,10 @@
+use super::gitops_write::{log_written, write_gitops_files, GitopsFile};
 use super::{kubectl_apply_stdin, run_cmd, run_cmd_output};
 use clap::Args;
 use serde::Deserialize;
 use std::error::Error;
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
@@ -52,6 +54,12 @@ pub struct AwsArgs {
     /// Refresh credentials and AWS runtime region; skips Provider and ProviderConfig apply
     #[arg(long)]
     pub refresh: bool,
+
+    /// Write non-secret Provider / DeploymentRuntimeConfig / ProviderConfig YAML
+    /// under this directory (e.g. `./gitops/cluster`). Credential Secrets are
+    /// **not** written — still applied live only.
+    #[arg(long)]
+    pub gitops: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,25 +111,55 @@ pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    let runtime_yaml = build_runtime_config_yaml(&args.runtime_config_name, &region);
+    let provider_yaml = build_provider_yaml(
+        &args.provider_name,
+        &args.provider_package,
+        &args.runtime_config_name,
+    );
+    let provider_config_yaml = build_provider_config_yaml(
+        &args.namespace,
+        &args.provider_config_name,
+        &args.secret_name,
+    );
+
+    if let Some(gitops) = &args.gitops {
+        let written = write_gitops_files(
+            gitops,
+            &[
+                GitopsFile {
+                    rel_path: "runtime/aws.yaml".into(),
+                    yaml: runtime_yaml.clone(),
+                },
+                GitopsFile {
+                    rel_path: "providers/aws.yaml".into(),
+                    yaml: provider_yaml.clone(),
+                },
+                GitopsFile {
+                    rel_path: "providerconfigs/aws.yaml".into(),
+                    yaml: provider_config_yaml.clone(),
+                },
+            ],
+        )?;
+        log_written(&written);
+        log::info!(
+            "AWS non-secret manifests written under {} (Secret still applied live only)",
+            gitops.display()
+        );
+    }
+
     log::info!(
         "Applying AWS provider runtime '{}' for region '{}'...",
         args.runtime_config_name,
         region
     );
-    kubectl_apply_stdin(&build_runtime_config_yaml(
-        &args.runtime_config_name,
-        &region,
-    ))?;
+    kubectl_apply_stdin(&runtime_yaml)?;
 
     log::info!(
         "Applying provider-family-aws package '{}'...",
         args.provider_package
     );
-    kubectl_apply_stdin(&build_provider_yaml(
-        &args.provider_name,
-        &args.provider_package,
-        &args.runtime_config_name,
-    ))?;
+    kubectl_apply_stdin(&provider_yaml)?;
 
     wait_for_crd(PROVIDER_CONFIG_CRD)?;
 
@@ -141,11 +179,7 @@ pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
         args.namespace,
         args.provider_config_name
     );
-    kubectl_apply_stdin(&build_provider_config_yaml(
-        &args.namespace,
-        &args.provider_config_name,
-        &args.secret_name,
-    ))?;
+    kubectl_apply_stdin(&provider_config_yaml)?;
 
     log::info!(
         "AWS provider configured from profile '{}' for region '{}' (ProviderConfig: {}/{})",

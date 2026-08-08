@@ -47,15 +47,15 @@ pub fn run(args: &OpenArgs) -> Result<(), Box<dyn Error>> {
     };
 
     let services = discover_services(&ws.namespace).unwrap_or_default();
-    let kubefwd = command_exists("kubefwd");
-    let prefer_kubefwd = match ws.host_access_mode.as_deref() {
+    // Prefer cluster DNS URLs when the workspace last used dns mode.
+    let prefer_dns = match ws.host_access_mode.as_deref() {
         Some("map") => false,
-        _ => kubefwd,
+        _ => true,
     };
     let plan = plan_host_access(
         &ws.namespace,
         &services,
-        prefer_kubefwd,
+        prefer_dns,
         ws.port_base.unwrap_or(18000),
     );
 

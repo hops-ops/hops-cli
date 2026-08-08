@@ -5,6 +5,8 @@
 //! adapters used by the CLI entrypoints.
 
 pub mod application;
+pub mod cluster_dns;
+pub mod cluster_gitops;
 pub mod delivery;
 pub mod net;
 pub mod reconcile;

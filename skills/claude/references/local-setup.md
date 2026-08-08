@@ -3,21 +3,28 @@
 ## Quick Start
 
 ```bash
-# 1. Install Colima
-hops local install
+# 1. Start local k8s + Crossplane + providers + registry
+#    (backend preference is user-local: ~/.hops/local/backend)
+hops local start --backend dory
 
-# 2. Start local k8s + Crossplane + providers + registry
-hops local start
+# 2. Install platform packages into the CP *and* pin them in cluster gitops
+hops config install --repo hops-ops/psql-stack --version v0.9.1 \
+  --gitops ./gitops/cluster --local
+hops config install --repo hops-ops/auth-stack --version v1.6.0 \
+  --gitops ./gitops/cluster --local
 
-# 3. Configure AWS provider auth from your AWS profile
+# 3. Watch/apply cluster gitops (packages + XRs). Or pass --gitops on start.
+hops local gitops cluster ./gitops/cluster
+
+# 4. Optional cloud provider auth (writes live Secrets; use --gitops for non-secret YAML)
 hops local aws --profile hops
-
-# 4. Configure GitHub provider auth from gh CLI
 hops local github --owner hops-ops
-
-# 5. Install a configuration package
-hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
 ```
+
+**Local CP note:** `hops local start` creates Helm/Kubernetes ProviderConfigs named
+`default`. Stack XRs must pin `helmProviderConfigRef` / `kubernetesProviderConfigRef`
+to `default` (scaffolded by `config install --gitops --local`). See
+[config-install.md](./config-install.md).
 
 ## Commands
 
@@ -25,11 +32,34 @@ hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
 Installs Colima via Homebrew.
 
 ### `hops local start`
-- Starts Colima with `--kubernetes --cpu 8 --memory 16 --disk 60`
-- Installs Crossplane from `crossplane-stable/crossplane`
-- Applies bootstrap manifests: runtime config, providers, provider configs, registry
-- Configures Docker for insecure pulls from the in-cluster registry
-- Adds host mapping for `registry.crossplane-system.svc.cluster.local`
+- Starts the chosen backend (colima / kind / dory)
+- Installs **pinned** Crossplane Helm chart (`CROSSPLANE_CHART_VERSION` in `start.rs`)
+- Applies bootstrap Providers (pinned tags in `bootstrap/providers/`):
+  - `provider-helm` (needs ≥ v1.3.0 for Zitadel chart JSON-schema $ref fix)
+  - `provider-kubernetes`
+- Applies ProviderConfigs named `default`, local registry, DRCs
+- Configures node trust for the in-cluster registry
+
+With **`--gitops PATH`** (e.g. `./gitops/cluster`):
+1. Writes the same helm/k8s bootstrap into the tree (`providers/`, `providerconfigs/`, `runtime/`)
+2. Runs `hops local gitops cluster PATH` (apply + watch) so day-to-day CP state is gitops-owned
+
+```bash
+hops local start --backend dory --gitops ./gitops/cluster
+```
+
+**Version bumps:** Renovate owns these pins (`cli/renovate.json` customManagers →
+github-releases). Prefer merging Renovate PRs (`local-start-crossplane-bootstrap`
+group) over hand-editing tags.
+
+**Replace a bootstrap provider with a local build** (keep SemVer deps working):
+
+```bash
+hops provider install --path /path/to/provider-helm --gitops ./gitops/cluster
+# writes providers/ + runtime/ + imageconfigs/ with vMAJOR.999.N package pin
+```
+
+See [local-source-packages.md](./local-source-packages.md).
 
 ### `hops local stop` / `hops local destroy` / `hops local uninstall`
 Stop, delete, or uninstall Colima respectively.
@@ -77,7 +107,7 @@ Installs GitHub provider and bootstraps auth.
 │  │  └──────────────────────────────────┘  │ │
 │  └────────────────────────────────────────┘ │
 └─────────────────────────────────────────────┘
-     localhost:30500 → registry:5000
+     127.0.0.1:30500 → registry:5000 (host push; use IPv4 not localhost)
 ```
 
 ## Logging

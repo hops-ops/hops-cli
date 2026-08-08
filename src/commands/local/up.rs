@@ -1,6 +1,9 @@
 //! `hops local up` — front-door: register workspace, reconcile, delivery, host access.
 
 use super::workbench::application::{load_applications, resolve_delivery_host_path};
+use super::workbench::cluster_gitops::{
+    reconcile_cluster_dir, resolve_cluster_path, should_reconcile_cluster_change,
+};
 use super::workbench::delivery::{
     attach_sync_delivery, discover_sync_targets, probe_node_path_visibility,
     select_delivery_strategy, stop_mutagen_sessions, DeliveryStrategy, NodePathProber,
@@ -16,26 +19,48 @@ use super::workbench::reconcile::{
 use super::workbench::registry::{
     default_name_from_cwd, list_workspaces, namespace_for_name, save_workspace, WorkspaceRecord,
 };
-use super::{command_exists, local_state_dir, run_cmd_output};
+use super::workbench::watch::{
+    is_chart_or_env_path, should_ignore_watch_path, watch_roots_for_applications, WatchPathClass,
+};
+use super::{local_state_dir, run_cmd_output};
 use clap::Args;
+use notify::{RecursiveMode, Watcher};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 #[derive(Args, Debug)]
 pub struct UpArgs {
-    /// Path to env directory of Application YAMLs (e.g. ./gitops/env/local).
+    /// Path to env directory of Application YAMLs (e.g. ./gitops/envs/local).
     pub env_path: PathBuf,
 
     /// Workspace name (isolates namespace). Defaults to cwd basename.
     #[arg(long)]
     pub name: Option<String>,
 
-    /// Watch env/chart paths after first reconcile.
+    /// Path to **shared** control-plane gitops (PSQLStack, AuthStack, packages).
+    /// Not per-worktree: one tree per local CP, usually meta-repo `gitops/cluster`.
+    /// Default: `--cluster`, else `$HOPS_LOCAL_CLUSTER`, else walk up from env/cwd
+    /// for `gitops/cluster`. Project charts stay under each app's `.gitops/deploy`.
+    #[arg(long)]
+    pub cluster: Option<PathBuf>,
+
+    /// Skip applying/watching cluster gitops.
+    #[arg(long, default_value_t = false)]
+    pub no_cluster: bool,
+
+    /// Run a single bring-up and exit (disables the default watch).
+    #[arg(long, default_value_t = false)]
+    pub once: bool,
+
+    /// Watch env/chart/cluster paths after first reconcile (default).
+    /// Redundant unless scripting; use `--once` to disable.
     #[arg(long, default_value_t = false)]
     pub watch: bool,
 
-    /// Debounce seconds for --watch.
+    /// Debounce seconds while watching.
     #[arg(long, default_value_t = 1)]
     pub debounce: u64,
 
@@ -140,6 +165,45 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
     if let Some(d) = &probe_detail {
         log::info!("delivery probe: {d}");
     }
+
+    // Shared CP gitops first (one cluster tree for the whole local CP), then env apps.
+    let cluster_path = if args.no_cluster {
+        None
+    } else {
+        match resolve_cluster_path(Some(&env_path), args.cluster.as_deref()) {
+            Some(p) => Some(p.canonicalize().map_err(|e| {
+                format!(
+                    "cluster path {}: {e} (pass --cluster <dir> or set HOPS_LOCAL_CLUSTER)",
+                    p.display()
+                )
+            })?),
+            None => None,
+        }
+    };
+    if let Some(ref cluster) = cluster_path {
+        log::info!(
+            "cluster gitops (shared CP, not per-worktree): {}",
+            cluster.display()
+        );
+        match reconcile_cluster_dir(cluster, args.dry_run) {
+            Ok(r) => {
+                log::info!(
+                    "cluster gitops: {} applied, {} error(s)",
+                    r.applied.len(),
+                    r.errors.len()
+                );
+            }
+            Err(e) => {
+                // Don't hard-fail app bring-up if packages aren't installed yet.
+                log::warn!("cluster gitops reconcile: {e}");
+            }
+        }
+    } else if !args.no_cluster {
+        log::debug!(
+            "no cluster gitops found (tried --cluster, $HOPS_LOCAL_CLUSTER, walk-up gitops/cluster); skipping platform apply"
+        );
+    }
+
     let results = reconcile_applications(&env_path, &opts, &SystemHelm, &SystemKubectl)?;
     for r in &results {
         log::info!(
@@ -155,8 +219,8 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
     if !args.dry_run && !args.no_delivery {
         if let Some(DeliveryStrategy::Sync) = delivery_mode {
             let targets =
-                wait_for_sync_targets(&namespace, &name, "/workspace", &app_delivery_hosts, 45);
-            match attach_sync_delivery(&targets, &name, args.watch) {
+                wait_for_sync_targets(&namespace, &name, "/workspace", &app_delivery_hosts, 90);
+            match attach_sync_delivery(&targets, &name, wants_watch(args)) {
                 Ok(attach) => {
                     sync_pids = attach.sync_pids;
                     mutagen_sessions = attach.mutagen_sessions;
@@ -183,16 +247,15 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
         })
     };
 
-    let kubefwd = command_exists("kubefwd");
-    // Plan first for dry-run / no-net; live path may rewrite plan via auto fallback.
-    let mut plan = plan_host_access(&namespace, &services, kubefwd, port_base);
+    // Prefer cluster DNS mode (hops-native); map is fallback.
+    let mut plan = plan_host_access(&namespace, &services, true, port_base);
 
-    // Start real host access (kubefwd if it stays up, else map port-forwards)
+    // Start real host access: dns (hosts + loopback) or map 127.0.0.1 ports
     if !args.dry_run && !args.no_net && !services.is_empty() {
         match start_host_access_auto(
             &namespace,
             &services,
-            kubefwd,
+            false,
             port_base,
             &state_dir,
             &name,
@@ -205,7 +268,7 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
                 log::warn!("host access start failed: {e}");
             }
         }
-    } else if plan.mode == HostAccessMode::Map && services.is_empty() {
+    } else if services.is_empty() {
         log::info!("host access: deferred until services exist");
     }
 
@@ -232,8 +295,18 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
     if let Some(d) = delivery_mode {
         println!("delivery: {} ({})", d.as_str(), probe_detail.as_deref().unwrap_or("auto"));
     }
-    if plan.mode == HostAccessMode::Map {
-        log::info!("host access: map mode port-forwards (install kubefwd for cluster DNS URLs)");
+    match plan.mode {
+        HostAccessMode::Dns => {
+            println!(
+                "access:   cluster DNS (in-cluster Service URLs work on this machine)"
+            );
+        }
+        HostAccessMode::Map => {
+            println!(
+                "access:   map mode (127.0.0.1:port) — approve admin prompt on next up/status for real k8s DNS"
+            );
+        }
+        HostAccessMode::Kubefwd => {}
     }
     println!();
     println!("Useful commands:");
@@ -241,22 +314,172 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
     println!("  hops local open");
     println!("  hops local down --name {name}");
 
-    if args.watch {
-        use super::gitops::run_gitops_watch;
+    if wants_watch(args) {
         let env_for_watch = env_path.clone();
         let opts_watch = opts.clone();
-        run_gitops_watch(&env_path, args.debounce, move || {
-            let _ = reconcile_applications(
-                &env_for_watch,
-                &opts_watch,
-                &SystemHelm,
-                &SystemKubectl,
-            )?;
-            Ok(())
-        })?;
+        let cluster_for_watch = cluster_path.clone();
+        let dry = args.dry_run;
+        let cluster_arg = cluster_for_watch.clone();
+        run_combined_gitops_watch(
+            &env_path,
+            cluster_arg.as_deref(),
+            args.debounce,
+            move |kind| {
+                match kind {
+                    WatchRebuild::Cluster => {
+                        if let Some(ref c) = cluster_for_watch {
+                            reconcile_cluster_dir(c, dry)?;
+                        }
+                    }
+                    WatchRebuild::Env => {
+                        reconcile_applications(
+                            &env_for_watch,
+                            &opts_watch,
+                            &SystemHelm,
+                            &SystemKubectl,
+                        )?;
+                    }
+                    WatchRebuild::Both => {
+                        if let Some(ref c) = cluster_for_watch {
+                            let _ = reconcile_cluster_dir(c, dry);
+                        }
+                        reconcile_applications(
+                            &env_for_watch,
+                            &opts_watch,
+                            &SystemHelm,
+                            &SystemKubectl,
+                        )?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
     }
 
     Ok(())
+}
+
+/// Watch by default; `--once` or dry-run for one-shot / CI.
+fn wants_watch(args: &UpArgs) -> bool {
+    !args.once && !args.dry_run
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchRebuild {
+    Cluster,
+    Env,
+    Both,
+}
+
+/// Watch env Applications + charts + optional cluster gitops tree.
+fn run_combined_gitops_watch<F>(
+    env_path: &Path,
+    cluster_path: Option<&Path>,
+    debounce_secs: u64,
+    mut rebuild: F,
+) -> Result<(), Box<dyn Error>>
+where
+    F: FnMut(WatchRebuild) -> Result<(), Box<dyn Error>>,
+{
+    let roots = watch_roots_for_applications(env_path)?;
+    let env_canon = env_path
+        .canonicalize()
+        .unwrap_or_else(|_| env_path.to_path_buf());
+    let chart_paths: Vec<PathBuf> = roots
+        .iter()
+        .filter(|p| *p != &env_canon)
+        .cloned()
+        .collect();
+    let cluster_canon = cluster_path.map(|c| {
+        c.canonicalize().unwrap_or_else(|_| c.to_path_buf())
+    });
+
+    let debounce = Duration::from_secs(debounce_secs);
+    let (tx, rx) = mpsc::channel::<WatchRebuild>();
+
+    let env_c = env_canon.clone();
+    let charts = chart_paths.clone();
+    let cluster_c = cluster_canon.clone();
+    let mut watcher =
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+            Ok(event) => {
+                let mut hit_cluster = false;
+                let mut hit_env = false;
+                for p in &event.paths {
+                    if should_ignore_watch_path(p) {
+                        continue;
+                    }
+                    if let Some(ref cp) = cluster_c {
+                        if should_reconcile_cluster_change(p, cp) {
+                            hit_cluster = true;
+                            continue;
+                        }
+                    }
+                    if is_chart_or_env_path(p, &env_c, &charts) == WatchPathClass::ChartOrEnv {
+                        hit_env = true;
+                    }
+                }
+                if hit_cluster && hit_env {
+                    let _ = tx.send(WatchRebuild::Both);
+                } else if hit_cluster {
+                    let _ = tx.send(WatchRebuild::Cluster);
+                } else if hit_env {
+                    let _ = tx.send(WatchRebuild::Env);
+                }
+            }
+            Err(e) => log::debug!("watch error: {e:?}"),
+        })?;
+
+    for root in &roots {
+        if root.exists() {
+            watcher.watch(root, RecursiveMode::Recursive)?;
+            log::info!("Watching {}", root.display());
+        }
+    }
+    if let Some(ref cp) = cluster_canon {
+        if cp.exists() {
+            watcher.watch(cp, RecursiveMode::Recursive)?;
+            log::info!("Watching cluster gitops {}", cp.display());
+        }
+    }
+    log::info!(
+        "GitOps watch active (debounce {}s): env/charts + cluster → local CP. Ctrl+C to stop.",
+        debounce_secs
+    );
+
+    loop {
+        let first = rx.recv().map_err(|_| "watcher channel closed")?;
+        let mut kind = first;
+        // Debounce and merge events
+        let mut deadline = Instant::now() + debounce;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(next) => {
+                    kind = match (kind, next) {
+                        (WatchRebuild::Both, _) | (_, WatchRebuild::Both) => WatchRebuild::Both,
+                        (WatchRebuild::Cluster, WatchRebuild::Env)
+                        | (WatchRebuild::Env, WatchRebuild::Cluster) => WatchRebuild::Both,
+                        (a, _) => a,
+                    };
+                    deadline = Instant::now() + debounce;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("watcher channel closed".into());
+                }
+            }
+        }
+        log::info!("──────────────────────────────────────────────");
+        log::info!("GitOps change ({kind:?}), reconciling...");
+        match rebuild(kind) {
+            Ok(()) => log::info!("Reconcile succeeded."),
+            Err(e) => log::error!("Reconcile failed: {e}"),
+        }
+    }
 }
 
 fn collect_app_delivery_hosts(

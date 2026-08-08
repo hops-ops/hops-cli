@@ -3,6 +3,7 @@ kind: Provider
 metadata:
   name: crossplane-contrib-provider-helm
 spec:
-  package: xpkg.crossplane.io/crossplane-contrib/provider-helm:v1.1.0
+  # Renovate: github-releases crossplane-contrib/provider-helm (cli/renovate.json)
+  package: xpkg.crossplane.io/crossplane-contrib/provider-helm:v1.3.0
   runtimeConfigRef:
     name: local-dev-helm

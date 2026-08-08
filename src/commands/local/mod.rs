@@ -6,6 +6,7 @@ mod doctor;
 mod down;
 mod github;
 mod gitops;
+pub mod gitops_write;
 mod install;
 mod listmonk;
 mod open;
@@ -141,7 +142,7 @@ pub enum LocalCommands {
     Status(status::StatusArgs),
     /// Open the workspace UI URL in a browser
     Open(open::OpenArgs),
-    /// Reconcile env Application YAMLs (advanced; prefer `hops local up`)
+    /// Local gitops: `cluster` (shared CP) or `worktree` (app namespaces)
     Gitops(gitops::GitopsArgs),
     /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
     Aws(aws::AwsArgs),

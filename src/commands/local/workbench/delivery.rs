@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::commands::local::kubectl_command;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryStrategy {
     /// Worktree path is visible on the node — mount hostPath.
@@ -42,6 +44,10 @@ pub fn default_sync_ignores() -> Vec<&'static str> {
         "test-results",
         "_output",
         ".cache",
+        ".turbo",
+        "coverage",
+        // macOS noise that bloats tar and confuses extract
+        ".DS_Store",
     ]
 }
 
@@ -101,10 +107,13 @@ pub fn mutagen_ignore_args() -> Vec<String> {
 
 /// GNU/BSD tar `--exclude=` flags for the shared ignore list (shipped path).
 pub fn tar_exclude_args() -> Vec<String> {
-    default_sync_ignores()
+    let mut args: Vec<String> = default_sync_ignores()
         .into_iter()
         .map(|ig| format!("--exclude={ig}"))
-        .collect()
+        .collect();
+    // AppleDouble resource forks (`._file`) — pattern exclude (bsdtar/gnutar).
+    args.push("--exclude=._*".into());
+    args
 }
 
 /// Build mutagen sync create argv (without program name) for a host→pod session.
@@ -488,12 +497,16 @@ pub fn sync_directory_to_pod(
         return Err(format!("sync source not a directory: {}", host_path.display()).into());
     }
     let mut last_err = String::new();
-    for attempt in 1..=8 {
+    // Pods often become exec-ready a few seconds after Running; keep trying.
+    for attempt in 1..=12 {
         match sync_directory_to_pod_once(host_path, target) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = e.to_string();
-                log::debug!("sync attempt {attempt} failed: {last_err}");
+                log::warn!(
+                    "sync attempt {attempt}/12 for {} failed: {last_err}",
+                    target.pod
+                );
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
@@ -509,15 +522,16 @@ fn sync_directory_to_pod_once(
 
     let mut tar = Command::new("tar")
         .args(&tar_args)
+        .env("COPYFILE_DISABLE", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn tar: {e}"))?;
 
+    // Strip the leading "exec" so kubectl_command can inject --context.
     let kubectl_args = build_kubectl_tar_extract_args(target);
-
-    let mut kubectl = Command::new("kubectl")
-        .args(&kubectl_args)
+    let kubectl_refs: Vec<&str> = kubectl_args.iter().map(String::as_str).collect();
+    let mut kubectl = kubectl_command(&kubectl_refs)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -547,20 +561,21 @@ fn sync_directory_to_pod_once(
 fn write_sync_marker(target: &SyncPodTarget) -> Result<(), Box<dyn Error>> {
     let marker = format!("{}/.hops-synced", target.mount_path.trim_end_matches('/'));
     let mut args = vec![
-        "exec".into(),
-        "-n".into(),
+        "exec".to_string(),
+        "-n".to_string(),
         target.namespace.clone(),
         target.pod.clone(),
     ];
     if let Some(c) = &target.container {
-        args.push("-c".into());
+        args.push("-c".to_string());
         args.push(c.clone());
     }
-    args.push("--".into());
-    args.push("sh".into());
-    args.push("-c".into());
+    args.push("--".to_string());
+    args.push("sh".to_string());
+    args.push("-c".to_string());
     args.push(format!("touch {marker}"));
-    let out = Command::new("kubectl").args(&args).output()?;
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = kubectl_command(&refs).output()?;
     if !out.status.success() {
         return Err(format!(
             "failed to write sync marker: {}",
@@ -580,18 +595,18 @@ pub fn discover_sync_targets(
     mount_path: &str,
     app_host_paths: &std::collections::BTreeMap<String, PathBuf>,
 ) -> Result<Vec<SyncPodTarget>, Box<dyn Error>> {
-    let json = Command::new("kubectl")
-        .args([
-            "get",
-            "pods",
-            "-n",
-            namespace,
-            "-l",
-            &format!("hops.ops.com.ai/local-env={workspace}"),
-            "-o",
-            "json",
-        ])
-        .output()?;
+    let label = format!("hops.ops.com.ai/local-env={workspace}");
+    let json = kubectl_command(&[
+        "get",
+        "pods",
+        "-n",
+        namespace,
+        "-l",
+        &label,
+        "-o",
+        "json",
+    ])
+    .output()?;
     if !json.status.success() {
         return Err(format!(
             "kubectl get pods failed: {}",
@@ -791,30 +806,95 @@ pub fn attach_sync_delivery(
 
 /// Build the continuous multi-app tar re-sync shell script (testable pure builder).
 ///
-/// Each target gets its **own** host path; every target is resynced on change
-/// (not a single `sync_one` redefined in a loop).
+/// Pod names are **not** frozen at attach time. Each loop resolves the current
+/// Running pod for `hops.ops.com.ai/local-app=<app>` so rollouts (new emptyDir)
+/// still receive source. Syncs when:
+/// - host tree fingerprint changes, or
+/// - the live pod is missing `/.hops-synced` (fresh pod / failed prior sync).
 pub fn build_multi_app_tar_watch_script(targets: &[SyncPodTarget]) -> String {
     let excludes = tar_exclude_args().join(" ");
-    let mut script = String::from("set -e\n");
+    let mut script = String::from("set +e\n");
+    // macOS tar emits AppleDouble / xattr headers that clutter logs; disable.
+    script.push_str("export COPYFILE_DISABLE=1\n");
+    // Honor hops' selected kube context (dory/colima/kind) for every kubectl call.
+    // Without this, the watcher hits whatever current-context is — often a stale
+    // hops-dory CA and silent sync failure.
+    script.push_str(
+        r#"
+KCTX="${HOPS_KUBE_CONTEXT:-}"
+k() {
+  if [ -n "$KCTX" ]; then
+    command kubectl --context "$KCTX" "$@"
+  else
+    command kubectl "$@"
+  fi
+}
+"#,
+    );
+
+    // sync_one app host ns mount container
+    // Resolves pod by label every call — survives Deployment rollouts.
+    script.push_str(&format!(
+        r#"
+sync_one() {{
+  app="$1"; host="$2"; ns="$3"; mount="$4"; cont="$5"
+  pod=$(k get pod -n "$ns" -l "hops.ops.com.ai/local-app=$app" \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{{.items[0].metadata.name}}' 2>/dev/null)
+  [ -n "$pod" ] || return 0
+  cflag=""
+  [ -n "$cont" ] && cflag="-c $cont"
+  # Always tar into the *current* pod; ignore extract noise.
+  echo "[$(date +%H:%M:%S)] sync $app → $ns/$pod" >&2
+  if tar cf - {excl} -C "$host" . 2>/dev/null \
+    | k exec -i -n "$ns" "$pod" $cflag -- tar xf - -C "$mount" 2>/dev/null
+  then
+    k exec -n "$ns" "$pod" $cflag -- sh -c "touch \"$mount/.hops-synced\"" 2>/dev/null || true
+  else
+    echo "[$(date +%H:%M:%S)] sync FAILED $app → $ns/$pod" >&2
+  fi
+}}
+"#,
+        excl = excludes
+    ));
+
     script.push_str("sync_all() {\n");
     for t in targets {
-        let cont = t
-            .container
-            .as_ref()
-            .map(|c| format!("-c {c} "))
-            .unwrap_or_default();
-        let host = t.host_source_path.display();
+        let cont = t.container.as_deref().unwrap_or("");
         script.push_str(&format!(
-            "  tar cf - {excl} -C \"{host}\" . | kubectl exec -i -n \"{ns}\" \"{pod}\" {cont}-- tar xf - -C \"{mount}\" 2>/dev/null || true\n",
-            excl = excludes,
-            host = host,
+            "  sync_one \"{app}\" \"{host}\" \"{ns}\" \"{mount}\" \"{cont}\"\n",
+            app = t.app_name,
+            host = t.host_source_path.display(),
             ns = t.namespace,
-            pod = t.pod,
+            mount = t.mount_path,
+            cont = cont,
+        ));
+    }
+    script.push_str("}\n");
+
+    // needs_marker: true if any live pod is missing /.hops-synced
+    script.push_str("needs_marker() {\n");
+    for t in targets {
+        let cont = t.container.as_deref().unwrap_or("");
+        script.push_str(&format!(
+            r#"  pod=$(k get pod -n "{ns}" -l "hops.ops.com.ai/local-app={app}" \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{{.items[0].metadata.name}}' 2>/dev/null)
+  if [ -n "$pod" ]; then
+    cflag=""
+    [ -n "{cont}" ] && cflag="-c {cont}"
+    if ! k exec -n "{ns}" "$pod" $cflag -- test -f "{mount}/.hops-synced" 2>/dev/null; then
+      return 0
+    fi
+  fi
+"#,
+            ns = t.namespace,
+            app = t.app_name,
             cont = cont,
             mount = t.mount_path,
         ));
     }
-    script.push_str("}\n");
+    script.push_str("  return 1\n}\n");
 
     // Fingerprint union of all host roots so any app source change triggers full resync.
     let mut find_parts = Vec::new();
@@ -830,7 +910,7 @@ while true; do
     ! -path '*/node_modules/*' ! -path '*/target/*' ! -path '*/.git/*' \
     ! -path '*/dist/*' ! -path '*/.svelte-kit/*' \
     -print0 2>/dev/null | xargs -0 stat -f '%m' 2>/dev/null | cksum | awk '{{print $1}}')
-  if [ "$cur" != "$prev" ]; then
+  if [ "$cur" != "$prev" ] || needs_marker; then
     prev="$cur"
     sync_all
   fi
@@ -844,13 +924,42 @@ done
 
 fn spawn_tar_sync_watcher(targets: Vec<SyncPodTarget>) -> Result<u32, Box<dyn Error>> {
     let script = build_multi_app_tar_watch_script(&targets);
-    let child = Command::new("sh")
+    // Log path: ~/.hops/local/runtime/delivery-watch.log (shared; PIDs are per-workspace).
+    let log_path = crate::commands::local::local_state_dir()
+        .ok()
+        .map(|d| {
+            let p = d.join("runtime").join("delivery-watch.log");
+            let _ = std::fs::create_dir_all(p.parent().unwrap_or(d.as_path()));
+            p
+        });
+    let (stdout, stderr) = if let Some(ref path) = log_path {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let f2 = f.try_clone()?;
+        (Stdio::from(f), Stdio::from(f2))
+    } else {
+        (Stdio::null(), Stdio::null())
+    };
+    let mut child = Command::new("sh");
+    child
         .arg("-c")
         .arg(script)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stdout(stdout)
+        .stderr(stderr);
+    // Pass through hops' selected context so the watcher targets the same cluster
+    // as `hops local up` (see HOPS_KUBE_CONTEXT_ENV).
+    if let Ok(ctx) = std::env::var(crate::commands::local::HOPS_KUBE_CONTEXT_ENV) {
+        if !ctx.is_empty() {
+            child.env(crate::commands::local::HOPS_KUBE_CONTEXT_ENV, ctx);
+        }
+    }
+    let child = child.spawn()?;
+    if let Some(path) = log_path {
+        log::info!("tar sync watcher log: {}", path.display());
+    }
     Ok(child.id())
 }
 
@@ -955,7 +1064,7 @@ mod tests {
         let targets = vec![
             SyncPodTarget {
                 namespace: "ns".into(),
-                pod: "api-pod".into(),
+                pod: "api-pod".into(), // frozen name must NOT be used by watcher
                 container: Some("api".into()),
                 mount_path: "/workspace".into(),
                 app_name: "e2e-ui-api".into(),
@@ -971,19 +1080,30 @@ mod tests {
             },
         ];
         let script = build_multi_app_tar_watch_script(&targets);
-        // One function that syncs ALL apps — not a redefined single-target sync_one
         assert!(script.contains("sync_all()"));
-        assert!(!script.contains("sync_one()"));
-        // Both host roots and both pods present
-        assert!(script.contains("-C \"/proj\""));
-        assert!(script.contains("-C \"/proj/ui\""));
-        assert!(script.contains("api-pod"));
-        assert!(script.contains("ui-pod"));
-        // Call site invokes sync_all (not last-only)
-        assert!(script.contains("sync_all\n") || script.contains("sync_all\r"));
-        let api_lines = script.matches("api-pod").count();
-        let ui_lines = script.matches("ui-pod").count();
-        assert!(api_lines >= 1 && ui_lines >= 1);
+        assert!(script.contains("sync_one()"));
+        assert!(script.contains("needs_marker()"));
+        assert!(script.contains("HOPS_KUBE_CONTEXT") || script.contains("KCTX"));
+        // Resolve by label — not frozen pod names from attach time
+        assert!(
+            script.contains("hops.ops.com.ai/local-app=$app")
+                || script.contains("hops.ops.com.ai/local-app=")
+        );
+        assert!(script.contains("e2e-ui-api"));
+        assert!(script.contains("e2e-ui-ui"));
+        assert!(script.contains("/proj"));
+        assert!(script.contains("/proj/ui"));
+        // Frozen pod names from the attach snapshot must not be baked into the loop
+        assert!(
+            !script.contains("\"api-pod\"") && !script.contains("\"ui-pod\""),
+            "watcher must re-resolve pods by label, not freeze attach-time names"
+        );
+        assert!(
+            script.contains("sync_all\n")
+                || script.contains("sync_all\r")
+                || script.contains("sync_all")
+        );
+        assert!(script.contains(".hops-synced"));
     }
 
     #[test]

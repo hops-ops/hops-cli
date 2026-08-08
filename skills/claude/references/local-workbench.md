@@ -4,21 +4,23 @@ Develop against the laptop control plane without learning volumes, hostPath, or 
 
 ## One-time prerequisite
 
-Start the local control plane once:
+Start the local control plane (optional `--gitops` = bootstrap then full
+`gitops cluster` apply + watch until Ctrl+C):
 
 ```bash
-hops local start
+hops local start --backend dory --gitops ./gitops/cluster
 ```
-
-Optional but useful: install [kubefwd](https://github.com/txn2/kubefwd) so service URLs look like cluster DNS. Without it, hops maps unique localhost ports automatically.
 
 Also need `helm` and `kubectl` on your PATH.
 
 ## Daily loop
 
 ```bash
-# From your project (or pass an absolute env path)
-hops local up ./gitops/env/local
+# Shared CP watch (if start did not use --gitops, or after Ctrl+C)
+hops local gitops cluster ./gitops/cluster
+
+# Per-worktree apps (Application YAMLs → hops-wt-* namespaces) — watches by default
+hops local gitops worktree ./gitops/envs/local --name dogfood
 
 # See workspaces and app URLs
 hops local status
@@ -32,7 +34,7 @@ hops local down
 hops local down --purge
 ```
 
-That is the full happy path: **up / status / open / down**.
+Watch is the default for both gitops commands. Use `--once` for a single reconcile (CI/scripts).
 
 ## Concurrent worktrees
 
@@ -40,10 +42,10 @@ Use a distinct name per worktree so namespaces and URLs stay isolated:
 
 ```bash
 # Terminal A
-hops local up ./gitops/env/local --name alice
+hops local gitops worktree ./gitops/envs/local --name alice
 
 # Terminal B
-hops local up ./gitops/env/local --name bob
+hops local gitops worktree ./gitops/envs/local --name bob
 
 hops local status
 hops local down --name alice
@@ -56,7 +58,9 @@ Each name maps to namespace `hops-wt-<name>` and gets its own access URLs.
 
 ```bash
 cd distributed/tests/e2e-ui
-hops local up ./gitops/env/local --name e2e
+hops local start --backend dory --gitops ./gitops/cluster
+hops local gitops cluster ./gitops/cluster
+hops local gitops worktree ./gitops/envs/local --name e2e
 hops local status
 hops local open
 hops local down --name e2e --purge
@@ -69,18 +73,36 @@ helm template api ./api/.gitops/deploy --set local=true --set appRuntime=cluster
 helm template ui ./ui/.gitops/deploy --set local=true --set appRuntime=cluster-dev
 ```
 
-## What `up` does (plain language)
+## Layout
 
-1. Checks the control plane is reachable (if not: run `hops local start`)
-2. Registers your workspace name → namespace
-3. Applies the Applications in the env directory into that namespace
-4. Attaches source delivery automatically (you do not pick a mode)
-5. Prints app URLs
+```text
+gitops/
+  cluster/          # shared CP (one per machine) — hops local gitops cluster
+  envs/local/       # app Applications — hops local gitops worktree
+```
 
-## Advanced (not required for day-to-day)
+- **cluster** — not per-worktree; packages + platform XRs on the local CP
+- **worktree** — env Application YAMLs into isolated `hops-wt-*` namespaces
 
-- `hops local gitops <env> --once` — reconcile only
-- `hops local gitops <env> --watch` — re-apply when env YAML or chart files change
+## Developing configs & providers on this CP
+
+Iterate from **source** while keeping the cluster gitops tree coherent:
+
+```bash
+# Stack XRDs / compositions
+hops config install --path xrs/stacks/k8s/auth --gitops ./gitops/cluster --local
+
+# Provider implementation (SemVer-safe vMAJOR.999.N + ImageConfig in gitops)
+hops provider install --path /path/to/provider-helm --gitops ./gitops/cluster
+```
+
+Source installs write **`imageconfigs/`** rewrites; published installs do not.
+Provider source tags must stay **`vMAJOR.999.N`** (not bare `dev-sha`) so
+Configuration deps like `>=v1` still resolve.
+
+See [local-source-packages.md](./local-source-packages.md).
+
+## Advanced
+
+- `--once` on either gitops subcommand for one-shot / CI
 - Compose-style host run remains available via e2e-ui `make up` / `make run`
-
-Prefer `up` / `down` / `status` / `open` unless you are debugging the reconcile path.
