@@ -298,8 +298,7 @@ fn build_runtime_values(opts: &ReconcileOptions, app_name: &str) -> BTreeMap<Str
         .or_insert(Value::Bool(true));
     runtime.insert("namespace".into(), Value::String(opts.namespace.clone()));
 
-    // Per-app sourceDelivery block (mode + hostPath). Never stamp a single
-    // monorepo root onto every chart.
+    // sourceDelivery: mode + hostPath (usually the git worktree root for all apps).
     let mut sd = serde_yaml::Mapping::new();
     if let Some(mode) = &opts.delivery_mode {
         sd.insert(
@@ -663,13 +662,15 @@ spec:
     }
 
     #[test]
-    fn build_runtime_values_injects_per_app_host_path() {
+    fn build_runtime_values_injects_delivery_host_path() {
+        // Usual case: same worktree root for every app in the workspace.
+        let root = PathBuf::from("/worktrees/feature-x");
         let mut hosts = BTreeMap::new();
-        hosts.insert("e2e-ui-ui".into(), PathBuf::from("/proj/ui"));
-        hosts.insert("e2e-ui-api".into(), PathBuf::from("/proj"));
+        hosts.insert("e2e-ui-ui".into(), root.clone());
+        hosts.insert("e2e-ui-api".into(), root.clone());
         let opts = ReconcileOptions {
-            namespace: "hops-wt-x".into(),
-            workspace_name: "x".into(),
+            namespace: "hops-wt-feature-x".into(),
+            workspace_name: "feature-x".into(),
             runtime_values: BTreeMap::new(),
             app_delivery_host_paths: hosts,
             delivery_mode: Some("hostPath".into()),
@@ -679,13 +680,9 @@ spec:
         let api = build_runtime_values(&opts, "e2e-ui-api");
         assert_eq!(
             ui["sourceDelivery"]["hostPath"],
-            Value::String("/proj/ui".into())
+            Value::String("/worktrees/feature-x".into())
         );
         assert_eq!(
-            api["sourceDelivery"]["hostPath"],
-            Value::String("/proj".into())
-        );
-        assert_ne!(
             ui["sourceDelivery"]["hostPath"],
             api["sourceDelivery"]["hostPath"]
         );

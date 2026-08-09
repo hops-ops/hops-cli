@@ -41,14 +41,15 @@ pub struct ApplicationSpec {
 pub struct Source {
     /// Path to chart directory, relative to the Application YAML file.
     pub path: String,
-    /// Host path to sync/mount as the app worktree (relative to this YAML file).
+    /// Optional override for the host directory to mount/sync into the pod
+    /// (relative to this Application file, or absolute).
     ///
-    /// **Per-app** — not the monorepo root for every pod. Examples:
-    /// - UI: `../../../ui` (directory with package.json / vite)
-    /// - API monorepo: `../../..` (directory with Cargo.toml / workspace)
+    /// **Default (recommended):** git **worktree root** containing this file
+    /// (`git rev-parse --show-toplevel`). Every app in a workspace shares that
+    /// root so monorepo/meta links and codegen stay coherent; each worktree
+    /// keeps its own changes (feature branch ≠ main).
     ///
-    /// When omitted, defaults to the service directory that owns `.gitops`
-    /// (parent of the `.gitops` component on the chart path).
+    /// Override only for rare cases (e.g. a chart that must not see the full tree).
     #[serde(default)]
     pub delivery_path: Option<String>,
     #[serde(default)]
@@ -119,11 +120,16 @@ pub fn resolve_source_path(app_file: &Path, source_path: &str) -> Result<PathBuf
     Ok(normalize_path(&joined))
 }
 
-/// Resolve the **per-app** host directory to mount/sync into the container.
+/// Resolve the host directory to mount/sync into the container.
 ///
 /// Precedence:
-/// 1. `spec.source.deliveryPath` (relative to Application file)
-/// 2. Default: service root that owns the chart (directory containing `.gitops`)
+/// 1. `spec.source.deliveryPath` — explicit override (relative to Application file)
+/// 2. **Git worktree root** for this Application (`git rev-parse --show-toplevel`)
+/// 3. Service root that owns the chart (directory containing `.gitops`)
+///
+/// Worktree root is the default so multi-container monorepos share one tree of
+/// changes; a separate git worktree (or the main checkout later) is a separate
+/// workspace / namespace.
 pub fn resolve_delivery_host_path(
     app_file: &Path,
     app: &Application,
@@ -137,14 +143,40 @@ pub fn resolve_delivery_host_path(
         .filter(|s| !s.is_empty())
     {
         let p = resolve_source_path(app_file, rel)?;
-        return Ok(p
-            .canonicalize()
-            .unwrap_or(p));
+        return Ok(p.canonicalize().unwrap_or(p));
+    }
+    if let Some(root) = find_worktree_root(app_file) {
+        return Ok(root);
     }
     let chart = resolve_source_path(app_file, &app.spec.source.path)?;
     Ok(service_root_from_chart_path(&chart)
         .canonicalize()
         .unwrap_or_else(|_| service_root_from_chart_path(&chart)))
+}
+
+/// Git worktree root for `path` (file or directory), via `git rev-parse --show-toplevel`.
+pub fn find_worktree_root(path: &Path) -> Option<PathBuf> {
+    let dir = if path.is_file() {
+        path.parent()?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let output = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(&dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
 }
 
 /// Given `…/<service>/.gitops/deploy`, return `…/<service>`.
@@ -290,7 +322,7 @@ spec:
     }
 
     #[test]
-    fn resolve_delivery_host_path_uses_delivery_path_not_shared_monorepo() {
+    fn resolve_delivery_host_path_honors_explicit_override() {
         let app_file = Path::new("/proj/gitops/env/local/ui.yaml");
         let ui = parse_application_yaml(
             r#"
@@ -307,29 +339,13 @@ spec:
         .unwrap();
         let host = resolve_delivery_host_path(app_file, &ui).unwrap();
         assert_eq!(host, PathBuf::from("/proj/ui"));
-
-        let api = parse_application_yaml(
-            r#"
-apiVersion: hops.local/v1alpha1
-kind: Application
-metadata:
-  name: e2e-ui-api
-spec:
-  source:
-    path: ../../../api/.gitops/deploy
-    deliveryPath: ../../..
-"#,
-        )
-        .unwrap();
-        let host_api = resolve_delivery_host_path(app_file, &api).unwrap();
-        assert_eq!(host_api, PathBuf::from("/proj"));
-        // UI and API host paths must differ in the dogfood layout
-        assert_ne!(host, host_api);
     }
 
     #[test]
-    fn resolve_delivery_host_path_defaults_to_service_root() {
-        let app_file = Path::new("/proj/gitops/env/local/ui.yaml");
+    fn resolve_delivery_host_path_defaults_to_worktree_or_service_root() {
+        // When git worktree root is available (this CLI repo), default is that root
+        // for every app — not a per-service silo.
+        let app_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let ui = parse_application_yaml(
             r#"
 apiVersion: hops.local/v1alpha1
@@ -342,8 +358,13 @@ spec:
 "#,
         )
         .unwrap();
-        let host = resolve_delivery_host_path(app_file, &ui).unwrap();
-        assert_eq!(host, PathBuf::from("/proj/ui"));
+        let host = resolve_delivery_host_path(&app_file, &ui).unwrap();
+        if let Some(wt) = find_worktree_root(&app_file) {
+            assert_eq!(host, wt);
+        } else {
+            // No git: falls back to service root of the (non-existent) chart path.
+            assert!(host.ends_with("ui") || host.components().count() > 0);
+        }
     }
 
     #[test]

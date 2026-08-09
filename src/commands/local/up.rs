@@ -1,6 +1,8 @@
 //! `hops local up` — front-door: register workspace, reconcile, delivery, host access.
 
-use super::workbench::application::{load_applications, resolve_delivery_host_path};
+use super::workbench::application::{
+    find_worktree_root, load_applications, resolve_delivery_host_path,
+};
 use super::workbench::cluster_gitops::{
     reconcile_cluster_dir, resolve_cluster_path, should_reconcile_cluster_change,
 };
@@ -114,13 +116,15 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
 
     let state_dir = local_state_dir()?;
 
-    // Per-app host roots (UI → ui/, API monorepo → e2e-ui root, etc.)
+    // Delivery host roots: default is the git **worktree root** for each app
+    // (shared monorepo/meta tree of *this* worktree's changes). Explicit
+    // `deliveryPath` overrides. Main checkout → hops-wt-main can come later.
     let app_delivery_hosts = collect_app_delivery_hosts(&env_path)?;
     for (app, host) in &app_delivery_hosts {
         log::info!("delivery host for `{app}`: {}", host.display());
     }
-    // Probe union: prefer hostPath only if EVERY app host path is visible on the node.
-    let project_root = infer_project_root(&env_path);
+    // Probe union: prefer hostPath only if EVERY delivery root is visible on the node.
+    let project_root = find_worktree_root(&env_path).or_else(|| infer_project_root(&env_path));
 
     let (delivery_mode, probe_detail) = if args.no_delivery {
         (None, None)

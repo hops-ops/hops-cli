@@ -67,6 +67,10 @@ pub fn namespace_for_name(name: &str) -> String {
 }
 
 /// Default workspace name from cwd basename.
+///
+/// For a git worktree at `…/worktrees/my-feature`, that becomes `my-feature`
+/// → namespace `hops-wt-my-feature`. The primary checkout (later: `main`) would
+/// similarly map to `hops-wt-main` when run from that tree.
 pub fn default_name_from_cwd(cwd: &Path) -> String {
     cwd.file_name()
         .and_then(|s| s.to_str())
