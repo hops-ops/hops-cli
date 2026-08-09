@@ -10,14 +10,14 @@ use super::workbench::delivery::{
     SystemNodeProber,
 };
 use super::workbench::net::{
-    allocate_port_base, format_status_card, host_access_status_line, plan_host_access,
-    start_host_access_auto, HostAccessMode, ServiceEndpoint,
+    discover_workspace_endpoints, format_status_card, host_access_status_line, plan_host_access,
+    start_host_access, ServiceEndpoint,
 };
 use super::workbench::reconcile::{
     reconcile_applications, ReconcileOptions, SystemHelm, SystemKubectl,
 };
 use super::workbench::registry::{
-    default_name_from_cwd, list_workspaces, namespace_for_name, save_workspace, WorkspaceRecord,
+    default_name_from_cwd, namespace_for_name, save_workspace, WorkspaceRecord,
 };
 use super::workbench::watch::{
     is_chart_or_env_path, should_ignore_watch_path, watch_roots_for_applications, WatchPathClass,
@@ -72,7 +72,7 @@ pub struct UpArgs {
     #[arg(long)]
     pub delivery: Option<String>,
 
-    /// Skip starting kubefwd / port-forward (plan URLs only).
+    /// Skip host access (Service FQDNs + port-forward supervisor).
     #[arg(long, default_value_t = false)]
     pub no_net: bool,
 
@@ -113,12 +113,6 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
     let namespace = namespace_for_name(&name);
 
     let state_dir = local_state_dir()?;
-    let existing = list_workspaces(&state_dir).unwrap_or_default();
-    let port_base = existing
-        .iter()
-        .find(|r| r.name == name)
-        .and_then(|r| r.port_base)
-        .unwrap_or_else(|| allocate_port_base(&existing));
 
     // Per-app host roots (UI → ui/, API monorepo → e2e-ui root, etc.)
     let app_delivery_hosts = collect_app_delivery_hosts(&env_path)?;
@@ -237,29 +231,21 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Discover services for URL card
+    // Discover services for URL card (workspace + related in-cluster FQDNs)
     let services = if args.dry_run {
-        default_service_stubs(&results)
+        default_service_stubs(&namespace, &results)
     } else {
-        discover_services(&namespace).unwrap_or_else(|e| {
+        discover_workspace_endpoints(&namespace).unwrap_or_else(|e| {
             log::debug!("service discovery deferred: {e}");
-            default_service_stubs(&results)
+            default_service_stubs(&namespace, &results)
         })
     };
 
-    // Prefer cluster DNS mode (hops-native); map is fallback.
-    let mut plan = plan_host_access(&namespace, &services, true, port_base);
+    // Workspace Services → cluster FQDNs + supervisor-kept port-forwards.
+    let mut plan = plan_host_access(&namespace, &services);
 
-    // Start real host access: dns (hosts + loopback) or map 127.0.0.1 ports
     if !args.dry_run && !args.no_net && !services.is_empty() {
-        match start_host_access_auto(
-            &namespace,
-            &services,
-            false,
-            port_base,
-            &state_dir,
-            &name,
-        ) {
+        match start_host_access(&namespace, &services, &state_dir, &name) {
             Ok((live_plan, rt)) => {
                 plan = live_plan;
                 log::info!("{}", host_access_status_line(&rt));
@@ -281,8 +267,6 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
         namespace: namespace.clone(),
         env_path: env_path.display().to_string(),
         project_root: project_root.map(|p| p.display().to_string()),
-        host_access_mode: Some(plan.mode.as_str().to_string()),
-        port_base: plan.port_base.or(Some(port_base)),
         delivery_mode: delivery_mode.map(|d| d.as_str().to_string()),
         updated_at: Some(chrono_lite_now()),
     };
@@ -295,19 +279,9 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
     if let Some(d) = delivery_mode {
         println!("delivery: {} ({})", d.as_str(), probe_detail.as_deref().unwrap_or("auto"));
     }
-    match plan.mode {
-        HostAccessMode::Dns => {
-            println!(
-                "access:   cluster DNS (in-cluster Service URLs work on this machine)"
-            );
-        }
-        HostAccessMode::Map => {
-            println!(
-                "access:   map mode (127.0.0.1:port) — approve admin prompt on next up/status for real k8s DNS"
-            );
-        }
-        HostAccessMode::Kubefwd => {}
-    }
+    println!(
+        "access:   cluster DNS (Service FQDNs; supervisor restarts port-forwards)"
+    );
     println!();
     println!("Useful commands:");
     println!("  hops local status");
@@ -568,40 +542,14 @@ fn wait_for_sync_targets(
     }
 }
 
-fn discover_services(namespace: &str) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
-    let json = run_cmd_output("kubectl", &["get", "svc", "-n", namespace, "-o", "json"])?;
-    let value: serde_json::Value = serde_json::from_str(&json)?;
-    let mut out = Vec::new();
-    if let Some(items) = value.get("items").and_then(|i| i.as_array()) {
-        for item in items {
-            let name = item
-                .pointer("/metadata/name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if name.is_empty() || name == "kubernetes" {
-                continue;
-            }
-            let port = item
-                .pointer("/spec/ports/0/port")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(80) as u16;
-            out.push(ServiceEndpoint {
-                name,
-                port,
-                protocol: "TCP".into(),
-            });
-        }
-    }
-    Ok(out)
-}
-
 fn default_service_stubs(
+    namespace: &str,
     results: &[super::workbench::reconcile::ReconcileResult],
 ) -> Vec<ServiceEndpoint> {
     results
         .iter()
         .map(|r| ServiceEndpoint {
+            namespace: namespace.to_string(),
             name: r.app_name.clone(),
             port: if r.app_name.contains("ui") {
                 5180

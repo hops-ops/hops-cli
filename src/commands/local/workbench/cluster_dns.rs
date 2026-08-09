@@ -1,4 +1,4 @@
-//! Hops-native cluster DNS access (kubefwd-class without the kubefwd binary).
+//! Loopback IPs + `/etc/hosts` so Service FQDNs resolve on the host.
 //!
 //! For each Service in a hops-local workspace namespace:
 //! 1. Allocate a unique loopback IP in `127.53.0.0/16`
@@ -25,6 +25,10 @@ pub const HOSTS_END: &str = "# END hops-local-dns";
 
 /// Loopback range reserved for hops (avoids common 127.0.0.1 tooling).
 pub const DNS_IP_PREFIX: &str = "127.53";
+
+/// macOS stub resolver for `*.svc.cluster.local` (bypasses mDNS 5s timeout).
+pub const MACOS_LOCAL_DNS_PORT: u16 = 53535;
+pub const MACOS_RESOLVER_PATH: &str = "/etc/resolver/svc.cluster.local";
 
 /// Kubernetes-style FQDN used by in-cluster clients and our hosts entries.
 pub fn cluster_dns_name(service: &str, namespace: &str) -> String {
@@ -242,13 +246,74 @@ pub fn rebuild_hosts_from_blocks(
     Ok(())
 }
 
+/// True when `/etc/hosts` managed block + lo0 aliases already match desired config.
+/// Used to skip admin prompts on subsequent `up`/`status`.
+pub fn dns_os_config_present(hosts_body: &str, loopback_ips: &[String]) -> bool {
+    let current = fs::read_to_string("/etc/hosts").unwrap_or_default();
+    let desired_block = extract_managed_block(hosts_body);
+    let current_block = extract_managed_block(&current);
+    if desired_block.is_empty() || desired_block != current_block {
+        return false;
+    }
+    if !cfg!(target_os = "macos") {
+        return true;
+    }
+    if !macos_resolver_present() {
+        return false;
+    }
+    let lo0 = Command::new("ifconfig")
+        .arg("lo0")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    loopback_ips.iter().all(|ip| {
+        ip.is_empty() || ip == "127.0.0.1" || lo0.contains(ip.as_str())
+    })
+}
+
+fn macos_resolver_present() -> bool {
+    if !cfg!(target_os = "macos") {
+        return true;
+    }
+    let Ok(text) = fs::read_to_string(MACOS_RESOLVER_PATH) else {
+        return false;
+    };
+    text.contains("127.0.0.1") && text.contains(&MACOS_LOCAL_DNS_PORT.to_string())
+}
+
+fn extract_managed_block(hosts: &str) -> String {
+    let mut out = String::new();
+    let mut in_block = false;
+    for line in hosts.lines() {
+        let t = line.trim();
+        if t == HOSTS_BEGIN {
+            in_block = true;
+            continue;
+        }
+        if t == HOSTS_END {
+            break;
+        }
+        if in_block {
+            out.push_str(t);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Apply hosts file **and** macOS lo0 aliases in **one** elevation when needed.
 ///
 /// This is the main privileged entry for cluster DNS setup.
+/// Skips elevation entirely when OS config already matches (no re-prompt).
 pub fn apply_privileged_dns_config(
     hosts_body: &str,
     loopback_ips: &[String],
 ) -> Result<(), Box<dyn Error>> {
+    if dns_os_config_present(hosts_body, loopback_ips) {
+        log::debug!("cluster DNS OS config already present; skipping admin prompt");
+        return Ok(());
+    }
+
     let tmp = std::env::temp_dir().join(format!("hops-hosts-{}.tmp", std::process::id()));
     fs::write(&tmp, hosts_body)?;
     #[cfg(unix)]
@@ -270,21 +335,26 @@ pub fn apply_privileged_dns_config(
                 " && (ifconfig lo0 | grep -q '{ip}' || ifconfig lo0 alias {ip} netmask 0xff000000)"
             ));
         }
+        // Bypass mDNS 5s timeout for *.svc.cluster.local via a local stub DNS.
+        let port = MACOS_LOCAL_DNS_PORT;
+        shell.push_str(&format!(
+            " && mkdir -p /etc/resolver && printf 'nameserver 127.0.0.1\\nport {port}\\n' > '{MACOS_RESOLVER_PATH}'"
+        ));
         shell.push_str(
             " ; dscacheutil -flushcache 2>/dev/null; killall -HUP mDNSResponder 2>/dev/null; true",
         );
     }
 
     log::info!(
-        "Configuring cluster DNS on this machine (admin required): /etc/hosts + loopback aliases"
+        "Configuring cluster DNS on this machine (admin required once): /etc/hosts + loopback aliases"
     );
-    let result = run_privileged_shell(&shell);
+    let result = run_privileged_shell(&shell, PrivilegedPrompt::InteractiveOnce);
     let _ = fs::remove_file(&tmp);
     result.map_err(|e| {
         format!(
             "cluster DNS needs admin privileges to write /etc/hosts (and lo0 aliases on macOS).\n\
              {e}\n\
-             Re-run `hops local up` or `hops local status` and approve the prompt,\n\
+             Re-run `hops local up` or `hops local status` and approve the **single** prompt,\n\
              or grant passwordless sudo for hops on this machine."
         )
         .into()
@@ -296,9 +366,24 @@ pub fn write_etc_hosts(content: &str) -> Result<(), Box<dyn Error>> {
     apply_privileged_dns_config(content, &[])
 }
 
-/// Run a shell script with elevation: `sudo -n`, then macOS GUI admin, then `sudo`.
-pub fn run_privileged_shell(script: &str) -> Result<(), Box<dyn Error>> {
-    // 1) passwordless sudo
+/// Whether elevation may prompt the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivilegedPrompt {
+    /// `sudo -n` only — never open a password dialog (cleanup / best-effort).
+    Never,
+    /// At most one interactive elevation (sudo **or** macOS GUI, not both).
+    InteractiveOnce,
+}
+
+/// Run a shell script with elevation.
+///
+/// **Never** cascades multiple password prompts: passwordless sudo first, then
+/// exactly one interactive path (TTY → `sudo`, else macOS → `osascript`).
+pub fn run_privileged_shell(
+    script: &str,
+    prompt: PrivilegedPrompt,
+) -> Result<(), Box<dyn Error>> {
+    // 1) passwordless sudo (cached ticket after a recent successful elevation)
     let status = Command::new("sudo")
         .args(["-n", "sh", "-c", script])
         .stdin(Stdio::null())
@@ -309,16 +394,31 @@ pub fn run_privileged_shell(script: &str) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    // 2) macOS GUI admin dialog (works without TTY — IDEs, agent runners)
+    if matches!(prompt, PrivilegedPrompt::Never) {
+        return Err("admin elevation required (non-interactive; sudo -n failed)".into());
+    }
+
+    // 2) Exactly one interactive method — do not fall through to a second prompt.
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        let status = Command::new("sudo")
+            .args(["sh", "-c", script])
+            .status()
+            .map_err(|e| format!("sudo failed to start: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err("admin elevation denied or failed (sudo)".into());
+    }
+
     if cfg!(target_os = "macos") {
-        // Escape for AppleScript double-quoted string inside do shell script.
+        // GUI admin dialog (IDEs / agents without a TTY). Escape for AppleScript.
         let escaped = script
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('\n', "; ");
-        let applescript = format!(
-            "do shell script \"{escaped}\" with administrator privileges"
-        );
+        let applescript =
+            format!("do shell script \"{escaped}\" with administrator privileges");
         let status = Command::new("osascript")
             .args(["-e", &applescript])
             .status()
@@ -326,17 +426,10 @@ pub fn run_privileged_shell(script: &str) -> Result<(), Box<dyn Error>> {
         if status.success() {
             return Ok(());
         }
+        return Err("admin elevation denied or failed (macOS dialog)".into());
     }
 
-    // 3) interactive sudo (real terminal)
-    let status = Command::new("sudo")
-        .args(["sh", "-c", script])
-        .status()
-        .map_err(|e| format!("sudo failed to start: {e}"))?;
-    if status.success() {
-        return Ok(());
-    }
-    Err("admin elevation denied or failed".into())
+    Err("admin elevation required but no TTY and no GUI helper available".into())
 }
 
 /// Ensure loopback aliases exist (macOS needs `ifconfig lo0 alias`; Linux /8 is fine).
@@ -365,12 +458,12 @@ pub fn ensure_loopback_aliases(ips: &[String]) -> Result<(), Box<dyn Error>> {
             " && ifconfig lo0 alias {ip} netmask 0xff000000"
         ));
     }
-    run_privileged_shell(&shell).map_err(|e| {
+    run_privileged_shell(&shell, PrivilegedPrompt::InteractiveOnce).map_err(|e| {
         format!("could not create loopback aliases on lo0: {e}").into()
     })
 }
 
-/// Best-effort remove loopback aliases (macOS).
+/// Best-effort remove loopback aliases (macOS). **Never prompts** — cleanup only.
 pub fn remove_loopback_aliases(ips: &[String]) {
     if !cfg!(target_os = "macos") {
         return;
@@ -385,7 +478,7 @@ pub fn remove_loopback_aliases(ips: &[String]) {
         shell.push_str(&format!(" ; ifconfig lo0 -alias {ip} 2>/dev/null"));
     }
     if any {
-        let _ = run_privileged_shell(&shell);
+        let _ = run_privileged_shell(&shell, PrivilegedPrompt::Never);
     }
 }
 
@@ -436,11 +529,13 @@ mod tests {
     fn allocate_stable_across_calls() {
         let services = vec![
             ServiceEndpoint {
+                namespace: "hops-wt-x".into(),
                 name: "api".into(),
                 port: 8791,
                 protocol: "TCP".into(),
             },
             ServiceEndpoint {
+                namespace: "hops-wt-x".into(),
                 name: "ui".into(),
                 port: 5180,
                 protocol: "TCP".into(),

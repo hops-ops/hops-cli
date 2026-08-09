@@ -1,10 +1,10 @@
 //! `hops local status` — workspace health: pods, URLs, delivery, host access.
 //!
-//! Self-heals dead map-mode port-forwards by default so "status" is usable truth.
+//! Self-heals a dead DNS supervisor / port-forwards by default so status is usable truth.
 
 use super::workbench::net::{
-    ensure_host_access, format_status_card_with_listen, host_access_status_line,
-    load_host_access_runtime, plan_host_access, url_listen_status, HostAccessMode, ServiceEndpoint,
+    discover_workspace_endpoints, ensure_host_access, format_status_card_with_listen,
+    host_access_status_line, load_host_access_runtime, plan_host_access, url_listen_status,
 };
 use super::workbench::registry::{list_workspaces, load_workspace};
 use super::{local_state_dir, run_cmd_output};
@@ -18,8 +18,8 @@ pub struct StatusArgs {
     #[arg(long)]
     pub name: Option<String>,
 
-    /// Do not restart dead host-access processes (map port-forwards).
-    /// By default status self-heals so URLs stay usable after pod rollouts.
+    /// Do not restart dead host-access processes (DNS supervisor / port-forwards).
+    /// By default status self-heals so FQDN URLs stay usable after pod rollouts.
     #[arg(long, default_value_t = false)]
     pub no_heal: bool,
 
@@ -55,21 +55,10 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         if i > 0 {
             println!();
         }
-        let services = discover_services(&ws.namespace).unwrap_or_default();
-        let port_base = ws.port_base.unwrap_or(18000);
-        let prefer_dns = match ws.host_access_mode.as_deref() {
-            Some("map") => false,
-            _ => true,
-        };
+        let services = discover_workspace_endpoints(&ws.namespace).unwrap_or_default();
 
         let (plan, healed) = if !args.no_heal && !services.is_empty() {
-            match ensure_host_access(
-                &ws.namespace,
-                &services,
-                port_base,
-                &state_dir,
-                &ws.name,
-            ) {
+            match ensure_host_access(&ws.namespace, &services, &state_dir, &ws.name) {
                 Ok((plan, _rt, healed)) => {
                     if healed {
                         println!("note:     host access restarted (self-heal)");
@@ -78,11 +67,11 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
                 }
                 Err(e) => {
                     log::warn!("host access heal failed: {e}");
-                    (plan_host_access(&ws.namespace, &services, prefer_dns, port_base), false)
+                    (plan_host_access(&ws.namespace, &services), false)
                 }
             }
         } else {
-            (plan_host_access(&ws.namespace, &services, prefer_dns, port_base), false)
+            (plan_host_access(&ws.namespace, &services), false)
         };
         let _ = healed;
 
@@ -125,19 +114,19 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
 
         if let Some(rt) = load_host_access_runtime(&state_dir, &ws.name)? {
             println!("{}", host_access_status_line(&rt));
-        } else if plan.mode == HostAccessMode::Map && services.is_empty() {
+        } else if services.is_empty() {
             println!("note:     no services listed yet — is the workspace up?");
         } else {
             println!("access processes: not recorded (re-run hops local up to start them)");
         }
 
-        // URL listen summary for --check
-        if plan.mode == HostAccessMode::Map {
-            for (name, ok) in &listen {
-                if !ok {
-                    all_ok = false;
-                    println!("warn:     {name} URL not listening (port-forward dead or app not ready)");
-                }
+        // URL listen summary for --check (cluster FQDN endpoints)
+        for (name, ok) in &listen {
+            if !ok {
+                all_ok = false;
+                println!(
+                    "warn:     {name} FQDN not listening (port-forward dead or app not ready)"
+                );
             }
         }
     }
@@ -194,37 +183,6 @@ fn discover_pods(namespace: &str) -> Result<Vec<PodStatus>, Box<dyn Error>> {
                 ready,
                 ready_containers,
                 total_containers,
-            });
-        }
-    }
-    Ok(out)
-}
-
-fn discover_services(namespace: &str) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
-    let json = run_cmd_output(
-        "kubectl",
-        &["get", "svc", "-n", namespace, "-o", "json"],
-    )?;
-    let value: serde_json::Value = serde_json::from_str(&json)?;
-    let mut out = Vec::new();
-    if let Some(items) = value.get("items").and_then(|i| i.as_array()) {
-        for item in items {
-            let name = item
-                .pointer("/metadata/name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if name.is_empty() || name == "kubernetes" {
-                continue;
-            }
-            let port = item
-                .pointer("/spec/ports/0/port")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(80) as u16;
-            out.push(ServiceEndpoint {
-                name,
-                port,
-                protocol: "TCP".into(),
             });
         }
     }

@@ -1,8 +1,8 @@
 //! `hops local open` — open the primary UI URL in a browser when possible.
 
-use super::workbench::net::{plan_host_access, ServiceEndpoint};
+use super::workbench::net::{discover_workspace_endpoints, plan_host_access};
 use super::workbench::registry::{list_workspaces, load_workspace};
-use super::{command_exists, local_state_dir, run_cmd, run_cmd_output};
+use super::{command_exists, local_state_dir, run_cmd};
 use clap::Args;
 use std::error::Error;
 
@@ -46,18 +46,8 @@ pub fn run(args: &OpenArgs) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let services = discover_services(&ws.namespace).unwrap_or_default();
-    // Prefer cluster DNS URLs when the workspace last used dns mode.
-    let prefer_dns = match ws.host_access_mode.as_deref() {
-        Some("map") => false,
-        _ => true,
-    };
-    let plan = plan_host_access(
-        &ws.namespace,
-        &services,
-        prefer_dns,
-        ws.port_base.unwrap_or(18000),
-    );
+    let services = discover_workspace_endpoints(&ws.namespace).unwrap_or_default();
+    let plan = plan_host_access(&ws.namespace, &services);
 
     let url = pick_url(&plan.urls, args.service.as_deref()).ok_or_else(|| {
         "No service URL available. Is the workspace up? Try hops local status.".to_string()
@@ -73,11 +63,20 @@ fn pick_url(
     service: Option<&str>,
 ) -> Option<String> {
     if let Some(svc) = service {
-        return urls.get(svc).cloned();
+        // Accept bare name, or ns/name key.
+        if let Some(u) = urls.get(svc) {
+            return Some(u.clone());
+        }
+        for (key, url) in urls {
+            if key == svc || key.ends_with(&format!("/{svc}")) || key.contains(svc) {
+                return Some(url.clone());
+            }
+        }
+        return None;
     }
-    // Prefer UI-ish names
+    // Prefer UI-ish names in the workspace namespace first.
     for (name, url) in urls {
-        if name.contains("ui") {
+        if name.contains("ui") && !name.contains("login") {
             return Some(url.clone());
         }
     }
@@ -101,33 +100,4 @@ fn open_browser(url: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn discover_services(namespace: &str) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
-    let json = run_cmd_output(
-        "kubectl",
-        &["get", "svc", "-n", namespace, "-o", "json"],
-    )?;
-    let value: serde_json::Value = serde_json::from_str(&json)?;
-    let mut out = Vec::new();
-    if let Some(items) = value.get("items").and_then(|i| i.as_array()) {
-        for item in items {
-            let name = item
-                .pointer("/metadata/name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if name.is_empty() || name == "kubernetes" {
-                continue;
-            }
-            let port = item
-                .pointer("/spec/ports/0/port")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(80) as u16;
-            out.push(ServiceEndpoint {
-                name,
-                port,
-                protocol: "TCP".into(),
-            });
-        }
-    }
-    Ok(out)
-}
+

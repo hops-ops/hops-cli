@@ -1,20 +1,23 @@
-//! Host access: plan URLs **and** start/stop port-forwards / cluster DNS.
+//! Host access — one path.
 //!
-//! Modes (preferred first):
-//! - **dns** — hops-native kubefwd-class: loopback IPs + `/etc/hosts` + port-forward
-//!   on real service ports so `svc.ns.svc.cluster.local` works on the host
-//! - **map** — unique `127.0.0.1:18xxx` ports (no sudo)
-//! - **kubefwd** — external binary (optional legacy)
+//! Services this workspace cares about:
+//! - Services in the workspace namespace
+//! - In-cluster `*.svc.cluster.local` endpoints referenced by those pods
+//!   (e.g. OIDC issuer in `auth`)
 //!
-//! Map/dns port-forwards die on pod rollouts; [`ensure_host_access`] restarts them.
+//! For each:
+//! 1. allocate loopback IPs in `127.53.0.0/16`
+//! 2. write `/etc/hosts` + lo0 aliases (one admin elevation)
+//! 3. run a supervisor that keeps `kubectl port-forward` alive
+//!
+//! URLs are real k8s FQDNs, e.g.
+//! `http://e2e-ui-ui.hops-wt-dogfood.svc.cluster.local:5180`
 
 use super::cluster_dns::{
-    self, build_dns_port_forward_args, format_dns_url, rebuild_hosts_from_blocks,
-    remove_loopback_aliases, sync_alloc_for_namespace,
+    self, format_dns_url, remove_loopback_aliases, sync_alloc_for_namespace, MACOS_LOCAL_DNS_PORT,
 };
-use super::registry::WorkspaceRecord;
-use crate::commands::local::kubectl_command;
-use std::collections::BTreeMap;
+use crate::commands::local::{kubectl_command, HOPS_KUBE_CONTEXT_ENV};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
@@ -22,205 +25,122 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-/// Default starting port for map-mode allocation (avoids privileged + common dev ports).
-pub const MAP_PORT_BASE_START: u16 = 18000;
-/// Ports reserved per workspace in map mode (stride).
-pub const MAP_PORT_STRIDE: u16 = 100;
-/// Runtime state subdir under local state dir.
 pub const RUNTIME_SUBDIR: &str = "runtime";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HostAccessMode {
-    /// Hops-native cluster DNS (hosts + loopback IP + port-forward on service ports).
-    Dns,
-    /// External kubefwd binary (optional).
-    Kubefwd,
-    /// Unique localhost ports via port-forward map (no sudo).
-    Map,
-}
-
-impl HostAccessMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            HostAccessMode::Dns => "dns",
-            HostAccessMode::Kubefwd => "kubefwd",
-            HostAccessMode::Map => "map",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "dns" | "cluster-dns" | "cluster" => Some(HostAccessMode::Dns),
-            "kubefwd" => Some(HostAccessMode::Kubefwd),
-            "map" => Some(HostAccessMode::Map),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceEndpoint {
+    pub namespace: String,
     pub name: String,
     pub port: u16,
     pub protocol: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostAccessPlan {
-    pub mode: HostAccessMode,
-    pub namespace: String,
-    /// Service name → URL for host browser/curl.
-    pub urls: BTreeMap<String, String>,
-    /// Map-mode only: service → host port.
-    pub port_map: BTreeMap<String, u16>,
-    pub port_base: Option<u16>,
-    /// Dns mode: service → loopback IP (127.53.x.y).
-    pub ip_map: BTreeMap<String, String>,
-}
-
-impl Default for HostAccessPlan {
-    fn default() -> Self {
-        Self {
-            mode: HostAccessMode::Map,
-            namespace: String::new(),
-            urls: BTreeMap::new(),
-            port_map: BTreeMap::new(),
-            port_base: None,
-            ip_map: BTreeMap::new(),
-        }
+impl ServiceEndpoint {
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.namespace, self.name)
     }
 }
 
-/// Started host-access processes for a workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostAccessPlan {
+    /// Primary workspace namespace (status / cards).
+    pub namespace: String,
+    pub urls: BTreeMap<String, String>,
+    /// service key `ns/name` → loopback IP
+    pub ip_map: BTreeMap<String, String>,
+    /// service key → port
+    pub service_ports: BTreeMap<String, u16>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct HostAccessRuntime {
-    pub mode: String,
     pub namespace: String,
     pub pids: Vec<u32>,
-    /// Optional log path.
     #[serde(default)]
     pub log_path: Option<String>,
-    /// Map mode: service name → host port (needed to re-heal without re-planning).
-    #[serde(default)]
-    pub port_map: BTreeMap<String, u16>,
-    /// Map/dns: service name → service port inside the cluster.
+    /// service key `ns/name` → port (preferred). Also accepts bare name for older files.
     #[serde(default)]
     pub service_ports: BTreeMap<String, u16>,
-    /// Dns mode: service → loopback bind IP.
+    /// service key `ns/name` → loopback IP
     #[serde(default)]
     pub ip_map: BTreeMap<String, String>,
 }
 
-/// Format kubefwd-style URL for a service in a namespace.
-pub fn format_kubefwd_url(service: &str, namespace: &str, port: u16) -> String {
-    format!("http://{service}.{namespace}.svc.cluster.local:{port}")
+pub fn format_dns_service_url(service: &str, namespace: &str, port: u16) -> String {
+    format_dns_url(service, namespace, port)
 }
 
-/// Format map-mode localhost URL.
-pub fn format_map_url(host_port: u16) -> String {
-    format!("http://127.0.0.1:{host_port}")
+pub fn plan_host_access(namespace: &str, services: &[ServiceEndpoint]) -> HostAccessPlan {
+    plan_host_access_with_ips(namespace, services, &BTreeMap::new())
 }
 
-/// Allocate a non-overlapping port base for a new workspace given existing records.
-pub fn allocate_port_base(existing: &[WorkspaceRecord]) -> u16 {
-    let mut used: Vec<u16> = existing.iter().filter_map(|r| r.port_base).collect();
-    used.sort_unstable();
-    let mut candidate = MAP_PORT_BASE_START;
-    for base in used {
-        if candidate == base {
-            candidate = base.saturating_add(MAP_PORT_STRIDE);
-        } else if candidate < base {
-            break;
-        }
-    }
-    candidate
-}
-
-/// Plan host access for services in a workspace namespace.
-///
-/// `prefer` selects mode when possible; dns needs IPs from `ip_map` (pass empty
-/// to get placeholder URLs until start allocates IPs).
-pub fn plan_host_access(
+pub fn plan_host_access_with_ips(
     namespace: &str,
     services: &[ServiceEndpoint],
-    prefer_cluster_dns: bool,
-    port_base: u16,
-) -> HostAccessPlan {
-    plan_host_access_mode(
-        namespace,
-        services,
-        if prefer_cluster_dns {
-            HostAccessMode::Dns
-        } else {
-            HostAccessMode::Map
-        },
-        port_base,
-        &BTreeMap::new(),
-    )
-}
-
-/// Plan with an explicit mode and optional pre-allocated dns IPs.
-pub fn plan_host_access_mode(
-    namespace: &str,
-    services: &[ServiceEndpoint],
-    mode: HostAccessMode,
-    port_base: u16,
     ip_map: &BTreeMap<String, String>,
 ) -> HostAccessPlan {
-    match mode {
-        HostAccessMode::Dns | HostAccessMode::Kubefwd => {
-            let mut urls = BTreeMap::new();
-            for svc in services {
-                urls.insert(
-                    svc.name.clone(),
-                    format_dns_url(&svc.name, namespace, svc.port),
-                );
-            }
-            HostAccessPlan {
-                mode,
-                namespace: namespace.to_string(),
-                urls,
-                port_map: BTreeMap::new(),
-                port_base: None,
-                ip_map: ip_map.clone(),
-            }
-        }
-        HostAccessMode::Map => {
-            let mut urls = BTreeMap::new();
-            let mut port_map = BTreeMap::new();
-            for (i, svc) in services.iter().enumerate() {
-                let host_port = port_base.saturating_add(i as u16);
-                port_map.insert(svc.name.clone(), host_port);
-                urls.insert(svc.name.clone(), format_map_url(host_port));
-            }
-            HostAccessPlan {
-                mode: HostAccessMode::Map,
-                namespace: namespace.to_string(),
-                urls,
-                port_map,
-                port_base: Some(port_base),
-                ip_map: BTreeMap::new(),
-            }
-        }
+    let mut urls = BTreeMap::new();
+    let mut service_ports = BTreeMap::new();
+    for svc in services {
+        let key = svc.key();
+        urls.insert(key.clone(), format_dns_url(&svc.name, &svc.namespace, svc.port));
+        service_ports.insert(key, svc.port);
+    }
+    HostAccessPlan {
+        namespace: namespace.to_string(),
+        urls,
+        ip_map: ip_map.clone(),
+        service_ports,
     }
 }
 
-/// Render a short status card for humans (no kubectl literacy).
 pub fn format_status_card(workspace: &str, plan: &HostAccessPlan) -> String {
+    format_status_card_with_listen(workspace, plan, &BTreeMap::new())
+}
+
+pub fn format_status_card_with_listen(
+    workspace: &str,
+    plan: &HostAccessPlan,
+    listen: &BTreeMap<String, bool>,
+) -> String {
     let mut lines = Vec::new();
     lines.push(format!("workspace: {workspace}"));
     lines.push(format!("namespace: {}", plan.namespace));
-    lines.push(format!("access:   {}", plan.mode.as_str()));
+    lines.push("access:   cluster DNS (Service FQDNs)".into());
     if plan.urls.is_empty() {
         lines.push("urls:     (no services discovered yet)".into());
     } else {
         lines.push("urls:".into());
-        for (name, url) in &plan.urls {
-            lines.push(format!("  - {name}: {url}"));
+        for (key, url) in &plan.urls {
+            let mark = match listen.get(key) {
+                Some(true) => " [up]",
+                Some(false) => " [down]",
+                None => "",
+            };
+            lines.push(format!("  - {key}: {url}{mark}"));
         }
     }
     lines.join("\n")
+}
+
+pub fn host_access_status_line(rt: &HostAccessRuntime) -> String {
+    let alive = rt.pids.iter().filter(|p| pid_is_alive(**p)).count();
+    let listen = rt
+        .ip_map
+        .iter()
+        .filter(|(key, ip)| {
+            let port = rt.service_ports.get(*key).copied().unwrap_or(80);
+            ip_port_listening(ip, port)
+        })
+        .count();
+    format!(
+        "access: dns supervisor {}/{} alive; {}/{} endpoints listening",
+        alive,
+        rt.pids.len().max(1),
+        listen,
+        rt.ip_map.len()
+    )
 }
 
 fn runtime_path(state_dir: &Path, workspace: &str) -> PathBuf {
@@ -232,13 +152,11 @@ fn runtime_path(state_dir: &Path, workspace: &str) -> PathBuf {
 pub fn save_host_access_runtime(
     state_dir: &Path,
     workspace: &str,
-    runtime: &HostAccessRuntime,
-) -> Result<PathBuf, Box<dyn Error>> {
-    let dir = state_dir.join(RUNTIME_SUBDIR);
-    fs::create_dir_all(&dir)?;
-    let path = runtime_path(state_dir, workspace);
-    fs::write(&path, serde_json::to_string_pretty(runtime)?)?;
-    Ok(path)
+    rt: &HostAccessRuntime,
+) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(state_dir.join(RUNTIME_SUBDIR))?;
+    fs::write(runtime_path(state_dir, workspace), serde_json::to_string_pretty(rt)?)?;
+    Ok(())
 }
 
 pub fn load_host_access_runtime(
@@ -249,16 +167,612 @@ pub fn load_host_access_runtime(
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(&path)?;
-    Ok(Some(serde_json::from_str(&text)?))
+    Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
 }
 
 pub fn clear_host_access_runtime(state_dir: &Path, workspace: &str) {
-    let path = runtime_path(state_dir, workspace);
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(runtime_path(state_dir, workspace));
 }
 
-/// Build argv for map-mode port-forward (testable pure function).
+/// Services in `namespace` (first TCP port each).
+pub fn discover_services(namespace: &str) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
+    discover_services_in_namespace(namespace)
+}
+
+fn discover_services_in_namespace(
+    namespace: &str,
+) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
+    let output = kubectl_command(&["get", "svc", "-n", namespace, "-o", "json"])
+        .output()
+        .map_err(|e| format!("kubectl get svc failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl get svc -n {namespace} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let mut out = Vec::new();
+    for item in v["items"].as_array().cloned().unwrap_or_default() {
+        let name = item["metadata"]["name"].as_str().unwrap_or("").to_string();
+        if name.is_empty() || name == "kubernetes" {
+            continue;
+        }
+        for p in item["spec"]["ports"].as_array().cloned().unwrap_or_default() {
+            let port = p["port"].as_u64().unwrap_or(0) as u16;
+            let protocol = p["protocol"].as_str().unwrap_or("TCP");
+            if port == 0 || (protocol != "TCP" && protocol != "tcp") {
+                continue;
+            }
+            // Skip postgres-ish ports for host browser access.
+            if port == 5432 {
+                continue;
+            }
+            out.push(ServiceEndpoint {
+                namespace: namespace.to_string(),
+                name: name.clone(),
+                port,
+                protocol: "TCP".into(),
+            });
+            break;
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Workspace Services **plus** in-cluster FQDNs referenced by pod env
+/// (OIDC issuer, etc.).
+pub fn discover_workspace_endpoints(
+    namespace: &str,
+) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
+    let mut by_key: BTreeMap<String, ServiceEndpoint> = BTreeMap::new();
+    for svc in discover_services_in_namespace(namespace)? {
+        by_key.insert(svc.key(), svc);
+    }
+
+    for (ref_ns, ref_name, port_hint) in scan_pod_cluster_dns_refs(namespace)? {
+        if ref_ns == namespace && by_key.contains_key(&format!("{ref_ns}/{ref_name}")) {
+            continue;
+        }
+        let key = format!("{ref_ns}/{ref_name}");
+        if by_key.contains_key(&key) {
+            continue;
+        }
+        // Resolve live service port when possible.
+        let port = match service_port(&ref_ns, &ref_name) {
+            Ok(p) => p,
+            Err(_) => port_hint.unwrap_or(80),
+        };
+        if port == 5432 {
+            continue;
+        }
+        by_key.insert(
+            key,
+            ServiceEndpoint {
+                namespace: ref_ns,
+                name: ref_name,
+                port,
+                protocol: "TCP".into(),
+            },
+        );
+    }
+
+    Ok(by_key.into_values().collect())
+}
+
+fn service_port(namespace: &str, name: &str) -> Result<u16, Box<dyn Error>> {
+    let output = kubectl_command(&[
+        "get",
+        "svc",
+        name,
+        "-n",
+        namespace,
+        "-o",
+        "jsonpath={.spec.ports[0].port}",
+    ])
+    .output()
+    .map_err(|e| format!("kubectl get svc {name}: {e}"))?;
+    if !output.status.success() {
+        return Err("service not found".into());
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    s.trim()
+        .parse()
+        .map_err(|_| format!("bad port for {namespace}/{name}").into())
+}
+
+/// Parse pod env for `http(s)://svc.ns.svc.cluster.local:port` references.
+fn scan_pod_cluster_dns_refs(
+    namespace: &str,
+) -> Result<Vec<(String, String, Option<u16>)>, Box<dyn Error>> {
+    let output = kubectl_command(&["get", "pods", "-n", namespace, "-o", "json"])
+        .output()
+        .map_err(|e| format!("kubectl get pods failed: {e}"))?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let mut found: BTreeSet<(String, String, Option<u16>)> = BTreeSet::new();
+
+    for item in v["items"].as_array().cloned().unwrap_or_default() {
+        let containers = item["spec"]["containers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for c in containers {
+            for env in c["env"].as_array().cloned().unwrap_or_default() {
+                if let Some(val) = env["value"].as_str() {
+                    for (ns, name, port) in regex_lite_cluster_dns(val) {
+                        found.insert((ns, name, port));
+                    }
+                }
+            }
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
+/// Minimal parser: find `name.namespace.svc.cluster.local` and optional `:port`.
+fn regex_lite_cluster_dns(s: &str) -> Vec<(String, String, Option<u16>)> {
+    let mut out = Vec::new();
+    let marker = ".svc.cluster.local";
+    let mut search_from = 0;
+    while let Some(rel) = s[search_from..].find(marker) {
+        let end = search_from + rel;
+        // walk back for hostname labels
+        let head = &s[..end];
+        let start = head
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let host = &s[start..end];
+        // expect name.namespace
+        let mut parts: Vec<&str> = host.split('.').collect();
+        if parts.len() >= 2 {
+            let ns = parts.pop().unwrap().to_string();
+            let name = parts.join(".");
+            if !name.is_empty() && !ns.is_empty() {
+                let after = end + marker.len();
+                let port = if s[after..].starts_with(':') {
+                    let digits: String = s[after + 1..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    digits.parse().ok()
+                } else {
+                    None
+                };
+                out.push((ns, name, port));
+            }
+        }
+        search_from = end + marker.len();
+    }
+    out
+}
+
+/// Start host access for workspace endpoints (FQDNs + supervisor).
+pub fn start_host_access(
+    namespace: &str,
+    services: &[ServiceEndpoint],
+    state_dir: &Path,
+    workspace: &str,
+) -> Result<(HostAccessPlan, HostAccessRuntime), Box<dyn Error>> {
+    if services.is_empty() {
+        return Ok((
+            plan_host_access(namespace, services),
+            HostAccessRuntime {
+                namespace: namespace.into(),
+                ..Default::default()
+            },
+        ));
+    }
+
+    // Allocate IPs per namespace group.
+    let mut by_ns: BTreeMap<String, Vec<ServiceEndpoint>> = BTreeMap::new();
+    for svc in services {
+        by_ns
+            .entry(svc.namespace.clone())
+            .or_default()
+            .push(svc.clone());
+    }
+
+    let mut ip_map: BTreeMap<String, String> = BTreeMap::new();
+    let mut ns_blocks: Vec<(String, BTreeMap<String, String>)> = Vec::new();
+    for (ns, svcs) in &by_ns {
+        // sync_alloc maps bare service name → ip; rekey to ns/name
+        let bare = sync_alloc_for_namespace(state_dir, ns, svcs)?;
+        let mut bare_for_hosts = BTreeMap::new();
+        for (name, ip) in bare {
+            bare_for_hosts.insert(name.clone(), ip.clone());
+            ip_map.insert(format!("{ns}/{name}"), ip);
+        }
+        ns_blocks.push((ns.clone(), bare_for_hosts));
+    }
+
+    let ips: Vec<String> = ip_map.values().cloned().collect();
+
+    let mut blocks = collect_dns_blocks_from_runtimes(state_dir, Some(workspace))?;
+    blocks.extend(ns_blocks);
+    let mut merged_by_ns: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for (ns, m) in blocks {
+        merged_by_ns.entry(ns).or_default().extend(m);
+    }
+    let mut host_lines = Vec::new();
+    for (ns, m) in &merged_by_ns {
+        host_lines.extend(cluster_dns::hosts_lines_for_workspace(ns, m));
+    }
+    let current = fs::read_to_string("/etc/hosts").unwrap_or_default();
+    let hosts_body = cluster_dns::merge_hosts_file(&current, &host_lines);
+
+    cluster_dns::apply_privileged_dns_config(&hosts_body, &ips)?;
+    verify_loopback_aliases_ready(&ips)?;
+
+    let plan = plan_host_access_with_ips(namespace, services, &ip_map);
+    // Zone file for macOS stub DNS (instant *.svc.cluster.local; avoid mDNS).
+    write_zone_file(state_dir, &merged_by_ns)?;
+    ensure_macos_stub_dns(state_dir)?;
+    let rt = start_dns_supervisor(&plan, services, state_dir, workspace)?;
+    std::thread::sleep(Duration::from_millis(700));
+    if !rt.pids.iter().any(|p| pid_is_alive(*p)) {
+        let tail = rt
+            .log_path
+            .as_ref()
+            .and_then(|p| fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        let tail: String = tail
+            .lines()
+            .rev()
+            .take(30)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!("dns supervisor exited immediately\n{tail}").into());
+    }
+    log::info!(
+        "host access: cluster DNS for {} endpoint(s)",
+        services.len()
+    );
+    Ok((plan, rt))
+}
+
+/// Write zone: fqdn → ip for the macOS stub DNS (and reloads on every start).
+fn write_zone_file(
+    state_dir: &Path,
+    by_ns: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<(), Box<dyn Error>> {
+    let path = state_dir.join(RUNTIME_SUBDIR).join("dns-zone.tsv");
+    fs::create_dir_all(path.parent().unwrap())?;
+    let mut body = String::new();
+    for (ns, m) in by_ns {
+        for (svc, ip) in m {
+            let fqdn = format!("{svc}.{ns}.svc.cluster.local");
+            let twin = format!("{svc}.{ns}.svc.cluster");
+            let short = format!("{svc}.{ns}");
+            body.push_str(&format!("{fqdn}\t{ip}\n{twin}\t{ip}\n{short}\t{ip}\n"));
+        }
+    }
+    fs::write(path, body)?;
+    Ok(())
+}
+
+/// macOS: run a tiny UDP DNS on 127.0.0.1:53535 answering A records from dns-zone.tsv.
+/// Paired with `/etc/resolver/svc.cluster.local` so getaddrinfo skips mDNS.
+fn ensure_macos_stub_dns(state_dir: &Path) -> Result<(), Box<dyn Error>> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let log_dir = state_dir.join(RUNTIME_SUBDIR);
+    fs::create_dir_all(&log_dir)?;
+    let zone = log_dir.join("dns-zone.tsv");
+    let script = log_dir.join("macos-stub-dns.py");
+    let pid_path = log_dir.join("macos-stub-dns.pid");
+    let log_path = log_dir.join("macos-stub-dns.log");
+
+    // Already healthy?
+    if let Ok(raw) = fs::read_to_string(&pid_path) {
+        if let Ok(pid) = raw.trim().parse::<u32>() {
+            if pid_is_alive(pid) && stub_dns_responds() {
+                return Ok(());
+            }
+            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+        }
+    }
+
+    let py = format!(
+        r#"#!/usr/bin/env python3
+import socket, struct, sys, time, os
+ZONE = '{zone}'
+PORT = {port}
+LOG = '{log}'
+
+def load_zone():
+    m = {{}}
+    try:
+        with open(ZONE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    m[parts[0].lower().rstrip('.')] = parts[1]
+    except FileNotFoundError:
+        pass
+    return m
+
+def parse_qname(data, off):
+    labels = []
+    while True:
+        if off >= len(data):
+            raise ValueError('bad qname')
+        l = data[off]
+        if l == 0:
+            return '.'.join(labels).lower(), off + 1
+        if (l & 0xC0) == 0xC0:
+            # pointer — not expected in questions we generate answers for
+            ptr = struct.unpack('!H', data[off:off+2])[0] & 0x3FFF
+            name, _ = parse_qname(data, ptr)
+            return name, off + 2
+        off += 1
+        labels.append(data[off:off+l].decode('ascii', 'ignore'))
+        off += l
+
+def encode_name(name):
+    out = b''
+    for lab in name.split('.'):
+        if not lab:
+            continue
+        b = lab.encode('ascii')
+        out += bytes([len(b)]) + b
+    return out + b'\x00'
+
+def build_response(req, zone):
+    if len(req) < 12:
+        return None
+    tid = req[:2]
+    flags_qr = b'\x81\x80'  # standard response, recursion available
+    # parse question
+    try:
+        qname, qend = parse_qname(req, 12)
+    except Exception:
+        return None
+    if qend + 4 > len(req):
+        return None
+    qtype, qclass = struct.unpack('!HH', req[qend:qend+4])
+    question = req[12:qend+4]
+    ip = zone.get(qname)
+    if qtype != 1 or qclass != 1 or not ip:  # A IN
+        # NXDOMAIN-ish empty answer so clients fall through quickly
+        return tid + flags_qr + struct.pack('!HHHH', 1, 0, 0, 0) + question
+    try:
+        addr = socket.inet_aton(ip)
+    except OSError:
+        return tid + flags_qr + struct.pack('!HHHH', 1, 0, 0, 0) + question
+    answer = encode_name(qname) + struct.pack('!HHIH', 1, 1, 30, 4) + addr
+    return tid + flags_qr + struct.pack('!HHHH', 1, 1, 0, 0) + question + answer
+
+def main():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('127.0.0.1', PORT))
+    with open(LOG, 'a') as lf:
+        lf.write('start port=%s zone=%s\\n' % (PORT, ZONE))
+        lf.flush()
+        zone = load_zone()
+        last = time.time()
+        while True:
+            sock.settimeout(2.0)
+            try:
+                data, addr = sock.recvfrom(512)
+            except socket.timeout:
+                if time.time() - last > 2:
+                    zone = load_zone()
+                    last = time.time()
+                continue
+            if time.time() - last > 2:
+                zone = load_zone()
+                last = time.time()
+            resp = build_response(data, zone)
+            if resp:
+                sock.sendto(resp, addr)
+
+if __name__ == '__main__':
+    main()
+"#,
+        zone = zone.display().to_string(),
+        port = MACOS_LOCAL_DNS_PORT,
+        log = log_path.display().to_string(),
+    );
+    fs::write(&script, py)?;
+    import_unix_chmod(&script);
+
+    let log_out = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log_err = log_out.try_clone()?;
+    let child = Command::new("python3")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_out))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .map_err(|e| format!("failed to spawn macOS stub DNS: {e}"))?;
+    let pid = child.id();
+    std::mem::forget(child);
+    fs::write(&pid_path, format!("{pid}\n"))?;
+    std::thread::sleep(Duration::from_millis(200));
+    if !pid_is_alive(pid) {
+        return Err("macOS stub DNS exited immediately".into());
+    }
+    log::info!("macOS stub DNS for *.svc.cluster.local on 127.0.0.1:{MACOS_LOCAL_DNS_PORT} pid={pid}");
+    Ok(())
+}
+
+fn stub_dns_responds() -> bool {
+    // best-effort: UDP not easy to probe without a real query; process alive is enough
+    true
+}
+
+fn verify_loopback_aliases_ready(ips: &[String]) -> Result<(), Box<dyn Error>> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let lo0 = Command::new("ifconfig")
+        .arg("lo0")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let missing: Vec<&str> = ips
+        .iter()
+        .filter(|ip| !ip.is_empty() && *ip != "127.0.0.1" && !lo0.contains(ip.as_str()))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "lo0 missing aliases ({}); approve the single admin prompt so aliases apply",
+        missing.join(", ")
+    )
+    .into())
+}
+
+fn start_dns_supervisor(
+    plan: &HostAccessPlan,
+    services: &[ServiceEndpoint],
+    state_dir: &Path,
+    workspace: &str,
+) -> Result<HostAccessRuntime, Box<dyn Error>> {
+    let _ = stop_host_access_processes_only(state_dir, workspace);
+
+    let log_dir = state_dir.join(RUNTIME_SUBDIR);
+    fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join(format!("{workspace}.host-access.log"));
+    let config_path = log_dir.join(format!("{workspace}.dns-forwards.tsv"));
+    let script_path = log_dir.join(format!("{workspace}.dns-sup.sh"));
+    let piddir = log_dir.join(format!("{workspace}.dns-pf-pids"));
+
+    // TSV: NS \t SVC \t IP \t PORT \t KEY
+    let mut tsv = String::new();
+    for svc in services {
+        let key = svc.key();
+        let ip = plan
+            .ip_map
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1".into());
+        tsv.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            svc.namespace, svc.name, ip, svc.port, key
+        ));
+    }
+    fs::write(&config_path, &tsv)?;
+
+    let q = |s: &str| s.replace('\'', r"'\''");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -u
+CONFIG='{config}'
+LOG='{log}'
+PIDDIR='{piddir}'
+export KUBECONFIG="${{KUBECONFIG:-}}"
+KCTX="${{HOPS_KUBE_CONTEXT:-}}"
+k() {{
+  if [ -n "$KCTX" ]; then
+    command kubectl --context "$KCTX" "$@"
+  else
+    command kubectl "$@"
+  fi
+}}
+mkdir -p "$PIDDIR"
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) supervisor start" >>"$LOG"
+cleanup() {{
+  for f in "$PIDDIR"/*.pid; do
+    [ -f "$f" ] || continue
+    kill "$(cat "$f")" 2>/dev/null || true
+  done
+  exit 0
+}}
+trap cleanup TERM INT HUP
+while true; do
+  while IFS=$'\t' read -r NS SVC IP PORT KEY; do
+    [ -z "${{NS:-}}" ] && continue
+    safe=$(echo "$KEY" | tr '/:' '__')
+    pf="$PIDDIR/$safe.pid"
+    pid=""
+    if [ -f "$pf" ]; then pid=$(cat "$pf" 2>/dev/null || true); fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then continue; fi
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null || true
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) restart $KEY" >>"$LOG"
+    else
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) start $KEY $IP:$PORT" >>"$LOG"
+    fi
+    k port-forward -n "$NS" --address "$IP" "svc/$SVC" "${{PORT}}:${{PORT}}" >>"$LOG" 2>&1 &
+    echo $! >"$pf"
+  done < "$CONFIG"
+  sleep 2
+done
+"#,
+        config = q(&config_path.to_string_lossy()),
+        log = q(&log_path.to_string_lossy()),
+        piddir = q(&piddir.to_string_lossy()),
+    );
+    fs::write(&script_path, script)?;
+    import_unix_chmod(&script_path);
+
+    let log_out = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log_err = log_out.try_clone()?;
+    let mut cmd = Command::new("bash");
+    cmd.arg(&script_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_out))
+        .stderr(Stdio::from(log_err));
+    if let Ok(kc) = std::env::var("KUBECONFIG") {
+        cmd.env("KUBECONFIG", kc);
+    }
+    if let Ok(ctx) = std::env::var(HOPS_KUBE_CONTEXT_ENV) {
+        cmd.env(HOPS_KUBE_CONTEXT_ENV, ctx);
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn dns supervisor: {e}"))?;
+    let pid = child.id();
+    std::mem::forget(child);
+
+    let service_ports: BTreeMap<String, u16> = services
+        .iter()
+        .map(|s| (s.key(), s.port))
+        .collect();
+    let runtime = HostAccessRuntime {
+        namespace: plan.namespace.clone(),
+        pids: vec![pid],
+        log_path: Some(log_path.display().to_string()),
+        service_ports,
+        ip_map: plan.ip_map.clone(),
+    };
+    save_host_access_runtime(state_dir, workspace, &runtime)?;
+    log::info!("host access started (dns supervisor) pid={pid}");
+    Ok(runtime)
+}
+
+#[cfg(unix)]
+fn import_unix_chmod(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
+}
+#[cfg(not(unix))]
+fn import_unix_chmod(_path: &Path) {}
+
+/// Build `kubectl port-forward` argv (package registry host publish).
 pub fn build_port_forward_args(
     namespace: &str,
     service: &str,
@@ -274,108 +788,201 @@ pub fn build_port_forward_args(
     ]
 }
 
-/// Build argv for kubefwd (testable pure function).
-pub fn build_kubefwd_args(namespace: &str) -> Vec<String> {
-    vec!["svc".into(), "-n".into(), namespace.into()]
+pub fn localhost_port_listening(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(200),
+    )
+    .is_ok()
 }
 
-fn command_exists(program: &str) -> bool {
-    Command::new("sh")
-        .args(["-c", &format!("command -v {program} >/dev/null 2>&1")])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+pub fn ip_port_listening(ip: &str, port: u16) -> bool {
+    let Ok(addr) = format!("{ip}:{port}").parse::<SocketAddr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
-/// Prefer hops-native **dns** mode: real k8s FQDNs + service ports on the host.
-///
-/// Requires admin to write `/etc/hosts` and (macOS) lo0 aliases — that is
-/// intentional so app configs using in-cluster URLs work unchanged.
-/// Falls back to map-mode only if elevation is denied.
-pub fn start_host_access_auto(
+pub fn host_access_needs_heal(rt: &HostAccessRuntime) -> bool {
+    if rt.ip_map.is_empty() {
+        return true;
+    }
+    if !rt.pids.iter().any(|p| pid_is_alive(*p)) {
+        return true;
+    }
+    for (key, ip) in &rt.ip_map {
+        let port = rt.service_ports.get(key).copied().unwrap_or(80);
+        if !ip_port_listening(ip, port) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn ensure_host_access(
     namespace: &str,
     services: &[ServiceEndpoint],
-    _kubefwd_available: bool,
-    port_base: u16,
     state_dir: &Path,
     workspace: &str,
-) -> Result<(HostAccessPlan, HostAccessRuntime), Box<dyn Error>> {
-    if !services.is_empty() {
-        match try_start_dns_access(namespace, services, state_dir, workspace) {
-            Ok((plan, rt)) => {
-                log::info!(
-                    "host access: cluster DNS — use in-cluster Service URLs on this machine"
-                );
-                return Ok((plan, rt));
+) -> Result<(HostAccessPlan, HostAccessRuntime, bool), Box<dyn Error>> {
+    let prior = load_host_access_runtime(state_dir, workspace)?;
+    if let Some(rt) = &prior {
+        if !host_access_needs_heal(rt) {
+            return Ok((plan_from_runtime(rt), rt.clone(), false));
+        }
+        log::info!("host access unhealthy; restarting dns supervisor");
+    }
+    let services = if services.is_empty() {
+        prior
+            .as_ref()
+            .map(services_from_runtime)
+            .unwrap_or_else(|| services.to_vec())
+    } else {
+        services.to_vec()
+    };
+    let (plan, rt) = start_host_access(namespace, &services, state_dir, workspace)?;
+    std::thread::sleep(Duration::from_millis(400));
+    Ok((plan, rt, true))
+}
+
+fn plan_from_runtime(rt: &HostAccessRuntime) -> HostAccessPlan {
+    let mut urls = BTreeMap::new();
+    for (key, port) in &rt.service_ports {
+        let (ns, name) = split_service_key(key, &rt.namespace);
+        urls.insert(key.clone(), format_dns_url(&name, &ns, *port));
+    }
+    if urls.is_empty() {
+        for key in rt.ip_map.keys() {
+            let (ns, name) = split_service_key(key, &rt.namespace);
+            urls.insert(key.clone(), format_dns_url(&name, &ns, 80));
+        }
+    }
+    HostAccessPlan {
+        namespace: rt.namespace.clone(),
+        urls,
+        ip_map: rt.ip_map.clone(),
+        service_ports: rt.service_ports.clone(),
+    }
+}
+
+fn split_service_key(key: &str, default_ns: &str) -> (String, String) {
+    if let Some((ns, name)) = key.split_once('/') {
+        (ns.to_string(), name.to_string())
+    } else {
+        (default_ns.to_string(), key.to_string())
+    }
+}
+
+fn services_from_runtime(rt: &HostAccessRuntime) -> Vec<ServiceEndpoint> {
+    let keys: Vec<String> = if !rt.service_ports.is_empty() {
+        rt.service_ports.keys().cloned().collect()
+    } else {
+        rt.ip_map.keys().cloned().collect()
+    };
+    keys.into_iter()
+        .map(|key| {
+            let (ns, name) = split_service_key(&key, &rt.namespace);
+            ServiceEndpoint {
+                namespace: ns,
+                name,
+                port: rt.service_ports.get(&key).copied().unwrap_or(80),
+                protocol: "TCP".into(),
             }
-            Err(e) => {
-                log::warn!(
-                    "cluster DNS setup failed ({e}); falling back to map-mode 127.0.0.1 ports"
-                );
-                let _ = stop_host_access(state_dir, workspace);
+        })
+        .collect()
+}
+
+pub fn url_listen_status(plan: &HostAccessPlan) -> BTreeMap<String, bool> {
+    let mut out = BTreeMap::new();
+    for (key, ip) in &plan.ip_map {
+        let port = plan.service_ports.get(key).copied().unwrap_or(80);
+        out.insert(key.clone(), ip_port_listening(ip, port));
+    }
+    out
+}
+
+fn stop_host_access_processes_only(
+    state_dir: &Path,
+    workspace: &str,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(rt) = load_host_access_runtime(state_dir, workspace)? {
+        for pid in &rt.pids {
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        for pid in &rt.pids {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        let piddir = state_dir
+            .join(RUNTIME_SUBDIR)
+            .join(format!("{workspace}.dns-pf-pids"));
+        if let Ok(entries) = fs::read_dir(piddir) {
+            for ent in entries.flatten() {
+                if let Ok(s) = fs::read_to_string(ent.path()) {
+                    if let Ok(pid) = s.trim().parse::<u32>() {
+                        let _ = Command::new("kill")
+                            .args(["-TERM", &pid.to_string()])
+                            .status();
+                    }
+                }
             }
         }
     }
-
-    let plan = plan_host_access_mode(
-        namespace,
-        services,
-        HostAccessMode::Map,
-        port_base,
-        &BTreeMap::new(),
-    );
-    let rt = start_host_access_with_services(&plan, services, state_dir, workspace)?;
-    Ok((plan, rt))
+    clear_host_access_runtime(state_dir, workspace);
+    Ok(())
 }
 
-fn try_start_dns_access(
-    namespace: &str,
-    services: &[ServiceEndpoint],
-    state_dir: &Path,
-    workspace: &str,
-) -> Result<(HostAccessPlan, HostAccessRuntime), Box<dyn Error>> {
-    // Unique 127.53.x.y per service so every Service keeps its real cluster port
-    // (kubefwd model). Privileged: lo0 aliases (macOS) + /etc/hosts.
-    let ip_map = sync_alloc_for_namespace(state_dir, namespace, services)?;
-    let ips: Vec<String> = ip_map.values().cloned().collect();
-
-    // Merge hosts for all dns workspaces + this one.
-    let mut blocks = collect_dns_blocks_from_runtimes(state_dir, Some(workspace))?;
-    blocks.push((namespace.to_string(), ip_map.clone()));
-    let mut by_ns: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    for (ns, m) in blocks {
-        by_ns.insert(ns, m);
+pub fn stop_host_access(state_dir: &Path, workspace: &str) -> Result<(), Box<dyn Error>> {
+    let rt = load_host_access_runtime(state_dir, workspace)?;
+    stop_host_access_processes_only(state_dir, workspace)?;
+    if let Some(rt) = rt {
+        if !rt.ip_map.is_empty() {
+            remove_loopback_aliases(&rt.ip_map.values().cloned().collect::<Vec<_>>());
+            if let Ok(blocks) = collect_dns_blocks_from_runtimes(state_dir, Some(workspace)) {
+                let _ = rebuild_hosts_from_blocks_noprompt(&blocks);
+            }
+        }
     }
-    let merged_blocks: Vec<(String, BTreeMap<String, String>)> = by_ns.into_iter().collect();
-    let mut host_lines = Vec::new();
-    for (ns, m) in &merged_blocks {
-        host_lines.extend(cluster_dns::hosts_lines_for_workspace(ns, m));
+    Ok(())
+}
+
+fn rebuild_hosts_from_blocks_noprompt(
+    blocks: &[(String, BTreeMap<String, String>)],
+) -> Result<(), Box<dyn Error>> {
+    use super::cluster_dns::{
+        dns_os_config_present, hosts_lines_for_workspace, merge_hosts_file, run_privileged_shell,
+        PrivilegedPrompt,
+    };
+    let mut lines = Vec::new();
+    for (ns, ips) in blocks {
+        lines.extend(hosts_lines_for_workspace(ns, ips));
     }
     let current = fs::read_to_string("/etc/hosts").unwrap_or_default();
-    let hosts_body = cluster_dns::merge_hosts_file(&current, &host_lines);
-
-    // One elevation: hosts + all loopback aliases.
-    cluster_dns::apply_privileged_dns_config(&hosts_body, &ips)?;
-
-    let plan = plan_host_access_mode(namespace, services, HostAccessMode::Dns, 0, &ip_map);
-    let rt = start_host_access_with_services(&plan, services, state_dir, workspace)?;
-    std::thread::sleep(Duration::from_millis(500));
-    if !rt.pids.iter().any(|p| pid_is_alive(*p)) {
-        return Err("dns port-forwards exited immediately".into());
+    let merged = merge_hosts_file(&current, &lines);
+    if dns_os_config_present(&merged, &[]) {
+        return Ok(());
     }
-    Ok((plan, rt))
+    let tmp =
+        std::env::temp_dir().join(format!("hops-hosts-down-{}.tmp", std::process::id()));
+    fs::write(&tmp, &merged)?;
+    let script = format!("cp '{}' /etc/hosts && chmod 644 /etc/hosts", tmp.display());
+    let res = run_privileged_shell(&script, PrivilegedPrompt::Never);
+    let _ = fs::remove_file(&tmp);
+    res
 }
 
-/// Gather ip_maps from saved runtimes in dns mode (optionally skip one workspace).
 fn collect_dns_blocks_from_runtimes(
     state_dir: &Path,
     skip_workspace: Option<&str>,
 ) -> Result<Vec<(String, BTreeMap<String, String>)>, Box<dyn Error>> {
     let dir = state_dir.join(RUNTIME_SUBDIR);
-    let mut out = Vec::new();
-    let entries = match fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(out),
+    let mut by_ns: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
     };
     for ent in entries.flatten() {
         let name = ent.file_name().to_string_lossy().into_owned();
@@ -386,341 +993,20 @@ fn collect_dns_blocks_from_runtimes(
         if skip_workspace == Some(ws) {
             continue;
         }
-        let text = match fs::read_to_string(ent.path()) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let rt: HostAccessRuntime = match serde_json::from_str(&text) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if rt.mode != HostAccessMode::Dns.as_str() || rt.ip_map.is_empty() {
+        let Ok(text) = fs::read_to_string(ent.path()) else {
             continue;
-        }
-        out.push((rt.namespace, rt.ip_map));
-    }
-    Ok(out)
-}
-
-/// Start host access processes (kubefwd or kubectl port-forward). Records PIDs.
-pub fn start_host_access_with_services(
-    plan: &HostAccessPlan,
-    services: &[ServiceEndpoint],
-    state_dir: &Path,
-    workspace: &str,
-) -> Result<HostAccessRuntime, Box<dyn Error>> {
-    let _ = stop_host_access(state_dir, workspace);
-
-    let log_dir = state_dir.join(RUNTIME_SUBDIR);
-    fs::create_dir_all(&log_dir)?;
-    let log_path = log_dir.join(format!("{workspace}.host-access.log"));
-
-    let mut pids = Vec::new();
-    let open_log = || -> Result<(fs::File, fs::File), Box<dyn Error>> {
-        let f = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        let f2 = f.try_clone()?;
-        Ok((f, f2))
-    };
-
-    match plan.mode {
-        HostAccessMode::Kubefwd => {
-            if !command_exists("kubefwd") {
-                return Err("kubefwd not on PATH".into());
-            }
-            let args = build_kubefwd_args(&plan.namespace);
-            let (out, err) = open_log()?;
-            let child = Command::new("kubefwd")
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(out))
-                .stderr(Stdio::from(err))
-                .spawn()
-                .map_err(|e| format!("failed to spawn kubefwd: {e}"))?;
-            pids.push(child.id());
-            std::mem::forget(child);
-        }
-        HostAccessMode::Dns => {
-            let port_by_name: BTreeMap<&str, u16> = services
-                .iter()
-                .map(|s| (s.name.as_str(), s.port))
-                .collect();
-            for (svc_name, bind_ip) in &plan.ip_map {
-                let svc_port = port_by_name.get(svc_name.as_str()).copied().unwrap_or(80);
-                let args = build_dns_port_forward_args(
-                    &plan.namespace,
-                    svc_name,
-                    bind_ip,
-                    svc_port,
-                );
-                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                let (out, err) = open_log()?;
-                let child = kubectl_command(&arg_refs)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::from(out))
-                    .stderr(Stdio::from(err))
-                    .spawn()
-                    .map_err(|e| format!("failed to spawn kubectl port-forward (dns): {e}"))?;
-                pids.push(child.id());
-                std::mem::forget(child);
-            }
-        }
-        HostAccessMode::Map => {
-            let port_by_name: BTreeMap<&str, u16> = services
-                .iter()
-                .map(|s| (s.name.as_str(), s.port))
-                .collect();
-            for (svc_name, host_port) in &plan.port_map {
-                let svc_port = port_by_name.get(svc_name.as_str()).copied().unwrap_or(80);
-                let args = build_port_forward_args(
-                    &plan.namespace,
-                    svc_name,
-                    *host_port,
-                    svc_port,
-                );
-                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                let (out, err) = open_log()?;
-                let child = kubectl_command(&arg_refs)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::from(out))
-                    .stderr(Stdio::from(err))
-                    .spawn()
-                    .map_err(|e| format!("failed to spawn kubectl port-forward: {e}"))?;
-                pids.push(child.id());
-                std::mem::forget(child);
-            }
+        };
+        let Ok(rt) = serde_json::from_str::<HostAccessRuntime>(&text) else {
+            continue;
+        };
+        for (key, ip) in rt.ip_map {
+            let (ns, svc) = split_service_key(&key, &rt.namespace);
+            by_ns.entry(ns).or_default().insert(svc, ip);
         }
     }
-
-    let service_ports: BTreeMap<String, u16> = services
-        .iter()
-        .map(|s| (s.name.clone(), s.port))
-        .collect();
-    let runtime = HostAccessRuntime {
-        mode: plan.mode.as_str().to_string(),
-        namespace: plan.namespace.clone(),
-        pids: pids.clone(),
-        log_path: Some(log_path.display().to_string()),
-        port_map: plan.port_map.clone(),
-        service_ports,
-        ip_map: plan.ip_map.clone(),
-    };
-    save_host_access_runtime(state_dir, workspace, &runtime)?;
-    log::info!(
-        "host access started ({}) pids={:?}",
-        plan.mode.as_str(),
-        pids
-    );
-    Ok(runtime)
+    Ok(by_ns.into_iter().collect())
 }
 
-/// True if something is accepting TCP connections on 127.0.0.1:port.
-pub fn localhost_port_listening(port: u16) -> bool {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
-}
-
-/// Whether host access needs a restart (dead PIDs or ports not listening).
-pub fn host_access_needs_heal(rt: &HostAccessRuntime) -> bool {
-    let any_pid = rt.pids.iter().any(|p| pid_is_alive(*p));
-    if !any_pid {
-        return true;
-    }
-    match HostAccessMode::parse(&rt.mode).unwrap_or(HostAccessMode::Map) {
-        HostAccessMode::Map => {
-            if rt.port_map.is_empty() {
-                return false;
-            }
-            rt.port_map
-                .values()
-                .any(|port| !localhost_port_listening(*port))
-        }
-        HostAccessMode::Dns => {
-            // Probe service_port on each bind IP.
-            for (svc, ip) in &rt.ip_map {
-                let port = rt.service_ports.get(svc).copied().unwrap_or(80);
-                if !ip_port_listening(ip, port) {
-                    return true;
-                }
-            }
-            false
-        }
-        HostAccessMode::Kubefwd => false,
-    }
-}
-
-/// TCP probe for `ip:port` (dns mode uses 127.53.x.y).
-pub fn ip_port_listening(ip: &str, port: u16) -> bool {
-    let Ok(addr) = format!("{ip}:{port}").parse::<SocketAddr>() else {
-        return false;
-    };
-    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
-}
-
-/// Restart host access when processes or localhost ports are dead.
-///
-/// Uses recorded `port_map` / `service_ports` when present; otherwise rebuilds
-/// from `services` + `port_base`.
-pub fn ensure_host_access(
-    namespace: &str,
-    services: &[ServiceEndpoint],
-    port_base: u16,
-    state_dir: &Path,
-    workspace: &str,
-) -> Result<(HostAccessPlan, HostAccessRuntime, bool), Box<dyn Error>> {
-    let prior = load_host_access_runtime(state_dir, workspace)?;
-
-    if let Some(rt) = &prior {
-        if !host_access_needs_heal(rt) {
-            return Ok((plan_from_runtime(rt), rt.clone(), false));
-        }
-        log::info!("host access unhealthy; restarting ({})", rt.mode);
-    }
-
-    // Rebuild services list from runtime maps if discovery is empty.
-    let services = if services.is_empty() {
-        prior
-            .as_ref()
-            .map(services_from_runtime)
-            .unwrap_or_else(|| services.to_vec())
-    } else {
-        services.to_vec()
-    };
-
-    // Always prefer dns on restart; auto falls back to map if sudo/hosts fails.
-    let (plan, rt) =
-        start_host_access_auto(namespace, &services, false, port_base, state_dir, workspace)?;
-    std::thread::sleep(Duration::from_millis(400));
-    Ok((plan, rt, true))
-}
-
-fn plan_from_runtime(rt: &HostAccessRuntime) -> HostAccessPlan {
-    let mode = HostAccessMode::parse(&rt.mode).unwrap_or(HostAccessMode::Map);
-    let mut urls = BTreeMap::new();
-    match mode {
-        HostAccessMode::Map => {
-            for (name, host_port) in &rt.port_map {
-                urls.insert(name.clone(), format_map_url(*host_port));
-            }
-        }
-        HostAccessMode::Dns | HostAccessMode::Kubefwd => {
-            for (name, port) in &rt.service_ports {
-                urls.insert(
-                    name.clone(),
-                    format_dns_url(name, &rt.namespace, *port),
-                );
-            }
-            // Fallback if service_ports empty
-            if urls.is_empty() {
-                for name in rt.ip_map.keys() {
-                    urls.insert(
-                        name.clone(),
-                        format_dns_url(name, &rt.namespace, 80),
-                    );
-                }
-            }
-        }
-    }
-    HostAccessPlan {
-        mode,
-        namespace: rt.namespace.clone(),
-        urls,
-        port_map: rt.port_map.clone(),
-        port_base: rt.port_map.values().copied().min(),
-        ip_map: rt.ip_map.clone(),
-    }
-}
-
-fn services_from_runtime(rt: &HostAccessRuntime) -> Vec<ServiceEndpoint> {
-    let names: Vec<String> = if !rt.service_ports.is_empty() {
-        rt.service_ports.keys().cloned().collect()
-    } else if !rt.port_map.is_empty() {
-        rt.port_map.keys().cloned().collect()
-    } else {
-        rt.ip_map.keys().cloned().collect()
-    };
-    names
-        .into_iter()
-        .map(|name| ServiceEndpoint {
-            port: rt.service_ports.get(&name).copied().unwrap_or(80),
-            name,
-            protocol: "TCP".into(),
-        })
-        .collect()
-}
-
-/// Per-URL listen probe for status cards.
-pub fn url_listen_status(plan: &HostAccessPlan) -> BTreeMap<String, bool> {
-    let mut out = BTreeMap::new();
-    match plan.mode {
-        HostAccessMode::Map => {
-            for (name, host_port) in &plan.port_map {
-                out.insert(name.clone(), localhost_port_listening(*host_port));
-            }
-        }
-        HostAccessMode::Dns => {
-            for (name, ip) in &plan.ip_map {
-                // Extract port from URL if possible
-                let port = plan
-                    .urls
-                    .get(name)
-                    .and_then(|u| u.rsplit(':').next())
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(80);
-                out.insert(name.clone(), ip_port_listening(ip, port));
-            }
-        }
-        HostAccessMode::Kubefwd => {
-            for name in plan.urls.keys() {
-                out.insert(name.clone(), true);
-            }
-        }
-    }
-    out
-}
-
-/// Stop host access processes recorded for workspace (and best-effort pkill).
-pub fn stop_host_access(state_dir: &Path, workspace: &str) -> Result<(), Box<dyn Error>> {
-    if let Some(rt) = load_host_access_runtime(state_dir, workspace)? {
-        for pid in &rt.pids {
-            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
-        }
-        // Give processes a moment, then KILL
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        for pid in &rt.pids {
-            let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
-        }
-        // Also pkill by namespace pattern as safety net
-        let ns = &rt.namespace;
-        let _ = Command::new("sh")
-            .args([
-                "-c",
-                &format!(
-                    "pkill -f 'kubefwd.*{ns}' 2>/dev/null || true; \
-                     pkill -f 'port-forward.*-n {ns}' 2>/dev/null || true"
-                ),
-            ])
-            .status();
-
-        if rt.mode == HostAccessMode::Dns.as_str() {
-            let ips: Vec<String> = rt.ip_map.values().cloned().collect();
-            remove_loopback_aliases(&ips);
-            // Rebuild hosts without this workspace
-            if let Ok(blocks) = collect_dns_blocks_from_runtimes(state_dir, Some(workspace)) {
-                let _ = rebuild_hosts_from_blocks(&blocks);
-            }
-        }
-    }
-    clear_host_access_runtime(state_dir, workspace);
-    Ok(())
-}
-
-/// Whether a PID appears alive (not exited / not a zombie).
-///
-/// `kill -0` alone is insufficient after `mem::forget(Child)`: unreaped children
-/// stay as zombies and still "succeed" kill -0.
 pub fn pid_is_alive(pid: u32) -> bool {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "state="])
@@ -729,79 +1015,10 @@ pub fn pid_is_alive(pid: u32) -> bool {
         Ok(o) if o.status.success() => {
             let state = String::from_utf8_lossy(&o.stdout);
             let state = state.trim();
-            // Empty or Z/zombie → not usefully alive
             !state.is_empty() && !state.starts_with('Z') && !state.starts_with('z')
         }
         _ => false,
     }
-}
-
-/// Status line for host access runtime.
-pub fn host_access_status_line(rt: &HostAccessRuntime) -> String {
-    let alive: Vec<u32> = rt.pids.iter().copied().filter(|p| pid_is_alive(*p)).collect();
-    if alive.is_empty() {
-        return format!(
-            "access processes: none running (mode was {}; will heal on status/up)",
-            rt.mode
-        );
-    }
-    let listen = match HostAccessMode::parse(&rt.mode).unwrap_or(HostAccessMode::Map) {
-        HostAccessMode::Map if !rt.port_map.is_empty() => {
-            let ok = rt
-                .port_map
-                .values()
-                .filter(|p| localhost_port_listening(**p))
-                .count();
-            format!("; localhost {ok}/{} ports listening", rt.port_map.len())
-        }
-        HostAccessMode::Dns if !rt.ip_map.is_empty() => {
-            let mut ok = 0;
-            for (svc, ip) in &rt.ip_map {
-                let port = rt.service_ports.get(svc).copied().unwrap_or(80);
-                if ip_port_listening(ip, port) {
-                    ok += 1;
-                }
-            }
-            format!("; cluster-dns {ok}/{} endpoints listening", rt.ip_map.len())
-        }
-        _ => String::new(),
-    };
-    format!(
-        "access processes: {} alive (pids {}){}",
-        rt.mode,
-        alive
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-        listen
-    )
-}
-
-/// Human status card with optional listen markers on map URLs.
-pub fn format_status_card_with_listen(
-    workspace: &str,
-    plan: &HostAccessPlan,
-    listen: &BTreeMap<String, bool>,
-) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!("workspace: {workspace}"));
-    lines.push(format!("namespace: {}", plan.namespace));
-    lines.push(format!("access:   {}", plan.mode.as_str()));
-    if plan.urls.is_empty() {
-        lines.push("urls:     (no services discovered yet)".into());
-    } else {
-        lines.push("urls:".into());
-        for (name, url) in &plan.urls {
-            let mark = match listen.get(name) {
-                Some(true) => "  ok",
-                Some(false) => "  DOWN",
-                None => "",
-            };
-            lines.push(format!("  - {name}: {url}{mark}"));
-        }
-    }
-    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -809,176 +1026,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kubefwd_urls_include_namespace() {
-        let url = format_kubefwd_url("e2e-ui-ui", "hops-wt-alice", 5180);
-        assert_eq!(
-            url,
-            "http://e2e-ui-ui.hops-wt-alice.svc.cluster.local:5180"
-        );
-        let url2 = format_kubefwd_url("e2e-ui-ui", "hops-wt-bob", 5180);
-        assert_ne!(url, url2);
-    }
-
-    #[test]
-    fn two_workspaces_get_distinct_map_ports() {
-        let existing = vec![WorkspaceRecord {
-            name: "alice".into(),
-            namespace: "hops-wt-alice".into(),
-            env_path: "/x".into(),
-            project_root: None,
-            host_access_mode: Some("map".into()),
-            port_base: Some(18000),
-            delivery_mode: None,
-            updated_at: None,
-        }];
-        let bob_base = allocate_port_base(&existing);
-        assert_ne!(bob_base, 18000);
-        assert_eq!(bob_base, 18100);
-
-        let services = vec![
-            ServiceEndpoint {
-                name: "ui".into(),
-                port: 5180,
-                protocol: "TCP".into(),
-            },
-            ServiceEndpoint {
-                name: "api".into(),
-                port: 8791,
-                protocol: "TCP".into(),
-            },
-        ];
-        let alice = plan_host_access("hops-wt-alice", &services, false, 18000);
-        let bob = plan_host_access("hops-wt-bob", &services, false, bob_base);
-        assert_eq!(alice.mode, HostAccessMode::Map);
-        assert_eq!(bob.mode, HostAccessMode::Map);
-        assert_ne!(alice.urls.get("ui"), bob.urls.get("ui"));
-        assert_ne!(alice.port_map.get("ui"), bob.port_map.get("ui"));
-        assert!(alice.port_map.get("ui").unwrap() < bob.port_map.get("ui").unwrap());
-    }
-
-    #[test]
-    fn dns_mode_urls_use_cluster_fqdn() {
-        let services = vec![ServiceEndpoint {
-            name: "ui".into(),
+    fn plan_urls_are_cluster_fqdns() {
+        let svcs = vec![ServiceEndpoint {
+            namespace: "hops-wt-dogfood".into(),
+            name: "e2e-ui-ui".into(),
             port: 5180,
             protocol: "TCP".into(),
         }];
-        let plan = plan_host_access("hops-wt-x", &services, true, 18000);
-        assert_eq!(plan.mode, HostAccessMode::Dns);
-        assert!(plan.urls["ui"].contains("ui.hops-wt-x.svc.cluster.local:5180"));
-        assert!(plan.port_map.is_empty());
-    }
-
-    #[test]
-    fn status_card_lists_urls_without_kubectl() {
-        let services = vec![ServiceEndpoint {
-            name: "ui".into(),
-            port: 5180,
-            protocol: "TCP".into(),
-        }];
-        let plan = plan_host_access("hops-wt-alice", &services, true, 0);
-        let card = format_status_card("alice", &plan);
-        assert!(card.contains("workspace: alice"));
-        assert!(card.contains("ui:"));
-        assert!(!card.to_lowercase().contains("kubectl"));
-        assert!(card.contains("svc.cluster.local"));
-    }
-
-    #[test]
-    fn port_forward_args_bind_host_to_service_port() {
-        let args = build_port_forward_args("hops-wt-alice", "e2e-ui-ui", 18000, 5180);
+        let plan = plan_host_access("hops-wt-dogfood", &svcs);
         assert_eq!(
-            args,
-            vec![
-                "port-forward",
-                "-n",
-                "hops-wt-alice",
-                "svc/e2e-ui-ui",
-                "18000:5180",
-            ]
-        );
-        let args2 = build_port_forward_args("hops-wt-bob", "e2e-ui-ui", 18100, 5180);
-        assert_ne!(args, args2);
-        assert!(args2.contains(&"18100:5180".to_string()));
-    }
-
-    #[test]
-    fn kubefwd_args_target_namespace() {
-        assert_eq!(
-            build_kubefwd_args("hops-wt-alice"),
-            vec!["svc", "-n", "hops-wt-alice"]
+            plan.urls
+                .get("hops-wt-dogfood/e2e-ui-ui")
+                .map(String::as_str),
+            Some("http://e2e-ui-ui.hops-wt-dogfood.svc.cluster.local:5180")
         );
     }
 
     #[test]
-    fn host_access_runtime_round_trip() {
-        let dir = std::env::temp_dir().join(format!(
-            "lwb-net-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let mut port_map = BTreeMap::new();
-        port_map.insert("ui".into(), 18000);
-        let mut service_ports = BTreeMap::new();
-        service_ports.insert("ui".into(), 5180);
-        let rt = HostAccessRuntime {
-            mode: "map".into(),
-            namespace: "hops-wt-x".into(),
-            pids: vec![12345, 12346],
-            log_path: Some("/tmp/x.log".into()),
-            port_map,
-            service_ports,
-            ip_map: BTreeMap::new(),
-        };
-        save_host_access_runtime(&dir, "x", &rt).unwrap();
-        let loaded = load_host_access_runtime(&dir, "x").unwrap().unwrap();
-        assert_eq!(loaded.pids, vec![12345, 12346]);
-        assert_eq!(loaded.mode, "map");
-        assert_eq!(loaded.port_map.get("ui"), Some(&18000));
-        clear_host_access_runtime(&dir, "x");
-        assert!(load_host_access_runtime(&dir, "x").unwrap().is_none());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn host_access_needs_heal_when_no_pids() {
-        let rt = HostAccessRuntime {
-            mode: "map".into(),
-            namespace: "ns".into(),
-            pids: vec![],
-            log_path: None,
-            port_map: BTreeMap::new(),
-            service_ports: BTreeMap::new(),
-            ip_map: BTreeMap::new(),
-        };
-        assert!(host_access_needs_heal(&rt));
-    }
-
-    #[test]
-    fn map_mode_port_forward_args_match_started_processes() {
-        // Guarantees start_host_access_with_services map branch uses the pure builder.
-        let services = vec![
-            ServiceEndpoint {
-                name: "ui".into(),
-                port: 5180,
-                protocol: "TCP".into(),
-            },
-            ServiceEndpoint {
-                name: "api".into(),
-                port: 8791,
-                protocol: "TCP".into(),
-            },
-        ];
-        let plan = plan_host_access("hops-wt-alice", &services, false, 18000);
-        assert_eq!(plan.mode, HostAccessMode::Map);
-        for (svc, host_port) in &plan.port_map {
-            let svc_port = services.iter().find(|s| &s.name == svc).unwrap().port;
-            let args = build_port_forward_args(&plan.namespace, svc, *host_port, svc_port);
-            assert_eq!(args[0], "port-forward");
-            assert!(args.iter().any(|a| a == "hops-wt-alice"));
-            assert!(args.iter().any(|a| a == &format!("svc/{svc}")));
-            assert!(args.iter().any(|a| a == &format!("{host_port}:{svc_port}")));
-        }
+    fn parse_cluster_dns_from_env_value() {
+        let refs = regex_lite_cluster_dns(
+            "http://zitadel-zitadel.auth.svc.cluster.local:8080/oauth/v2/keys",
+        );
+        assert_eq!(
+            refs,
+            vec![("auth".into(), "zitadel-zitadel".into(), Some(8080))]
+        );
     }
 }

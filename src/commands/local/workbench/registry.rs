@@ -20,12 +20,6 @@ pub struct WorkspaceRecord {
     /// Absolute project root (parent of env path when known).
     #[serde(default)]
     pub project_root: Option<String>,
-    /// Host access mode last used.
-    #[serde(default)]
-    pub host_access_mode: Option<String>,
-    /// Map-mode port base when allocated.
-    #[serde(default)]
-    pub port_base: Option<u16>,
     /// Source delivery strategy selected.
     #[serde(default)]
     pub delivery_mode: Option<String>,
@@ -171,8 +165,6 @@ mod tests {
             namespace: namespace_for_name("alice"),
             env_path: "/proj/gitops/env/local".into(),
             project_root: Some("/proj".into()),
-            host_access_mode: None,
-            port_base: Some(18000),
             delivery_mode: Some("hostPath".into()),
             updated_at: None,
         };
@@ -181,8 +173,6 @@ mod tests {
             namespace: namespace_for_name("bob"),
             env_path: "/proj/gitops/env/local".into(),
             project_root: Some("/proj".into()),
-            host_access_mode: None,
-            port_base: Some(18100),
             delivery_mode: Some("sync".into()),
             updated_at: None,
         };
@@ -194,7 +184,6 @@ mod tests {
         assert_eq!(loaded_a.namespace, "hops-wt-alice");
         assert_eq!(loaded_b.namespace, "hops-wt-bob");
         assert_ne!(loaded_a.namespace, loaded_b.namespace);
-        assert_ne!(loaded_a.port_base, loaded_b.port_base);
 
         let all = list_workspaces(&dir).unwrap();
         assert_eq!(all.len(), 2);
