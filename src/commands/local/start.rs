@@ -6,11 +6,11 @@ use std::thread;
 use std::time::Duration;
 
 // Per-provider DRCs — never shared. Each pins its own cluster-admin SA so the
-// providers can never clobber each other's runtime config. See bootstrap/drc/.
-const DRC_K8S: &str = include_str!("../../../bootstrap/drc/kubernetes.yaml");
-const DRC_HELM: &str = include_str!("../../../bootstrap/drc/helm.yaml");
-const PROVIDER_HELM: &str = include_str!("../../../bootstrap/providers/provider-helm.yaml");
-const PROVIDER_K8S: &str = include_str!("../../../bootstrap/providers/provider-kubernetes.yaml");
+// providers can never clobber each other's runtime config. See bootstrap/providers/.
+const DRC_K8S: &str = include_str!("../../../bootstrap/providers/kubernetes-drc.yaml");
+const DRC_HELM: &str = include_str!("../../../bootstrap/providers/helm-drc.yaml");
+const PROVIDER_HELM: &str = include_str!("../../../bootstrap/providers/helm.yaml");
+const PROVIDER_K8S: &str = include_str!("../../../bootstrap/providers/kubernetes.yaml");
 const PC_HELM: &str = include_str!("../../../bootstrap/helm/pc.yaml");
 const PC_K8S: &str = include_str!("../../../bootstrap/k8s/pc.yaml");
 
