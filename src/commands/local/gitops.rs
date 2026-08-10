@@ -17,7 +17,9 @@ use super::workbench::reconcile::{
 use super::workbench::watch::{
     is_chart_or_env_path, should_ignore_watch_path, watch_roots_for_applications, WatchPathClass,
 };
+use super::workbench::registry::{activate_workspace_cluster, load_workspace};
 use super::workbench::{namespace_for_name, slugify_name};
+use super::local_state_dir;
 use clap::{Args, Subcommand};
 use notify::{RecursiveMode, Watcher};
 use std::collections::BTreeMap;
@@ -177,6 +179,15 @@ fn run_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
         .namespace
         .clone()
         .unwrap_or_else(|| namespace_for_name(&workspace_name));
+
+    // Sticky workspace→cluster: use bound kube context when registered.
+    if let Ok(state_dir) = local_state_dir() {
+        if let Ok(Some(rec)) = load_workspace(&state_dir, &workspace_name) {
+            if let Some((cluster, ctx)) = activate_workspace_cluster(&rec) {
+                log::info!("worktree gitops: bound cluster `{cluster}` (context {ctx})");
+            }
+        }
+    }
 
     let mut app_delivery_host_paths = BTreeMap::new();
     if let Ok(apps) = load_applications(&env_path) {
