@@ -188,12 +188,31 @@ nodes:
 }
 
 /// Host directory to bind into the kind node for hostPath delivery.
-/// Default: `$HOME` when it is an existing directory.
+///
+/// Precedence:
+/// 1. `HOPS_KIND_EXTRA_MOUNT` (absolute path)
+/// 2. `$HOME/dev` when it exists (narrower than full home — avoids kube-proxy
+///    EMFILE from watching huge home trees on Mac/Dory)
+/// 3. `$HOME` when it is a directory
 pub fn default_extra_mount_root() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("HOPS_KIND_EXTRA_MOUNT") {
+        let p = PathBuf::from(raw.trim());
+        if p.is_dir() {
+            return Some(p);
+        }
+        log::warn!(
+            "HOPS_KIND_EXTRA_MOUNT={} is not a directory; falling back",
+            p.display()
+        );
+    }
     let home = std::env::var_os("HOME")?;
-    let p = PathBuf::from(home);
-    if p.is_dir() {
-        Some(p)
+    let home = PathBuf::from(home);
+    let dev = home.join("dev");
+    if dev.is_dir() {
+        return Some(dev);
+    }
+    if home.is_dir() {
+        Some(home)
     } else {
         None
     }
@@ -454,7 +473,19 @@ fn create_cluster() -> Result<(), Box<dyn Error>> {
     if let Some(ref m) = mount {
         verify_node_mount(m)?;
     }
+    // Raise inotify limits: mounting large host trees (even $HOME/dev) can make
+    // kube-proxy fail with "too many open files" under default instance caps.
+    raise_node_inotify_limits();
     Ok(())
+}
+
+fn raise_node_inotify_limits() {
+    let node = node_container_name();
+    let script = "sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=1048576 >/dev/null 2>&1 || true";
+    match docker_output(&["exec", &node, "sh", "-c", script]) {
+        Ok(_) => log::info!("raised kind node inotify limits for host mounts"),
+        Err(e) => log::debug!("inotify sysctl skipped: {e}"),
+    }
 }
 
 fn verify_node_mount(host_path: &Path) -> Result<(), Box<dyn Error>> {
