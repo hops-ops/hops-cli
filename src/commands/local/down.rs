@@ -3,7 +3,8 @@
 use super::up::stop_delivery_runtime;
 use super::workbench::net::stop_host_access;
 use super::workbench::registry::{
-    list_workspaces, load_workspace, namespace_for_name, remove_workspace,
+    activate_workspace_cluster, list_workspaces, load_workspace, namespace_for_name,
+    remove_workspace,
 };
 use super::{local_state_dir, run_cmd};
 use clap::Args;
@@ -52,6 +53,12 @@ pub fn run(args: &DownArgs) -> Result<(), Box<dyn Error>> {
         .as_ref()
         .map(|r| r.namespace.clone())
         .unwrap_or_else(|| namespace_for_name(&name));
+
+    if let Some(ref rec) = record {
+        if let Some((cluster, ctx)) = activate_workspace_cluster(rec) {
+            log::info!("Using bound cluster `{cluster}` (context {ctx})");
+        }
+    }
 
     log::info!("Bringing down workspace `{name}` (namespace {namespace})");
 

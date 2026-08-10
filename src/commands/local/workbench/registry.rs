@@ -35,10 +35,12 @@ pub struct WorkspaceRecord {
 
 /// Resolve cluster binding for a workspace up/down/status operation.
 ///
+/// - **Sticky:** when the workspace is already bound and `requested_cluster` is
+///   omitted, return the **bound** cluster (do not fall back to process default).
 /// - No prior record: accept `requested` (or default) and bind.
-/// - Prior record matches requested/default: keep.
-/// - Prior record differs without `rebind`: error.
-/// - Prior record differs with `rebind`: accept new.
+/// - Explicit request matching bound: keep bound context.
+/// - Explicit request differing without `rebind`: error.
+/// - Explicit request differing with `rebind`: accept new.
 pub fn resolve_cluster_binding(
     existing: Option<&WorkspaceRecord>,
     requested_cluster: Option<&str>,
@@ -46,27 +48,33 @@ pub fn resolve_cluster_binding(
     default_kube_context: &str,
     rebind: bool,
 ) -> Result<(String, String), String> {
-    let requested = requested_cluster
+    let explicit = requested_cluster
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(default_cluster);
+        .filter(|s| !s.is_empty());
 
-    let kube = if requested == default_cluster {
-        default_kube_context.to_string()
-    } else {
-        // kind contexts are kind-<name>; product dory/colima keep their context.
-        if default_kube_context.starts_with("kind-") {
-            format!("kind-{requested}")
-        } else {
-            default_kube_context.to_string()
+    // Sticky core: no explicit --cluster-name → keep bound cluster if any.
+    if explicit.is_none() {
+        if let Some(rec) = existing {
+            if let Some(bound) = rec.cluster_name.as_deref().filter(|s| !s.is_empty()) {
+                let ctx = rec
+                    .kube_context
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| kube_context_for_cluster(bound, default_cluster, default_kube_context));
+                return Ok((bound.to_string(), ctx));
+            }
         }
-    };
+    }
 
-    match existing.and_then(|e| e.cluster_name.as_deref()) {
+    let requested = explicit.unwrap_or(default_cluster);
+    let kube = kube_context_for_cluster(requested, default_cluster, default_kube_context);
+
+    match existing.and_then(|e| e.cluster_name.as_deref().filter(|s| !s.is_empty())) {
         None => Ok((requested.to_string(), kube)),
         Some(bound) if bound == requested => {
             let ctx = existing
                 .and_then(|e| e.kube_context.clone())
+                .filter(|s| !s.is_empty())
                 .unwrap_or(kube);
             Ok((bound.to_string(), ctx))
         }
@@ -75,6 +83,46 @@ pub fn resolve_cluster_binding(
             "workspace is bound to cluster `{bound}`; pass `--rebind-cluster` to move to `{requested}`"
         )),
     }
+}
+
+/// Derive kube context for a logical cluster name.
+pub fn kube_context_for_cluster(
+    cluster_name: &str,
+    default_cluster: &str,
+    default_kube_context: &str,
+) -> String {
+    if cluster_name == default_cluster {
+        return default_kube_context.to_string();
+    }
+    // kind contexts are kind-<name>; product dory/colima keep their default context
+    // only when the name matches the default cluster identity.
+    if default_kube_context.starts_with("kind-") || default_kube_context.is_empty() {
+        format!("kind-{cluster_name}")
+    } else {
+        default_kube_context.to_string()
+    }
+}
+
+/// Activate process kube context (+ kind cluster name) from a workspace record.
+/// Returns the bound cluster name and context when present.
+pub fn activate_workspace_cluster(
+    record: &WorkspaceRecord,
+) -> Option<(String, String)> {
+    let cluster = record.cluster_name.as_deref()?.trim();
+    if cluster.is_empty() {
+        return None;
+    }
+    let ctx = record
+        .kube_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("kind-{cluster}"));
+
+    std::env::set_var(crate::commands::local::HOPS_KUBE_CONTEXT_ENV, &ctx);
+    crate::commands::local::backend::kind::set_active_cluster_name(cluster);
+    Some((cluster.to_string(), ctx))
 }
 
 /// DNS-1123-ish slug for a workspace name.
@@ -290,6 +338,34 @@ mod tests {
             resolve_cluster_binding(None, None, "hops", "kind-hops", false).unwrap();
         assert_eq!(c3, "hops");
         assert_eq!(k3, "kind-hops");
+    }
+
+    #[test]
+    fn sticky_omitted_request_keeps_bound_cluster_not_process_default() {
+        // Core sticky case: bound to dogfood; process default is hops; no --cluster-name.
+        let existing = WorkspaceRecord {
+            name: "alice".into(),
+            namespace: "alice".into(),
+            env_path: "/p".into(),
+            project_root: None,
+            delivery_mode: None,
+            updated_at: None,
+            cluster_name: Some("dogfood".into()),
+            kube_context: Some("kind-dogfood".into()),
+        };
+        let (c, k) =
+            resolve_cluster_binding(Some(&existing), None, "hops", "kind-hops", false).unwrap();
+        assert_eq!(c, "dogfood", "must keep sticky bind when request omitted");
+        assert_eq!(k, "kind-dogfood");
+        // Without stored kube_context, still derive kind-<bound>
+        let no_ctx = WorkspaceRecord {
+            kube_context: None,
+            ..existing.clone()
+        };
+        let (c2, k2) =
+            resolve_cluster_binding(Some(&no_ctx), None, "hops", "kind-hops", false).unwrap();
+        assert_eq!(c2, "dogfood");
+        assert_eq!(k2, "kind-dogfood");
     }
 
     #[test]

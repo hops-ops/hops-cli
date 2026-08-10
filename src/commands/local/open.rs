@@ -1,7 +1,9 @@
 //! `hops local open` — open the primary UI URL in a browser when possible.
 
 use super::workbench::net::{discover_workspace_endpoints, plan_host_access};
-use super::workbench::registry::{list_workspaces, load_workspace};
+use super::workbench::registry::{
+    activate_workspace_cluster, list_workspaces, load_workspace,
+};
 use super::{command_exists, local_state_dir, run_cmd};
 use clap::Args;
 use std::error::Error;
@@ -46,6 +48,9 @@ pub fn run(args: &OpenArgs) -> Result<(), Box<dyn Error>> {
         }
     };
 
+    if let Some((cluster, ctx)) = activate_workspace_cluster(&ws) {
+        log::debug!("open: bound cluster `{cluster}` (context {ctx})");
+    }
     let services = discover_workspace_endpoints(&ws.namespace).unwrap_or_default();
     let plan = plan_host_access(&ws.namespace, &services);
 

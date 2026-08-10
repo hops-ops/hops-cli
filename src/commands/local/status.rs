@@ -6,7 +6,9 @@ use super::workbench::net::{
     discover_workspace_endpoints, ensure_host_access, format_status_card_with_listen,
     host_access_status_line, load_host_access_runtime, plan_host_access, url_listen_status,
 };
-use super::workbench::registry::{list_workspaces, load_workspace};
+use super::workbench::registry::{
+    activate_workspace_cluster, list_workspaces, load_workspace,
+};
 use super::{local_state_dir, run_cmd_output};
 use clap::Args;
 use std::error::Error;
@@ -59,6 +61,8 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
             let ctx = ws.kube_context.as_deref().unwrap_or("-");
             println!("cluster:  {cn} (context {ctx})");
         }
+        // Target the workspace's bound cluster before kubectl discovery.
+        let _ = activate_workspace_cluster(ws);
         let services = discover_workspace_endpoints(&ws.namespace).unwrap_or_default();
 
         let (plan, healed) = if !args.no_heal && !services.is_empty() {
