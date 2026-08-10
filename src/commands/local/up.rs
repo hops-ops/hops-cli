@@ -19,8 +19,11 @@ use super::workbench::reconcile::{
     reconcile_applications, ReconcileOptions, SystemHelm, SystemKubectl,
 };
 use super::workbench::registry::{
-    default_name_from_cwd, namespace_for_name, save_workspace, WorkspaceRecord,
+    default_name_from_cwd, load_workspace, namespace_for_name, resolve_cluster_binding,
+    save_workspace, WorkspaceRecord,
 };
+use super::backend;
+use super::HOPS_KUBE_CONTEXT_ENV;
 use super::workbench::watch::{
     is_chart_or_env_path, should_ignore_watch_path, watch_roots_for_applications, WatchPathClass,
 };
@@ -44,10 +47,21 @@ pub struct UpArgs {
 
     /// Path to **shared** control-plane gitops (PSQLStack, AuthStack, packages).
     /// Not per-worktree: one tree per local CP, usually meta-repo `gitops/cluster`.
-    /// Default: `--cluster`, else `$HOPS_LOCAL_CLUSTER`, else walk up from env/cwd
+    /// Default: this path, else `$HOPS_LOCAL_CLUSTER`, else walk up from env/cwd
     /// for `gitops/cluster`. Project charts stay under each app's `.gitops/deploy`.
+    ///
+    /// Note: kube **cluster name** binding uses `--cluster-name` (not this path flag).
     #[arg(long)]
     pub cluster: Option<PathBuf>,
+
+    /// Bind this workspace to a named local control plane (e.g. kind name `hops`).
+    /// Sticky on the workspace record; changing requires `--rebind-cluster`.
+    #[arg(long = "cluster-name", value_name = "NAME")]
+    pub cluster_name: Option<String>,
+
+    /// Allow rebinding the workspace to a different `--cluster-name`.
+    #[arg(long, default_value_t = false)]
+    pub rebind_cluster: bool,
 
     /// Skip applying/watching cluster gitops.
     #[arg(long, default_value_t = false)]
@@ -115,6 +129,30 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
     let namespace = namespace_for_name(&name);
 
     let state_dir = local_state_dir()?;
+
+    // Workspace → cluster sticky binding (LWB-REQ-256/257).
+    let existing = load_workspace(&state_dir, &name)?;
+    let default_cluster = backend::kind::active_cluster_name();
+    let default_ctx = std::env::var(HOPS_KUBE_CONTEXT_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| backend::kind::kube_context_name());
+    let (bound_cluster, bound_ctx) = resolve_cluster_binding(
+        existing.as_ref(),
+        args.cluster_name.as_deref(),
+        &default_cluster,
+        &default_ctx,
+        args.rebind_cluster,
+    )
+    .map_err(|e| e)?;
+    // Activate bound kube context for this process when set.
+    if !bound_ctx.is_empty() {
+        std::env::set_var(HOPS_KUBE_CONTEXT_ENV, &bound_ctx);
+        backend::kind::set_active_cluster_name(&bound_cluster);
+    }
+    log::info!(
+        "Workspace `{name}` bound to cluster `{bound_cluster}` (context {bound_ctx})"
+    );
 
     // Delivery host roots: default is the git **worktree root** for each app
     // (shared monorepo/meta tree of *this* worktree's changes). Explicit
@@ -273,6 +311,8 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
         project_root: project_root.map(|p| p.display().to_string()),
         delivery_mode: delivery_mode.map(|d| d.as_str().to_string()),
         updated_at: Some(chrono_lite_now()),
+        cluster_name: Some(bound_cluster.clone()),
+        kube_context: Some(bound_ctx.clone()),
     };
     if !args.dry_run {
         save_workspace(&state_dir, &record)?;
@@ -280,6 +320,7 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
 
     println!();
     println!("{}", format_status_card(&name, &plan));
+    println!("cluster:  {bound_cluster} (context {bound_ctx})");
     if let Some(d) = delivery_mode {
         println!("delivery: {} ({})", d.as_str(), probe_detail.as_deref().unwrap_or("auto"));
     }

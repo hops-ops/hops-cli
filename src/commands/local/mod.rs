@@ -108,16 +108,30 @@ pub struct LocalArgs {
     #[arg(long, global = true)]
     pub context: Option<String>,
 
-    /// Local cluster backend to target. Defaults to the backend persisted by
-    /// the last successful `hops local start`, else an existing cluster if
-    /// one is detected, else the platform default (macOS: colima, otherwise
-    /// kind).
+    /// Local cluster backend to target (**deprecated** — prefer
+    /// `--cluster-provider` / `--docker-provider`). Maps 1:1 to both dimensions.
+    /// Defaults to the backend persisted by the last successful `hops local start`,
+    /// else an existing cluster if one is detected, else the platform default.
     #[arg(long, global = true, value_enum)]
     pub backend: Option<backend::Backend>,
 
+    /// How Kubernetes nodes are provisioned: `kind`, `dory` (product k3s), `colima`.
+    /// Preferred Mac hostPath path: `--cluster-provider kind --docker-provider dory`.
+    #[arg(long = "cluster-provider", visible_alias = "cp", global = true, value_enum)]
+    pub cluster_provider: Option<backend::ClusterProvider>,
+
+    /// Container engine for kind/tools: `dory`, `colima`, `docker`.
+    #[arg(long = "docker-provider", visible_alias = "dp", global = true, value_enum)]
+    pub docker_provider: Option<backend::DockerProvider>,
+
+    /// Named hops-managed kind cluster (`kind create --name`). Default `hops`
+    /// → kube context `kind-hops`. Distinct from workspace `--name`.
+    #[arg(long = "cluster-name", global = true, value_name = "NAME")]
+    pub cluster_name: Option<String>,
+
     /// Dory desktop integration name (kube context + docker context).
     /// Defaults to `hops-dory`. Persisted under `~/.hops/local/dory-name`.
-    /// Only used with `--backend dory` (or a persisted dory backend).
+    /// Only used with cluster-provider/backend dory.
     ///
     /// Named `--dory-name` (not `--name`) so it never collides with workspace
     /// `--name` on `hops local up|down|status|open|gitops worktree`.
@@ -176,12 +190,23 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
     }
 
     let explicit_context = args.context.as_deref().filter(|ctx| !ctx.is_empty());
-    let install_backend = matches!(&args.command, LocalCommands::Install)
-        .then(|| args.backend.unwrap_or_else(backend::platform_default));
-    let activation_flag = install_backend.or(args.backend);
-    let install_context = install_backend.map(|b| b.kube_context());
-    let activation_context = explicit_context.or(install_context.as_deref());
-    let backend = backend::activate(activation_flag, activation_context);
+    // Install with no provider flags uses platform default (same as before).
+    let backend_flag = if matches!(&args.command, LocalCommands::Install)
+        && args.backend.is_none()
+        && args.cluster_provider.is_none()
+        && args.docker_provider.is_none()
+    {
+        Some(backend::platform_default())
+    } else {
+        args.backend
+    };
+    let backend = backend::activate_with_providers(
+        backend_flag,
+        args.cluster_provider,
+        args.docker_provider,
+        args.cluster_name.as_deref(),
+        explicit_context,
+    )?;
 
     match &args.command {
         LocalCommands::Install => install::run(backend),

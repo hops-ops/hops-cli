@@ -7,6 +7,12 @@
 mod colima;
 mod dory;
 pub(crate) mod kind;
+pub mod providers;
+
+pub use providers::{
+    apply_docker_provider_env, load_persisted_providers, persist_providers, resolve_provider_pair,
+    ClusterProvider, DockerProvider,
+};
 
 use super::{local_state_dir, run_cmd_output, HOPS_KUBE_CONTEXT_ENV};
 use clap::Args;
@@ -81,7 +87,7 @@ impl Backend {
     pub fn kube_context(self) -> String {
         match self {
             Backend::Colima => "colima".to_string(),
-            Backend::Kind => "kind-hops".to_string(),
+            Backend::Kind => kind::kube_context_name(),
             // Merged into ~/.kube/config (default name hops-dory; see dory::context_name).
             Backend::Dory => dory::context_name(),
         }
@@ -255,6 +261,37 @@ pub fn resolve(flag: Option<Backend>) -> Backend {
         dory::cluster_exists,
         platform_default() == Backend::Colima,
     )
+}
+
+/// Resolve backend from optional provider pair + legacy backend flag, then activate.
+pub fn activate_with_providers(
+    backend_flag: Option<Backend>,
+    cluster_provider: Option<ClusterProvider>,
+    docker_provider: Option<DockerProvider>,
+    cluster_name: Option<&str>,
+    context: Option<&str>,
+) -> Result<Backend, Box<dyn Error>> {
+    if let Some(name) = cluster_name.map(str::trim).filter(|s| !s.is_empty()) {
+        kind::set_active_cluster_name(name);
+    } else if let Some(persisted) = load_persisted_providers() {
+        if let Some(name) = persisted.cluster_name.as_deref() {
+            kind::set_active_cluster_name(name);
+        }
+    }
+
+    let pair = resolve_provider_pair(backend_flag, cluster_provider, docker_provider)?;
+    let backend = match pair {
+        Some(p) => {
+            apply_docker_provider_env(p.docker)?;
+            let cname = kind::active_cluster_name();
+            let _ = persist_providers(p, Some(cname.as_str()));
+            p.as_backend()
+        }
+        None => resolve(backend_flag),
+    };
+
+    // Kind + default docker provider still auto-picks dory.sock inside kind module.
+    Ok(activate(Some(backend), context))
 }
 
 /// Resolve the backend once and activate the kube-targeting environment for

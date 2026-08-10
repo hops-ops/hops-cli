@@ -55,6 +55,10 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         if i > 0 {
             println!();
         }
+        if let Some(cn) = ws.cluster_name.as_deref() {
+            let ctx = ws.kube_context.as_deref().unwrap_or("-");
+            println!("cluster:  {cn} (context {ctx})");
+        }
         let services = discover_workspace_endpoints(&ws.namespace).unwrap_or_default();
 
         let (plan, healed) = if !args.no_heal && !services.is_empty() {

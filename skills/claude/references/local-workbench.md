@@ -15,8 +15,9 @@ tree copy). You do not need to learn volume types.
 
 ```bash
 # Dory app running (engine healthy). Product Dory Kubernetes is optional.
-# hops points kind at ~/.dory/dory.sock when present.
-hops local start --backend kind --gitops ./gitops/cluster
+# Preferred flags (cluster-provider + docker-provider):
+hops local start --cp kind --dp dory --gitops ./gitops/cluster
+# Deprecated alias still works: --backend kind (auto-picks dory.sock when present)
 ```
 
 Context is typically `kind-hops`. Confirm mounts:

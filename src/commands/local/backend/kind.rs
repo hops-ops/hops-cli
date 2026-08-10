@@ -28,8 +28,42 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-pub const CLUSTER_NAME: &str = "hops";
-const NODE_CONTAINER: &str = "hops-control-plane";
+/// Default kind cluster name (and historical hard-coded value).
+pub const DEFAULT_CLUSTER_NAME: &str = "hops";
+const KIND_CLUSTER_NAME_ENV: &str = "HOPS_KIND_CLUSTER_NAME";
+
+/// Active hops kind cluster name (`kind create --name`).
+pub fn active_cluster_name() -> String {
+    std::env::var(KIND_CLUSTER_NAME_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_CLUSTER_NAME.to_string())
+}
+
+/// Set active kind cluster name for this process (and kind create/delete).
+pub fn set_active_cluster_name(name: &str) {
+    let n = name.trim();
+    if n.is_empty() {
+        std::env::remove_var(KIND_CLUSTER_NAME_ENV);
+    } else {
+        std::env::set_var(KIND_CLUSTER_NAME_ENV, n);
+    }
+}
+
+/// kubeconfig context kind creates for the active name (`kind-<name>`).
+pub fn kube_context_name() -> String {
+    format!("kind-{}", active_cluster_name())
+}
+
+/// Docker container name for the control-plane node.
+pub fn node_container_name() -> String {
+    format!("{}-control-plane", active_cluster_name())
+}
+
+// Compatibility: older call sites used constants.
+#[allow(dead_code)]
+const CLUSTER_NAME: &str = DEFAULT_CLUSTER_NAME;
 
 /// kind node images before v0.27.0 ship containerd 1.x without certs.d
 /// `config_path` enabled, so our hosts.toml files would be ignored.
@@ -95,7 +129,8 @@ impl NodeMountReport {
 
 /// Whether the kind control-plane container is present on the resolved docker engine.
 pub fn kind_node_present() -> bool {
-    docker_output(&["inspect", "-f", "{{.Id}}", NODE_CONTAINER]).is_ok()
+    let node = node_container_name();
+    docker_output(&["inspect", "-f", "{{.Id}}", &node]).is_ok()
 }
 
 /// Probe the kind node for the default projects-root mount (same path as create).
@@ -116,7 +151,8 @@ pub fn report_projects_root_on_kind_node() -> NodeMountReport {
 
 /// `docker exec` test -d on the kind node (shared by create verify + doctor).
 pub fn node_sees_path(path: &str) -> bool {
-    docker_output(&["exec", NODE_CONTAINER, "test", "-d", path]).is_ok()
+    let node = node_container_name();
+    docker_output(&["exec", &node, "test", "-d", path]).is_ok()
 }
 
 /// Build the kind cluster config YAML.
@@ -254,29 +290,33 @@ pub fn start(size: &SizeArgs) -> Result<(), Box<dyn Error>> {
         return create_cluster();
     }
 
+    let name = active_cluster_name();
+    let node = node_container_name();
     if node_running() {
-        log::info!("kind cluster '{}' is already running", CLUSTER_NAME);
+        log::info!("kind cluster '{name}' is already running");
         log_mount_hint();
         return Ok(());
     }
 
     // kind has no start/stop; the node is a docker container. Restarting a
     // single-node cluster is reliable in practice but not guaranteed by kind.
-    log::info!("Starting stopped kind node '{}'...", NODE_CONTAINER);
-    docker_run(&["start", NODE_CONTAINER])?;
+    log::info!("Starting stopped kind node '{node}'...");
+    docker_run(&["start", &node])?;
     wait_for_api_after_restart()
 }
 
 pub fn stop() -> Result<(), Box<dyn Error>> {
-    log::info!("Stopping kind node '{}'...", NODE_CONTAINER);
-    docker_run(&["stop", NODE_CONTAINER])?;
+    let node = node_container_name();
+    log::info!("Stopping kind node '{node}'...");
+    docker_run(&["stop", &node])?;
     log::info!("kind cluster stopped");
     Ok(())
 }
 
 pub fn destroy() -> Result<(), Box<dyn Error>> {
-    log::info!("Deleting kind cluster '{}'...", CLUSTER_NAME);
-    let status = kind_cmd(&["delete", "cluster", "--name", CLUSTER_NAME])
+    let name = active_cluster_name();
+    log::info!("Deleting kind cluster '{name}'...");
+    let status = kind_cmd(&["delete", "cluster", "--name", &name])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -319,13 +359,15 @@ pub fn cluster_exists() -> bool {
     if !output.status.success() {
         return false;
     }
+    let name = active_cluster_name();
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .any(|line| line.trim() == CLUSTER_NAME)
+        .any(|line| line.trim() == name)
 }
 
 fn node_running() -> bool {
-    docker_output(&["inspect", "-f", "{{.State.Running}}", NODE_CONTAINER])
+    let node = node_container_name();
+    docker_output(&["inspect", "-f", "{{.State.Running}}", &node])
         .map(|out| out.trim() == "true")
         .unwrap_or(false)
 }
@@ -383,21 +425,20 @@ fn create_cluster() -> Result<(), Box<dyn Error>> {
              package push may need the same port)"
         );
     }
+    let name = active_cluster_name();
     if let Some(ref m) = mount {
         log::info!(
-            "Creating kind cluster '{}' with extraMounts {} → {} (hostPath delivery)...",
-            CLUSTER_NAME,
+            "Creating kind cluster '{name}' with extraMounts {} → {} (hostPath delivery)...",
             m.display(),
             m.display()
         );
     } else {
         log::info!(
-            "Creating kind cluster '{}' (no HOME mount; hostPath delivery may fall back to sync)...",
-            CLUSTER_NAME
+            "Creating kind cluster '{name}' (no HOME mount; hostPath delivery may fall back to sync)..."
         );
     }
 
-    let mut child = kind_cmd(&["create", "cluster", "--name", CLUSTER_NAME, "--config", "-"])
+    let mut child = kind_cmd(&["create", "cluster", "--name", &name, "--config", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -477,8 +518,8 @@ fn write_hosts_toml(registry_name: &str, cluster_ip: &str) -> Result<(), Box<dyn
     let path = format!("{}/hosts.toml", dir);
     let desired = hosts_toml(cluster_ip);
 
-    let current =
-        docker_output(&["exec", NODE_CONTAINER, "cat", &path]).unwrap_or_default();
+    let node = node_container_name();
+    let current = docker_output(&["exec", &node, "cat", &path]).unwrap_or_default();
     if current == desired {
         return Ok(());
     }
@@ -492,7 +533,7 @@ fn write_hosts_toml(registry_name: &str, cluster_ip: &str) -> Result<(), Box<dyn
     let mut child = docker_cmd(&[
         "exec",
         "-i",
-        NODE_CONTAINER,
+        &node,
         "sh",
         "-c",
         &format!("mkdir -p '{}' && cat > '{}'", dir, path),
@@ -564,6 +605,18 @@ mod tests {
         }
         .is_hostpath_capable());
         assert!(!NodeMountReport::NoKindNode.is_hostpath_capable());
+    }
+
+    #[test]
+    fn named_cluster_drives_context_and_node_container() {
+        set_active_cluster_name("dogfood");
+        assert_eq!(active_cluster_name(), "dogfood");
+        assert_eq!(kube_context_name(), "kind-dogfood");
+        assert_eq!(node_container_name(), "dogfood-control-plane");
+        set_active_cluster_name("hops");
+        assert_eq!(kube_context_name(), "kind-hops");
+        set_active_cluster_name("");
+        assert_eq!(active_cluster_name(), DEFAULT_CLUSTER_NAME);
     }
 
     #[test]
