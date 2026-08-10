@@ -4,14 +4,39 @@ Develop against the laptop control plane without learning volumes, hostPath, or 
 
 ## One-time prerequisite
 
-Start the local control plane (optional `--gitops` = bootstrap then full
-`gitops cluster` apply + watch until Ctrl+C):
+Also need `helm`, `kubectl`, and `kind` on your PATH (for the preferred Mac path).
+
+### Preferred on Mac (live edit / near-native HMR)
+
+Use **kind** as the Kubernetes node provider and **Dory** as the docker engine.
+hops mounts your home directory into the kind node so source delivery can use
+**hostPath** (edit on the Mac → files appear in cluster-dev pods without a full
+tree copy). You do not need to learn volume types.
+
+```bash
+# Dory app running (engine healthy). Product Dory Kubernetes is optional.
+# hops points kind at ~/.dory/dory.sock when present.
+hops local start --backend kind --gitops ./gitops/cluster
+```
+
+Context is typically `kind-hops`. Confirm mounts:
+
+```bash
+hops local doctor   # "kind node projects-root mount (hostPath capable)"
+```
+
+**Changing mounts:** recreate the kind cluster — `hops local reset --backend kind`
+(or destroy + start). Existing clusters created without mounts will not pick up
+home mounts until reset.
+
+### Alternative: product Dory Kubernetes
+
+Stock Dory k8s (`--backend dory`) is fine for platform experiments but usually
+**cannot** hostPath-mount Mac paths into the node; delivery falls back to sync.
 
 ```bash
 hops local start --backend dory --gitops ./gitops/cluster
 ```
-
-Also need `helm` and `kubectl` on your PATH.
 
 ## Daily loop
 
@@ -58,9 +83,11 @@ Each name maps to namespace `<name>` and gets its own access URLs.
 
 ```bash
 cd distributed/tests/e2e-ui
-hops local start --backend dory --gitops ./gitops/cluster
+# Prefer kind-on-Dory for hostPath HMR (see One-time prerequisite)
+hops local start --backend kind --gitops ./gitops/cluster
 hops local gitops cluster ./gitops/cluster
 hops local gitops worktree ./gitops/envs/local --name dogfood
+# or: hops local up ./gitops/envs/local --name dogfood
 hops local status
 hops local open
 hops local down --name dogfood --purge

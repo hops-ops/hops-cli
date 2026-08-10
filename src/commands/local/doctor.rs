@@ -84,6 +84,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         },
     );
 
+    // Source delivery / hostPath: kind node extraMounts of $HOME (Mac preferred path).
+    d.section("Source delivery (hostPath)");
+    check_kind_hostpath_mount(&mut d);
+
     d.print();
 
     if d.ok() {
@@ -107,6 +111,46 @@ struct ProviderExpectation<'a> {
     pc_resource: &'a str,
     pc_name: &'a str,
     pc_namespace: &'a str,
+}
+
+/// Report whether the hops kind node can see the projects-root mount used for
+/// hostPath delivery. Soft-skip when no kind node (other backends); fail when
+/// the node is up but missing the mount (recreate required).
+fn check_kind_hostpath_mount(d: &mut Doctor) {
+    use super::backend::kind::{report_projects_root_on_kind_node, NodeMountReport};
+
+    let report = report_projects_root_on_kind_node();
+    match &report {
+        NodeMountReport::NoKindNode => {
+            // Informational: doctor still passes if Crossplane checks pass.
+            d.check(
+                "kind node projects-root mount",
+                true,
+                report.summary(),
+            );
+        }
+        NodeMountReport::NoMountRoot => {
+            d.check(
+                "kind node projects-root mount",
+                true,
+                report.summary(),
+            );
+        }
+        NodeMountReport::Visible { .. } => {
+            d.check(
+                "kind node projects-root mount (hostPath capable)",
+                true,
+                report.summary(),
+            );
+        }
+        NodeMountReport::Missing { .. } => {
+            d.check(
+                "kind node projects-root mount (hostPath capable)",
+                false,
+                report.summary(),
+            );
+        }
+    }
 }
 
 fn check_provider(d: &mut Doctor, e: &ProviderExpectation) {

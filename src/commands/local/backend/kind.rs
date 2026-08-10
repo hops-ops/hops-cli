@@ -35,22 +35,88 @@ const NODE_CONTAINER: &str = "hops-control-plane";
 /// `config_path` enabled, so our hosts.toml files would be ignored.
 const MIN_KIND_VERSION: (u32, u32) = (0, 27);
 
-/// Host port published for the in-cluster registry NodePort (container 30500).
+/// Pure registry hostPort selection (testable without docker).
 ///
-/// When kind shares a docker engine with product Dory k8s (`dory-k8s`), host
-/// 30500 is often already bound — use 30501 so create succeeds (LWB-REQ-254 spike).
-pub fn registry_host_port() -> u16 {
-    // Prefer explicit override for multi-cluster / CI.
-    if let Ok(raw) = std::env::var("HOPS_KIND_REGISTRY_HOST_PORT") {
-        if let Ok(p) = raw.trim().parse::<u16>() {
-            return p;
-        }
+/// When kind shares a docker engine with product Dory k8s, host 30500 is often
+/// already bound — use 30501 so create succeeds (LWB-REQ-254).
+pub fn pick_registry_host_port(env_override: Option<u16>, dory_k8s_present: bool) -> u16 {
+    if let Some(p) = env_override {
+        return p;
     }
-    // Same docker engine as product dory-k8s → avoid clobbering its NodePort.
-    if docker_output(&["inspect", "-f", "{{.Id}}", "dory-k8s"]).is_ok() {
+    if dory_k8s_present {
         return 30501;
     }
     30500
+}
+
+/// Host port published for the in-cluster registry NodePort (container 30500).
+pub fn registry_host_port() -> u16 {
+    let env_override = std::env::var("HOPS_KIND_REGISTRY_HOST_PORT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok());
+    let dory_k8s = docker_output(&["inspect", "-f", "{{.Id}}", "dory-k8s"]).is_ok();
+    pick_registry_host_port(env_override, dory_k8s)
+}
+
+/// Result of checking whether the kind node can see the projects-root mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeMountReport {
+    /// No hops kind control-plane container (or docker unreachable).
+    NoKindNode,
+    /// HOME / projects root not configured on the host.
+    NoMountRoot,
+    /// Node can see the path (hostPath delivery capable for trees under it).
+    Visible { path: String },
+    /// Kind node is running but path missing — recreate with extraMounts.
+    Missing { path: String },
+}
+
+impl NodeMountReport {
+    /// One-line doctor/status summary.
+    pub fn summary(&self) -> String {
+        match self {
+            NodeMountReport::NoKindNode => {
+                "kind node not running (start/reset --backend kind for hostPath mounts)".into()
+            }
+            NodeMountReport::NoMountRoot => "no HOME/projects root to mount".into(),
+            NodeMountReport::Visible { path } => {
+                format!("hostPath capable — kind node sees {path}")
+            }
+            NodeMountReport::Missing { path } => format!(
+                "kind node missing mount {path}; run `hops local reset --backend kind` to apply extraMounts"
+            ),
+        }
+    }
+
+    pub fn is_hostpath_capable(&self) -> bool {
+        matches!(self, NodeMountReport::Visible { .. })
+    }
+}
+
+/// Whether the kind control-plane container is present on the resolved docker engine.
+pub fn kind_node_present() -> bool {
+    docker_output(&["inspect", "-f", "{{.Id}}", NODE_CONTAINER]).is_ok()
+}
+
+/// Probe the kind node for the default projects-root mount (same path as create).
+pub fn report_projects_root_on_kind_node() -> NodeMountReport {
+    if !kind_node_present() {
+        return NodeMountReport::NoKindNode;
+    }
+    let Some(root) = default_extra_mount_root() else {
+        return NodeMountReport::NoMountRoot;
+    };
+    let path = root.display().to_string();
+    if node_sees_path(&path) {
+        NodeMountReport::Visible { path }
+    } else {
+        NodeMountReport::Missing { path }
+    }
+}
+
+/// `docker exec` test -d on the kind node (shared by create verify + doctor).
+pub fn node_sees_path(path: &str) -> bool {
+    docker_output(&["exec", NODE_CONTAINER, "test", "-d", path]).is_ok()
 }
 
 /// Build the kind cluster config YAML.
@@ -352,30 +418,21 @@ fn create_cluster() -> Result<(), Box<dyn Error>> {
 
 fn verify_node_mount(host_path: &Path) -> Result<(), Box<dyn Error>> {
     let path_str = host_path.display().to_string();
-    match docker_output(&["exec", NODE_CONTAINER, "test", "-d", &path_str]) {
-        Ok(_) => {
-            log::info!("kind node sees host mount path {path_str}");
-            Ok(())
-        }
-        Err(_) => {
-            log::warn!(
-                "kind node does not see {path_str} after create; hostPath delivery will use sync. \
-                 Check docker engine file sharing / recreate with a reachable DOCKER_HOST."
-            );
-            Ok(())
-        }
+    if node_sees_path(&path_str) {
+        log::info!("kind node sees host mount path {path_str}");
+    } else {
+        log::warn!(
+            "kind node does not see {path_str} after create; hostPath delivery will use sync. \
+             Check docker engine file sharing / recreate with a reachable DOCKER_HOST."
+        );
     }
+    Ok(())
 }
 
 fn log_mount_hint() {
-    if let Some(m) = default_extra_mount_root() {
-        let path = m.display().to_string();
-        if docker_output(&["exec", NODE_CONTAINER, "test", "-d", &path]).is_err() {
-            log::warn!(
-                "kind node missing mount {path}; recreate with `hops local reset --backend kind` \
-                 to apply extraMounts for hostPath delivery"
-            );
-        }
+    let report = report_projects_root_on_kind_node();
+    if matches!(report, NodeMountReport::Missing { .. }) {
+        log::warn!("{}", report.summary());
     }
 }
 
@@ -485,6 +542,28 @@ mod tests {
         let cfg = build_kind_config(None, 30501);
         assert!(cfg.contains("hostPort: 30501"));
         assert!(cfg.contains("containerPort: 30500"));
+    }
+
+    #[test]
+    fn pick_registry_host_port_shifts_when_dory_k8s_present() {
+        assert_eq!(pick_registry_host_port(None, false), 30500);
+        assert_eq!(pick_registry_host_port(None, true), 30501);
+        assert_eq!(pick_registry_host_port(Some(30555), true), 30555);
+    }
+
+    #[test]
+    fn node_mount_report_summary_mentions_reset_when_missing() {
+        let s = NodeMountReport::Missing {
+            path: "/Users/dev".into(),
+        }
+        .summary();
+        assert!(s.contains("/Users/dev"));
+        assert!(s.contains("reset"));
+        assert!(NodeMountReport::Visible {
+            path: "/Users/dev".into()
+        }
+        .is_hostpath_capable());
+        assert!(!NodeMountReport::NoKindNode.is_hostpath_capable());
     }
 
     #[test]
