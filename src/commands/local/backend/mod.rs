@@ -230,7 +230,7 @@ impl FromStr for Backend {
 
 const BACKEND_FILE: &str = "backend";
 
-/// Persist the Dory desktop context name (`--name`, default hops-dory).
+/// Persist the Dory desktop context name (`--dory-name`, default hops-dory).
 pub fn persist_dory_context_name(name: &str) -> Result<(), Box<dyn Error>> {
     dory::persist_context_name(name)
 }
