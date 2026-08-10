@@ -491,12 +491,12 @@ image:
         )
         .unwrap();
         let mut runtime = BTreeMap::new();
-        runtime.insert("namespace".into(), Value::String("hops-wt-alice".into()));
+        runtime.insert("namespace".into(), Value::String("alice".into()));
         runtime.insert("appRuntime".into(), Value::String("host".into()));
         let merged = merge_helm_values(Some(&app), &runtime);
         assert_eq!(merged["local"], Value::Bool(true));
         assert_eq!(merged["appRuntime"], Value::String("host".into()));
-        assert_eq!(merged["namespace"], Value::String("hops-wt-alice".into()));
+        assert_eq!(merged["namespace"], Value::String("alice".into()));
         assert_eq!(merged["image"]["tag"], Value::String("app".into()));
     }
 
@@ -638,7 +638,7 @@ spec:
             namespaces: Mutex::new(Vec::new()),
         };
         let opts = ReconcileOptions {
-            namespace: "hops-wt-alice".into(),
+            namespace: "alice".into(),
             workspace_name: "alice".into(),
             runtime_values: BTreeMap::new(),
             app_delivery_host_paths: BTreeMap::new(),
@@ -647,16 +647,16 @@ spec:
         };
         let results = reconcile_applications(&env, &opts, &helm, &kubectl).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].namespace, "hops-wt-alice");
+        assert_eq!(results[0].namespace, "alice");
         assert!(results[0].applied);
         let applied = kubectl.applied.lock().unwrap();
         assert_eq!(applied.len(), 1);
         assert!(applied[0].contains("hops-local-gitops"));
         assert!(applied[0].contains("hops.ops.com.ai/local-env: alice"));
-        assert!(applied[0].contains("namespace: hops-wt-alice"));
+        assert!(applied[0].contains("namespace: alice"));
         assert_eq!(
             kubectl.namespaces.lock().unwrap().as_slice(),
-            &["hops-wt-alice".to_string()]
+            &["alice".to_string()]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -669,7 +669,7 @@ spec:
         hosts.insert("e2e-ui-ui".into(), root.clone());
         hosts.insert("e2e-ui-api".into(), root.clone());
         let opts = ReconcileOptions {
-            namespace: "hops-wt-feature-x".into(),
+            namespace: "feature-x".into(),
             workspace_name: "feature-x".into(),
             runtime_values: BTreeMap::new(),
             app_delivery_host_paths: hosts,

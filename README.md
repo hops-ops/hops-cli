@@ -96,7 +96,7 @@ hops local open
 hops local down
 ```
 
-Use `--name` for concurrent worktrees (`hops-wt-<name>` namespaces). Full guide: [skills/claude/references/local-workbench.md](skills/claude/references/local-workbench.md).
+Use `--name` for concurrent worktrees (`<name>` namespaces). Full guide: [skills/claude/references/local-workbench.md](skills/claude/references/local-workbench.md).
 
 ## Command Areas
 

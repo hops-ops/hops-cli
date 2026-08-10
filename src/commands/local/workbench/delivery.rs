@@ -1043,7 +1043,7 @@ mod tests {
     #[test]
     fn build_kubectl_tar_extract_args_targets_pod_mount() {
         let t = SyncPodTarget {
-            namespace: "hops-wt-alice".into(),
+            namespace: "alice".into(),
             pod: "e2e-ui-ui-xyz".into(),
             container: Some("ui".into()),
             mount_path: "/workspace".into(),
@@ -1052,7 +1052,7 @@ mod tests {
         };
         let args = build_kubectl_tar_extract_args(&t);
         assert!(args.contains(&"exec".into()));
-        assert!(args.contains(&"hops-wt-alice".into()));
+        assert!(args.contains(&"alice".into()));
         assert!(args.contains(&"e2e-ui-ui-xyz".into()));
         assert!(args.contains(&"-c".into()));
         assert!(args.contains(&"ui".into()));

@@ -9,7 +9,7 @@
 //!   gitops/cluster/                 # CP: PSQLStack, AuthStack, packages…
 //!   clients/foo/.gitops/deploy/     # per-project charts
 //!   platform/api/.gitops/deploy/
-//!   gitops/envs/local/              # Application YAMLs → hops-wt-* namespaces
+//!   gitops/envs/local/              # Application YAMLs → namespace = --name
 //! ```
 //!
 //! Env Applications only isolate **app** namespaces. Cluster YAML is applied

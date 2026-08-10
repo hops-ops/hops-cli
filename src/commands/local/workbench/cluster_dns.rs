@@ -11,7 +11,7 @@
 //! in-cluster URLs work on the laptop. Daily `up`/`status` reuses state when
 //! possible; elevation only when the OS config is missing/stale.
 //!
-//! Result: `curl http://e2e-ui-api.hops-wt-dogfood.svc.cluster.local:8791`
+//! Result: `curl http://e2e-ui-api.dogfood.svc.cluster.local:8791`
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -508,12 +508,12 @@ mod tests {
     #[test]
     fn cluster_names_look_like_k8s_dns() {
         assert_eq!(
-            cluster_dns_name("e2e-ui-api", "hops-wt-dogfood"),
-            "e2e-ui-api.hops-wt-dogfood.svc.cluster.local"
+            cluster_dns_name("e2e-ui-api", "dogfood"),
+            "e2e-ui-api.dogfood.svc.cluster.local"
         );
         assert_eq!(
-            format_dns_url("e2e-ui-ui", "hops-wt-dogfood", 5180),
-            "http://e2e-ui-ui.hops-wt-dogfood.svc.cluster.local:5180"
+            format_dns_url("e2e-ui-ui", "dogfood", 5180),
+            "http://e2e-ui-ui.dogfood.svc.cluster.local:5180"
         );
     }
 
@@ -529,21 +529,21 @@ mod tests {
     fn allocate_stable_across_calls() {
         let services = vec![
             ServiceEndpoint {
-                namespace: "hops-wt-x".into(),
+                namespace: "x".into(),
                 name: "api".into(),
                 port: 8791,
                 protocol: "TCP".into(),
             },
             ServiceEndpoint {
-                namespace: "hops-wt-x".into(),
+                namespace: "x".into(),
                 name: "ui".into(),
                 port: 5180,
                 protocol: "TCP".into(),
             },
         ];
         let mut existing = BTreeMap::new();
-        existing.insert("hops-wt-x/api".into(), "127.53.0.5".into());
-        let ips = allocate_service_ips("hops-wt-x", &services, &existing);
+        existing.insert("x/api".into(), "127.53.0.5".into());
+        let ips = allocate_service_ips("x", &services, &existing);
         assert_eq!(ips.get("api").map(String::as_str), Some("127.53.0.5"));
         assert!(ips.get("ui").unwrap().starts_with("127.53."));
         assert_ne!(ips.get("ui"), ips.get("api"));
@@ -553,20 +553,20 @@ mod tests {
     fn merge_hosts_replaces_block() {
         let existing = "127.0.0.1 localhost\n# BEGIN hops-local-dns (managed by hops local — do not edit)\nold\n# END hops-local-dns\n";
         let lines = hosts_lines_for_workspace(
-            "hops-wt-x",
+            "x",
             &BTreeMap::from([("foo".into(), "127.53.0.2".into())]),
         );
         let merged = merge_hosts_file(existing, &lines);
         assert!(merged.contains("127.0.0.1 localhost"));
-        assert!(merged.contains("foo.hops-wt-x.svc.cluster.local"));
-        assert!(merged.contains("foo.hops-wt-x.svc.cluster")); // mDNS-safe twin
+        assert!(merged.contains("foo.x.svc.cluster.local"));
+        assert!(merged.contains("foo.x.svc.cluster")); // mDNS-safe twin
         assert!(!merged.contains("\nold\n"));
         assert_eq!(merged.matches(HOSTS_BEGIN).count(), 1);
     }
 
     #[test]
     fn dns_port_forward_binds_address() {
-        let args = build_dns_port_forward_args("hops-wt-x", "api", "127.53.0.2", 8791);
+        let args = build_dns_port_forward_args("x", "api", "127.53.0.2", 8791);
         assert!(args.contains(&"--address".into()));
         assert!(args.contains(&"127.53.0.2".into()));
         assert!(args.contains(&"8791:8791".into()));

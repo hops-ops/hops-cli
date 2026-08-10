@@ -11,7 +11,7 @@
 //! 3. run a supervisor that keeps `kubectl port-forward` alive
 //!
 //! URLs are real k8s FQDNs, e.g.
-//! `http://e2e-ui-ui.hops-wt-dogfood.svc.cluster.local:5180`
+//! `http://e2e-ui-ui.dogfood.svc.cluster.local:5180`
 
 use super::cluster_dns::{
     self, format_dns_url, remove_loopback_aliases, sync_alloc_for_namespace, MACOS_LOCAL_DNS_PORT,
@@ -1028,17 +1028,17 @@ mod tests {
     #[test]
     fn plan_urls_are_cluster_fqdns() {
         let svcs = vec![ServiceEndpoint {
-            namespace: "hops-wt-dogfood".into(),
+            namespace: "dogfood".into(),
             name: "e2e-ui-ui".into(),
             port: 5180,
             protocol: "TCP".into(),
         }];
-        let plan = plan_host_access("hops-wt-dogfood", &svcs);
+        let plan = plan_host_access("dogfood", &svcs);
         assert_eq!(
             plan.urls
-                .get("hops-wt-dogfood/e2e-ui-ui")
+                .get("dogfood/e2e-ui-ui")
                 .map(String::as_str),
-            Some("http://e2e-ui-ui.hops-wt-dogfood.svc.cluster.local:5180")
+            Some("http://e2e-ui-ui.dogfood.svc.cluster.local:5180")
         );
     }
 

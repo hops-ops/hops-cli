@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! hops local gitops cluster  [PATH]   # shared CP (meta gitops/cluster)
-//! hops local gitops worktree <PATH>   # per-worktree apps (envs → hops-wt-*)
+//! hops local gitops worktree <PATH>   # per-worktree apps (envs → namespace = --name)
 //! ```
 //!
 //! Both **watch by default**; pass `--once` for a single reconcile (CI/scripts).
@@ -36,7 +36,7 @@ pub struct GitopsArgs {
 pub enum GitopsCommands {
     /// Shared control-plane gitops (packages, PSQLStack, AuthStack → local CP)
     Cluster(ClusterArgs),
-    /// Per-worktree app Applications (charts → hops-wt-* namespaces)
+    /// Per-worktree app Applications (charts → namespace = --name)
     Worktree(WorktreeArgs),
 }
 
@@ -164,7 +164,7 @@ fn run_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
     let workspace_name = args
         .name
         .clone()
-        .or_else(|| args.namespace.clone().map(|ns| strip_ns_prefix(&ns)))
+        .or_else(|| args.namespace.clone())
         .unwrap_or_else(|| {
             env_path
                 .file_name()
@@ -220,12 +220,6 @@ fn run_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
     }
 
     run_worktree_watch(&env_path, args.debounce, do_once)
-}
-
-fn strip_ns_prefix(ns: &str) -> String {
-    ns.strip_prefix("hops-wt-")
-        .unwrap_or(ns)
-        .to_string()
 }
 
 fn run_worktree_watch<F>(

@@ -19,7 +19,7 @@ Also need `helm` and `kubectl` on your PATH.
 # Shared CP watch (if start did not use --gitops, or after Ctrl+C)
 hops local gitops cluster ./gitops/cluster
 
-# Per-worktree apps (Application YAMLs → hops-wt-* namespaces) — watches by default
+# Per-worktree apps (Application YAMLs → namespace = --name) — watches by default
 hops local gitops worktree ./gitops/envs/local --name dogfood
 
 # See workspaces and app URLs
@@ -52,7 +52,7 @@ hops local down --name alice
 hops local down --name bob
 ```
 
-Each name maps to namespace `hops-wt-<name>` and gets its own access URLs.
+Each name maps to namespace `<name>` and gets its own access URLs.
 
 ## Dogfood: e2e-ui
 
@@ -60,10 +60,10 @@ Each name maps to namespace `hops-wt-<name>` and gets its own access URLs.
 cd distributed/tests/e2e-ui
 hops local start --backend dory --gitops ./gitops/cluster
 hops local gitops cluster ./gitops/cluster
-hops local gitops worktree ./gitops/envs/local --name e2e
+hops local gitops worktree ./gitops/envs/local --name dogfood
 hops local status
 hops local open
-hops local down --name e2e --purge
+hops local down --name dogfood --purge
 ```
 
 Charts live under `api/.gitops/deploy` and `ui/.gitops/deploy`. You can also render them without hops:
@@ -72,6 +72,48 @@ Charts live under `api/.gitops/deploy` and `ui/.gitops/deploy`. You can also ren
 helm template api ./api/.gitops/deploy --set local=true --set appRuntime=cluster-dev
 helm template ui ./ui/.gitops/deploy --set local=true --set appRuntime=cluster-dev
 ```
+
+### Agent rules (do not skip)
+
+Dogfood apps run as **`appRuntime: cluster-dev`** in namespace `= --name` with
+source delivery into the pods. The site you must fix is **that** stack — not a
+host `make run` you invent.
+
+**When the dogfood site is broken:**
+
+1. **Confirm runtime first** (`KUBECONFIG` = dory, e.g. `~/.kube/dory-config`):
+   ```bash
+   kubectl -n dogfood get pods
+   kubectl -n dogfood logs deploy/e2e-ui-api --tail=40
+   kubectl -n dogfood logs deploy/e2e-ui-ui --tail=40
+   ```
+2. **Compile before theorizing.** API is `cargo run` in a rust image; UI is
+   `npm install` + `js` build + `vite` in a node image. `rollout restart` alone
+   is not “fixed” until:
+   - API log shows `listening on http://0.0.0.0:8791` (not mid-`Compiling`)
+   - UI log shows Vite ready
+3. **Hit the real URLs** (cluster DNS / host FQDN path), not only pod logs:
+   ```bash
+   UI=http://e2e-ui-ui.dogfood.svc.cluster.local:5180
+   API=http://e2e-ui-api.dogfood.svc.cluster.local:8791
+   curl -sS -o /dev/null -w '%{http_code}\n' "$UI/" "$UI/chat"
+   curl -sS -X POST "$API/graphql" -H 'content-type: application/json' \
+     -d '{"query":"{ __typename }"}'
+   ```
+4. After service / GraphQL / pure / client changes on the host worktree, run
+   **`make gen-client`** in `tests/e2e-ui` (js build + wasm + client generate)
+   so delivery syncs artifacts the UI pod will load. Then restart pods and
+   **wait for compile**.
+5. Symptoms that are usually **stale binary / mid-compile / stale clients**, not
+   a roles redesign: `replica artifact schema does not match…`,
+   `createWasmJsonPure is not a function`, surface open errors that unit tests
+   pass for. Recompile + re-hit the site first.
+6. **Do not** paper over with more chart churn, host-only Makefile “watch”
+   experiments, or long GraphQL protocol essays when the pod never finished
+   building. **Do not** declare success without curling the live UI paths.
+
+**Kubeconfig:** prefer `~/.kube/dory-config` for dory; map host access uses
+cluster FQDNs (`*.svc.cluster.local`), not `localhost` alone.
 
 ## Layout
 
@@ -82,7 +124,7 @@ gitops/
 ```
 
 - **cluster** — not per-worktree; packages + platform XRs on the local CP
-- **worktree** — env Application YAMLs into isolated `hops-wt-*` namespaces
+- **worktree** — env Application YAMLs into namespace `= --name`
 
 ## Developing configs & providers on this CP
 

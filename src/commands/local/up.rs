@@ -118,7 +118,7 @@ pub fn run(args: &UpArgs) -> Result<(), Box<dyn Error>> {
 
     // Delivery host roots: default is the git **worktree root** for each app
     // (shared monorepo/meta tree of *this* worktree's changes). Explicit
-    // `deliveryPath` overrides. Main checkout → hops-wt-main can come later.
+    // `deliveryPath` overrides. Main checkout → namespace `main` can come later.
     let app_delivery_hosts = collect_app_delivery_hosts(&env_path)?;
     for (app, host) in &app_delivery_hosts {
         log::info!("delivery host for `{app}`: {}", host.display());

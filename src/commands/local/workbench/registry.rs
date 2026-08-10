@@ -6,14 +6,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const ENVS_SUBDIR: &str = "envs";
-pub const NAMESPACE_PREFIX: &str = "hops-wt-";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRecord {
     /// Workspace name (user-facing).
     pub name: String,
-    /// Kubernetes namespace.
+    /// Kubernetes namespace — same as the slugified workspace name (`--name`).
     pub namespace: String,
     /// Absolute path to the env Application directory.
     pub env_path: String,
@@ -55,22 +54,21 @@ pub fn slugify_name(name: &str) -> String {
     if trimmed.is_empty() {
         "workspace".to_string()
     } else {
-        // DNS-1123 label max 63; leave room for prefix.
-        let max = 63usize.saturating_sub(NAMESPACE_PREFIX.len());
-        trimmed.chars().take(max).collect()
+        // DNS-1123 label max 63.
+        trimmed.chars().take(63).collect()
     }
 }
 
-/// Namespace derived from workspace name: `hops-wt-<slug>`.
+/// Namespace = DNS-1123 slug of `--name` (e.g. `dogfood` →
+/// `e2e-ui-ui.dogfood.svc.cluster.local`).
 pub fn namespace_for_name(name: &str) -> String {
-    format!("{}{}", NAMESPACE_PREFIX, slugify_name(name))
+    slugify_name(name)
 }
 
 /// Default workspace name from cwd basename.
 ///
 /// For a git worktree at `…/worktrees/my-feature`, that becomes `my-feature`
-/// → namespace `hops-wt-my-feature`. The primary checkout (later: `main`) would
-/// similarly map to `hops-wt-main` when run from that tree.
+/// → namespace `my-feature`.
 pub fn default_name_from_cwd(cwd: &Path) -> String {
     cwd.file_name()
         .and_then(|s| s.to_str())
@@ -148,10 +146,10 @@ mod tests {
     #[test]
     fn slugify_and_namespace_are_dns_safe() {
         assert_eq!(slugify_name("My Worktree"), "my-worktree");
-        assert_eq!(namespace_for_name("My Worktree"), "hops-wt-my-worktree");
+        assert_eq!(namespace_for_name("My Worktree"), "my-worktree");
         assert_eq!(slugify_name("___"), "workspace");
-        assert_eq!(namespace_for_name("alice"), "hops-wt-alice");
-        assert_eq!(namespace_for_name("bob"), "hops-wt-bob");
+        assert_eq!(namespace_for_name("alice"), "alice");
+        assert_eq!(namespace_for_name("bob"), "bob");
         assert_ne!(namespace_for_name("alice"), namespace_for_name("bob"));
     }
 
@@ -185,8 +183,8 @@ mod tests {
 
         let loaded_a = load_workspace(&dir, "alice").unwrap().unwrap();
         let loaded_b = load_workspace(&dir, "bob").unwrap().unwrap();
-        assert_eq!(loaded_a.namespace, "hops-wt-alice");
-        assert_eq!(loaded_b.namespace, "hops-wt-bob");
+        assert_eq!(loaded_a.namespace, "alice");
+        assert_eq!(loaded_b.namespace, "bob");
         assert_ne!(loaded_a.namespace, loaded_b.namespace);
 
         let all = list_workspaces(&dir).unwrap();

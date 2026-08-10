@@ -275,8 +275,6 @@ spec:
       values:
         local: true
         appRuntime: cluster-dev
-  destination:
-    namespace: hops-wt-default
   syncPolicy:
     prune: false
 "#;
@@ -286,10 +284,8 @@ spec:
         let app = parse_application_yaml(SAMPLE).unwrap();
         assert_eq!(app.metadata.name, "e2e-ui-api");
         assert_eq!(app.spec.source.path, "../../../api/.gitops/deploy");
-        assert_eq!(
-            app.spec.destination.namespace.as_deref(),
-            Some("hops-wt-default")
-        );
+        // Destination ns is owned by hops --name at reconcile, not the YAML.
+        assert!(app.spec.destination.namespace.is_none());
         assert!(!app.spec.sync_policy.prune);
         let values = app.spec.source.helm.values.unwrap();
         assert_eq!(values["local"], Value::Bool(true));
