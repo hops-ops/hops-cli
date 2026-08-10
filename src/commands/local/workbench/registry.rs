@@ -71,6 +71,9 @@ pub fn resolve_cluster_binding(
 
     match existing.and_then(|e| e.cluster_name.as_deref().filter(|s| !s.is_empty())) {
         None => Ok((requested.to_string(), kube)),
+        // rebind always refreshes name + kube context (even if name is unchanged —
+        // e.g. same logical "hops" but context dory → kind-hops).
+        Some(_bound) if rebind => Ok((requested.to_string(), kube)),
         Some(bound) if bound == requested => {
             let ctx = existing
                 .and_then(|e| e.kube_context.clone())
@@ -78,7 +81,6 @@ pub fn resolve_cluster_binding(
                 .unwrap_or(kube);
             Ok((bound.to_string(), ctx))
         }
-        Some(_bound) if rebind => Ok((requested.to_string(), kube)),
         Some(bound) => Err(format!(
             "workspace is bound to cluster `{bound}`; pass `--rebind-cluster` to move to `{requested}`"
         )),
@@ -333,6 +335,17 @@ mod tests {
                 .unwrap();
         assert_eq!(c2, "dogfood");
         assert_eq!(k2, "kind-dogfood");
+        // Rebind same name refreshes stale kube context (dory → kind-hops)
+        let stale = WorkspaceRecord {
+            cluster_name: Some("hops".into()),
+            kube_context: Some("dory".into()),
+            ..existing.clone()
+        };
+        let (c4, k4) =
+            resolve_cluster_binding(Some(&stale), Some("hops"), "hops", "kind-hops", true)
+                .unwrap();
+        assert_eq!(c4, "hops");
+        assert_eq!(k4, "kind-hops", "rebind must refresh kube context");
         // First bind persists default
         let (c3, k3) =
             resolve_cluster_binding(None, None, "hops", "kind-hops", false).unwrap();
