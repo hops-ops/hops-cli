@@ -123,18 +123,10 @@ fn check_kind_hostpath_mount(d: &mut Doctor) {
     match &report {
         NodeMountReport::NoKindNode => {
             // Informational: doctor still passes if Crossplane checks pass.
-            d.check(
-                "kind node projects-root mount",
-                true,
-                report.summary(),
-            );
+            d.check("kind node projects-root mount", true, report.summary());
         }
         NodeMountReport::NoMountRoot => {
-            d.check(
-                "kind node projects-root mount",
-                true,
-                report.summary(),
-            );
+            d.check("kind node projects-root mount", true, report.summary());
         }
         NodeMountReport::Visible { .. } => {
             d.check(

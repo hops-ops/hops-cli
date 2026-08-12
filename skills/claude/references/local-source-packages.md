@@ -22,7 +22,8 @@ providers that Configurations depend on.
 ## Prerequisites
 
 ```bash
-hops local start --backend dory --gitops ./gitops/cluster
+hops local start --cluster-provider kind --docker-provider dory \
+  --cluster-name hops --gitops ./gitops/cluster
 # Creates: Crossplane, helm/k8s providers (pinned), ProviderConfigs named "default",
 # local OCI registry, and writes bootstrap YAML under gitops/cluster/
 ```

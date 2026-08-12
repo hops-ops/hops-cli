@@ -282,8 +282,13 @@ fn try_docker_node_probe(host_path: &Path) -> Result<Option<DeliveryProbe>, Box<
                 )));
             }
             Ok(_) => {
-                // Container exists but path missing → definitive not visible if we hit a real node
-                if docker_container_running(&container) {
+                // Path missing: only treat as definitive for containers that match an
+                // actual node name. Hardcoded fallbacks (`dory-k8s`, `hops-control-plane`)
+                // may be a *different* cluster (e.g. product dory k3s vs kind-hops) and
+                // must not short-circuit before trying the real node container.
+                if docker_container_running(&container)
+                    && node_names.iter().any(|n| n == &container)
+                {
                     return Ok(Some(probe_from_visibility(
                         host_path,
                         false,
@@ -299,12 +304,7 @@ fn try_docker_node_probe(host_path: &Path) -> Result<Option<DeliveryProbe>, Box<
 
 fn docker_container_running(name: &str) -> bool {
     Command::new("docker")
-        .args([
-            "inspect",
-            "-f",
-            "{{.State.Running}}",
-            name,
-        ])
+        .args(["inspect", "-f", "{{.State.Running}}", name])
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -313,10 +313,7 @@ fn docker_container_running(name: &str) -> bool {
 }
 
 fn try_kubectl_hostpath_probe(host_path: &Path) -> Result<DeliveryProbe, Box<dyn Error>> {
-    let name = format!(
-        "hops-path-probe-{}",
-        std::process::id() % 100_000
-    );
+    let name = format!("hops-path-probe-{}", std::process::id() % 100_000);
     let path_str = host_path.display().to_string();
     // Escape for YAML double quotes
     let path_yaml = path_str.replace('\\', "\\\\").replace('"', "\\\"");
@@ -390,7 +387,9 @@ spec:
                 "jsonpath={.status.phase}",
             ])
             .output()?;
-        let phase = String::from_utf8_lossy(&phase_out.stdout).trim().to_string();
+        let phase = String::from_utf8_lossy(&phase_out.stdout)
+            .trim()
+            .to_string();
 
         // FailedMount appears in events / container statuses
         let desc = Command::new("kubectl")
@@ -596,17 +595,8 @@ pub fn discover_sync_targets(
     app_host_paths: &std::collections::BTreeMap<String, PathBuf>,
 ) -> Result<Vec<SyncPodTarget>, Box<dyn Error>> {
     let label = format!("hops.ops.com.ai/local-env={workspace}");
-    let json = kubectl_command(&[
-        "get",
-        "pods",
-        "-n",
-        namespace,
-        "-l",
-        &label,
-        "-o",
-        "json",
-    ])
-    .output()?;
+    let json =
+        kubectl_command(&["get", "pods", "-n", namespace, "-l", &label, "-o", "json"]).output()?;
     if !json.status.success() {
         return Err(format!(
             "kubectl get pods failed: {}",
@@ -709,6 +699,51 @@ pub fn stop_mutagen_sessions(sessions: &[String]) {
     }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryRuntime {
+    mutagen_sessions: Vec<String>,
+    sync_pids: Vec<u32>,
+}
+
+/// Record delivery processes so the next reconcile or `local down` can stop them.
+pub(crate) fn save_delivery_runtime(
+    state_dir: &Path,
+    workspace: &str,
+    sessions: &[String],
+    pids: &[u32],
+) -> Result<(), Box<dyn Error>> {
+    let dir = state_dir.join("runtime");
+    std::fs::create_dir_all(&dir)?;
+    let runtime = DeliveryRuntime {
+        mutagen_sessions: sessions.to_vec(),
+        sync_pids: pids.to_vec(),
+    };
+    std::fs::write(
+        dir.join(format!("{workspace}.delivery.json")),
+        serde_json::to_string_pretty(&runtime)?,
+    )?;
+    Ok(())
+}
+
+/// Stop delivery processes recorded for a workspace (best-effort).
+pub(crate) fn stop_delivery_runtime(state_dir: &Path, workspace: &str) {
+    let path = state_dir
+        .join("runtime")
+        .join(format!("{workspace}.delivery.json"));
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(rt) = serde_json::from_str::<DeliveryRuntime>(&text) {
+            stop_mutagen_sessions(&rt.mutagen_sessions);
+            for pid in rt.sync_pids {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    let _ = std::fs::remove_file(path);
+}
+
 /// Attach sync delivery for all targets: each target uses its own `host_source_path`.
 ///
 /// `watch`: when true and mutagen unavailable, spawn a multi-target tar re-sync loop.
@@ -729,7 +764,10 @@ pub fn attach_sync_delivery(
     if targets.is_empty() {
         result
             .messages
-            .push("no Running pods to sync into yet; re-run up after pods are Ready".into());
+            .push(
+                "no Running pods to sync into yet; re-run `hops local gitops worktree` after pods are Ready"
+                    .into(),
+            );
         return Ok(result);
     }
 
@@ -925,13 +963,11 @@ done
 fn spawn_tar_sync_watcher(targets: Vec<SyncPodTarget>) -> Result<u32, Box<dyn Error>> {
     let script = build_multi_app_tar_watch_script(&targets);
     // Log path: ~/.hops/local/runtime/delivery-watch.log (shared; PIDs are per-workspace).
-    let log_path = crate::commands::local::local_state_dir()
-        .ok()
-        .map(|d| {
-            let p = d.join("runtime").join("delivery-watch.log");
-            let _ = std::fs::create_dir_all(p.parent().unwrap_or(d.as_path()));
-            p
-        });
+    let log_path = crate::commands::local::local_state_dir().ok().map(|d| {
+        let p = d.join("runtime").join("delivery-watch.log");
+        let _ = std::fs::create_dir_all(p.parent().unwrap_or(d.as_path()));
+        p
+    });
     let (stdout, stderr) = if let Some(ref path) = log_path {
         let f = std::fs::OpenOptions::new()
             .create(true)
@@ -950,7 +986,7 @@ fn spawn_tar_sync_watcher(targets: Vec<SyncPodTarget>) -> Result<u32, Box<dyn Er
         .stdout(stdout)
         .stderr(stderr);
     // Pass through hops' selected context so the watcher targets the same cluster
-    // as `hops local up` (see HOPS_KUBE_CONTEXT_ENV).
+    // as `hops local gitops worktree` (see HOPS_KUBE_CONTEXT_ENV).
     if let Ok(ctx) = std::env::var(crate::commands::local::HOPS_KUBE_CONTEXT_ENV) {
         if !ctx.is_empty() {
             child.env(crate::commands::local::HOPS_KUBE_CONTEXT_ENV, ctx);
@@ -977,10 +1013,7 @@ mod tests {
     fn prefers_host_path_when_probe_passes() {
         let probe =
             probe_from_visibility(Path::new("/Users/dev/proj"), true, "path exists on node");
-        assert_eq!(
-            select_delivery_strategy(&probe),
-            DeliveryStrategy::HostPath
-        );
+        assert_eq!(select_delivery_strategy(&probe), DeliveryStrategy::HostPath);
     }
 
     #[test]
@@ -1002,7 +1035,9 @@ mod tests {
     #[test]
     fn mutagen_and_tar_args_include_default_ignores() {
         let m = mutagen_ignore_args();
-        assert!(m.windows(2).any(|w| w[0] == "--ignore" && w[1] == "node_modules"));
+        assert!(m
+            .windows(2)
+            .any(|w| w[0] == "--ignore" && w[1] == "node_modules"));
         assert!(m.windows(2).any(|w| w[0] == "--ignore" && w[1] == "target"));
         let t = tar_exclude_args();
         assert!(t.iter().any(|a| a == "--exclude=node_modules"));
@@ -1023,7 +1058,9 @@ mod tests {
         assert!(args.contains(&"hops-lwb-alice-ui".into()));
         assert!(args.contains(&"/proj".into()));
         assert!(args.contains(&"kubectl://ns/pod/workspace".into()));
-        assert!(args.windows(2).any(|w| w[0] == "--ignore" && w[1] == "node_modules"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--ignore" && w[1] == "node_modules"));
     }
 
     #[test]
@@ -1145,8 +1182,11 @@ mod tests {
     #[test]
     fn select_delivery_strategy_never_assumes_hostpath_for_is_dir_only() {
         // Document the contract: mere host is_dir is NOT enough — probe must set visible.
-        let host_exists_but_node_blind =
-            probe_from_visibility(Path::new("/Users/me/proj"), false, "is_dir alone is not enough");
+        let host_exists_but_node_blind = probe_from_visibility(
+            Path::new("/Users/me/proj"),
+            false,
+            "is_dir alone is not enough",
+        );
         assert_eq!(
             select_delivery_strategy(&host_exists_but_node_blind),
             DeliveryStrategy::Sync

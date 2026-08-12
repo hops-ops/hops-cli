@@ -1,7 +1,7 @@
 //! `hops local open` — open the primary UI URL in a browser when possible.
 
 use super::workbench::net::{discover_workspace_endpoints, plan_host_access};
-use super::workbench::registry::{list_workspaces, load_workspace};
+use super::workbench::registry::{activate_workspace_cluster, list_workspaces, load_workspace};
 use super::{command_exists, local_state_dir, run_cmd};
 use clap::Args;
 use std::error::Error;
@@ -20,18 +20,13 @@ pub struct OpenArgs {
 pub fn run(args: &OpenArgs) -> Result<(), Box<dyn Error>> {
     let state_dir = local_state_dir()?;
     let ws = match &args.name {
-        Some(n) => load_workspace(&state_dir, n)?.ok_or_else(|| {
-            format!("Workspace `{n}` not found. Run hops local up first.")
-        })?,
+        Some(n) => load_workspace(&state_dir, n)?
+            .ok_or_else(|| format!("Workspace `{n}` is not registered."))?,
         None => {
             let all = list_workspaces(&state_dir)?;
             match all.as_slice() {
                 [only] => only.clone(),
-                [] => {
-                    return Err(
-                        "No workspaces registered. Run hops local up <env-path> first.".into(),
-                    )
-                }
+                [] => return Err("No workspaces registered.".into()),
                 many => {
                     return Err(format!(
                         "Multiple workspaces ({}); pass --name.",
@@ -46,6 +41,9 @@ pub fn run(args: &OpenArgs) -> Result<(), Box<dyn Error>> {
         }
     };
 
+    if let Some((cluster, ctx)) = activate_workspace_cluster(&ws) {
+        log::debug!("open: bound cluster `{cluster}` (context {ctx})");
+    }
     let services = discover_workspace_endpoints(&ws.namespace).unwrap_or_default();
     let plan = plan_host_access(&ws.namespace, &services);
 
@@ -99,5 +97,3 @@ fn open_browser(url: &str) -> Result<(), Box<dyn Error>> {
     println!("Open this URL in your browser: {url}");
     Ok(())
 }
-
-

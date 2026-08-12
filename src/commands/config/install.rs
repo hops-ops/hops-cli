@@ -1,10 +1,11 @@
-use crate::commands::local::backend::{self, Backend};
+use crate::commands::local::backend::{self, Backend, ClusterProvider, DockerProvider};
 use crate::commands::local::package_install::run_watch;
 use crate::commands::local::package_install::{
     docker_arch, ensure_cached_repo_checkout, ensure_registry, image_config_name,
-    parse_docker_push_digest, parse_repo_spec, resolve_repo_install_target, rewrite_registry,
-    rewrite_registry_with_tag, sanitize_name_component, short_hash, split_ref, strip_registry,
-    unique_suffix, RepoInstallTarget, RepoSpec, registry_pull, registry_push,
+    parse_docker_push_digest, parse_repo_spec, registry_pull, registry_push,
+    resolve_repo_install_target, rewrite_registry, rewrite_registry_with_tag,
+    sanitize_name_component, short_hash, split_ref, strip_registry, unique_suffix,
+    RepoInstallTarget, RepoSpec,
 };
 use crate::commands::local::{kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output};
 use clap::Args;
@@ -41,9 +42,17 @@ pub struct ConfigArgs {
     #[arg(long)]
     pub context: Option<String>,
 
-    /// Local cluster backend whose node should be wired for local package pulls.
-    #[arg(long, value_enum)]
-    pub backend: Option<Backend>,
+    /// How Kubernetes nodes are provisioned: `kind`, `dory`, or `colima`.
+    #[arg(long = "cluster-provider", value_enum)]
+    pub cluster_provider: Option<ClusterProvider>,
+
+    /// Container engine for kind/tools: `dory`, `colima`, or `docker`.
+    #[arg(long = "docker-provider", value_enum)]
+    pub docker_provider: Option<DockerProvider>,
+
+    /// Named hops-managed kind cluster. Default `hops` uses context `kind-hops`.
+    #[arg(long = "cluster-name", value_name = "NAME")]
+    pub cluster_name: Option<String>,
 
     /// Watch the project directory for changes and re-run install automatically
     #[arg(long, conflicts_with = "repo")]
@@ -98,6 +107,11 @@ struct PackageMetadataName {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConfigurationPackageMetadata {
+    metadata: PackageMetadataName,
+}
+
+#[derive(Debug, Deserialize)]
 struct PackageSpec {
     #[serde(rename = "package")]
     package_ref: Option<String>,
@@ -110,7 +124,13 @@ struct PackageResource {
 }
 
 pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
-    let backend = backend::activate(args.backend, args.context.as_deref());
+    let provider_selected = args.cluster_provider.is_some() || args.docker_provider.is_some();
+    let backend = backend::activate_with_providers(
+        args.cluster_provider,
+        args.docker_provider,
+        args.cluster_name.as_deref(),
+        args.context.as_deref(),
+    )?;
 
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => {
@@ -120,12 +140,12 @@ pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
             repo,
             args.skip_dependency_resolution,
             backend,
-            args.backend,
+            provider_selected,
             args.context.as_deref(),
         ),
         (None, _) => {
             let path = args.path.as_deref().unwrap_or(".");
-            prepare_local_registry(backend, args.backend, args.context.as_deref())?;
+            prepare_local_registry(backend, provider_selected, args.context.as_deref())?;
             run_local_path(path, args.skip_dependency_resolution)?;
 
             if args.watch {
@@ -145,7 +165,7 @@ fn run_repo_install(
     repo: &str,
     skip_dependency_resolution: bool,
     backend: Backend,
-    backend_flag: Option<Backend>,
+    provider_selected: bool,
     context: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
@@ -154,7 +174,7 @@ fn run_repo_install(
             &spec,
             skip_dependency_resolution,
             backend,
-            backend_flag,
+            provider_selected,
             context,
         ),
         RepoInstallTarget::PublishedVersion(version) => {
@@ -167,21 +187,21 @@ fn run_repo_clone(
     spec: &RepoSpec,
     skip_dependency_resolution: bool,
     backend: Backend,
-    backend_flag: Option<Backend>,
+    provider_selected: bool,
     context: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let cache_path = ensure_cached_repo_checkout(spec)?;
-    prepare_local_registry(backend, backend_flag, context)?;
+    prepare_local_registry(backend, provider_selected, context)?;
     run_local_path(&cache_path.to_string_lossy(), skip_dependency_resolution)
 }
 
 fn prepare_local_registry(
     backend: Backend,
-    backend_flag: Option<Backend>,
+    provider_selected: bool,
     context: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     ensure_registry()?;
-    backend::wire_local_registry_for_target(backend, backend_flag, context)
+    backend::wire_local_registry_for_target(backend, provider_selected, context)
 }
 
 fn apply_repo_version_spec(
@@ -380,7 +400,7 @@ spec:
     }
 
     // Patch and push configuration images.
-    let mut config_pull_refs = Vec::new();
+    let mut configurations = Vec::new();
     for img in &loaded {
         if !is_configuration_image(&img.source) {
             continue;
@@ -394,10 +414,10 @@ spec:
             dev_tag,
             img.source
         );
-        config_pull_refs.push(pull_ref.clone());
-
         let mut source_to_push = img.source.clone();
         let package_yaml = extract_package_yaml_from_uppkg(&img.uppkg_path, &img.source)?;
+        let configuration_name = configuration_name_from_package_yaml(&package_yaml, &pull_ref);
+        configurations.push((configuration_name, pull_ref.clone()));
         let (patched_yaml, changed) =
             rewrite_render_dependency_digests(&package_yaml, &render_rewrites);
         if changed {
@@ -415,10 +435,7 @@ spec:
 
     // Apply Crossplane Configuration resources and let Crossplane resolve
     // dependencies (skipDependencyResolution is intentionally not set).
-    for pull_ref in &config_pull_refs {
-        let (img_path, _) = split_ref(pull_ref);
-        let path = strip_registry(img_path);
-        let name = path.replace('/', "-");
+    for (name, pull_ref) in &configurations {
         let existing_package_ref = current_configuration_package_ref(&name)?;
         log_existing_install_replacement(&name, existing_package_ref.as_deref(), pull_ref);
 
@@ -608,6 +625,21 @@ spec:
 
 fn is_configuration_image(image: &str) -> bool {
     split_ref(image).1 == "configuration"
+}
+
+/// Prefer the package author's declared metadata.name so a source install
+/// updates the same Configuration object as a published GitOps pin. Fall back
+/// to the historical registry-path name for older packages without metadata.
+fn configuration_name_from_package_yaml(package_yaml: &str, pull_ref: &str) -> String {
+    serde_yaml::Deserializer::from_str(package_yaml)
+        .next()
+        .and_then(|document| ConfigurationPackageMetadata::deserialize(document).ok())
+        .map(|package| sanitize_name_component(&package.metadata.name))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            let (image_path, _) = split_ref(pull_ref);
+            strip_registry(image_path).replace('/', "-")
+        })
 }
 
 fn extract_package_yaml_from_uppkg(
@@ -1099,9 +1131,41 @@ spec:
     }
 
     #[test]
-    fn local_registry_wiring_skips_foreign_context_without_backend_flag() {
+    fn source_install_uses_declared_configuration_name() {
+        let package_yaml = r#"apiVersion: meta.pkg.crossplane.io/v1
+kind: Configuration
+metadata:
+  name: secret-stack
+---
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: secretstores.hops.ops.com.ai
+"#;
+        assert_eq!(
+            configuration_name_from_package_yaml(
+                package_yaml,
+                "registry.crossplane-system.svc.cluster.local:5000/hops-ops/secret-stack:dev-abc"
+            ),
+            "secret-stack"
+        );
+    }
+
+    #[test]
+    fn source_install_name_falls_back_to_registry_path() {
+        assert_eq!(
+            configuration_name_from_package_yaml(
+                "apiVersion: meta.pkg.crossplane.io/v1\nkind: Configuration\n",
+                "registry.crossplane-system.svc.cluster.local:5000/hops-ops/secret-stack:dev-abc"
+            ),
+            "hops-ops-secret-stack"
+        );
+    }
+
+    #[test]
+    fn local_registry_wiring_skips_foreign_context_without_provider_selection() {
         assert!(!backend::should_wire_local_registry(
-            None,
+            false,
             Some("kind-hops"),
             Backend::Colima
         ));

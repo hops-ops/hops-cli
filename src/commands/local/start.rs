@@ -255,10 +255,7 @@ fn ensure_registry_ready(backend: backend::Backend) -> Result<(), Box<dyn Error>
 }
 
 /// Longer wait used for Crossplane on cold nested-virt runners (~15 minutes).
-fn wait_for_deployment_with_diagnostics(
-    namespace: &str,
-    name: &str,
-) -> Result<(), Box<dyn Error>> {
+fn wait_for_deployment_with_diagnostics(namespace: &str, name: &str) -> Result<(), Box<dyn Error>> {
     match wait_for_deployment_attempts(namespace, name, 180) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -301,10 +298,7 @@ fn wait_for_deployment_attempts(
                 name,
                 i * 5
             );
-            let _ = run_cmd(
-                "kubectl",
-                &["get", "pods", "-n", namespace, "-o", "wide"],
-            );
+            let _ = run_cmd("kubectl", &["get", "pods", "-n", namespace, "-o", "wide"]);
         }
 
         thread::sleep(Duration::from_secs(5));
@@ -313,18 +307,15 @@ fn wait_for_deployment_attempts(
 }
 
 fn dump_namespace_diagnostics(namespace: &str) {
-    log::error!("Diagnostics for namespace {} after readiness timeout:", namespace);
+    log::error!(
+        "Diagnostics for namespace {} after readiness timeout:",
+        namespace
+    );
     let _ = run_cmd("kubectl", &["get", "pods", "-n", namespace, "-o", "wide"]);
     let _ = run_cmd("kubectl", &["describe", "pods", "-n", namespace]);
     let _ = run_cmd(
         "kubectl",
-        &[
-            "get",
-            "events",
-            "-n",
-            namespace,
-            "--sort-by=.lastTimestamp",
-        ],
+        &["get", "events", "-n", namespace, "--sort-by=.lastTimestamp"],
     );
     let _ = run_cmd("kubectl", &["get", "nodes", "-o", "wide"]);
 }
@@ -443,25 +434,29 @@ mod tests {
     #[test]
     fn start_args_bootstrap_defaults_false() {
         // clap default: bootstrap only when --bootstrap is passed
-        assert!(!StartArgs {
-            size: SizeArgs {
-                cpus: None,
-                memory: None,
-                disk: None,
-            },
-            yes: false,
-            bootstrap: false,
-        }
-        .bootstrap);
-        assert!(StartArgs {
-            size: SizeArgs {
-                cpus: None,
-                memory: None,
-                disk: None,
-            },
-            yes: false,
-            bootstrap: true,
-        }
-        .bootstrap);
+        assert!(
+            !StartArgs {
+                size: SizeArgs {
+                    cpus: None,
+                    memory: None,
+                    disk: None,
+                },
+                yes: false,
+                bootstrap: false,
+            }
+            .bootstrap
+        );
+        assert!(
+            StartArgs {
+                size: SizeArgs {
+                    cpus: None,
+                    memory: None,
+                    disk: None,
+                },
+                yes: false,
+                bootstrap: true,
+            }
+            .bootstrap
+        );
     }
 }

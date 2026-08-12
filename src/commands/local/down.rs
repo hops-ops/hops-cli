@@ -1,9 +1,10 @@
 //! `hops local down` — stop workspace host access, delivery, and optionally purge namespace.
 
-use super::up::stop_delivery_runtime;
+use super::workbench::delivery::stop_delivery_runtime;
 use super::workbench::net::stop_host_access;
 use super::workbench::registry::{
-    list_workspaces, load_workspace, namespace_for_name, remove_workspace,
+    activate_workspace_cluster, list_workspaces, load_workspace, namespace_for_name,
+    remove_workspace,
 };
 use super::{local_state_dir, run_cmd};
 use clap::Args;
@@ -28,11 +29,7 @@ pub fn run(args: &DownArgs) -> Result<(), Box<dyn Error>> {
             let all = list_workspaces(&state_dir)?;
             match all.as_slice() {
                 [only] => only.name.clone(),
-                [] => {
-                    return Err(
-                        "No workspaces registered. Pass --name or run hops local up first.".into(),
-                    )
-                }
+                [] => return Err("No workspaces registered. Pass --name explicitly.".into()),
                 _ => {
                     return Err(format!(
                         "Multiple workspaces registered ({}); pass --name <workspace>.",
@@ -53,9 +50,15 @@ pub fn run(args: &DownArgs) -> Result<(), Box<dyn Error>> {
         .map(|r| r.namespace.clone())
         .unwrap_or_else(|| namespace_for_name(&name));
 
+    if let Some(ref rec) = record {
+        if let Some((cluster, ctx)) = activate_workspace_cluster(rec) {
+            log::info!("Using bound cluster `{cluster}` (context {ctx})");
+        }
+    }
+
     log::info!("Bringing down workspace `{name}` (namespace {namespace})");
 
-    // Stop host access processes started by `up` (recorded PIDs + pkill safety net)
+    // Stop recorded host-access processes (recorded PIDs + pkill safety net).
     if let Err(e) = stop_host_access(&state_dir, &name) {
         log::warn!("host access stop: {e}");
     }

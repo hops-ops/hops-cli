@@ -37,9 +37,7 @@ fn colima_smoke_workflow_exists_and_pins_nested_virt_runner() {
         "must pin nested-virt-capable Intel runner"
     );
     assert!(
-        !text
-            .lines()
-            .any(|l| l.trim() == "runs-on: macos-latest"),
+        !text.lines().any(|l| l.trim() == "runs-on: macos-latest"),
         "must not use bare macos-latest as sole runs-on"
     );
     assert!(
@@ -53,7 +51,7 @@ fn colima_smoke_workflow_kind_parity_sequence() {
     let text = workflow_text();
     for needle in [
         "cargo build",
-        "start --backend colima",
+        "start --cluster-provider colima --docker-provider colima",
         "local doctor",
         "localhost:30500",
         "registry.crossplane-system.svc.cluster.local:5000",
@@ -66,16 +64,16 @@ fn colima_smoke_workflow_kind_parity_sequence() {
             "colima smoke missing kind-parity fragment: {needle}"
         );
     }
-    // stop/start resume: start without --backend after stop
+    // stop/start resume: persisted providers allow start without flags after stop.
     assert!(
-        text.contains("local start\n") || text.lines().any(|l| l.trim() == "./target/debug/hops-cli local start"),
-        "must start again without --backend after stop"
+        text.contains("local start\n")
+            || text
+                .lines()
+                .any(|l| l.trim() == "./target/debug/hops-cli local start"),
+        "must start again from persisted providers after stop"
     );
     for tool in ["colima", "docker", "kubectl", "helm"] {
-        assert!(
-            text.contains(tool),
-            "prereq install must mention {tool}"
-        );
+        assert!(text.contains(tool), "prereq install must mention {tool}");
     }
 }
 
@@ -89,7 +87,9 @@ fn colima_smoke_workflow_sizes_vm_for_gha_intel_runner() {
     );
     // 8Gi left CoreDNS thrashing; smoke needs headroom above that floor.
     assert!(
-        text.contains("--memory 10") || text.contains("--memory 11") || text.contains("--memory 12"),
+        text.contains("--memory 10")
+            || text.contains("--memory 11")
+            || text.contains("--memory 12"),
         "must allocate at least 10Gi to the colima VM on GHA intel runners"
     );
     assert!(

@@ -7,13 +7,19 @@
 //!
 //! Both **watch by default**; pass `--once` for a single reconcile (CI/scripts).
 
+use super::local_state_dir;
 use super::workbench::application::{load_applications, resolve_delivery_host_path};
 use super::workbench::cluster_gitops::{
     reconcile_cluster_dir, resolve_cluster_path, should_reconcile_cluster_change,
 };
+use super::workbench::delivery::{
+    attach_sync_delivery, discover_sync_targets, save_delivery_runtime, stop_delivery_runtime,
+    DeliveryStrategy, NodePathProber, SystemNodeProber,
+};
 use super::workbench::reconcile::{
     reconcile_applications, ReconcileOptions, SystemHelm, SystemKubectl,
 };
+use super::workbench::registry::{activate_workspace_cluster, load_workspace};
 use super::workbench::watch::{
     is_chart_or_env_path, should_ignore_watch_path, watch_roots_for_applications, WatchPathClass,
 };
@@ -109,7 +115,7 @@ pub fn run_cluster(args: &ClusterArgs) -> Result<(), Box<dyn Error>> {
         if let Err(e) = super::run_cmd_output("kubectl", &["cluster-info"]) {
             return Err(format!(
                 "Local control plane is not reachable ({e}).\n\
-                 Ensure Dory Kubernetes is Ready, then: hops local start --backend dory"
+                 Ensure the selected control plane is Ready, then run `hops local start` with matching --cluster-provider and --docker-provider values."
             )
             .into());
         }
@@ -178,21 +184,34 @@ fn run_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
         .clone()
         .unwrap_or_else(|| namespace_for_name(&workspace_name));
 
-    let mut app_delivery_host_paths = BTreeMap::new();
-    if let Ok(apps) = load_applications(&env_path) {
-        for (app_file, app) in apps {
-            if let Ok(host) = resolve_delivery_host_path(&app_file, &app) {
-                app_delivery_host_paths.insert(app.metadata.name, host);
+    // Sticky workspace→cluster: use bound kube context when registered.
+    if let Ok(state_dir) = local_state_dir() {
+        if let Ok(Some(rec)) = load_workspace(&state_dir, &workspace_name) {
+            if let Some((cluster, ctx)) = activate_workspace_cluster(&rec) {
+                log::info!("worktree gitops: bound cluster `{cluster}` (context {ctx})");
             }
         }
     }
+
+    let mut app_delivery_host_paths = BTreeMap::new();
+    for (app_file, app) in load_applications(&env_path)? {
+        let host = resolve_delivery_host_path(&app_file, &app)?;
+        app_delivery_host_paths.insert(app.metadata.name, host);
+    }
+    let (delivery_strategy, delivery_detail) =
+        resolve_worktree_delivery(&app_delivery_host_paths, &SystemNodeProber)?;
+    log::info!(
+        "worktree gitops: source delivery {} ({})",
+        delivery_strategy.as_str(),
+        delivery_detail
+    );
 
     let opts = ReconcileOptions {
         namespace: namespace.clone(),
         workspace_name: workspace_name.clone(),
         runtime_values: BTreeMap::new(),
         app_delivery_host_paths,
-        delivery_mode: Some("sync".into()),
+        delivery_mode: Some(delivery_strategy.as_str().into()),
         dry_run: args.dry_run,
     };
 
@@ -211,6 +230,38 @@ fn run_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
                 if r.applied { "applied" } else { "rendered" }
             );
         }
+
+        if !opts.dry_run {
+            let state_dir = local_state_dir()?;
+            // A previous run may have fallen back to a detached tar/mutagen
+            // sync runtime. Retire it even when the current probe selects
+            // hostPath, otherwise that stale writer keeps replacing files in
+            // the mounted tree and repeatedly restarts dev servers.
+            stop_delivery_runtime(&state_dir, &workspace_name);
+
+            if delivery_strategy != DeliveryStrategy::Sync {
+                return Ok(());
+            }
+
+            let targets = wait_for_sync_targets(
+                &opts.namespace,
+                &workspace_name,
+                "/workspace",
+                &opts.app_delivery_host_paths,
+                90,
+            );
+            let attached =
+                attach_sync_delivery(&targets, &workspace_name, !args.once && !args.dry_run)?;
+            save_delivery_runtime(
+                &state_dir,
+                &workspace_name,
+                &attached.mutagen_sessions,
+                &attached.sync_pids,
+            )?;
+            for message in attached.messages {
+                log::info!("delivery: {message}");
+            }
+        }
         Ok(())
     };
 
@@ -220,6 +271,52 @@ fn run_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
     }
 
     run_worktree_watch(&env_path, args.debounce, do_once)
+}
+
+fn resolve_worktree_delivery(
+    app_paths: &BTreeMap<String, PathBuf>,
+    prober: &dyn NodePathProber,
+) -> Result<(DeliveryStrategy, String), Box<dyn Error>> {
+    if app_paths.is_empty() {
+        return Err("worktree gitops found no Application source paths".into());
+    }
+
+    let mut all_visible = true;
+    let mut details = Vec::new();
+    for (app, host) in app_paths {
+        let probe = prober.probe(host)?;
+        all_visible &= probe.host_path_visible;
+        details.push(format!("{app}: {}", probe.detail));
+    }
+
+    let strategy = if all_visible {
+        DeliveryStrategy::HostPath
+    } else {
+        DeliveryStrategy::Sync
+    };
+    Ok((strategy, details.join("; ")))
+}
+
+fn wait_for_sync_targets(
+    namespace: &str,
+    workspace: &str,
+    mount_path: &str,
+    app_hosts: &BTreeMap<String, PathBuf>,
+    timeout_secs: u64,
+) -> Vec<super::workbench::delivery::SyncPodTarget> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match discover_sync_targets(namespace, workspace, mount_path, app_hosts) {
+            Ok(targets) if !targets.is_empty() => return targets,
+            Ok(_) => {}
+            Err(error) => log::debug!("sync target discovery: {error}"),
+        }
+        if Instant::now() >= deadline {
+            return discover_sync_targets(namespace, workspace, mount_path, app_hosts)
+                .unwrap_or_default();
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 fn run_worktree_watch<F>(
@@ -234,11 +331,7 @@ where
     let env_canon = env_path
         .canonicalize()
         .unwrap_or_else(|_| env_path.to_path_buf());
-    let chart_paths: Vec<PathBuf> = roots
-        .iter()
-        .filter(|p| *p != &env_canon)
-        .cloned()
-        .collect();
+    let chart_paths: Vec<PathBuf> = roots.iter().filter(|p| *p != &env_canon).cloned().collect();
 
     let debounce = Duration::from_secs(debounce_secs);
     let (tx, rx) = mpsc::channel();

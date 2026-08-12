@@ -206,11 +206,11 @@ jobs:
           # DOCKER_HOST + KUBECONFIG already in env from prior step
           dory readiness || true
 
-      - name: hops local start --backend dory
+      - name: hops local start with Dory providers
         run: |
           set -euxo pipefail
           # HOPS_DORY_DESKTOP=0 → env session only (no global context changes)
-          ./target/debug/hops-cli local start --backend dory
+          ./target/debug/hops-cli local start --cluster-provider dory --docker-provider dory
 
       - name: hops local doctor
         run: |
@@ -290,7 +290,7 @@ jobs:
           test -d "$FIXTURE"
           test -f "$FIXTURE/upbound.yaml"
 
-          ./target/debug/hops-cli config install --path "$FIXTURE" --backend dory
+          ./target/debug/hops-cli config install --path "$FIXTURE" --cluster-provider dory --docker-provider dory
 
           # Wait for Configuration package Healthy.
           for i in $(seq 1 90); do

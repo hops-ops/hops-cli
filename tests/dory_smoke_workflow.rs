@@ -125,7 +125,7 @@ fn dory_smoke_workflow_hops_integration_core() {
     let text = workflow_text();
     for needle in [
         "cargo build",
-        "start --backend dory",
+        "start --cluster-provider dory --docker-provider dory",
         "local doctor",
         "registry.crossplane-system.svc.cluster.local:5000",
         "30500",

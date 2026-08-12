@@ -86,14 +86,13 @@ hops xr --help
 Multi-workspace local GitOps on the laptop control plane:
 
 ```bash
-# once
-hops local start
+# shared control-plane tree (terminal 1)
+hops local gitops cluster ./gitops/cluster \
+  --cluster-provider kind --docker-provider dory --cluster-name hops
 
-# daily
-hops local up ./gitops/env/local
-hops local status
-hops local open
-hops local down
+# per-workspace tree (terminal 2)
+hops local gitops worktree ./gitops/envs/local --name alice \
+  --cluster-provider kind --docker-provider dory --cluster-name hops
 ```
 
 Use `--name` for concurrent worktrees (`<name>` namespaces). Full guide: [skills/claude/references/local-workbench.md](skills/claude/references/local-workbench.md).
@@ -208,9 +207,8 @@ Examples:
 ## Create a Local Control Plane
 
 ```bash
-# 1) Install the backend (via Homebrew). Defaults to colima on macOS;
-#    pass --backend kind to use kind on any docker daemon.
-hops local install
+# 1) Install/select the cluster and Docker providers.
+hops local install --cluster-provider kind --docker-provider dory
 
 # 2) Start local k8s + Crossplane + providers + local registry
 hops local start
@@ -228,9 +226,9 @@ hops local zitadel --source-context pat-local --domain auth.ops.com.ai
 hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
 ```
 
-### Cluster backends
+### Cluster and Docker providers
 
-`hops local` supports three backends behind the same commands:
+`hops local` separates Kubernetes node provisioning from the Docker engine:
 
 - **colima** — a VM running dockerd + k3s. macOS/Linux; supports `--cpus`,
   `--memory`, `--disk`, and `hops local resize`.
@@ -247,17 +245,14 @@ hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
   dockerd runs *inside* the engine — Mac `localhost` is the wrong plane. The
   VM is sized in the Dory app, so hops sizing flags don't apply.
 
-Select with the global `--backend` flag:
+Select both dimensions explicitly:
 
 ```bash
-hops local start --backend kind
+hops local start --cluster-provider kind --docker-provider dory --cluster-name hops
 ```
 
-The chosen backend is persisted to `~/.hops/local/backend` on a successful
-start, so later commands (`stop`, `destroy`, `doctor`, package installs)
-target the same cluster without the flag. Resolution order: `--backend` flag >
-persisted choice > existing cluster detection (colima wins) > platform
-default (macOS: colima, otherwise kind).
+The chosen pair is persisted to `~/.hops/local/providers.json` on a successful
+start, so later commands can target the same cluster without repeating flags.
 
 Unless `--context` is given, kubectl commands automatically use the backend's
 kubeconfig context (`colima`, `kind-hops`, or `hops-dory`), regardless of your
@@ -273,7 +268,7 @@ fork of Dory required.
 # 2. Enable Kubernetes in the app; wait until the cluster is running
 #    (product container is usually named dory-k8s)
 # 3. Bootstrap Crossplane + local package registry
-hops local start --backend dory
+hops local start --cluster-provider dory --docker-provider dory
 ```
 
 On start/activate, hops:
@@ -283,8 +278,8 @@ On start/activate, hops:
 - runs `kubectl config use-context hops-dory`
 - creates/uses a docker context of the same name → `unix://$HOME/.dory/dory.sock`
 
-`--dory-name` is intentionally **not** `--name`. Workspace commands use `--name` for the
-Kubernetes namespace (`hops local up|down|status|open|gitops worktree --name alice`).
+`--dory-name` is intentionally **not** `--name`. Workspace GitOps uses `--name`
+for the Kubernetes namespace.
 
 So you should **not** need:
 
@@ -294,22 +289,22 @@ export DOCKER_HOST=unix://$HOME/.dory/dory.sock
 ```
 
 ```bash
-hops local start --backend dory                    # dory name defaults to hops-dory
-hops local start --backend dory --dory-name mine   # custom kube+docker context name
-hops local up ./gitops/envs/local --name alice     # workspace ns only; does not rename Dory
+hops local start --cluster-provider dory --docker-provider dory
+hops local start --cluster-provider dory --docker-provider dory --dory-name mine
+hops local gitops worktree ./gitops/envs/local --name alice
 
 kubectl get nodes          # context hops-dory
 docker info                # context hops-dory
 hops local doctor
 hops local github -o hops-ops
-hops config install --path … --backend dory
+hops config install --path … --cluster-provider dory --docker-provider dory
 ```
 
 Alternatively, use kind on Dory's docker socket (no product k3s):
 
 ```bash
 docker context use dory   # product context from Dory.app
-hops local start --backend kind
+hops local start --cluster-provider kind --docker-provider dory --cluster-name hops
 ```
 
 **CI:** `.github/workflows/on-pr-dory-smoke.yaml` runs on a **self-hosted**
@@ -397,7 +392,7 @@ k3s is product-owned. hops does not run `dory k8s enable`.
 1. Install the Kubernetes component if needed: `dory component install kubernetes`
 2. Enable Kubernetes in the Dory app UI
 3. Wait until a `dory-k8s` container is running: `docker ps` (with context hops-dory)
-4. Re-run `hops local start --backend dory`
+4. Re-run `hops local start --cluster-provider dory --docker-provider dory`
 
 **`k ctx` has no dory / hops-dory entry**
 
@@ -406,7 +401,7 @@ merges that into `~/.kube/config` as **`hops-dory`** on activate/start. If the
 merge is missing:
 
 ```bash
-hops local doctor --backend dory
+hops local doctor --cluster-provider dory --docker-provider dory
 kubectl config get-contexts   # expect hops-dory
 kubectl config use-context hops-dory
 ```
@@ -423,7 +418,7 @@ Crossplane always pulls packages with HTTPS. The local registry must be TLS
 ```bash
 kubectl -n crossplane-system delete deploy registry
 kubectl -n crossplane-system delete secret hops-local-registry-tls
-hops local start --backend dory    # recreates TLS secret + registry + CA patch
+hops local start --cluster-provider dory --docker-provider dory
 ```
 
 **docker push to localhost:30500 fails (connection refused / HTTPS to HTTP)**
@@ -458,7 +453,7 @@ Avoid raw `kill` of dockerd inside the guest unless you are prepared to wait for
 ```bash
 dory doctor
 dory readiness
-hops local doctor --backend dory
+hops local doctor --cluster-provider dory --docker-provider dory
 docker context show
 kubectl config current-context
 kubectl get configuration,provider -A

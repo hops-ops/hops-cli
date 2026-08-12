@@ -222,9 +222,7 @@ pub fn sync_alloc_for_namespace(
     });
     let service_ips = allocate_service_ips(namespace, services, &alloc.bindings);
     for (svc, ip) in &service_ips {
-        alloc
-            .bindings
-            .insert(alloc_key(namespace, svc), ip.clone());
+        alloc.bindings.insert(alloc_key(namespace, svc), ip.clone());
     }
     save_ip_alloc(state_dir, &alloc)?;
     Ok(service_ips)
@@ -266,9 +264,9 @@ pub fn dns_os_config_present(hosts_body: &str, loopback_ips: &[String]) -> bool 
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    loopback_ips.iter().all(|ip| {
-        ip.is_empty() || ip == "127.0.0.1" || lo0.contains(ip.as_str())
-    })
+    loopback_ips
+        .iter()
+        .all(|ip| ip.is_empty() || ip == "127.0.0.1" || lo0.contains(ip.as_str()))
 }
 
 fn macos_resolver_present() -> bool {
@@ -354,7 +352,7 @@ pub fn apply_privileged_dns_config(
         format!(
             "cluster DNS needs admin privileges to write /etc/hosts (and lo0 aliases on macOS).\n\
              {e}\n\
-             Re-run `hops local up` or `hops local status` and approve the **single** prompt,\n\
+             Re-run `hops local status` and approve the **single** prompt,\n\
              or grant passwordless sudo for hops on this machine."
         )
         .into()
@@ -379,10 +377,7 @@ pub enum PrivilegedPrompt {
 ///
 /// **Never** cascades multiple password prompts: passwordless sudo first, then
 /// exactly one interactive path (TTY → `sudo`, else macOS → `osascript`).
-pub fn run_privileged_shell(
-    script: &str,
-    prompt: PrivilegedPrompt,
-) -> Result<(), Box<dyn Error>> {
+pub fn run_privileged_shell(script: &str, prompt: PrivilegedPrompt) -> Result<(), Box<dyn Error>> {
     // 1) passwordless sudo (cached ticket after a recent successful elevation)
     let status = Command::new("sudo")
         .args(["-n", "sh", "-c", script])
@@ -417,8 +412,7 @@ pub fn run_privileged_shell(
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('\n', "; ");
-        let applescript =
-            format!("do shell script \"{escaped}\" with administrator privileges");
+        let applescript = format!("do shell script \"{escaped}\" with administrator privileges");
         let status = Command::new("osascript")
             .args(["-e", &applescript])
             .status()
@@ -454,13 +448,10 @@ pub fn ensure_loopback_aliases(ips: &[String]) -> Result<(), Box<dyn Error>> {
     }
     let mut shell = String::from("true");
     for ip in &missing {
-        shell.push_str(&format!(
-            " && ifconfig lo0 alias {ip} netmask 0xff000000"
-        ));
+        shell.push_str(&format!(" && ifconfig lo0 alias {ip} netmask 0xff000000"));
     }
-    run_privileged_shell(&shell, PrivilegedPrompt::InteractiveOnce).map_err(|e| {
-        format!("could not create loopback aliases on lo0: {e}").into()
-    })
+    run_privileged_shell(&shell, PrivilegedPrompt::InteractiveOnce)
+        .map_err(|e| format!("could not create loopback aliases on lo0: {e}").into())
 }
 
 /// Best-effort remove loopback aliases (macOS). **Never prompts** — cleanup only.
@@ -552,10 +543,8 @@ mod tests {
     #[test]
     fn merge_hosts_replaces_block() {
         let existing = "127.0.0.1 localhost\n# BEGIN hops-local-dns (managed by hops local — do not edit)\nold\n# END hops-local-dns\n";
-        let lines = hosts_lines_for_workspace(
-            "x",
-            &BTreeMap::from([("foo".into(), "127.53.0.2".into())]),
-        );
+        let lines =
+            hosts_lines_for_workspace("x", &BTreeMap::from([("foo".into(), "127.53.0.2".into())]));
         let merged = merge_hosts_file(existing, &lines);
         assert!(merged.contains("127.0.0.1 localhost"));
         assert!(merged.contains("foo.x.svc.cluster.local"));

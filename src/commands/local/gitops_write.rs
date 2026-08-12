@@ -51,10 +51,7 @@ pub fn write_gitops_files(
     // Document the secrets gap next to written providers.
     let readme = root.join("SECRETS.md");
     if !readme.exists() {
-        fs::write(
-            &readme,
-            SECRETS_README,
-        )?;
+        fs::write(&readme, SECRETS_README)?;
         written.push(readme);
     }
     Ok(written)
@@ -69,7 +66,7 @@ External Secrets / SOPS; local workbench does not have that path yet.
 
 Until then:
 
-1. Apply this tree (or let `hops local up` grow a cluster phase).
+1. Apply this tree with `hops local gitops cluster`.
 2. Create live secrets with:
    - `hops local aws` / `github` / `zitadel` (without relying on git for credentials)
    - or a future `hops local secrets sync`
