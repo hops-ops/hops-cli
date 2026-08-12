@@ -300,12 +300,19 @@ pub(crate) fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
     log::info!("Waiting for Kubernetes API...");
     // ~10 minutes — nested-virt apiserver can stay overloaded after package install.
     for _ in 0..120 {
-        let result = run_cmd_output("kubectl", &["get", "--raw", "/readyz"]);
-        if result.is_ok() {
+        if kubectl_command(&["get", "--raw", "/readyz"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
             return Ok(());
         }
         // Fall back to a cheap list if /readyz is denied on some setups.
-        if run_cmd_output("kubectl", &["get", "ns", "default"]).is_ok() {
+        if kubectl_command(&["get", "ns", "default"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_secs(5));
@@ -357,17 +364,46 @@ pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
         if !stderr.trim().is_empty() {
             eprint!("{stderr}");
         }
+        if !is_transient_kubectl_apply_error(&stderr) {
+            return Err(format!("kubectl apply exited with {last_err}").into());
+        }
+        if attempt == ATTEMPTS {
+            break;
+        }
         log::warn!(
             "kubectl apply failed (attempt {}/{}, {}); waiting for API...",
             attempt,
             ATTEMPTS,
             output.status
         );
-        let _ = wait_for_kubernetes();
+        wait_for_kubernetes().map_err(|e| {
+            format!("kubectl apply exited with {last_err}; API recovery failed: {e}")
+        })?;
         std::thread::sleep(std::time::Duration::from_secs(10));
     }
 
     Err(format!("kubectl apply exited with {last_err} after retries").into())
+}
+
+fn is_transient_kubectl_apply_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    [
+        "unable to connect to the server",
+        "connection refused",
+        "connection reset",
+        "connection timed out",
+        "i/o timeout",
+        "tls handshake timeout",
+        "context deadline exceeded",
+        "dial tcp",
+        "no route to host",
+        "service unavailable",
+        "gateway timeout",
+        "server is currently unable to handle the request",
+        "unexpected eof",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Apply a JSON merge patch with `kubectl patch --type merge`.

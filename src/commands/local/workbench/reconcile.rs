@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -86,6 +87,34 @@ pub trait KubectlApplier {
     ) -> Result<(), Box<dyn Error>>;
 }
 
+struct TemporaryValuesFile {
+    path: PathBuf,
+}
+
+impl TemporaryValuesFile {
+    fn create(contents: &str) -> Result<Self, Box<dyn Error>> {
+        let path =
+            std::env::temp_dir().join(format!("hops-lwb-values-{}.yaml", uuid::Uuid::new_v4()));
+        let temporary = Self { path };
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary.path)?;
+        file.write_all(contents.as_bytes())?;
+        Ok(temporary)
+    }
+}
+
+impl Drop for TemporaryValuesFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Real helm binary runner.
 pub struct SystemHelm;
 
@@ -97,12 +126,7 @@ impl HelmRunner for SystemHelm {
         namespace: &str,
         values_yaml: &str,
     ) -> Result<String, Box<dyn Error>> {
-        let values_path = std::env::temp_dir().join(format!(
-            "hops-lwb-values-{}-{}.yaml",
-            std::process::id(),
-            release
-        ));
-        std::fs::write(&values_path, values_yaml)?;
+        let values_file = TemporaryValuesFile::create(values_yaml)?;
         let output = Command::new("helm")
             .args([
                 "template",
@@ -111,10 +135,9 @@ impl HelmRunner for SystemHelm {
                 "--namespace",
                 namespace,
                 "--values",
-                &values_path.to_string_lossy(),
+                &values_file.path.to_string_lossy(),
             ])
             .output()?;
-        let _ = std::fs::remove_file(&values_path);
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
@@ -151,10 +174,8 @@ impl KubectlApplier for SystemKubectl {
         // Apply one document at a time so a missing platform CRD (e.g. PSQLCluster
         // when the pack is not installed) does not prevent core Deploy/Service apply.
         let mut hard_errors = Vec::new();
-        for doc in split_yaml_docs_owned(yaml) {
-            if doc.trim().is_empty() {
-                continue;
-            }
+        for doc in parse_yaml_docs(yaml)? {
+            let doc = serde_yaml::to_string(&doc)?;
             match crate::commands::local::kubectl_apply_stdin(&doc) {
                 Ok(()) => {}
                 Err(e) => {
@@ -260,11 +281,7 @@ fn inventory_name(app_name: &str) -> String {
 
 fn managed_object_refs(yaml: &str) -> Result<Vec<ManagedObjectRef>, Box<dyn Error>> {
     let mut refs = BTreeSet::new();
-    for doc in split_yaml_docs_owned(yaml) {
-        if doc.trim().is_empty() {
-            continue;
-        }
-        let value: Value = serde_yaml::from_str(&doc)?;
+    for value in parse_yaml_docs(yaml)? {
         let Some(root) = value.as_mapping() else {
             continue;
         };
@@ -408,23 +425,17 @@ pub fn inject_labels(workspace_name: &str, app_name: &str) -> BTreeMap<String, S
     labels
 }
 
-fn split_yaml_docs_owned(s: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut buf = String::new();
-    for line in s.lines() {
-        if line.trim() == "---" {
-            if !buf.trim().is_empty() {
-                parts.push(std::mem::take(&mut buf));
-            }
-        } else {
-            buf.push_str(line);
-            buf.push('\n');
+fn parse_yaml_docs(s: &str) -> Result<Vec<Value>, Box<dyn Error>> {
+    use serde::Deserialize;
+
+    let mut docs = Vec::new();
+    for document in serde_yaml::Deserializer::from_str(s) {
+        let value = Value::deserialize(document)?;
+        if !value.is_null() {
+            docs.push(value);
         }
     }
-    if !buf.trim().is_empty() {
-        parts.push(buf);
-    }
-    parts
+    Ok(docs)
 }
 
 fn inject_labels_into_value(value: &mut Value, labels: &BTreeMap<String, String>) {
@@ -488,12 +499,9 @@ pub fn render_labels_into_manifests(
     labels: &BTreeMap<String, String>,
 ) -> Result<String, Box<dyn Error>> {
     let mut out_docs = Vec::new();
-    for doc in split_yaml_docs_owned(rendered) {
-        if doc.trim().is_empty() {
-            continue;
-        }
-        let mut value: Value = serde_yaml::from_str(&doc)
-            .map_err(|e| format!("parse rendered manifest: {e}\n---\n{doc}"))?;
+    for mut value in
+        parse_yaml_docs(rendered).map_err(|e| format!("parse rendered manifest: {e}"))?
+    {
         inject_labels_into_value(&mut value, labels);
         out_docs.push(serde_yaml::to_string(&value)?);
     }
@@ -733,11 +741,7 @@ fn is_app_workload_kind(api_version: &str, kind: &str) -> bool {
 /// Never overwrites an already-set namespace.
 pub fn ensure_namespace_on_docs(yaml: &str, namespace: &str) -> Result<String, Box<dyn Error>> {
     let mut out = Vec::new();
-    for doc in split_yaml_docs_owned(yaml) {
-        if doc.trim().is_empty() {
-            continue;
-        }
-        let mut value: Value = serde_yaml::from_str(&doc)?;
+    for mut value in parse_yaml_docs(yaml)? {
         if let Some(root) = value.as_mapping_mut() {
             let kind = root
                 .get(Value::String("kind".into()))
@@ -853,6 +857,19 @@ spec:
         assert!(
             dep.contains("local-env: ws"),
             "deployment/pod template missing local-env: {dep}"
+        );
+    }
+
+    #[test]
+    fn parser_preserves_document_markers_inside_block_scalars() {
+        let rendered = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: sample\ndata:\n  script: |\n    before\n    ---\n    after\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: sample\n";
+        let labels = inject_labels("ws", "app");
+        let out = render_labels_into_manifests(rendered, &labels).unwrap();
+        let docs = parse_yaml_docs(&out).unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(
+            docs[0]["data"]["script"].as_str(),
+            Some("before\n---\nafter\n")
         );
     }
 

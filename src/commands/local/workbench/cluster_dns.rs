@@ -13,11 +13,13 @@
 //!
 //! Result: `curl http://e2e-ui-api.dogfood.svc.cluster.local:8791`
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Managed block markers in `/etc/hosts` (and the runtime mirror).
 pub const HOSTS_BEGIN: &str = "# BEGIN hops-local-dns (managed by hops local — do not edit)";
@@ -151,18 +153,33 @@ pub fn merge_hosts_file(existing: &str, all_workspace_lines: &[String]) -> Strin
 
 /// Remove the hops-managed block from hosts content.
 pub fn strip_managed_block(existing: &str) -> String {
-    let mut out = String::new();
-    let mut in_block = false;
-    for line in existing.lines() {
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut pending_begin = None;
+    let mut matched_ranges = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
         if line.trim() == HOSTS_BEGIN {
-            in_block = true;
-            continue;
+            // A later BEGIN supersedes an unmatched earlier one. This preserves an
+            // interrupted block as ordinary user content while still recognizing a
+            // subsequent complete block written by hops.
+            pending_begin = Some(index);
+        } else if line.trim() == HOSTS_END {
+            if let Some(begin) = pending_begin.take() {
+                matched_ranges.push((begin, index));
+            }
         }
-        if line.trim() == HOSTS_END {
-            in_block = false;
-            continue;
-        }
-        if !in_block {
+    }
+    if pending_begin.is_some() {
+        log::warn!("unterminated hops-local block in /etc/hosts; preserving original content");
+    }
+    if matched_ranges.is_empty() {
+        return existing.to_string();
+    }
+    let mut out = String::new();
+    for (index, line) in lines.into_iter().enumerate() {
+        if !matched_ranges
+            .iter()
+            .any(|(begin, end)| index >= *begin && index <= *end)
+        {
             out.push_str(line);
             out.push('\n');
         }
@@ -183,12 +200,58 @@ fn alloc_path(state_dir: &Path) -> PathBuf {
     state_dir.join("runtime").join("dns-ip-alloc.json")
 }
 
+pub(crate) struct DnsStateLock {
+    _file: File,
+}
+
+impl Drop for DnsStateLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            use std::os::fd::AsRawFd;
+            let _ = libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+pub(crate) fn acquire_dns_state_lock(state_dir: &Path) -> Result<DnsStateLock, Box<dyn Error>> {
+    let runtime_dir = state_dir.join("runtime");
+    fs::create_dir_all(&runtime_dir)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(runtime_dir.join("dns-state.lock"))?;
+    #[cfg(unix)]
+    unsafe {
+        use std::os::fd::AsRawFd;
+        if libc::flock(file.as_raw_fd(), libc::LOCK_EX) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(DnsStateLock { _file: file })
+}
+
 pub fn load_ip_alloc(state_dir: &Path) -> DnsIpAlloc {
     let path = alloc_path(state_dir);
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    match fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|error| {
+            log::warn!(
+                "ignoring corrupt DNS allocation file {}: {error}",
+                path.display()
+            );
+            DnsIpAlloc::default()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DnsIpAlloc::default(),
+        Err(error) => {
+            log::warn!(
+                "could not read DNS allocation file {}: {error}",
+                path.display()
+            );
+            DnsIpAlloc::default()
+        }
+    }
 }
 
 pub fn save_ip_alloc(state_dir: &Path, alloc: &DnsIpAlloc) -> Result<(), Box<dyn Error>> {
@@ -202,6 +265,15 @@ pub fn save_ip_alloc(state_dir: &Path, alloc: &DnsIpAlloc) -> Result<(), Box<dyn
 
 /// Update alloc bindings for this namespace's services; drop stale services in ns.
 pub fn sync_alloc_for_namespace(
+    state_dir: &Path,
+    namespace: &str,
+    services: &[super::net::ServiceEndpoint],
+) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    let _lock = acquire_dns_state_lock(state_dir)?;
+    sync_alloc_for_namespace_locked(state_dir, namespace, services)
+}
+
+pub(crate) fn sync_alloc_for_namespace_locked(
     state_dir: &Path,
     namespace: &str,
     services: &[super::net::ServiceEndpoint],
@@ -226,6 +298,27 @@ pub fn sync_alloc_for_namespace(
     }
     save_ip_alloc(state_dir, &alloc)?;
     Ok(service_ips)
+}
+
+pub fn parse_ifconfig_inet_addresses(output: &str) -> BTreeSet<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("inet"))
+                .then(|| fields.next())
+                .flatten()
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn loopback_inet_addresses() -> BTreeSet<String> {
+    Command::new("ifconfig")
+        .arg("lo0")
+        .output()
+        .map(|output| parse_ifconfig_inet_addresses(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
 }
 
 /// Rebuild /etc/hosts managed block from **all** workspace runtimes that use dns mode.
@@ -259,14 +352,10 @@ pub fn dns_os_config_present(hosts_body: &str, loopback_ips: &[String]) -> bool 
     if !macos_resolver_present() {
         return false;
     }
-    let lo0 = Command::new("ifconfig")
-        .arg("lo0")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
+    let lo0 = loopback_inet_addresses();
     loopback_ips
         .iter()
-        .all(|ip| ip.is_empty() || ip == "127.0.0.1" || lo0.contains(ip.as_str()))
+        .all(|ip| ip.is_empty() || ip == "127.0.0.1" || lo0.contains(ip))
 }
 
 fn macos_resolver_present() -> bool {
@@ -307,22 +396,92 @@ pub fn apply_privileged_dns_config(
     hosts_body: &str,
     loopback_ips: &[String],
 ) -> Result<(), Box<dyn Error>> {
+    apply_privileged_dns_config_with_prompt(
+        hosts_body,
+        loopback_ips,
+        PrivilegedPrompt::InteractiveOnce,
+    )
+}
+
+pub(crate) fn apply_privileged_dns_config_noprompt(hosts_body: &str) -> Result<(), Box<dyn Error>> {
+    apply_privileged_dns_config_with_prompt(hosts_body, &[], PrivilegedPrompt::Never)
+}
+
+struct StagedHostsFile {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl StagedHostsFile {
+    fn create(hosts_body: &str) -> Result<Self, Box<dyn Error>> {
+        let dir = std::env::temp_dir().join(format!("hops-hosts-{}", uuid::Uuid::new_v4()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&dir)?;
+        let path = dir.join("hosts");
+        let staged = Self { dir, path };
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&staged.path)?;
+        file.write_all(hosts_body.as_bytes())?;
+        Ok(staged)
+    }
+}
+
+impl Drop for StagedHostsFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_dir(&self.dir);
+    }
+}
+
+fn safe_privileged_path(path: &str) -> bool {
+    !path.is_empty()
+        && path
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
+}
+
+fn apply_privileged_dns_config_with_prompt(
+    hosts_body: &str,
+    loopback_ips: &[String],
+    prompt: PrivilegedPrompt,
+) -> Result<(), Box<dyn Error>> {
     if dns_os_config_present(hosts_body, loopback_ips) {
         log::debug!("cluster DNS OS config already present; skipping admin prompt");
         return Ok(());
     }
 
-    let tmp = std::env::temp_dir().join(format!("hops-hosts-{}.tmp", std::process::id()));
-    fs::write(&tmp, hosts_body)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644));
+    let staged = StagedHostsFile::create(hosts_body)?;
+    let tmp_s = staged.path.to_string_lossy().into_owned();
+    if !safe_privileged_path(&tmp_s) {
+        return Err("temporary hosts path contains unsupported shell metacharacters".into());
     }
-    let tmp_s = tmp.to_string_lossy().into_owned();
+    if loopback_ips
+        .iter()
+        .any(|ip| !ip.is_empty() && ip.parse::<std::net::Ipv4Addr>().is_err())
+    {
+        return Err("invalid loopback IP in DNS configuration".into());
+    }
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let backup = format!(
+        "/etc/hosts.hops-backup-{timestamp}-{}",
+        uuid::Uuid::new_v4()
+    );
 
     let mut shell = String::new();
-    shell.push_str(&format!("cp '{tmp_s}' /etc/hosts && chmod 644 /etc/hosts"));
+    shell.push_str(&format!(
+        "cp /etc/hosts '{backup}' && chmod 600 '{backup}' && cp '{tmp_s}' /etc/hosts && chmod 644 /etc/hosts"
+    ));
     if cfg!(target_os = "macos") {
         for ip in loopback_ips {
             if ip == "127.0.0.1" || ip.is_empty() {
@@ -346,8 +505,10 @@ pub fn apply_privileged_dns_config(
     log::info!(
         "Configuring cluster DNS on this machine (admin required once): /etc/hosts + loopback aliases"
     );
-    let result = run_privileged_shell(&shell, PrivilegedPrompt::InteractiveOnce);
-    let _ = fs::remove_file(&tmp);
+    let result = run_privileged_shell(&shell, prompt);
+    if result.is_ok() {
+        log::info!("backed up /etc/hosts to {backup}");
+    }
     result.map_err(|e| {
         format!(
             "cluster DNS needs admin privileges to write /etc/hosts (and lo0 aliases on macOS).\n\
@@ -407,7 +568,9 @@ pub fn run_privileged_shell(script: &str, prompt: PrivilegedPrompt) -> Result<()
     }
 
     if cfg!(target_os = "macos") {
-        // GUI admin dialog (IDEs / agents without a TTY). Escape for AppleScript.
+        // GUI admin dialog (IDEs / agents without a TTY). AppleScript escaping alone
+        // does not neutralize shell substitutions, so interpolated paths are validated
+        // before this function is called.
         let escaped = script
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
@@ -431,16 +594,11 @@ pub fn ensure_loopback_aliases(ips: &[String]) -> Result<(), Box<dyn Error>> {
     if !cfg!(target_os = "macos") {
         return Ok(());
     }
+    let configured = loopback_inet_addresses();
     let missing: Vec<String> = ips
         .iter()
         .filter(|ip| !ip.is_empty() && *ip != "127.0.0.1")
-        .filter(|ip| {
-            !Command::new("ifconfig")
-                .arg("lo0")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains(ip.as_str()))
-                .unwrap_or(false)
-        })
+        .filter(|ip| !configured.contains(*ip))
         .cloned()
         .collect();
     if missing.is_empty() {
@@ -470,6 +628,15 @@ pub fn remove_loopback_aliases(ips: &[String]) {
     }
     if any {
         let _ = run_privileged_shell(&shell, PrivilegedPrompt::Never);
+    }
+}
+
+pub(crate) fn remove_macos_resolver_noprompt() {
+    if cfg!(target_os = "macos") {
+        let _ = run_privileged_shell(
+            "rm -f '/etc/resolver/svc.cluster.local'; dscacheutil -flushcache 2>/dev/null; killall -HUP mDNSResponder 2>/dev/null; true",
+            PrivilegedPrompt::Never,
+        );
     }
 }
 
@@ -551,6 +718,31 @@ mod tests {
         assert!(merged.contains("foo.x.svc.cluster")); // mDNS-safe twin
         assert!(!merged.contains("\nold\n"));
         assert_eq!(merged.matches(HOSTS_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn unterminated_managed_block_preserves_original_hosts() {
+        let existing = format!("127.0.0.1 localhost\n{HOSTS_BEGIN}\nkeep-this-line\n");
+        assert_eq!(strip_managed_block(&existing), existing);
+    }
+
+    #[test]
+    fn later_complete_block_does_not_consume_unterminated_user_content() {
+        let existing = format!(
+            "127.0.0.1 localhost\n{HOSTS_BEGIN}\nkeep-this-line\n{HOSTS_BEGIN}\nmanaged\n{HOSTS_END}\n"
+        );
+        let stripped = strip_managed_block(&existing);
+        assert!(stripped.contains("keep-this-line"));
+        assert!(stripped.contains(HOSTS_BEGIN));
+        assert!(!stripped.contains("managed\n"));
+    }
+
+    #[test]
+    fn ifconfig_parser_matches_complete_inet_addresses() {
+        let output = "\tinet 127.0.0.1 netmask 0xff000000\n\tinet 127.53.0.25 netmask 0xff000000\n";
+        let addresses = parse_ifconfig_inet_addresses(output);
+        assert!(addresses.contains("127.53.0.25"));
+        assert!(!addresses.contains("127.53.0.2"));
     }
 
     #[test]

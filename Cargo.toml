@@ -24,6 +24,7 @@ rusoto_sts = "0.48.0"
 tokio = { version = "1.45.1", features = ["rt-multi-thread"] }
 uuid = { version = "1.17.0", features = ["v4"] }
 notify = "8.2.0"
+libc = "0.2"
 
 [features]
 vendored = ["openssl-sys/vendored"]

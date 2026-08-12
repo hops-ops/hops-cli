@@ -628,6 +628,7 @@ dependencies = [
  "dialoguer",
  "fern",
  "flate2",
+ "libc",
  "log",
  "notify",
  "openssl-sys",

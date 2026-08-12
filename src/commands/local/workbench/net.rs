@@ -14,8 +14,10 @@
 //! `http://e2e-ui-ui.dogfood.svc.cluster.local:5180`
 
 use super::cluster_dns::{
-    self, format_dns_url, remove_loopback_aliases, sync_alloc_for_namespace, MACOS_LOCAL_DNS_PORT,
+    self, acquire_dns_state_lock, format_dns_url, parse_ifconfig_inet_addresses,
+    remove_loopback_aliases, sync_alloc_for_namespace_locked, MACOS_LOCAL_DNS_PORT,
 };
+use super::registry::slugify_name;
 use crate::commands::local::{kubectl_command, HOPS_KUBE_CONTEXT_ENV};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -149,7 +151,7 @@ pub fn host_access_status_line(rt: &HostAccessRuntime) -> String {
 fn runtime_path(state_dir: &Path, workspace: &str) -> PathBuf {
     state_dir
         .join(RUNTIME_SUBDIR)
-        .join(format!("{workspace}.host-access.json"))
+        .join(format!("{}.host-access.json", slugify_name(workspace)))
 }
 
 pub fn save_host_access_runtime(
@@ -337,10 +339,10 @@ fn regex_lite_cluster_dns(s: &str) -> Vec<(String, String, Option<u16>)> {
             .unwrap_or(0);
         let host = &s[start..end];
         // expect name.namespace
-        let mut parts: Vec<&str> = host.split('.').collect();
-        if parts.len() >= 2 {
-            let ns = parts.pop().unwrap().to_string();
-            let name = parts.join(".");
+        let parts: Vec<&str> = host.split('.').collect();
+        if parts.len() == 2 {
+            let name = parts[0].to_string();
+            let ns = parts[1].to_string();
             if !name.is_empty() && !ns.is_empty() {
                 let after = end + marker.len();
                 let port = if s[after..].starts_with(':') {
@@ -377,6 +379,10 @@ pub fn start_host_access(
         ));
     }
 
+    // Serialize allocation, runtime collection, /etc/hosts, and zone updates across
+    // worktrees so each update observes the previous workspace's complete state.
+    let _dns_state_lock = acquire_dns_state_lock(state_dir)?;
+
     // Allocate IPs per namespace group.
     let mut by_ns: BTreeMap<String, Vec<ServiceEndpoint>> = BTreeMap::new();
     for svc in services {
@@ -390,7 +396,7 @@ pub fn start_host_access(
     let mut ns_blocks: Vec<(String, BTreeMap<String, String>)> = Vec::new();
     for (ns, svcs) in &by_ns {
         // sync_alloc maps bare service name → ip; rekey to ns/name
-        let bare = sync_alloc_for_namespace(state_dir, ns, svcs)?;
+        let bare = sync_alloc_for_namespace_locked(state_dir, ns, svcs)?;
         let mut bare_for_hosts = BTreeMap::new();
         for (name, ip) in bare {
             bare_for_hosts.insert(name.clone(), ip.clone());
@@ -420,7 +426,9 @@ pub fn start_host_access(
     let plan = plan_host_access_with_ips(namespace, services, &ip_map);
     // Zone file for macOS stub DNS (instant *.svc.cluster.local; avoid mDNS).
     write_zone_file(state_dir, &merged_by_ns)?;
-    ensure_macos_stub_dns(state_dir)?;
+    if let Err(error) = ensure_macos_stub_dns(state_dir) {
+        log::warn!("macOS stub DNS unavailable ({error}); falling back to /etc/hosts resolution");
+    }
     let rt = start_dns_supervisor(&plan, services, state_dir, workspace)?;
     std::thread::sleep(Duration::from_millis(700));
     if !rt.pids.iter().any(|p| pid_is_alive(*p)) {
@@ -637,11 +645,11 @@ fn verify_loopback_aliases_ready(ips: &[String]) -> Result<(), Box<dyn Error>> {
     let lo0 = Command::new("ifconfig")
         .arg("lo0")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .map(|o| parse_ifconfig_inet_addresses(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default();
     let missing: Vec<&str> = ips
         .iter()
-        .filter(|ip| !ip.is_empty() && *ip != "127.0.0.1" && !lo0.contains(ip.as_str()))
+        .filter(|ip| !ip.is_empty() && *ip != "127.0.0.1" && !lo0.contains(*ip))
         .map(String::as_str)
         .collect();
     if missing.is_empty() {
@@ -661,6 +669,7 @@ fn start_dns_supervisor(
     workspace: &str,
 ) -> Result<HostAccessRuntime, Box<dyn Error>> {
     let _ = stop_host_access_processes_only(state_dir, workspace);
+    let workspace = slugify_name(workspace);
 
     let log_dir = state_dir.join(RUNTIME_SUBDIR);
     fs::create_dir_all(&log_dir)?;
@@ -718,9 +727,16 @@ while true; do
     pf="$PIDDIR/$safe.pid"
     pid=""
     if [ -f "$pf" ]; then pid=$(cat "$pf" 2>/dev/null || true); fi
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then continue; fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      state=$(ps -o state= -p "$pid" 2>/dev/null || true)
+      case "$state" in
+        Z*|z*) wait "$pid" 2>/dev/null || true; rm -f "$pf" ;;
+        *) continue ;;
+      esac
+    fi
     if [ -n "$pid" ]; then
       kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
       echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) restart $KEY" >>"$LOG"
     else
       echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) start $KEY $IP:$PORT" >>"$LOG"
@@ -768,7 +784,7 @@ done
         service_ports,
         ip_map: plan.ip_map.clone(),
     };
-    save_host_access_runtime(state_dir, workspace, &runtime)?;
+    save_host_access_runtime(state_dir, &workspace, &runtime)?;
     log::info!("host access started (dns supervisor) pid={pid}");
     Ok(runtime)
 }
@@ -914,45 +930,74 @@ fn stop_host_access_processes_only(
     state_dir: &Path,
     workspace: &str,
 ) -> Result<(), Box<dyn Error>> {
-    if let Some(rt) = load_host_access_runtime(state_dir, workspace)? {
+    let workspace = slugify_name(workspace);
+    if let Some(rt) = load_host_access_runtime(state_dir, &workspace)? {
+        let supervisor_marker = format!("{workspace}.dns-sup.sh");
         for pid in &rt.pids {
-            let _ = Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
+            if pid_command_contains_all(*pid, &[&supervisor_marker]) {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
         }
         std::thread::sleep(Duration::from_millis(200));
         for pid in &rt.pids {
-            let _ = Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
+            if pid_command_contains_all(*pid, &[&supervisor_marker]) {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
         }
         let piddir = state_dir
             .join(RUNTIME_SUBDIR)
             .join(format!("{workspace}.dns-pf-pids"));
-        if let Ok(entries) = fs::read_dir(piddir) {
+        if let Ok(entries) = fs::read_dir(&piddir) {
             for ent in entries.flatten() {
                 if let Ok(s) = fs::read_to_string(ent.path()) {
                     if let Ok(pid) = s.trim().parse::<u32>() {
-                        let _ = Command::new("kill")
-                            .args(["-TERM", &pid.to_string()])
-                            .status();
+                        if pid_command_contains_all(pid, &["kubectl", "port-forward"]) {
+                            let _ = Command::new("kill")
+                                .args(["-TERM", &pid.to_string()])
+                                .status();
+                        }
                     }
                 }
+                let _ = fs::remove_file(ent.path());
             }
+            let _ = fs::remove_dir(&piddir);
         }
     }
-    clear_host_access_runtime(state_dir, workspace);
+    clear_host_access_runtime(state_dir, &workspace);
     Ok(())
 }
 
+fn pid_command_contains_all(pid: u32, needles: &[&str]) -> bool {
+    Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .map(|output| {
+            let command = String::from_utf8_lossy(&output.stdout);
+            needles.iter().all(|needle| command.contains(needle))
+        })
+        .unwrap_or(false)
+}
+
 pub fn stop_host_access(state_dir: &Path, workspace: &str) -> Result<(), Box<dyn Error>> {
+    let _dns_state_lock = acquire_dns_state_lock(state_dir)?;
     let rt = load_host_access_runtime(state_dir, workspace)?;
     stop_host_access_processes_only(state_dir, workspace)?;
     if let Some(rt) = rt {
         if !rt.ip_map.is_empty() {
             remove_loopback_aliases(&rt.ip_map.values().cloned().collect::<Vec<_>>());
             if let Ok(blocks) = collect_dns_blocks_from_runtimes(state_dir, Some(workspace)) {
+                let by_ns: BTreeMap<String, BTreeMap<String, String>> =
+                    blocks.iter().cloned().collect();
+                let _ = write_zone_file(state_dir, &by_ns);
                 let _ = rebuild_hosts_from_blocks_noprompt(&blocks);
+                if blocks.is_empty() {
+                    stop_macos_stub_dns(state_dir);
+                    cluster_dns::remove_macos_resolver_noprompt();
+                }
             }
         }
     }
@@ -962,25 +1007,41 @@ pub fn stop_host_access(state_dir: &Path, workspace: &str) -> Result<(), Box<dyn
 fn rebuild_hosts_from_blocks_noprompt(
     blocks: &[(String, BTreeMap<String, String>)],
 ) -> Result<(), Box<dyn Error>> {
-    use super::cluster_dns::{
-        dns_os_config_present, hosts_lines_for_workspace, merge_hosts_file, run_privileged_shell,
-        PrivilegedPrompt,
-    };
+    use super::cluster_dns::{hosts_lines_for_workspace, merge_hosts_file};
     let mut lines = Vec::new();
     for (ns, ips) in blocks {
         lines.extend(hosts_lines_for_workspace(ns, ips));
     }
     let current = fs::read_to_string("/etc/hosts").unwrap_or_default();
     let merged = merge_hosts_file(&current, &lines);
-    if dns_os_config_present(&merged, &[]) {
-        return Ok(());
+    cluster_dns::apply_privileged_dns_config_noprompt(&merged)
+}
+
+fn stop_macos_stub_dns(state_dir: &Path) {
+    if !cfg!(target_os = "macos") {
+        return;
     }
-    let tmp = std::env::temp_dir().join(format!("hops-hosts-down-{}.tmp", std::process::id()));
-    fs::write(&tmp, &merged)?;
-    let script = format!("cp '{}' /etc/hosts && chmod 644 /etc/hosts", tmp.display());
-    let res = run_privileged_shell(&script, PrivilegedPrompt::Never);
-    let _ = fs::remove_file(&tmp);
-    res
+    let runtime = state_dir.join(RUNTIME_SUBDIR);
+    let pid_path = runtime.join("macos-stub-dns.pid");
+    let script_path = runtime.join("macos-stub-dns.py");
+    if let Ok(raw) = fs::read_to_string(&pid_path) {
+        if let Ok(pid) = raw.trim().parse::<u32>() {
+            let owns_pid = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "args="])
+                .output()
+                .map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains(&script_path.to_string_lossy().to_string())
+                })
+                .unwrap_or(false);
+            if owns_pid {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    let _ = fs::remove_file(pid_path);
 }
 
 fn collect_dns_blocks_from_runtimes(
@@ -988,6 +1049,7 @@ fn collect_dns_blocks_from_runtimes(
     skip_workspace: Option<&str>,
 ) -> Result<Vec<(String, BTreeMap<String, String>)>, Box<dyn Error>> {
     let dir = state_dir.join(RUNTIME_SUBDIR);
+    let skip_workspace = skip_workspace.map(slugify_name);
     let mut by_ns: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let Ok(entries) = fs::read_dir(&dir) else {
         return Ok(Vec::new());
@@ -998,7 +1060,7 @@ fn collect_dns_blocks_from_runtimes(
             continue;
         }
         let ws = name.trim_end_matches(".host-access.json");
-        if skip_workspace == Some(ws) {
+        if skip_workspace.as_deref() == Some(ws) {
             continue;
         }
         let Ok(text) = fs::read_to_string(ent.path()) else {
@@ -1057,5 +1119,36 @@ mod tests {
             refs,
             vec![("auth".into(), "zitadel-zitadel".into(), Some(8080))]
         );
+    }
+
+    #[test]
+    fn parser_ignores_pod_specific_cluster_dns_names() {
+        let refs = regex_lite_cluster_dns("http://pod-0.service.ns.svc.cluster.local:8080");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn runtime_path_slugifies_workspace_name() {
+        let path = runtime_path(Path::new("/state"), "../../My Workspace");
+        assert_eq!(
+            path,
+            Path::new("/state/runtime/my-workspace.host-access.json")
+        );
+    }
+
+    #[test]
+    fn runtime_collection_slugifies_skipped_workspace_name() {
+        let dir = std::env::temp_dir().join(format!("hops-net-test-{}", uuid::Uuid::new_v4()));
+        let runtime = HostAccessRuntime {
+            namespace: "my-workspace".into(),
+            ip_map: BTreeMap::from([("my-workspace/removed-service".into(), "127.53.0.2".into())]),
+            ..Default::default()
+        };
+        save_host_access_runtime(&dir, "My Workspace", &runtime).unwrap();
+
+        let blocks = collect_dns_blocks_from_runtimes(&dir, Some("My Workspace")).unwrap();
+
+        assert!(blocks.is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 }
