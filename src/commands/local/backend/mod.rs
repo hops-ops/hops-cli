@@ -6,7 +6,7 @@
 
 mod colima;
 mod dory;
-mod kind;
+pub(crate) mod kind;
 
 use super::{local_state_dir, run_cmd_output, HOPS_KUBE_CONTEXT_ENV};
 use clap::Args;

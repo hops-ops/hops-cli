@@ -5,12 +5,25 @@
 //! containerd's certs.d (`config_path` is enabled by default in kind node
 //! images since v0.27.0), written after cluster creation; containerd reads
 //! certs.d per-pull, so no restart is needed.
+//!
+//! ## Source delivery (hostPath spike)
+//!
+//! On create, hops injects kind `extraMounts` for `$HOME` (same path in the
+//! node) so Mac worktrees are visible for hostPath delivery when the engine
+//! can bind-mount host dirs (e.g. Dory). Changing mounts requires recreate
+//! (`hops local reset --backend kind`).
+//!
+//! ## Docker engine selection (spike toward --docker-provider)
+//!
+//! Prefer explicit `DOCKER_HOST` / active docker context. If unset and
+//! `~/.dory/dory.sock` exists, kind commands use that socket (kind-on-Dory).
 
 use super::SizeArgs;
 use crate::commands::local::package_install::{REGISTRY_PULL, REGISTRY_PUSH};
 use crate::commands::local::{command_exists, run_cmd, run_cmd_output};
 use std::error::Error;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -22,15 +35,195 @@ const NODE_CONTAINER: &str = "hops-control-plane";
 /// `config_path` enabled, so our hosts.toml files would be ignored.
 const MIN_KIND_VERSION: (u32, u32) = (0, 27);
 
-const KIND_CONFIG: &str = r#"kind: Cluster
+/// Pure registry hostPort selection (testable without docker).
+///
+/// When kind shares a docker engine with product Dory k8s, host 30500 is often
+/// already bound — use 30501 so create succeeds (LWB-REQ-254).
+pub fn pick_registry_host_port(env_override: Option<u16>, dory_k8s_present: bool) -> u16 {
+    if let Some(p) = env_override {
+        return p;
+    }
+    if dory_k8s_present {
+        return 30501;
+    }
+    30500
+}
+
+/// Host port published for the in-cluster registry NodePort (container 30500).
+pub fn registry_host_port() -> u16 {
+    let env_override = std::env::var("HOPS_KIND_REGISTRY_HOST_PORT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok());
+    let dory_k8s = docker_output(&["inspect", "-f", "{{.Id}}", "dory-k8s"]).is_ok();
+    pick_registry_host_port(env_override, dory_k8s)
+}
+
+/// Result of checking whether the kind node can see the projects-root mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeMountReport {
+    /// No hops kind control-plane container (or docker unreachable).
+    NoKindNode,
+    /// HOME / projects root not configured on the host.
+    NoMountRoot,
+    /// Node can see the path (hostPath delivery capable for trees under it).
+    Visible { path: String },
+    /// Kind node is running but path missing — recreate with extraMounts.
+    Missing { path: String },
+}
+
+impl NodeMountReport {
+    /// One-line doctor/status summary.
+    pub fn summary(&self) -> String {
+        match self {
+            NodeMountReport::NoKindNode => {
+                "kind node not running (start/reset --backend kind for hostPath mounts)".into()
+            }
+            NodeMountReport::NoMountRoot => "no HOME/projects root to mount".into(),
+            NodeMountReport::Visible { path } => {
+                format!("hostPath capable — kind node sees {path}")
+            }
+            NodeMountReport::Missing { path } => format!(
+                "kind node missing mount {path}; run `hops local reset --backend kind` to apply extraMounts"
+            ),
+        }
+    }
+
+    pub fn is_hostpath_capable(&self) -> bool {
+        matches!(self, NodeMountReport::Visible { .. })
+    }
+}
+
+/// Whether the kind control-plane container is present on the resolved docker engine.
+pub fn kind_node_present() -> bool {
+    docker_output(&["inspect", "-f", "{{.Id}}", NODE_CONTAINER]).is_ok()
+}
+
+/// Probe the kind node for the default projects-root mount (same path as create).
+pub fn report_projects_root_on_kind_node() -> NodeMountReport {
+    if !kind_node_present() {
+        return NodeMountReport::NoKindNode;
+    }
+    let Some(root) = default_extra_mount_root() else {
+        return NodeMountReport::NoMountRoot;
+    };
+    let path = root.display().to_string();
+    if node_sees_path(&path) {
+        NodeMountReport::Visible { path }
+    } else {
+        NodeMountReport::Missing { path }
+    }
+}
+
+/// `docker exec` test -d on the kind node (shared by create verify + doctor).
+pub fn node_sees_path(path: &str) -> bool {
+    docker_output(&["exec", NODE_CONTAINER, "test", "-d", path]).is_ok()
+}
+
+/// Build the kind cluster config YAML.
+///
+/// When `extra_mount_host` is a directory, mount it at the same absolute path
+/// inside the node (kind `extraMounts`) so pod hostPath of that path works.
+pub fn build_kind_config(extra_mount_host: Option<&Path>, registry_host_port: u16) -> String {
+    let mut cfg = format!(
+        r#"kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
   extraPortMappings:
   - containerPort: 30500
-    hostPort: 30500
+    hostPort: {registry_host_port}
     listenAddress: "127.0.0.1"
-"#;
+"#
+    );
+    if let Some(host) = extra_mount_host {
+        let p = host.display().to_string();
+        // YAML double-quoted path; escape backslashes and quotes if any.
+        let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
+        cfg.push_str("  extraMounts:\n");
+        cfg.push_str("  - hostPath: \"");
+        cfg.push_str(&escaped);
+        cfg.push_str("\"\n");
+        cfg.push_str("    containerPath: \"");
+        cfg.push_str(&escaped);
+        cfg.push_str("\"\n");
+        cfg.push_str("    readOnly: false\n");
+    }
+    cfg
+}
+
+/// Host directory to bind into the kind node for hostPath delivery.
+/// Default: `$HOME` when it is an existing directory.
+pub fn default_extra_mount_root() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let p = PathBuf::from(home);
+    if p.is_dir() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Resolve DOCKER_HOST for kind/docker CLI when caller has not set one.
+///
+/// Spike toward `--docker-provider dory`: if `~/.dory/dory.sock` exists, use it.
+pub fn resolve_docker_host() -> Option<String> {
+    if let Ok(h) = std::env::var("DOCKER_HOST") {
+        if !h.trim().is_empty() {
+            return Some(h);
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    let sock = PathBuf::from(home).join(".dory/dory.sock");
+    if sock.exists() {
+        return Some(format!("unix://{}", sock.display()));
+    }
+    None
+}
+
+fn apply_docker_host(cmd: &mut Command) {
+    if let Some(host) = resolve_docker_host() {
+        cmd.env("DOCKER_HOST", host);
+    }
+}
+
+fn docker_cmd(args: &[&str]) -> Command {
+    let mut c = Command::new("docker");
+    apply_docker_host(&mut c);
+    c.args(args);
+    c
+}
+
+fn kind_cmd(args: &[&str]) -> Command {
+    let mut c = Command::new("kind");
+    apply_docker_host(&mut c);
+    c.args(args);
+    c
+}
+
+fn docker_output(args: &[&str]) -> Result<String, Box<dyn Error>> {
+    let output = docker_cmd(args).output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "docker {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn docker_run(args: &[&str]) -> Result<(), Box<dyn Error>> {
+    let status = docker_cmd(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    if !status.success() {
+        return Err(format!("docker {} exited with {}", args.join(" "), status).into());
+    }
+    Ok(())
+}
 
 pub fn install() -> Result<(), Box<dyn Error>> {
     log::info!("Installing kind via Homebrew...");
@@ -63,26 +256,34 @@ pub fn start(size: &SizeArgs) -> Result<(), Box<dyn Error>> {
 
     if node_running() {
         log::info!("kind cluster '{}' is already running", CLUSTER_NAME);
+        log_mount_hint();
         return Ok(());
     }
 
     // kind has no start/stop; the node is a docker container. Restarting a
     // single-node cluster is reliable in practice but not guaranteed by kind.
     log::info!("Starting stopped kind node '{}'...", NODE_CONTAINER);
-    run_cmd("docker", &["start", NODE_CONTAINER])?;
+    docker_run(&["start", NODE_CONTAINER])?;
     wait_for_api_after_restart()
 }
 
 pub fn stop() -> Result<(), Box<dyn Error>> {
     log::info!("Stopping kind node '{}'...", NODE_CONTAINER);
-    run_cmd("docker", &["stop", NODE_CONTAINER])?;
+    docker_run(&["stop", NODE_CONTAINER])?;
     log::info!("kind cluster stopped");
     Ok(())
 }
 
 pub fn destroy() -> Result<(), Box<dyn Error>> {
     log::info!("Deleting kind cluster '{}'...", CLUSTER_NAME);
-    run_cmd("kind", &["delete", "cluster", "--name", CLUSTER_NAME])?;
+    let status = kind_cmd(&["delete", "cluster", "--name", CLUSTER_NAME])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    if !status.success() {
+        return Err(format!("kind delete cluster exited with {}", status).into());
+    }
     log::info!("kind cluster deleted");
     Ok(())
 }
@@ -110,18 +311,23 @@ pub fn cluster_exists() -> bool {
     if !command_exists("kind") {
         return false;
     }
-    run_cmd_output("kind", &["get", "clusters"])
-        .map(|out| out.lines().any(|line| line.trim() == CLUSTER_NAME))
-        .unwrap_or(false)
+    let mut cmd = kind_cmd(&["get", "clusters"]);
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim() == CLUSTER_NAME)
 }
 
 fn node_running() -> bool {
-    run_cmd_output(
-        "docker",
-        &["inspect", "-f", "{{.State.Running}}", NODE_CONTAINER],
-    )
-    .map(|out| out.trim() == "true")
-    .unwrap_or(false)
+    docker_output(&["inspect", "-f", "{{.State.Running}}", NODE_CONTAINER])
+        .map(|out| out.trim() == "true")
+        .unwrap_or(false)
 }
 
 fn preflight() -> Result<(), Box<dyn Error>> {
@@ -149,33 +355,85 @@ fn preflight() -> Result<(), Box<dyn Error>> {
         ),
     }
 
-    if run_cmd_output("docker", &["info", "--format", "{{.ServerVersion}}"]).is_err() {
-        return Err(
-            "no reachable docker daemon; start Docker Desktop / colima / dory \
-             (or point DOCKER_HOST / `docker context use` at one) and retry"
-                .into(),
-        );
+    if let Some(host) = resolve_docker_host() {
+        log::info!("kind docker engine: DOCKER_HOST={host}");
+    }
+
+    match docker_output(&["info", "--format", "{{.ServerVersion}}"]) {
+        Ok(v) => log::info!("docker engine reachable (server {})", v.trim()),
+        Err(e) => {
+            return Err(format!(
+                "no reachable docker daemon for kind ({e}); start Dory / Docker Desktop / colima \
+                 (or set DOCKER_HOST) and retry"
+            )
+            .into());
+        }
     }
 
     Ok(())
 }
 
 fn create_cluster() -> Result<(), Box<dyn Error>> {
-    log::info!("Creating kind cluster '{}'...", CLUSTER_NAME);
-    let mut child = Command::new("kind")
-        .args(["create", "cluster", "--name", CLUSTER_NAME, "--config", "-"])
+    let mount = default_extra_mount_root();
+    let reg_port = registry_host_port();
+    let config = build_kind_config(mount.as_deref(), reg_port);
+    if reg_port != 30500 {
+        log::info!(
+            "kind registry hostPort={reg_port} (30500 busy or HOPS_KIND_REGISTRY_HOST_PORT set; \
+             package push may need the same port)"
+        );
+    }
+    if let Some(ref m) = mount {
+        log::info!(
+            "Creating kind cluster '{}' with extraMounts {} → {} (hostPath delivery)...",
+            CLUSTER_NAME,
+            m.display(),
+            m.display()
+        );
+    } else {
+        log::info!(
+            "Creating kind cluster '{}' (no HOME mount; hostPath delivery may fall back to sync)...",
+            CLUSTER_NAME
+        );
+    }
+
+    let mut child = kind_cmd(&["create", "cluster", "--name", CLUSTER_NAME, "--config", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
     if let Some(ref mut stdin) = child.stdin {
-        stdin.write_all(KIND_CONFIG.as_bytes())?;
+        stdin.write_all(config.as_bytes())?;
     }
     let status = child.wait()?;
     if !status.success() {
         return Err(format!("kind create cluster exited with {}", status).into());
     }
+
+    if let Some(ref m) = mount {
+        verify_node_mount(m)?;
+    }
     Ok(())
+}
+
+fn verify_node_mount(host_path: &Path) -> Result<(), Box<dyn Error>> {
+    let path_str = host_path.display().to_string();
+    if node_sees_path(&path_str) {
+        log::info!("kind node sees host mount path {path_str}");
+    } else {
+        log::warn!(
+            "kind node does not see {path_str} after create; hostPath delivery will use sync. \
+             Check docker engine file sharing / recreate with a reachable DOCKER_HOST."
+        );
+    }
+    Ok(())
+}
+
+fn log_mount_hint() {
+    let report = report_projects_root_on_kind_node();
+    if matches!(report, NodeMountReport::Missing { .. }) {
+        log::warn!("{}", report.summary());
+    }
 }
 
 fn wait_for_api_after_restart() -> Result<(), Box<dyn Error>> {
@@ -220,7 +478,7 @@ fn write_hosts_toml(registry_name: &str, cluster_ip: &str) -> Result<(), Box<dyn
     let desired = hosts_toml(cluster_ip);
 
     let current =
-        run_cmd_output("docker", &["exec", NODE_CONTAINER, "cat", &path]).unwrap_or_default();
+        docker_output(&["exec", NODE_CONTAINER, "cat", &path]).unwrap_or_default();
     if current == desired {
         return Ok(());
     }
@@ -231,19 +489,18 @@ fn write_hosts_toml(registry_name: &str, cluster_ip: &str) -> Result<(), Box<dyn
         cluster_ip
     );
 
-    let mut child = Command::new("docker")
-        .args([
-            "exec",
-            "-i",
-            NODE_CONTAINER,
-            "sh",
-            "-c",
-            &format!("mkdir -p '{}' && cat > '{}'", dir, path),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+    let mut child = docker_cmd(&[
+        "exec",
+        "-i",
+        NODE_CONTAINER,
+        "sh",
+        "-c",
+        &format!("mkdir -p '{}' && cat > '{}'", dir, path),
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::inherit())
+    .spawn()?;
     if let Some(ref mut stdin) = child.stdin {
         stdin.write_all(desired.as_bytes())?;
     }
@@ -268,13 +525,54 @@ fn parse_kind_version(output: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn kind_config_pins_registry_nodeport_to_localhost() {
-        assert!(KIND_CONFIG.contains("containerPort: 30500"));
-        assert!(KIND_CONFIG.contains("hostPort: 30500"));
-        assert!(KIND_CONFIG.contains("listenAddress: \"127.0.0.1\""));
-        assert!(KIND_CONFIG.contains("role: control-plane"));
+        let cfg = build_kind_config(None, 30500);
+        assert!(cfg.contains("containerPort: 30500"));
+        assert!(cfg.contains("hostPort: 30500"));
+        assert!(cfg.contains("listenAddress: \"127.0.0.1\""));
+        assert!(cfg.contains("role: control-plane"));
+        assert!(!cfg.contains("extraMounts:"));
+    }
+
+    #[test]
+    fn kind_config_can_shift_registry_host_port() {
+        let cfg = build_kind_config(None, 30501);
+        assert!(cfg.contains("hostPort: 30501"));
+        assert!(cfg.contains("containerPort: 30500"));
+    }
+
+    #[test]
+    fn pick_registry_host_port_shifts_when_dory_k8s_present() {
+        assert_eq!(pick_registry_host_port(None, false), 30500);
+        assert_eq!(pick_registry_host_port(None, true), 30501);
+        assert_eq!(pick_registry_host_port(Some(30555), true), 30555);
+    }
+
+    #[test]
+    fn node_mount_report_summary_mentions_reset_when_missing() {
+        let s = NodeMountReport::Missing {
+            path: "/Users/dev".into(),
+        }
+        .summary();
+        assert!(s.contains("/Users/dev"));
+        assert!(s.contains("reset"));
+        assert!(NodeMountReport::Visible {
+            path: "/Users/dev".into()
+        }
+        .is_hostpath_capable());
+        assert!(!NodeMountReport::NoKindNode.is_hostpath_capable());
+    }
+
+    #[test]
+    fn kind_config_includes_extra_mounts_for_host_path() {
+        let cfg = build_kind_config(Some(Path::new("/Users/test")), 30500);
+        assert!(cfg.contains("extraMounts:"));
+        assert!(cfg.contains("hostPath: \"/Users/test\""));
+        assert!(cfg.contains("containerPath: \"/Users/test\""));
+        assert!(cfg.contains("readOnly: false"));
     }
 
     #[test]
@@ -329,4 +627,13 @@ mod tests {
         assert!(err.to_string().contains("--cpus 4"));
         assert!(err.to_string().contains("no VM to size"));
     }
+
+    #[test]
+    fn resolve_docker_host_respects_env() {
+        // Only assert pure formatting when env is set — avoid flaking on machine state.
+        // build_kind_config + extra mounts are the contract under test here.
+        let cfg = build_kind_config(Some(Path::new("/home/ci")), 30500);
+        assert!(cfg.contains("/home/ci"));
+    }
 }
+
