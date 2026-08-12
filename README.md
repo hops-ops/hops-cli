@@ -81,6 +81,23 @@ hops validate --help
 hops xr --help
 ```
 
+## Local workbench (happy path)
+
+Multi-workspace local GitOps on the laptop control plane:
+
+```bash
+# once
+hops local start
+
+# daily
+hops local up ./gitops/env/local
+hops local status
+hops local open
+hops local down
+```
+
+Use `--name` for concurrent worktrees (`<name>` namespaces). Full guide: [skills/claude/references/local-workbench.md](skills/claude/references/local-workbench.md).
+
 ## Command Areas
 
 `hops-cli` is organized into a few command groups:
@@ -593,7 +610,7 @@ Notes:
   - Source-build mode intended for a local control plane because it depends on the local registry flow
   - Runs `up project build` in `PATH` (defaults to current directory)
   - Loads generated `.uppkg` artifacts from `<PATH>/_output`
-  - Pushes package images to the registry exposed at `localhost:30500`
+  - Pushes package images to the registry exposed at `127.0.0.1:30500` (IPv4; avoids Docker's `localhost` → `[::1]` path)
   - Applies Crossplane `Configuration` resources pointing at `registry.crossplane-system.svc.cluster.local:5000/...`
   - Supports `--skip-dependency-resolution`
 - `config install --repo <org/repo> [--reload]`

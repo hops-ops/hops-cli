@@ -585,6 +585,8 @@ fn ensure_engine_env_only() {
 }
 
 /// Fallback when merge fails: point hops child processes at the side file.
+/// Prefer `~/.kube/dory-config` first so its certs win over a stale `dory`
+/// user that may still live in `~/.kube/config` after cluster recreate.
 pub fn export_kubeconfig_env() {
     let Some(dory_cfg) = kubeconfig_path() else {
         return;
@@ -593,21 +595,22 @@ pub fn export_kubeconfig_env() {
         return;
     }
     let existing = std::env::var("KUBECONFIG").unwrap_or_default();
-    if existing.split(':').any(|p| p == dory_cfg) {
-        return;
-    }
-    let rest = if existing.is_empty() {
+    let parts: Vec<&str> = existing
+        .split(':')
+        .filter(|p| !p.is_empty() && *p != dory_cfg.as_str())
+        .collect();
+    let rest = if parts.is_empty() {
         match home() {
             Ok(h) => h.join(".kube/config").to_string_lossy().into_owned(),
             Err(_) => String::new(),
         }
     } else {
-        existing
+        parts.join(":")
     };
     if rest.is_empty() {
         std::env::set_var("KUBECONFIG", &dory_cfg);
     } else {
-        std::env::set_var("KUBECONFIG", format!("{}:{}", dory_cfg, rest));
+        std::env::set_var("KUBECONFIG", format!("{dory_cfg}:{rest}"));
     }
 }
 

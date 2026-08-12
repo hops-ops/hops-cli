@@ -1,7 +1,9 @@
+use super::gitops_write::{log_written, write_gitops_files, GitopsFile};
 use super::{kubectl_apply_stdin, run_cmd_output};
 use clap::Args;
 use serde_json::json;
 use std::error::Error;
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -71,6 +73,11 @@ pub struct ZitadelArgs {
     /// Refresh credentials in the secret only; skips Provider and ProviderConfig apply
     #[arg(long)]
     pub refresh: bool,
+
+    /// Write non-secret Provider / ProviderConfig YAML under this directory
+    /// (e.g. `./gitops/cluster`). Credential Secrets are not written.
+    #[arg(long)]
+    pub gitops: Option<PathBuf>,
 }
 
 pub fn run(args: &ZitadelArgs) -> Result<(), Box<dyn Error>> {
@@ -99,14 +106,39 @@ pub fn run(args: &ZitadelArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    let provider_yaml = build_provider_yaml(&args.provider_name, &args.provider_package);
+    let provider_config_yaml = build_provider_config_yaml(
+        &args.namespace,
+        &args.provider_config_name,
+        &args.secret_name,
+    );
+
+    if let Some(gitops) = &args.gitops {
+        let written = write_gitops_files(
+            gitops,
+            &[
+                GitopsFile {
+                    rel_path: "providers/zitadel.yaml".into(),
+                    yaml: provider_yaml.clone(),
+                },
+                GitopsFile {
+                    rel_path: "providerconfigs/zitadel.yaml".into(),
+                    yaml: provider_config_yaml.clone(),
+                },
+            ],
+        )?;
+        log_written(&written);
+        log::info!(
+            "Zitadel non-secret manifests written under {} (Secret still applied live only)",
+            gitops.display()
+        );
+    }
+
     log::info!(
         "Applying provider-upjet-zitadel package '{}'...",
         args.provider_package
     );
-    kubectl_apply_stdin(&build_provider_yaml(
-        &args.provider_name,
-        &args.provider_package,
-    ))?;
+    kubectl_apply_stdin(&provider_yaml)?;
 
     wait_for_crd(PROVIDER_CONFIG_CRD)?;
 
@@ -126,11 +158,7 @@ pub fn run(args: &ZitadelArgs) -> Result<(), Box<dyn Error>> {
         args.namespace,
         args.provider_config_name
     );
-    kubectl_apply_stdin(&build_provider_config_yaml(
-        &args.namespace,
-        &args.provider_config_name,
-        &args.secret_name,
-    ))?;
+    kubectl_apply_stdin(&provider_config_yaml)?;
 
     log::info!(
         "Zitadel provider configured for '{}' (ProviderConfig: {}/{})",

@@ -194,7 +194,7 @@ fn wait_for_api_after_restart() -> Result<(), Box<dyn Error>> {
 }
 
 /// Alias both registry pull names to the registry Service's ClusterIP via
-/// containerd certs.d files on the node. `localhost:30500` is what provider
+/// containerd certs.d files on the node. `127.0.0.1:30500` is what provider
 /// runtime pods reference; aliasing it here means the name never depends on
 /// kube-proxy's localhost-NodePort behavior. Files live on the node's
 /// writable layer, so they survive docker stop/start (unlike /etc/hosts,

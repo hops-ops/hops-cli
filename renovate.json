@@ -1,6 +1,60 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    ":dependencyDashboard"
+  ],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Automerge patch updates that pass checks",
+      "matchUpdateTypes": ["patch"],
+      "automerge": true,
+      "matchManagers": ["custom.regex"]
+    },
+    {
+      "description": "Group local-start bootstrap Crossplane pins",
+      "groupName": "local-start-crossplane-bootstrap",
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": [
+        "crossplane/crossplane",
+        "crossplane-contrib/provider-helm",
+        "crossplane-contrib/provider-kubernetes"
+      ]
+    },
+    {
+      "description": "Conventional commit prefix for bootstrap pin bumps",
+      "matchManagers": ["custom.regex"],
+      "matchDatasources": ["github-releases"],
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "deps"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Bootstrap Provider package tags (hops local start)",
+      "managerFilePatterns": [
+        "bootstrap/providers/**/*.yaml"
+      ],
+      "matchStrings": [
+        "package:\\s*xpkg\\.crossplane\\.io/(?<depName>[^:]+):(?<currentValue>v?[0-9][^\\s]+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "packageNameTemplate": "{{depName}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Crossplane Helm chart version pin in hops local start",
+      "managerFilePatterns": [
+        "src/commands/local/start.rs"
+      ],
+      "matchStrings": [
+        "const CROSSPLANE_CHART_VERSION: &str = \"(?<currentValue>[^\"]+)\";"
+      ],
+      "datasourceTemplate": "github-releases",
+      "packageNameTemplate": "crossplane/crossplane",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    }
   ]
 }
