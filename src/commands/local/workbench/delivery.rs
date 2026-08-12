@@ -233,9 +233,7 @@ fn try_docker_node_probe(host_path: &Path) -> Result<Option<DeliveryProbe>, Box<
     if !command_exists("docker") || !command_exists("kubectl") {
         return Ok(None);
     }
-    let nodes_json = Command::new("kubectl")
-        .args(["get", "nodes", "-o", "json"])
-        .output()?;
+    let nodes_json = kubectl_command(&["get", "nodes", "-o", "json"]).output()?;
     if !nodes_json.status.success() {
         return Ok(None);
     }
@@ -349,8 +347,8 @@ spec:
     );
 
     // Apply
-    let mut child = Command::new("kubectl")
-        .args(["apply", "-f", "-"])
+    let mut apply = kubectl_command(&["apply", "-f", "-"]);
+    let mut child = apply
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -360,9 +358,8 @@ spec:
     }
     let apply_out = child.wait_with_output()?;
     if !apply_out.status.success() {
-        let _ = Command::new("kubectl")
-            .args(["delete", "pod", &name, "-n", "default", "--wait=false"])
-            .output();
+        let _ =
+            kubectl_command(&["delete", "pod", &name, "-n", "default", "--wait=false"]).output();
         return Err(format!(
             "probe pod apply failed: {}",
             String::from_utf8_lossy(&apply_out.stderr)
@@ -376,25 +373,22 @@ spec:
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(400));
-        let phase_out = Command::new("kubectl")
-            .args([
-                "get",
-                "pod",
-                &name,
-                "-n",
-                "default",
-                "-o",
-                "jsonpath={.status.phase}",
-            ])
-            .output()?;
+        let phase_out = kubectl_command(&[
+            "get",
+            "pod",
+            &name,
+            "-n",
+            "default",
+            "-o",
+            "jsonpath={.status.phase}",
+        ])
+        .output()?;
         let phase = String::from_utf8_lossy(&phase_out.stdout)
             .trim()
             .to_string();
 
         // FailedMount appears in events / container statuses
-        let desc = Command::new("kubectl")
-            .args(["describe", "pod", &name, "-n", "default"])
-            .output()?;
+        let desc = kubectl_command(&["describe", "pod", &name, "-n", "default"]).output()?;
         let desc_s = String::from_utf8_lossy(&desc.stdout);
         if desc_s.contains("FailedMount")
             || desc_s.contains("failed to mount")
@@ -407,9 +401,7 @@ spec:
         }
 
         if phase == "Succeeded" || phase == "Failed" || phase == "Running" {
-            let logs = Command::new("kubectl")
-                .args(["logs", &name, "-n", "default", "--tail=20"])
-                .output()?;
+            let logs = kubectl_command(&["logs", &name, "-n", "default", "--tail=20"]).output()?;
             let log_s = String::from_utf8_lossy(&logs.stdout);
             if log_s.contains("HOPS_PATH_VISIBLE") {
                 visible = true;
@@ -429,17 +421,16 @@ spec:
         }
     }
 
-    let _ = Command::new("kubectl")
-        .args([
-            "delete",
-            "pod",
-            &name,
-            "-n",
-            "default",
-            "--wait=false",
-            "--ignore-not-found=true",
-        ])
-        .output();
+    let _ = kubectl_command(&[
+        "delete",
+        "pod",
+        &name,
+        "-n",
+        "default",
+        "--wait=false",
+        "--ignore-not-found=true",
+    ])
+    .output();
 
     Ok(probe_from_visibility(host_path, visible, detail))
 }
@@ -947,7 +938,11 @@ while true; do
   cur=$(find {roots} -type f \
     ! -path '*/node_modules/*' ! -path '*/target/*' ! -path '*/.git/*' \
     ! -path '*/dist/*' ! -path '*/.svelte-kit/*' \
-    -print0 2>/dev/null | xargs -0 stat -f '%m' 2>/dev/null | cksum | awk '{{print $1}}')
+    -print0 2>/dev/null | xargs -0 sh -c '
+      for file do
+        stat -c "%Y" "$file" 2>/dev/null || stat -f "%m" "$file" 2>/dev/null
+      done
+    ' sh | cksum | awk '{{print $1}}')
   if [ "$cur" != "$prev" ] || needs_marker; then
     prev="$cur"
     sync_all
