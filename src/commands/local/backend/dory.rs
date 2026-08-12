@@ -483,7 +483,7 @@ pub const DEFAULT_CONTEXT_NAME: &str = "hops-dory";
 const NAME_FILE: &str = "dory-name";
 const NAME_ENV: &str = "HOPS_DORY_NAME";
 
-/// Resolved context name: `--name` (persisted) > `HOPS_DORY_NAME` > file > `hops-dory`.
+/// Resolved context name: `--dory-name` (persisted) > `HOPS_DORY_NAME` > file > `hops-dory`.
 pub fn context_name() -> String {
     if let Ok(v) = std::env::var(NAME_ENV) {
         let t = v.trim();
@@ -515,12 +515,12 @@ pub fn persist_context_name(name: &str) -> Result<(), Box<dyn Error>> {
 fn validate_context_name(name: &str) -> Result<String, Box<dyn Error>> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("--name must not be empty".into());
+        return Err("--dory-name must not be empty".into());
     }
     // kubectl context names: keep it simple (no path separators / whitespace).
     if name.contains(['/', '\\', ' ', '\t', '\n', ':']) {
         return Err(format!(
-            "invalid --name '{name}': use a simple token (e.g. hops-dory)"
+            "invalid --dory-name '{name}': use a simple token (e.g. hops-dory)"
         )
         .into());
     }
@@ -545,7 +545,7 @@ pub fn desktop_integration_enabled() -> bool {
 
 /// Wire Dory into the normal developer desktop:
 /// - merge stock `~/.kube/dory-config` into `~/.kube/config` as context **`hops-dory`**
-///   (or `--name` / `HOPS_DORY_NAME`)
+///   (or `--dory-name` / `HOPS_DORY_NAME`)
 /// - `kubectl config use-context <name>`
 /// - ensure/use a docker context of the same name pointing at `~/.dory/dory.sock`
 ///

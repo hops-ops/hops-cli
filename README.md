@@ -279,9 +279,12 @@ hops local start --backend dory
 On start/activate, hops:
 
 - merges stock `~/.kube/dory-config` into `~/.kube/config` as context **`hops-dory`**
-  (override with `--name <name>` or `HOPS_DORY_NAME`; persisted in `~/.hops/local/dory-name`)
+  (override with `--dory-name <name>` or `HOPS_DORY_NAME`; persisted in `~/.hops/local/dory-name`)
 - runs `kubectl config use-context hops-dory`
 - creates/uses a docker context of the same name → `unix://$HOME/.dory/dory.sock`
+
+`--dory-name` is intentionally **not** `--name`. Workspace commands use `--name` for the
+Kubernetes namespace (`hops local up|down|status|open|gitops worktree --name alice`).
 
 So you should **not** need:
 
@@ -291,8 +294,9 @@ export DOCKER_HOST=unix://$HOME/.dory/dory.sock
 ```
 
 ```bash
-hops local start --backend dory              # name defaults to hops-dory
-hops local start --backend dory --name mine  # custom kube+docker context name
+hops local start --backend dory                    # dory name defaults to hops-dory
+hops local start --backend dory --dory-name mine   # custom kube+docker context name
+hops local up ./gitops/envs/local --name alice     # workspace ns only; does not rename Dory
 
 kubectl get nodes          # context hops-dory
 docker info                # context hops-dory

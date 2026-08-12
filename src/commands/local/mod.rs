@@ -115,11 +115,14 @@ pub struct LocalArgs {
     #[arg(long, global = true, value_enum)]
     pub backend: Option<backend::Backend>,
 
-    /// Name for Dory desktop integration (kube context + docker context).
+    /// Dory desktop integration name (kube context + docker context).
     /// Defaults to `hops-dory`. Persisted under `~/.hops/local/dory-name`.
     /// Only used with `--backend dory` (or a persisted dory backend).
-    #[arg(long, global = true, value_name = "NAME")]
-    pub name: Option<String>,
+    ///
+    /// Named `--dory-name` (not `--name`) so it never collides with workspace
+    /// `--name` on `hops local up|down|status|open|gitops worktree`.
+    #[arg(long = "dory-name", global = true, value_name = "NAME")]
+    pub dory_name: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -163,7 +166,12 @@ pub enum LocalCommands {
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
-    if let Some(name) = args.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(name) = args
+        .dory_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         backend::persist_dory_context_name(name)?;
     }
 
@@ -430,5 +438,72 @@ mod tests {
             )),
             vec!["repo", "update", "crossplane-stable"]
         );
+    }
+
+    /// Regression: workspace `--name` must not populate Dory's `--dory-name`.
+    /// Dual workspaces (`up --name alice` then `up --name bob`) used to rewrite
+    /// the desktop kube/docker context and delete the real `dory` context.
+    #[test]
+    fn workspace_name_does_not_set_dory_name() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        #[command(name = "hops-local-test")]
+        struct Cli {
+            #[command(flatten)]
+            local: LocalArgs,
+        }
+
+        let parsed = Cli::try_parse_from([
+            "hops-local-test",
+            "up",
+            "./gitops/envs/local",
+            "--name",
+            "alice",
+            "--once",
+            "--no-cluster",
+        ])
+        .expect("parse up --name alice");
+        assert!(
+            parsed.local.dory_name.is_none(),
+            "workspace --name must not set dory_name; got {:?}",
+            parsed.local.dory_name
+        );
+        match parsed.local.command {
+            LocalCommands::Up(up) => {
+                assert_eq!(up.name.as_deref(), Some("alice"));
+                assert!(up.once);
+                assert!(up.no_cluster);
+            }
+            other => panic!("expected Up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dory_name_flag_is_distinct_from_workspace_name() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        #[command(name = "hops-local-test")]
+        struct Cli {
+            #[command(flatten)]
+            local: LocalArgs,
+        }
+
+        let parsed = Cli::try_parse_from([
+            "hops-local-test",
+            "--dory-name",
+            "mine",
+            "up",
+            "./env",
+            "--name",
+            "bob",
+        ])
+        .expect("parse --dory-name mine up --name bob");
+        assert_eq!(parsed.local.dory_name.as_deref(), Some("mine"));
+        match parsed.local.command {
+            LocalCommands::Up(up) => assert_eq!(up.name.as_deref(), Some("bob")),
+            other => panic!("expected Up, got {other:?}"),
+        }
     }
 }

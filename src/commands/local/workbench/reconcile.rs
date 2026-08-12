@@ -443,7 +443,75 @@ fn sanitize_release_name(name: &str) -> String {
     s.trim_matches('-').chars().take(53).collect()
 }
 
-fn ensure_namespace_on_docs(yaml: &str, namespace: &str) -> Result<String, Box<dyn Error>> {
+/// Kinds that are cluster-scoped (never get a namespace stamp).
+fn is_cluster_scoped_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "Namespace"
+            | "ClusterRole"
+            | "ClusterRoleBinding"
+            | "CustomResourceDefinition"
+            | "ClusterProviderConfig"
+            | "ClusterSecretStore"
+            | "PriorityClass"
+            | "StorageClass"
+            | "PersistentVolume"
+            | "MutatingWebhookConfiguration"
+            | "ValidatingWebhookConfiguration"
+    )
+}
+
+/// Workload / app kinds that live in the worktree app namespace when the chart
+/// did not set `metadata.namespace`. Shared identity MRs (Project, Role,
+/// HumanUser, …) set their own namespace in the chart and are **not** rewritten.
+fn is_app_workload_kind(api_version: &str, kind: &str) -> bool {
+    // Core / apps workloads
+    if matches!(
+        kind,
+        "Deployment"
+            | "StatefulSet"
+            | "DaemonSet"
+            | "ReplicaSet"
+            | "Job"
+            | "CronJob"
+            | "Service"
+            | "ServiceAccount"
+            | "ConfigMap"
+            | "Secret"
+            | "PersistentVolumeClaim"
+            | "NetworkPolicy"
+            | "Ingress"
+            | "HorizontalPodAutoscaler"
+            | "PodDisruptionBudget"
+            | "Role"
+            | "RoleBinding"
+    ) {
+        // k8s rbac Role/RoleBinding use rbac.authorization.k8s.io — not Zitadel Role
+        if kind == "Role" || kind == "RoleBinding" {
+            return api_version.starts_with("rbac.authorization.k8s.io/");
+        }
+        return true;
+    }
+    // External Secrets (worktree OIDC secret materialization)
+    if kind == "ExternalSecret" {
+        return true;
+    }
+    // Worktree-scoped Zitadel OIDC app + instance Features (Login V2 for this UI)
+    if kind == "Oidc" && api_version.contains("application.zitadel") {
+        return true;
+    }
+    if kind == "Features" && api_version.contains("instance.zitadel") {
+        return true;
+    }
+    false
+}
+
+/// Stamp worktree namespace only onto app workloads that lack `metadata.namespace`.
+///
+/// Shared identity resources (e.g. Project/Role/HumanUser with
+/// `projectNamespace: default`) keep the namespace declared by the chart.
+/// Never overwrites an already-set namespace.
+pub fn ensure_namespace_on_docs(yaml: &str, namespace: &str) -> Result<String, Box<dyn Error>> {
     let mut out = Vec::new();
     for doc in split_yaml_docs_owned(yaml) {
         if doc.trim().is_empty() {
@@ -454,18 +522,27 @@ fn ensure_namespace_on_docs(yaml: &str, namespace: &str) -> Result<String, Box<d
             let kind = root
                 .get(Value::String("kind".into()))
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let cluster_scoped = matches!(
-                kind,
-                "Namespace" | "ClusterRole" | "ClusterRoleBinding" | "CustomResourceDefinition"
-            );
-            if !cluster_scoped {
-                let meta_key = Value::String("metadata".into());
-                if let Some(meta) = root.get_mut(&meta_key).and_then(|v| v.as_mapping_mut()) {
-                    meta.insert(
-                        Value::String("namespace".into()),
-                        Value::String(namespace.to_string()),
-                    );
+                .unwrap_or("")
+                .to_string();
+            let api_version = root
+                .get(Value::String("apiVersion".into()))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if is_cluster_scoped_kind(&kind) {
+                out.push(serde_yaml::to_string(&value)?);
+                continue;
+            }
+            let meta_key = Value::String("metadata".into());
+            if let Some(meta) = root.get_mut(&meta_key).and_then(|v| v.as_mapping_mut()) {
+                let ns_key = Value::String("namespace".into());
+                let has_ns = meta
+                    .get(&ns_key)
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                if !has_ns && is_app_workload_kind(&api_version, &kind) {
+                    meta.insert(ns_key, Value::String(namespace.to_string()));
                 }
             }
         }
@@ -659,6 +736,114 @@ spec:
             &["alice".to_string()]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_namespace_stamps_workload_missing_ns_only() {
+        let yaml = r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: e2e-ui-ui
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: e2e-ui-ui
+  namespace: already-set
+---
+apiVersion: project.zitadel.m.crossplane.io/v1alpha1
+kind: Project
+metadata:
+  name: e2e-ui
+  namespace: default
+---
+apiVersion: project.zitadel.m.crossplane.io/v1alpha1
+kind: Role
+metadata:
+  name: e2e-role-user
+  namespace: default
+---
+apiVersion: user.zitadel.m.crossplane.io/v1alpha1
+kind: HumanUser
+metadata:
+  name: e2e-alice
+  namespace: default
+---
+apiVersion: application.zitadel.m.crossplane.io/v1alpha1
+kind: Oidc
+metadata:
+  name: e2e-ui-alice-web
+---
+apiVersion: instance.zitadel.m.crossplane.io/v1alpha1
+kind: Features
+metadata:
+  name: e2e-ui-login-v2
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: never-namespaced
+"#;
+        let out = ensure_namespace_on_docs(yaml, "alice").unwrap();
+        // Workload without ns → worktree
+        assert!(out.contains("name: e2e-ui-ui\n  namespace: alice") || out.contains("namespace: alice\n  name: e2e-ui-ui")
+            || (out.contains("kind: Service") && out.contains("namespace: alice")));
+        // Already set preserved
+        assert!(out.contains("namespace: already-set"));
+        // Shared identity preserved
+        let project_idx = out.find("kind: Project").unwrap();
+        let project_slice = &out[project_idx..project_idx + 200.min(out.len() - project_idx)];
+        assert!(
+            project_slice.contains("namespace: default"),
+            "Project must keep default ns, got: {project_slice}"
+        );
+        assert!(out.contains("name: e2e-role-user"));
+        assert!(out.contains("name: e2e-alice"));
+        // Oidc/Features missing ns → worktree (app-scoped)
+        let oidc_idx = out.find("kind: Oidc").unwrap();
+        let oidc_slice = &out[oidc_idx..];
+        assert!(
+            oidc_slice.contains("namespace: alice"),
+            "Oidc without ns should get worktree ns"
+        );
+        let feat_idx = out.find("kind: Features").unwrap();
+        assert!(
+            out[feat_idx..].contains("namespace: alice"),
+            "Features without ns should get worktree ns"
+        );
+        // Cluster-scoped: no namespace key forced
+        let cr_idx = out.find("kind: ClusterRole").unwrap();
+        let cr_doc = &out[cr_idx..];
+        // only this doc until end
+        assert!(
+            !cr_doc.lines().any(|l| l.trim() == "namespace: alice"),
+            "ClusterRole must not get worktree ns"
+        );
+    }
+
+    #[test]
+    fn ensure_namespace_dual_workspaces_preserve_shared_and_isolate_workloads() {
+        let shared = r#"
+apiVersion: project.zitadel.m.crossplane.io/v1alpha1
+kind: Project
+metadata:
+  name: e2e-ui
+  namespace: default
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: e2e-ui-ui
+"#;
+        let alice = ensure_namespace_on_docs(shared, "alice").unwrap();
+        let bob = ensure_namespace_on_docs(shared, "bob").unwrap();
+        assert!(alice.contains("namespace: default"));
+        assert!(bob.contains("namespace: default"));
+        assert!(alice.contains("namespace: alice"));
+        assert!(bob.contains("namespace: bob"));
+        assert!(!alice.contains("namespace: bob"));
+        assert!(!bob.contains("namespace: alice"));
     }
 
     #[test]
