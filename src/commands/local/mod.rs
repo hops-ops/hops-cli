@@ -329,25 +329,7 @@ pub(crate) fn wait_for_kubernetes() -> Result<(), Box<dyn Error>> {
 /// connection errors. Captures stderr on failure so callers can classify soft
 /// errors (missing CRDs).
 pub fn kubectl_apply_stdin(yaml: &str) -> Result<(), Box<dyn Error>> {
-    kubectl_apply_stdin_with_namespace(yaml, None)
-}
-
-pub(crate) fn kubectl_apply_stdin_in_namespace(
-    yaml: &str,
-    namespace: &str,
-) -> Result<(), Box<dyn Error>> {
-    kubectl_apply_stdin_with_namespace(yaml, Some(namespace))
-}
-
-fn kubectl_apply_stdin_with_namespace(
-    yaml: &str,
-    namespace: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
-    let mut args = vec!["apply", "--validate=false", "-f", "-"];
-    if let Some(namespace) = namespace {
-        args.extend(["--namespace", namespace]);
-    }
-    let full = with_kube_context(&args);
+    let full = with_kube_context(&["apply", "--validate=false", "-f", "-"]);
     // Nested-virt CI (colima/GHA) can lose the apiserver for minutes after
     // Crossplane/provider install (TLS handshake timeouts). Retry with backoff
     // and re-probe the API between attempts.

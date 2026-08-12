@@ -221,6 +221,7 @@ pub(crate) fn acquire_dns_state_lock(state_dir: &Path) -> Result<DnsStateLock, B
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(runtime_dir.join("dns-state.lock"))?;
     #[cfg(unix)]
     unsafe {

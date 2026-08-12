@@ -1049,6 +1049,7 @@ fn collect_dns_blocks_from_runtimes(
     skip_workspace: Option<&str>,
 ) -> Result<Vec<(String, BTreeMap<String, String>)>, Box<dyn Error>> {
     let dir = state_dir.join(RUNTIME_SUBDIR);
+    let skip_workspace = skip_workspace.map(slugify_name);
     let mut by_ns: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let Ok(entries) = fs::read_dir(&dir) else {
         return Ok(Vec::new());
@@ -1059,7 +1060,7 @@ fn collect_dns_blocks_from_runtimes(
             continue;
         }
         let ws = name.trim_end_matches(".host-access.json");
-        if skip_workspace == Some(ws) {
+        if skip_workspace.as_deref() == Some(ws) {
             continue;
         }
         let Ok(text) = fs::read_to_string(ent.path()) else {
@@ -1133,5 +1134,21 @@ mod tests {
             path,
             Path::new("/state/runtime/my-workspace.host-access.json")
         );
+    }
+
+    #[test]
+    fn runtime_collection_slugifies_skipped_workspace_name() {
+        let dir = std::env::temp_dir().join(format!("hops-net-test-{}", uuid::Uuid::new_v4()));
+        let runtime = HostAccessRuntime {
+            namespace: "my-workspace".into(),
+            ip_map: BTreeMap::from([("my-workspace/removed-service".into(), "127.53.0.2".into())]),
+            ..Default::default()
+        };
+        save_host_access_runtime(&dir, "My Workspace", &runtime).unwrap();
+
+        let blocks = collect_dns_blocks_from_runtimes(&dir, Some("My Workspace")).unwrap();
+
+        assert!(blocks.is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 }
