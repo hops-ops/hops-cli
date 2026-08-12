@@ -1,7 +1,7 @@
 //! Cluster-provider vs docker-provider (LWB-REQ-260…263).
 //!
-//! Pure resolution: dual flags + deprecated `--backend` alias. Side effects
-//! (persist, DOCKER_HOST) stay in the backend lifecycle layer.
+//! Pure resolution of the two provider dimensions. Side effects (persist,
+//! DOCKER_HOST) stay in the backend lifecycle layer.
 
 use super::Backend;
 use serde::{Deserialize, Serialize};
@@ -102,24 +102,6 @@ pub struct ProviderPair {
 }
 
 impl ProviderPair {
-    /// 1:1 map from deprecated `--backend`.
-    pub fn from_backend(backend: Backend) -> Self {
-        match backend {
-            Backend::Kind => ProviderPair {
-                cluster: ClusterProvider::Kind,
-                docker: DockerProvider::Docker,
-            },
-            Backend::Dory => ProviderPair {
-                cluster: ClusterProvider::Dory,
-                docker: DockerProvider::Dory,
-            },
-            Backend::Colima => ProviderPair {
-                cluster: ClusterProvider::Colima,
-                docker: DockerProvider::Colima,
-            },
-        }
-    }
-
     /// Preferred Mac hostPath path: kind nodes on Dory engine.
     pub fn kind_on_dory() -> Self {
         ProviderPair {
@@ -157,31 +139,24 @@ impl ProviderPair {
 ///
 /// Precedence:
 /// 1. Explicit `--cluster-provider` / `--docker-provider` (pair, with defaults for missing half)
-/// 2. Deprecated `--backend` alone → 1:1 map
-/// 3. `None` → caller uses existing backend resolve
+/// 2. `None` → caller uses persisted provider/backend state or detection
 pub fn resolve_provider_pair(
-    backend: Option<Backend>,
     cluster_provider: Option<ClusterProvider>,
     docker_provider: Option<DockerProvider>,
 ) -> Result<Option<ProviderPair>, Box<dyn Error>> {
     if cluster_provider.is_none() && docker_provider.is_none() {
-        return Ok(backend.map(ProviderPair::from_backend));
+        return Ok(None);
     }
 
-    // When either cp/dp is set, build a pair (fill missing half from backend alias or defaults).
-    let base = backend
-        .map(ProviderPair::from_backend)
-        .unwrap_or_else(|| {
-            // Mac default preference for hostPath path when only one side given.
-            if cfg!(target_os = "macos") {
-                ProviderPair::kind_on_dory()
-            } else {
-                ProviderPair {
-                    cluster: ClusterProvider::Kind,
-                    docker: DockerProvider::Docker,
-                }
-            }
-        });
+    // When either provider is set, fill the missing half from platform defaults.
+    let base = if cfg!(target_os = "macos") {
+        ProviderPair::kind_on_dory()
+    } else {
+        ProviderPair {
+            cluster: ClusterProvider::Kind,
+            docker: DockerProvider::Docker,
+        }
+    };
 
     let pair = ProviderPair {
         cluster: cluster_provider.unwrap_or(base.cluster),
@@ -260,25 +235,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backend_alias_maps_one_to_one() {
-        assert_eq!(
-            ProviderPair::from_backend(Backend::Kind),
-            ProviderPair {
-                cluster: ClusterProvider::Kind,
-                docker: DockerProvider::Docker
-            }
-        );
-        assert_eq!(
-            ProviderPair::from_backend(Backend::Dory).as_backend(),
-            Backend::Dory
-        );
-        assert_eq!(
-            ProviderPair::from_backend(Backend::Colima).docker,
-            DockerProvider::Colima
-        );
-    }
-
-    #[test]
     fn kind_on_dory_is_valid() {
         let p = ProviderPair::kind_on_dory();
         p.validate().unwrap();
@@ -296,26 +252,14 @@ mod tests {
 
     #[test]
     fn resolve_cp_dp_without_backend() {
-        let p = resolve_provider_pair(
-            None,
-            Some(ClusterProvider::Kind),
-            Some(DockerProvider::Dory),
-        )
-        .unwrap()
-        .unwrap();
+        let p = resolve_provider_pair(Some(ClusterProvider::Kind), Some(DockerProvider::Dory))
+            .unwrap()
+            .unwrap();
         assert_eq!(p, ProviderPair::kind_on_dory());
     }
 
     #[test]
-    fn resolve_backend_only() {
-        let p = resolve_provider_pair(Some(Backend::Kind), None, None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(p.cluster, ClusterProvider::Kind);
-    }
-
-    #[test]
     fn resolve_neither_returns_none() {
-        assert!(resolve_provider_pair(None, None, None).unwrap().is_none());
+        assert!(resolve_provider_pair(None, None).unwrap().is_none());
     }
 }

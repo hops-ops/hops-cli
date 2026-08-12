@@ -11,7 +11,7 @@
 //! On create, hops injects kind `extraMounts` for `$HOME` (same path in the
 //! node) so Mac worktrees are visible for hostPath delivery when the engine
 //! can bind-mount host dirs (e.g. Dory). Changing mounts requires recreate
-//! (`hops local reset --backend kind`).
+//! (`hops local reset --cluster-provider kind --docker-provider dory`).
 //!
 //! ## Docker engine selection (spike toward --docker-provider)
 //!
@@ -110,14 +110,14 @@ impl NodeMountReport {
     pub fn summary(&self) -> String {
         match self {
             NodeMountReport::NoKindNode => {
-                "kind node not running (start/reset --backend kind for hostPath mounts)".into()
+                "kind node not running (start/reset with --cluster-provider kind for hostPath mounts)".into()
             }
             NodeMountReport::NoMountRoot => "no HOME/projects root to mount".into(),
             NodeMountReport::Visible { path } => {
                 format!("hostPath capable — kind node sees {path}")
             }
             NodeMountReport::Missing { path } => format!(
-                "kind node missing mount {path}; run `hops local reset --backend kind` to apply extraMounts"
+                "kind node missing mount {path}; run `hops local reset --cluster-provider kind --docker-provider dory` to apply extraMounts"
             ),
         }
     }
@@ -297,7 +297,7 @@ pub fn uninstall() -> Result<(), Box<dyn Error>> {
 pub fn start(size: &SizeArgs) -> Result<(), Box<dyn Error>> {
     if size.any_set() {
         return Err(format!(
-            "the kind backend has no VM to size; drop{} (resources are governed by the docker daemon kind runs on)",
+            "the kind cluster provider has no VM to size; drop{} (resources are governed by the selected Docker provider)",
             size.command_suffix()
         )
         .into());
@@ -394,7 +394,7 @@ fn node_running() -> bool {
 fn preflight() -> Result<(), Box<dyn Error>> {
     if !command_exists("kind") {
         return Err(
-            "kind is not installed; run `hops local install --backend kind` or `brew install kind`"
+            "kind is not installed; run `hops local install --cluster-provider kind --docker-provider docker` or `brew install kind`"
                 .into(),
         );
     }
@@ -720,4 +720,3 @@ mod tests {
         assert!(cfg.contains("/home/ci"));
     }
 }
-

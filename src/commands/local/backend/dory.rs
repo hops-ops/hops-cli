@@ -15,10 +15,10 @@
 //! - **Node image pulls:** k3s `registries.yaml` mirrors → Service ClusterIP.
 
 use super::SizeArgs;
-use crate::commands::local::{command_exists, run_cmd, run_cmd_output};
 use crate::commands::local::package_install::{
     REGISTRY_HOSTNAME, REGISTRY_PULL_INCLUSTER, REGISTRY_PUSH,
 };
+use crate::commands::local::{command_exists, run_cmd, run_cmd_output};
 use std::error::Error;
 use std::path::PathBuf;
 use std::thread;
@@ -64,7 +64,7 @@ pub fn install() -> Result<(), Box<dyn Error>> {
     run_cmd("brew", &["install", "--cask", "Augani/dory/dory"])?;
     log::info!(
         "Dory installed; open the app, wait until the engine is healthy, \
-         enable Kubernetes, then re-run `hops local start --backend dory`"
+         enable Kubernetes, then re-run `hops local start --cluster-provider dory --docker-provider dory`"
     );
     Ok(())
 }
@@ -79,7 +79,7 @@ pub fn uninstall() -> Result<(), Box<dyn Error>> {
 pub fn start(size: &SizeArgs) -> Result<(), Box<dyn Error>> {
     if size.any_set() {
         return Err(format!(
-            "the dory backend's VM is sized by the Dory app, not hops; drop{}",
+            "the dory cluster provider's VM is sized by the Dory app, not hops; drop{}",
             size.command_suffix()
         )
         .into());
@@ -122,7 +122,7 @@ pub fn reset() -> Result<(), Box<dyn Error>> {
     preflight()?;
     destroy()?;
     log::info!(
-        "Enable Kubernetes in the Dory app, then run `hops local start --backend dory` again"
+        "Enable Kubernetes in the Dory app, then run `hops local start --cluster-provider dory --docker-provider dory` again"
     );
     Ok(())
 }
@@ -192,7 +192,7 @@ fn ensure_k8s_node_running() -> Result<(), Box<dyn Error>> {
     Err(
         "Dory Kubernetes is not enabled (no `dory-k8s` container).\n\
          In the Dory app: enable Kubernetes, wait until it is running, then re-run:\n\
-           hops local start --backend dory\n\
+           hops local start --cluster-provider dory --docker-provider dory\n\
          (hops uses stock Dory only — it does not create the cluster for you.)"
             .into(),
     )
@@ -239,12 +239,9 @@ fn ensure_side_kubeconfig_hint() {
     if std::path::Path::new(&path).is_file() {
         return;
     }
-    if let Ok(yaml) = engine_docker_output(&[
-        "exec",
-        NODE_CONTAINER,
-        "cat",
-        "/etc/rancher/k3s/k3s.yaml",
-    ]) {
+    if let Ok(yaml) =
+        engine_docker_output(&["exec", NODE_CONTAINER, "cat", "/etc/rancher/k3s/k3s.yaml"])
+    {
         if yaml.contains("server:") {
             if let Some(parent) = std::path::Path::new(&path).parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -298,9 +295,7 @@ fn node_ip() -> Result<String, Box<dyn Error>> {
 /// Restarts the node only when the file content changes.
 fn ensure_k3s_registry_mirrors(cluster_ip: &str) -> Result<(), Box<dyn Error>> {
     if !node_running() {
-        return Err(
-            "dory k8s node is not running; enable Kubernetes in the Dory app first".into(),
-        );
+        return Err("dory k8s node is not running; enable Kubernetes in the Dory app first".into());
     }
 
     let push = registry_push_addr()?;
@@ -407,8 +402,11 @@ fn ensure_engine_push_path() -> Result<(), Box<dyn Error>> {
 
 fn ensure_dockerd_insecure_for_push(push_hostport: &str) -> Result<(), Box<dyn Error>> {
     // Already configured?
-    if let Ok(info) = engine_docker_output(&["info", "-f", "{{json .RegistryConfig.InsecureRegistryCIDRs}}{{json .RegistryConfig.IndexConfigs}}"])
-    {
+    if let Ok(info) = engine_docker_output(&[
+        "info",
+        "-f",
+        "{{json .RegistryConfig.InsecureRegistryCIDRs}}{{json .RegistryConfig.IndexConfigs}}",
+    ]) {
         if info.contains(push_hostport) || info.contains("192.168.215.0/24") {
             return Ok(());
         }
@@ -519,10 +517,9 @@ fn validate_context_name(name: &str) -> Result<String, Box<dyn Error>> {
     }
     // kubectl context names: keep it simple (no path separators / whitespace).
     if name.contains(['/', '\\', ' ', '\t', '\n', ':']) {
-        return Err(format!(
-            "invalid --dory-name '{name}': use a simple token (e.g. hops-dory)"
-        )
-        .into());
+        return Err(
+            format!("invalid --dory-name '{name}': use a simple token (e.g. hops-dory)").into(),
+        );
     }
     Ok(name.to_string())
 }
@@ -690,16 +687,12 @@ fn ensure_user_kubeconfig_context(name: &str) -> Result<(), Box<dyn Error>> {
         let backup = kube_dir.join("config.hops-dory-backup");
         let _ = std::fs::copy(&main, &backup);
         std::fs::write(&main, merged)?;
-        let _ = std::fs::set_permissions(
-            &main,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        );
+        let _ =
+            std::fs::set_permissions(&main, std::os::unix::fs::PermissionsExt::from_mode(0o600));
     } else {
         std::fs::copy(&tmp, &main)?;
-        let _ = std::fs::set_permissions(
-            &main,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        );
+        let _ =
+            std::fs::set_permissions(&main, std::os::unix::fs::PermissionsExt::from_mode(0o600));
     }
     let _ = std::fs::remove_file(&tmp);
 
@@ -732,8 +725,8 @@ fn ensure_docker_context_default(name: &str) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let host = format!("host=unix://{}", sock.display());
-    let contexts = run_cmd_output("docker", &["context", "ls", "--format", "{{.Name}}"])
-        .unwrap_or_default();
+    let contexts =
+        run_cmd_output("docker", &["context", "ls", "--format", "{{.Name}}"]).unwrap_or_default();
     if !contexts.lines().any(|n| n.trim() == name) {
         log::info!(
             "Creating docker context '{}' → unix://{}",
@@ -741,16 +734,10 @@ fn ensure_docker_context_default(name: &str) -> Result<(), Box<dyn Error>> {
             sock.display()
         );
         // Ignore failure if a stale context exists with different metadata.
-        let create = run_cmd(
-            "docker",
-            &["context", "create", name, "--docker", &host],
-        );
+        let create = run_cmd("docker", &["context", "create", name, "--docker", &host]);
         if create.is_err() {
             // Update in place when possible.
-            let _ = run_cmd(
-                "docker",
-                &["context", "update", name, "--docker", &host],
-            );
+            let _ = run_cmd("docker", &["context", "update", name, "--docker", &host]);
         }
     }
     run_cmd("docker", &["context", "use", name])?;
@@ -794,7 +781,7 @@ mod tests {
     fn missing_k8s_error_mentions_app_not_fork() {
         let msg = "Dory Kubernetes is not enabled (no `dory-k8s` container).\n\
          In the Dory app: enable Kubernetes, wait until it is running, then re-run:\n\
-           hops local start --backend dory\n\
+           hops local start --cluster-provider dory --docker-provider dory\n\
          (hops uses stock Dory only — it does not create the cluster for you.)";
         assert!(msg.contains("Dory app"));
         assert!(!msg.contains("feat/scriptable"));

@@ -67,7 +67,6 @@ pub fn resolve_cluster_path(
 ///
 /// ```text
 /// gitops/envs/local     → sibling gitops/cluster
-/// gitops/env/local      → sibling gitops/cluster
 /// some/deep/project     → walk up → <meta>/gitops/cluster
 /// <meta>/gitops         → <meta>/gitops/cluster
 /// ```
@@ -109,10 +108,7 @@ pub fn discover_cluster_path(env_path: &Path) -> Option<PathBuf> {
 fn walk_up_for_cluster(start: &Path) -> Option<PathBuf> {
     let mut cur = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
     loop {
-        for candidate in [
-            cur.join("gitops").join("cluster"),
-            cur.join("cluster"),
-        ] {
+        for candidate in [cur.join("gitops").join("cluster"), cur.join("cluster")] {
             if candidate.is_dir() {
                 return Some(candidate);
             }
@@ -185,7 +181,9 @@ pub fn should_apply_manifest(path: &Path) -> bool {
     if !(name.ends_with(".yaml") || name.ends_with(".yml")) {
         return false;
     }
-    if name.ends_with(".example") || name.ends_with(".example.yaml") || name.ends_with(".example.yml")
+    if name.ends_with(".example")
+        || name.ends_with(".example.yaml")
+        || name.ends_with(".example.yml")
     {
         return false;
     }
@@ -247,9 +245,7 @@ pub fn reconcile_cluster_dir(
             Ok(()) => {
                 log::info!(
                     "  {} {}",
-                    path.strip_prefix(&cluster_path)
-                        .unwrap_or(&path)
-                        .display(),
+                    path.strip_prefix(&cluster_path).unwrap_or(&path).display(),
                     if dry_run { "dry-run" } else { "applied" }
                 );
                 result.applied.push(path);
@@ -313,8 +309,12 @@ pub fn should_reconcile_cluster_change(changed: &Path, cluster_path: &Path) -> b
     if crate::commands::local::workbench::watch::should_ignore_watch_path(changed) {
         return false;
     }
-    let cluster = cluster_path.canonicalize().unwrap_or_else(|_| cluster_path.to_path_buf());
-    let changed_norm = changed.canonicalize().unwrap_or_else(|_| changed.to_path_buf());
+    let cluster = cluster_path
+        .canonicalize()
+        .unwrap_or_else(|_| cluster_path.to_path_buf());
+    let changed_norm = changed
+        .canonicalize()
+        .unwrap_or_else(|_| changed.to_path_buf());
     if !(changed_norm == cluster || changed_norm.starts_with(&cluster)) {
         return false;
     }
@@ -324,9 +324,7 @@ pub fn should_reconcile_cluster_change(changed: &Path, cluster_path: &Path) -> b
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    name.ends_with(".yaml")
-        || name.ends_with(".yml")
-        || !changed.exists() // deletion of a prior manifest
+    name.ends_with(".yaml") || name.ends_with(".yml") || !changed.exists() // deletion of a prior manifest
 }
 
 #[cfg(test)]
@@ -360,11 +358,10 @@ mod tests {
         .unwrap();
         let manifests = collect_cluster_manifests(&dir).unwrap();
         assert_eq!(manifests.len(), 2);
-        assert!(manifests[0].ends_with("packages/psql-stack.yaml")
-            || manifests[0]
-                .file_name()
-                .and_then(|s| s.to_str())
-                == Some("psql-stack.yaml"));
+        assert!(
+            manifests[0].ends_with("packages/psql-stack.yaml")
+                || manifests[0].file_name().and_then(|s| s.to_str()) == Some("psql-stack.yaml")
+        );
         assert!(path_under_packages(&dir, &manifests[0]));
         assert!(!path_under_packages(&dir, &manifests[1]));
         let _ = fs::remove_dir_all(&dir);
@@ -385,7 +382,10 @@ mod tests {
         fs::create_dir_all(&envs).unwrap();
         fs::create_dir_all(&cluster).unwrap();
         let found = discover_cluster_path(&envs).unwrap();
-        assert_eq!(found.canonicalize().unwrap(), cluster.canonicalize().unwrap());
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            cluster.canonicalize().unwrap()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -444,7 +444,11 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let good = dir.join("good.yaml");
         let bad = dir.join("bad.yaml");
-        fs::write(&good, "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: n\n").unwrap();
+        fs::write(
+            &good,
+            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: n\n",
+        )
+        .unwrap();
         fs::write(&bad, "just: a map\n").unwrap();
         assert!(should_apply_manifest(&good));
         assert!(!should_apply_manifest(&bad));

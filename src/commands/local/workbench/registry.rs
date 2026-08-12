@@ -48,9 +48,7 @@ pub fn resolve_cluster_binding(
     default_kube_context: &str,
     rebind: bool,
 ) -> Result<(String, String), String> {
-    let explicit = requested_cluster
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let explicit = requested_cluster.map(str::trim).filter(|s| !s.is_empty());
 
     // Sticky core: no explicit --cluster-name → keep bound cluster if any.
     if explicit.is_none() {
@@ -60,7 +58,9 @@ pub fn resolve_cluster_binding(
                     .kube_context
                     .clone()
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| kube_context_for_cluster(bound, default_cluster, default_kube_context));
+                    .unwrap_or_else(|| {
+                        kube_context_for_cluster(bound, default_cluster, default_kube_context)
+                    });
                 return Ok((bound.to_string(), ctx));
             }
         }
@@ -107,9 +107,7 @@ pub fn kube_context_for_cluster(
 
 /// Activate process kube context (+ kind cluster name) from a workspace record.
 /// Returns the bound cluster name and context when present.
-pub fn activate_workspace_cluster(
-    record: &WorkspaceRecord,
-) -> Option<(String, String)> {
+pub fn activate_workspace_cluster(record: &WorkspaceRecord) -> Option<(String, String)> {
     let cluster = record.cluster_name.as_deref()?.trim();
     if cluster.is_empty() {
         return None;
@@ -189,7 +187,10 @@ fn record_path(state_dir: &Path, name: &str) -> PathBuf {
         .join(format!("{}.json", slugify_name(name)))
 }
 
-pub fn save_workspace(state_dir: &Path, record: &WorkspaceRecord) -> Result<PathBuf, Box<dyn Error>> {
+pub fn save_workspace(
+    state_dir: &Path,
+    record: &WorkspaceRecord,
+) -> Result<PathBuf, Box<dyn Error>> {
     ensure_envs_dir(state_dir)?;
     let path = record_path(state_dir, &record.name);
     let json = serde_json::to_string_pretty(record)?;
@@ -197,7 +198,10 @@ pub fn save_workspace(state_dir: &Path, record: &WorkspaceRecord) -> Result<Path
     Ok(path)
 }
 
-pub fn load_workspace(state_dir: &Path, name: &str) -> Result<Option<WorkspaceRecord>, Box<dyn Error>> {
+pub fn load_workspace(
+    state_dir: &Path,
+    name: &str,
+) -> Result<Option<WorkspaceRecord>, Box<dyn Error>> {
     let path = record_path(state_dir, name);
     if !path.exists() {
         return Ok(None);
@@ -265,7 +269,7 @@ mod tests {
         let a = WorkspaceRecord {
             name: "alice".into(),
             namespace: namespace_for_name("alice"),
-            env_path: "/proj/gitops/env/local".into(),
+            env_path: "/proj/gitops/envs/local".into(),
             project_root: Some("/proj".into()),
             delivery_mode: Some("hostPath".into()),
             updated_at: None,
@@ -275,7 +279,7 @@ mod tests {
         let b = WorkspaceRecord {
             name: "bob".into(),
             namespace: namespace_for_name("bob"),
-            env_path: "/proj/gitops/env/local".into(),
+            env_path: "/proj/gitops/envs/local".into(),
             project_root: Some("/proj".into()),
             delivery_mode: Some("sync".into()),
             updated_at: None,
@@ -325,10 +329,14 @@ mod tests {
         assert_eq!(c, "hops");
         assert_eq!(k, "kind-hops");
         // Different without rebind: err
-        assert!(
-            resolve_cluster_binding(Some(&existing), Some("dogfood"), "hops", "kind-hops", false)
-                .is_err()
-        );
+        assert!(resolve_cluster_binding(
+            Some(&existing),
+            Some("dogfood"),
+            "hops",
+            "kind-hops",
+            false
+        )
+        .is_err());
         // Rebind: ok
         let (c2, k2) =
             resolve_cluster_binding(Some(&existing), Some("dogfood"), "hops", "kind-hops", true)
@@ -342,13 +350,11 @@ mod tests {
             ..existing.clone()
         };
         let (c4, k4) =
-            resolve_cluster_binding(Some(&stale), Some("hops"), "hops", "kind-hops", true)
-                .unwrap();
+            resolve_cluster_binding(Some(&stale), Some("hops"), "hops", "kind-hops", true).unwrap();
         assert_eq!(c4, "hops");
         assert_eq!(k4, "kind-hops", "rebind must refresh kube context");
         // First bind persists default
-        let (c3, k3) =
-            resolve_cluster_binding(None, None, "hops", "kind-hops", false).unwrap();
+        let (c3, k3) = resolve_cluster_binding(None, None, "hops", "kind-hops", false).unwrap();
         assert_eq!(c3, "hops");
         assert_eq!(k3, "kind-hops");
     }

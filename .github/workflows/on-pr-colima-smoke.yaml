@@ -1,7 +1,7 @@
 name: colima backend smoke
 
 # End-to-end check of `hops local` on the colima backend on macOS.
-# Mirrors on-pr-kind-smoke.yaml with --backend colima and kubectl --context colima.
+# Mirrors on-pr-kind-smoke.yaml with colima as both providers and kubectl --context colima.
 #
 # Runner constraints:
 # - Colima needs nested virtualization (Lima VM). Pin macos-15-intel — that
@@ -12,7 +12,7 @@ name: colima backend smoke
 #   (macOS 15 Local Network Privacy can block non-root VM-IP access).
 #
 # Install: brew provides colima/docker/kubectl/helm only. Do not pre-start
-# colima here — hops local start --backend colima owns cluster bring-up.
+# colima here — hops local start with colima providers owns cluster bring-up.
 #
 # Sizing: hops defaults (8 CPU / 16 GiB / 60 GiB) exceed standard
 # macos-15-intel runners (~4 CPU / ~14 GiB). Pass explicit smaller sizes
@@ -57,14 +57,14 @@ jobs:
           sysctl hw.memsize
           df -h /
 
-      - name: hops local start --backend colima
+      - name: hops local start with colima providers
         run: |
           set -euxo pipefail
           # Fit macos-15-intel (~4 CPU / ~14 GiB RAM). Defaults (8/16/60) OOM VZ.
           # Memory 10 (not 8): at 8Gi CoreDNS/metrics-server thrash and smoke pods
           # sit in ContainerCreating without IPs even after images pull. Leave ~4Gi
           # for host macOS + VZ. Disk 40: registry PVC requests 20Gi.
-          ./target/debug/hops-cli local start --backend colima \
+          ./target/debug/hops-cli local start --cluster-provider colima --docker-provider colima \
             --cpus 3 --memory 10 --disk 40
 
       - name: hops local doctor

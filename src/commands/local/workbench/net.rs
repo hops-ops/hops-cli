@@ -84,7 +84,10 @@ pub fn plan_host_access_with_ips(
     let mut service_ports = BTreeMap::new();
     for svc in services {
         let key = svc.key();
-        urls.insert(key.clone(), format_dns_url(&svc.name, &svc.namespace, svc.port));
+        urls.insert(
+            key.clone(),
+            format_dns_url(&svc.name, &svc.namespace, svc.port),
+        );
         service_ports.insert(key, svc.port);
     }
     HostAccessPlan {
@@ -155,7 +158,10 @@ pub fn save_host_access_runtime(
     rt: &HostAccessRuntime,
 ) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(state_dir.join(RUNTIME_SUBDIR))?;
-    fs::write(runtime_path(state_dir, workspace), serde_json::to_string_pretty(rt)?)?;
+    fs::write(
+        runtime_path(state_dir, workspace),
+        serde_json::to_string_pretty(rt)?,
+    )?;
     Ok(())
 }
 
@@ -179,9 +185,7 @@ pub fn discover_services(namespace: &str) -> Result<Vec<ServiceEndpoint>, Box<dy
     discover_services_in_namespace(namespace)
 }
 
-fn discover_services_in_namespace(
-    namespace: &str,
-) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
+fn discover_services_in_namespace(namespace: &str) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
     let output = kubectl_command(&["get", "svc", "-n", namespace, "-o", "json"])
         .output()
         .map_err(|e| format!("kubectl get svc failed: {e}"))?;
@@ -199,7 +203,11 @@ fn discover_services_in_namespace(
         if name.is_empty() || name == "kubernetes" {
             continue;
         }
-        for p in item["spec"]["ports"].as_array().cloned().unwrap_or_default() {
+        for p in item["spec"]["ports"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
             let port = p["port"].as_u64().unwrap_or(0) as u16;
             let protocol = p["protocol"].as_str().unwrap_or("TCP");
             if port == 0 || (protocol != "TCP" && protocol != "tcp") {
@@ -478,7 +486,9 @@ fn ensure_macos_stub_dns(state_dir: &Path) -> Result<(), Box<dyn Error>> {
             if pid_is_alive(pid) && stub_dns_responds() {
                 return Ok(());
             }
-            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
         }
     }
 
@@ -609,7 +619,9 @@ if __name__ == '__main__':
     if !pid_is_alive(pid) {
         return Err("macOS stub DNS exited immediately".into());
     }
-    log::info!("macOS stub DNS for *.svc.cluster.local on 127.0.0.1:{MACOS_LOCAL_DNS_PORT} pid={pid}");
+    log::info!(
+        "macOS stub DNS for *.svc.cluster.local on 127.0.0.1:{MACOS_LOCAL_DNS_PORT} pid={pid}"
+    );
     Ok(())
 }
 
@@ -748,10 +760,7 @@ done
     let pid = child.id();
     std::mem::forget(child);
 
-    let service_ports: BTreeMap<String, u16> = services
-        .iter()
-        .map(|s| (s.key(), s.port))
-        .collect();
+    let service_ports: BTreeMap<String, u16> = services.iter().map(|s| (s.key(), s.port)).collect();
     let runtime = HostAccessRuntime {
         namespace: plan.namespace.clone(),
         pids: vec![pid],
@@ -966,8 +975,7 @@ fn rebuild_hosts_from_blocks_noprompt(
     if dns_os_config_present(&merged, &[]) {
         return Ok(());
     }
-    let tmp =
-        std::env::temp_dir().join(format!("hops-hosts-down-{}.tmp", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("hops-hosts-down-{}.tmp", std::process::id()));
     fs::write(&tmp, &merged)?;
     let script = format!("cp '{}' /etc/hosts && chmod 644 /etc/hosts", tmp.display());
     let res = run_privileged_shell(&script, PrivilegedPrompt::Never);
@@ -1035,9 +1043,7 @@ mod tests {
         }];
         let plan = plan_host_access("dogfood", &svcs);
         assert_eq!(
-            plan.urls
-                .get("dogfood/e2e-ui-ui")
-                .map(String::as_str),
+            plan.urls.get("dogfood/e2e-ui-ui").map(String::as_str),
             Some("http://e2e-ui-ui.dogfood.svc.cluster.local:5180")
         );
     }

@@ -186,9 +186,9 @@ impl Backend {
         }
     }
 
-    /// Backend-specific package registry for local provider/config installs.
-    /// All backends use an in-cluster NodePort registry for Crossplane package
-    /// pulls (pod network). Host push is always localhost:30500.
+    /// Cluster-provider-specific package registry for local provider/config installs.
+    /// Every cluster provider uses an in-cluster NodePort registry for Crossplane
+    /// package pulls (pod network).
     pub fn ensure_package_registry(self) -> Result<(), Box<dyn Error>> {
         crate::commands::local::package_install::ensure_incluster_registry()
     }
@@ -205,11 +205,16 @@ impl Backend {
             Backend::Dory => dory::registry_push_addr().unwrap_or_else(|_| {
                 crate::commands::local::package_install::REGISTRY_PUSH.to_string()
             }),
-            Backend::Colima | Backend::Kind => {
-                crate::commands::local::package_install::REGISTRY_PUSH.to_string()
-            }
+            // Use explicit IPv4. Dory's dockerd can resolve `localhost` to ::1,
+            // where its published kind port terminates the TLS request with EOF.
+            Backend::Kind => kind_registry_push(kind::registry_host_port()),
+            Backend::Colima => crate::commands::local::package_install::REGISTRY_PUSH.to_string(),
         }
     }
+}
+
+fn kind_registry_push(host_port: u16) -> String {
+    format!("127.0.0.1:{host_port}")
 }
 
 impl fmt::Display for Backend {
@@ -227,7 +232,7 @@ impl FromStr for Backend {
             "kind" => Ok(Backend::Kind),
             "dory" => Ok(Backend::Dory),
             other => Err(format!(
-                "unknown backend '{}' (expected colima, kind, or dory)",
+                "unknown persisted cluster provider '{}' (expected colima, kind, or dory)",
                 other
             )),
         }
@@ -263,9 +268,8 @@ pub fn resolve(flag: Option<Backend>) -> Backend {
     )
 }
 
-/// Resolve backend from optional provider pair + legacy backend flag, then activate.
+/// Resolve the backend adapter from the optional provider pair, then activate.
 pub fn activate_with_providers(
-    backend_flag: Option<Backend>,
     cluster_provider: Option<ClusterProvider>,
     docker_provider: Option<DockerProvider>,
     cluster_name: Option<&str>,
@@ -279,7 +283,7 @@ pub fn activate_with_providers(
         }
     }
 
-    let pair = resolve_provider_pair(backend_flag, cluster_provider, docker_provider)?;
+    let pair = resolve_provider_pair(cluster_provider, docker_provider)?;
     let backend = match pair {
         Some(p) => {
             apply_docker_provider_env(p.docker)?;
@@ -287,7 +291,7 @@ pub fn activate_with_providers(
             let _ = persist_providers(p, Some(cname.as_str()));
             p.as_backend()
         }
-        None => resolve(backend_flag),
+        None => resolve(None),
     };
 
     // Kind + default docker provider still auto-picks dory.sock inside kind module.
@@ -320,7 +324,7 @@ pub fn activate(flag: Option<Backend>, context: Option<&str>) -> Backend {
         KubeContextExport::Unset { missing_context } => {
             std::env::remove_var(HOPS_KUBE_CONTEXT_ENV);
             log::warn!(
-                "Kubernetes context '{}' for backend '{}' was not found; using kubeconfig current-context. Pass --context to target a specific cluster.",
+                "Kubernetes context '{}' for cluster provider '{}' was not found; using kubeconfig current-context. Pass --context to target a specific cluster.",
                 missing_context,
                 backend.name()
             );
@@ -411,11 +415,11 @@ pub fn wire_local_registry(backend: Backend) -> Result<(), Box<dyn Error>> {
 }
 
 pub fn should_wire_local_registry(
-    backend_flag: Option<Backend>,
+    provider_selected: bool,
     context: Option<&str>,
     backend: Backend,
 ) -> bool {
-    if backend_flag.is_some() {
+    if provider_selected {
         return true;
     }
 
@@ -427,15 +431,15 @@ pub fn should_wire_local_registry(
 
 pub fn wire_local_registry_for_target(
     backend: Backend,
-    backend_flag: Option<Backend>,
+    provider_selected: bool,
     context: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    if should_wire_local_registry(backend_flag, context, backend) {
+    if should_wire_local_registry(provider_selected, context, backend) {
         return wire_local_registry(backend);
     }
 
     log::warn!(
-        "registry node wiring skipped: explicit --context does not match a selected backend"
+        "registry node wiring skipped: explicit --context does not match the selected cluster provider"
     );
     Ok(())
 }
@@ -582,13 +586,13 @@ mod tests {
 
     #[test]
     fn registry_wiring_allowed_without_explicit_context() {
-        assert!(should_wire_local_registry(None, None, Backend::Colima));
+        assert!(should_wire_local_registry(false, None, Backend::Colima));
     }
 
     #[test]
-    fn registry_wiring_skips_foreign_explicit_context_without_backend_flag() {
+    fn registry_wiring_skips_foreign_explicit_context_without_provider_selection() {
         assert!(!should_wire_local_registry(
-            None,
+            false,
             Some("kind-hops"),
             Backend::Colima
         ));
@@ -597,18 +601,23 @@ mod tests {
     #[test]
     fn registry_wiring_allowed_when_context_matches_backend() {
         assert!(should_wire_local_registry(
-            None,
+            false,
             Some("kind-hops"),
             Backend::Kind
         ));
     }
 
     #[test]
-    fn registry_wiring_allowed_when_backend_is_explicit() {
+    fn registry_wiring_allowed_when_provider_is_explicit() {
         assert!(should_wire_local_registry(
-            Some(Backend::Colima),
+            true,
             Some("foreign"),
             Backend::Colima
         ));
+    }
+
+    #[test]
+    fn kind_registry_push_uses_ipv4_loopback() {
+        assert_eq!(kind_registry_push(30501), "127.0.0.1:30501");
     }
 }

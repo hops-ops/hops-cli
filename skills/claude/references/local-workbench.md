@@ -15,9 +15,8 @@ tree copy). You do not need to learn volume types.
 
 ```bash
 # Dory app running (engine healthy). Product Dory Kubernetes is optional.
-# Preferred flags (cluster-provider + docker-provider):
-hops local start --cp kind --dp dory --gitops ./gitops/cluster
-# Deprecated alias still works: --backend kind (auto-picks dory.sock when present)
+hops local start --cluster-provider kind --docker-provider dory \
+  --cluster-name hops --gitops ./gitops/cluster
 ```
 
 Context is typically `kind-hops`. Confirm mounts:
@@ -26,17 +25,19 @@ Context is typically `kind-hops`. Confirm mounts:
 hops local doctor   # "kind node projects-root mount (hostPath capable)"
 ```
 
-**Changing mounts:** recreate the kind cluster — `hops local reset --backend kind`
+**Changing mounts:** recreate the kind cluster —
+`hops local reset --cluster-provider kind --docker-provider dory --cluster-name hops`
 (or destroy + start). Existing clusters created without mounts will not pick up
 home mounts until reset.
 
 ### Alternative: product Dory Kubernetes
 
-Stock Dory k8s (`--backend dory`) is fine for platform experiments but usually
+Stock Dory k8s (`--cluster-provider dory --docker-provider dory`) is fine for platform experiments but usually
 **cannot** hostPath-mount Mac paths into the node; delivery falls back to sync.
 
 ```bash
-hops local start --backend dory --gitops ./gitops/cluster
+hops local start --cluster-provider dory --docker-provider dory \
+  --gitops ./gitops/cluster
 ```
 
 ## Daily loop
@@ -48,16 +49,7 @@ hops local gitops cluster ./gitops/cluster
 # Per-worktree apps (Application YAMLs → namespace = --name) — watches by default
 hops local gitops worktree ./gitops/envs/local --name dogfood
 
-# See workspaces and app URLs
-hops local status
-
-# Open the UI in a browser
-hops local open
-
-# When finished
-hops local down
-# Optional: delete the namespace too
-hops local down --purge
+# Stop either watcher with Ctrl+C.
 ```
 
 Watch is the default for both gitops commands. Use `--once` for a single reconcile (CI/scripts).
@@ -73,25 +65,19 @@ hops local gitops worktree ./gitops/envs/local --name alice
 # Terminal B
 hops local gitops worktree ./gitops/envs/local --name bob
 
-hops local status
-hops local down --name alice
-hops local down --name bob
 ```
 
-Each name maps to namespace `<name>` and gets its own access URLs.
+Each name maps to namespace `<name>`.
 
 ## Dogfood: e2e-ui
 
 ```bash
 cd distributed/tests/e2e-ui
 # Prefer kind-on-Dory for hostPath HMR (see One-time prerequisite)
-hops local start --backend kind --gitops ./gitops/cluster
+hops local start --cluster-provider kind --docker-provider dory \
+  --cluster-name hops --gitops ./gitops/cluster
 hops local gitops cluster ./gitops/cluster
 hops local gitops worktree ./gitops/envs/local --name dogfood
-# or: hops local up ./gitops/envs/local --name dogfood
-hops local status
-hops local open
-hops local down --name dogfood --purge
 ```
 
 Charts live under `api/.gitops/deploy` and `ui/.gitops/deploy`. You can also render them without hops:
@@ -109,7 +95,7 @@ host `make run` you invent.
 
 **When the dogfood site is broken:**
 
-1. **Confirm runtime first** (`KUBECONFIG` = dory, e.g. `~/.kube/dory-config`):
+1. **Confirm runtime first** (`kubectl --context kind-hops`):
    ```bash
    kubectl -n dogfood get pods
    kubectl -n dogfood logs deploy/e2e-ui-api --tail=40
@@ -140,8 +126,8 @@ host `make run` you invent.
    experiments, or long GraphQL protocol essays when the pod never finished
    building. **Do not** declare success without curling the live UI paths.
 
-**Kubeconfig:** prefer `~/.kube/dory-config` for dory; map host access uses
-cluster FQDNs (`*.svc.cluster.local`), not `localhost` alone.
+**Kube context:** use `kind-hops`; map host access uses cluster FQDNs
+(`*.svc.cluster.local`), not `localhost` alone.
 
 ## Layout
 

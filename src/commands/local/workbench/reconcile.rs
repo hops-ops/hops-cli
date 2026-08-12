@@ -1,11 +1,13 @@
 //! Application reconcile: helm template + label inject + apply.
 
 use super::application::{load_applications, resolve_source_path, Application};
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Label value for `app.kubernetes.io/managed-by`.
 pub const MANAGED_BY_VALUE: &str = "hops-local-gitops";
@@ -40,6 +42,16 @@ pub struct ReconcileResult {
     pub applied: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedObjectRef {
+    api_version: String,
+    kind: String,
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    namespace: Option<String>,
+}
+
 /// Abstraction over `helm template` for tests.
 pub trait HelmRunner {
     fn template(
@@ -59,6 +71,19 @@ pub trait KubectlApplier {
         labels: &BTreeMap<String, String>,
     ) -> Result<(), Box<dyn Error>>;
     fn apply(&self, yaml: &str) -> Result<(), Box<dyn Error>>;
+    fn prune(
+        &self,
+        app_name: &str,
+        inventory_namespace: &str,
+        desired_yaml: &str,
+    ) -> Result<(), Box<dyn Error>>;
+    fn record_inventory(
+        &self,
+        app_name: &str,
+        workspace_name: &str,
+        inventory_namespace: &str,
+        desired_yaml: &str,
+    ) -> Result<(), Box<dyn Error>>;
 }
 
 /// Real helm binary runner.
@@ -148,6 +173,198 @@ impl KubectlApplier for SystemKubectl {
             Err(format!("kubectl apply failed:\n  - {}", hard_errors.join("\n  - ")).into())
         }
     }
+
+    fn prune(
+        &self,
+        app_name: &str,
+        inventory_namespace: &str,
+        desired_yaml: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(previous) = load_inventory(app_name, inventory_namespace)? else {
+            // First prune-enabled reconcile seeds inventory after a successful
+            // apply. It must not infer ownership from broad label queries.
+            return Ok(());
+        };
+        // A worktree Application may render shared resources in another
+        // namespace, but its prune inventory is owned by this workspace. Never
+        // let one workspace delete another namespace's shared identity objects.
+        let previous = object_refs_in_namespace(previous, inventory_namespace);
+        let desired =
+            object_refs_in_namespace(managed_object_refs(desired_yaml)?, inventory_namespace);
+        let stale = stale_object_refs(&previous, &desired);
+        if stale.is_empty() {
+            return Ok(());
+        }
+
+        let delete_yaml = object_refs_as_delete_yaml(&stale)?;
+        let mut child = crate::commands::local::kubectl_command(&[
+            "delete",
+            "--ignore-not-found=true",
+            "--wait=true",
+            "-f",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .spawn()?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or("failed to open kubectl delete stdin")?
+            .write_all(delete_yaml.as_bytes())?;
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(format!("kubectl prune exited with {status}").into());
+        }
+        log::info!(
+            "Pruned {} stale object(s) for Application {}",
+            stale.len(),
+            app_name
+        );
+        Ok(())
+    }
+
+    fn record_inventory(
+        &self,
+        app_name: &str,
+        workspace_name: &str,
+        inventory_namespace: &str,
+        desired_yaml: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let refs =
+            object_refs_in_namespace(managed_object_refs(desired_yaml)?, inventory_namespace);
+        let resources_json = serde_json::to_string(&refs)?;
+        let name = inventory_name(app_name);
+        let inventory = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": name,
+                "namespace": inventory_namespace,
+                "labels": {
+                    "app.kubernetes.io/managed-by": MANAGED_BY_VALUE,
+                    (WORKSPACE_ENV_LABEL): workspace_name,
+                    (WORKSPACE_APP_LABEL): app_name,
+                }
+            },
+            "data": {
+                "resources.json": resources_json,
+            }
+        });
+        crate::commands::local::kubectl_apply_stdin(&serde_yaml::to_string(&inventory)?)
+    }
+}
+
+fn inventory_name(app_name: &str) -> String {
+    format!("hops-lgi-{}", sanitize_release_name(app_name))
+}
+
+fn managed_object_refs(yaml: &str) -> Result<Vec<ManagedObjectRef>, Box<dyn Error>> {
+    let mut refs = BTreeSet::new();
+    for doc in split_yaml_docs_owned(yaml) {
+        if doc.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_yaml::from_str(&doc)?;
+        let Some(root) = value.as_mapping() else {
+            continue;
+        };
+        let api_version = root
+            .get(Value::String("apiVersion".into()))
+            .and_then(Value::as_str);
+        let kind = root
+            .get(Value::String("kind".into()))
+            .and_then(Value::as_str);
+        let metadata = root
+            .get(Value::String("metadata".into()))
+            .and_then(Value::as_mapping);
+        let name = metadata
+            .and_then(|m| m.get(Value::String("name".into())))
+            .and_then(Value::as_str);
+        let (Some(api_version), Some(kind), Some(name)) = (api_version, kind, name) else {
+            continue;
+        };
+        let namespace = metadata
+            .and_then(|m| m.get(Value::String("namespace".into())))
+            .and_then(Value::as_str)
+            .filter(|ns| !ns.is_empty())
+            .map(str::to_string);
+        refs.insert(ManagedObjectRef {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            namespace,
+        });
+    }
+    Ok(refs.into_iter().collect())
+}
+
+fn stale_object_refs(
+    previous: &[ManagedObjectRef],
+    desired: &[ManagedObjectRef],
+) -> Vec<ManagedObjectRef> {
+    let desired: BTreeSet<_> = desired.iter().collect();
+    previous
+        .iter()
+        .filter(|item| !desired.contains(item))
+        .cloned()
+        .collect()
+}
+
+fn object_refs_in_namespace(refs: Vec<ManagedObjectRef>, namespace: &str) -> Vec<ManagedObjectRef> {
+    refs.into_iter()
+        .filter(|item| item.namespace.as_deref() == Some(namespace))
+        .collect()
+}
+
+fn object_refs_as_delete_yaml(refs: &[ManagedObjectRef]) -> Result<String, Box<dyn Error>> {
+    let mut docs = Vec::new();
+    for item in refs {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("name".into(), serde_json::Value::String(item.name.clone()));
+        if let Some(namespace) = &item.namespace {
+            metadata.insert(
+                "namespace".into(),
+                serde_json::Value::String(namespace.clone()),
+            );
+        }
+        let object = serde_json::json!({
+            "apiVersion": item.api_version,
+            "kind": item.kind,
+            "metadata": metadata,
+        });
+        docs.push(serde_yaml::to_string(&object)?);
+    }
+    Ok(docs.join("---\n"))
+}
+
+fn load_inventory(
+    app_name: &str,
+    inventory_namespace: &str,
+) -> Result<Option<Vec<ManagedObjectRef>>, Box<dyn Error>> {
+    let name = inventory_name(app_name);
+    let output = crate::commands::local::kubectl_command(&[
+        "-n",
+        inventory_namespace,
+        "get",
+        "configmap",
+        &name,
+        "-o",
+        "json",
+    ])
+    .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("NotFound") || stderr.contains("not found") {
+            return Ok(None);
+        }
+        return Err(format!("failed to read GitOps inventory {name}: {stderr}").into());
+    }
+    let config_map: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let raw = config_map
+        .pointer("/data/resources.json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("GitOps inventory {name} has no data.resources.json"))?;
+    Ok(Some(serde_json::from_str(raw)?))
 }
 
 /// Missing CRDs / unknown types are expected until platform packs are installed.
@@ -161,10 +378,7 @@ fn is_soft_apply_error(msg: &str) -> bool {
 
 /// Merge chart-level application values with runtime inject.
 /// Precedence: base (app helm values) ← runtime_values (runtime wins on key clash).
-pub fn merge_helm_values(
-    app_values: Option<&Value>,
-    runtime: &BTreeMap<String, Value>,
-) -> Value {
+pub fn merge_helm_values(app_values: Option<&Value>, runtime: &BTreeMap<String, Value>) -> Value {
     let mut out = serde_yaml::Mapping::new();
     if let Some(Value::Mapping(m)) = app_values {
         for (k, v) in m {
@@ -255,7 +469,10 @@ fn inject_labels_into_metadata_map(
     };
     let labels_key = Value::String("labels".into());
     if !meta.contains_key(&labels_key) {
-        meta.insert(labels_key.clone(), Value::Mapping(serde_yaml::Mapping::new()));
+        meta.insert(
+            labels_key.clone(),
+            Value::Mapping(serde_yaml::Mapping::new()),
+        );
     }
     let Some(label_map) = meta.get_mut(&labels_key).and_then(|v| v.as_mapping_mut()) else {
         return;
@@ -293,18 +510,13 @@ fn values_to_yaml(values: &Value) -> Result<String, Box<dyn Error>> {
 
 fn build_runtime_values(opts: &ReconcileOptions, app_name: &str) -> BTreeMap<String, Value> {
     let mut runtime = opts.runtime_values.clone();
-    runtime
-        .entry("local".into())
-        .or_insert(Value::Bool(true));
+    runtime.entry("local".into()).or_insert(Value::Bool(true));
     runtime.insert("namespace".into(), Value::String(opts.namespace.clone()));
 
     // sourceDelivery: mode + hostPath (usually the git worktree root for all apps).
     let mut sd = serde_yaml::Mapping::new();
     if let Some(mode) = &opts.delivery_mode {
-        sd.insert(
-            Value::String("mode".into()),
-            Value::String(mode.clone()),
-        );
+        sd.insert(Value::String("mode".into()), Value::String(mode.clone()));
     }
     if let Some(host) = opts.app_delivery_host_paths.get(app_name) {
         sd.insert(
@@ -349,10 +561,7 @@ pub fn reconcile_applications<H: HelmRunner, K: KubectlApplier>(
             "app.kubernetes.io/managed-by".to_string(),
             MANAGED_BY_VALUE.to_string(),
         );
-        m.insert(
-            WORKSPACE_ENV_LABEL.to_string(),
-            opts.workspace_name.clone(),
-        );
+        m.insert(WORKSPACE_ENV_LABEL.to_string(), opts.workspace_name.clone());
         m
     };
 
@@ -412,7 +621,18 @@ fn reconcile_one<H: HelmRunner, K: KubectlApplier>(
     let applied = if opts.dry_run {
         false
     } else {
+        if app.spec.sync_policy.prune {
+            kubectl.prune(&app.metadata.name, &opts.namespace, &labeled)?;
+        }
         kubectl.apply(&labeled)?;
+        if app.spec.sync_policy.prune {
+            kubectl.record_inventory(
+                &app.metadata.name,
+                &opts.workspace_name,
+                &opts.namespace,
+                &labeled,
+            )?;
+        }
         true
     };
 
@@ -581,7 +801,9 @@ image:
     fn inject_labels_contains_required_keys() {
         let labels = inject_labels("alice", "e2e-ui-api");
         assert_eq!(
-            labels.get("app.kubernetes.io/managed-by").map(String::as_str),
+            labels
+                .get("app.kubernetes.io/managed-by")
+                .map(String::as_str),
             Some(MANAGED_BY_VALUE)
         );
         assert_eq!(
@@ -624,11 +846,93 @@ spec:
         assert!(out.matches("hops-local-gitops").count() >= 2);
         // Pod template must carry workspace labels for kubectl -l discovery
         let docs: Vec<&str> = out.split("---").collect();
-        let dep = docs.iter().find(|d| d.contains("kind: Deployment")).unwrap();
+        let dep = docs
+            .iter()
+            .find(|d| d.contains("kind: Deployment"))
+            .unwrap();
         assert!(
             dep.contains("local-env: ws"),
             "deployment/pod template missing local-env: {dep}"
         );
+    }
+
+    #[test]
+    fn inventory_diff_prunes_only_removed_exact_objects() {
+        let previous = managed_object_refs(
+            r#"
+apiVersion: application.zitadel.m.crossplane.io/v1alpha1
+kind: Oidc
+metadata:
+  name: e2e-ui-alice-web
+  namespace: alice
+---
+apiVersion: project.zitadel.m.crossplane.io/v1alpha1
+kind: Project
+metadata:
+  name: e2e-ui
+  namespace: default
+"#,
+        )
+        .unwrap();
+        let desired = managed_object_refs(
+            r#"
+apiVersion: application.zitadel.m.crossplane.io/v1alpha1
+kind: Oidc
+metadata:
+  name: e2e-ui-alice-web-g1
+  namespace: alice
+---
+apiVersion: project.zitadel.m.crossplane.io/v1alpha1
+kind: Project
+metadata:
+  name: e2e-ui
+  namespace: default
+"#,
+        )
+        .unwrap();
+
+        let stale = stale_object_refs(&previous, &desired);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].kind, "Oidc");
+        assert_eq!(stale[0].name, "e2e-ui-alice-web");
+        assert_eq!(stale[0].namespace.as_deref(), Some("alice"));
+
+        let delete_yaml = object_refs_as_delete_yaml(&stale).unwrap();
+        assert!(delete_yaml.contains("application.zitadel.m.crossplane.io/v1alpha1"));
+        assert!(delete_yaml.contains("name: e2e-ui-alice-web"));
+        assert!(delete_yaml.contains("namespace: alice"));
+        assert!(!delete_yaml.contains("e2e-ui-alice-web-g1"));
+        assert!(!delete_yaml.contains("kind: Project"));
+    }
+
+    #[test]
+    fn prune_inventory_is_scoped_to_the_workspace_namespace() {
+        let refs = managed_object_refs(
+            r#"
+apiVersion: application.zitadel.m.crossplane.io/v1alpha1
+kind: Oidc
+metadata:
+  name: e2e-ui-alice-web-g1
+  namespace: alice
+---
+apiVersion: project.zitadel.m.crossplane.io/v1alpha1
+kind: Project
+metadata:
+  name: e2e-ui
+  namespace: default
+---
+apiVersion: example.org/v1
+kind: ClusterThing
+metadata:
+  name: shared
+"#,
+        )
+        .unwrap();
+
+        let scoped = object_refs_in_namespace(refs, "alice");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].kind, "Oidc");
+        assert_eq!(scoped[0].namespace.as_deref(), Some("alice"));
     }
 
     struct MockHelm {
@@ -650,6 +954,8 @@ spec:
     struct MockKubectl {
         applied: Mutex<Vec<String>>,
         namespaces: Mutex<Vec<String>>,
+        pruned: Mutex<Vec<String>>,
+        inventories: Mutex<Vec<String>>,
     }
 
     impl KubectlApplier for MockKubectl {
@@ -663,6 +969,25 @@ spec:
         }
         fn apply(&self, yaml: &str) -> Result<(), Box<dyn Error>> {
             self.applied.lock().unwrap().push(yaml.to_string());
+            Ok(())
+        }
+        fn prune(
+            &self,
+            app_name: &str,
+            _inventory_namespace: &str,
+            _desired_yaml: &str,
+        ) -> Result<(), Box<dyn Error>> {
+            self.pruned.lock().unwrap().push(app_name.to_string());
+            Ok(())
+        }
+        fn record_inventory(
+            &self,
+            app_name: &str,
+            _workspace_name: &str,
+            _inventory_namespace: &str,
+            _desired_yaml: &str,
+        ) -> Result<(), Box<dyn Error>> {
+            self.inventories.lock().unwrap().push(app_name.to_string());
             Ok(())
         }
     }
@@ -704,6 +1029,8 @@ spec:
         local: true
   destination:
     namespace: should-be-overridden
+  syncPolicy:
+    prune: true
 "#;
         std::fs::write(env.join("app.yaml"), app_yaml).unwrap();
 
@@ -713,6 +1040,8 @@ spec:
         let kubectl = MockKubectl {
             applied: Mutex::new(Vec::new()),
             namespaces: Mutex::new(Vec::new()),
+            pruned: Mutex::new(Vec::new()),
+            inventories: Mutex::new(Vec::new()),
         };
         let opts = ReconcileOptions {
             namespace: "alice".into(),
@@ -734,6 +1063,14 @@ spec:
         assert_eq!(
             kubectl.namespaces.lock().unwrap().as_slice(),
             &["alice".to_string()]
+        );
+        assert_eq!(
+            kubectl.pruned.lock().unwrap().as_slice(),
+            &["demo-app".to_string()]
+        );
+        assert_eq!(
+            kubectl.inventories.lock().unwrap().as_slice(),
+            &["demo-app".to_string()]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -787,8 +1124,11 @@ metadata:
 "#;
         let out = ensure_namespace_on_docs(yaml, "alice").unwrap();
         // Workload without ns → worktree
-        assert!(out.contains("name: e2e-ui-ui\n  namespace: alice") || out.contains("namespace: alice\n  name: e2e-ui-ui")
-            || (out.contains("kind: Service") && out.contains("namespace: alice")));
+        assert!(
+            out.contains("name: e2e-ui-ui\n  namespace: alice")
+                || out.contains("namespace: alice\n  name: e2e-ui-ui")
+                || (out.contains("kind: Service") && out.contains("namespace: alice"))
+        );
         // Already set preserved
         assert!(out.contains("namespace: already-set"));
         // Shared identity preserved

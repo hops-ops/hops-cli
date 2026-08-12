@@ -18,7 +18,6 @@ mod status;
 mod stop;
 mod uninstall;
 pub mod workbench;
-mod up;
 mod zitadel;
 
 use clap::{Args, Subcommand};
@@ -102,26 +101,19 @@ pub struct LocalArgs {
     pub command: LocalCommands,
 
     /// Kubernetes context to use for all kubectl commands (e.g. "colima").
-    /// Defaults to the resolved backend's own context. Global: applies to
+    /// Defaults to the selected cluster provider's context. Global: applies to
     /// every `hops local` subcommand and may be given before or after the
     /// subcommand.
     #[arg(long, global = true)]
     pub context: Option<String>,
 
-    /// Local cluster backend to target (**deprecated** — prefer
-    /// `--cluster-provider` / `--docker-provider`). Maps 1:1 to both dimensions.
-    /// Defaults to the backend persisted by the last successful `hops local start`,
-    /// else an existing cluster if one is detected, else the platform default.
-    #[arg(long, global = true, value_enum)]
-    pub backend: Option<backend::Backend>,
-
     /// How Kubernetes nodes are provisioned: `kind`, `dory` (product k3s), `colima`.
     /// Preferred Mac hostPath path: `--cluster-provider kind --docker-provider dory`.
-    #[arg(long = "cluster-provider", visible_alias = "cp", global = true, value_enum)]
+    #[arg(long = "cluster-provider", global = true, value_enum)]
     pub cluster_provider: Option<backend::ClusterProvider>,
 
     /// Container engine for kind/tools: `dory`, `colima`, `docker`.
-    #[arg(long = "docker-provider", visible_alias = "dp", global = true, value_enum)]
+    #[arg(long = "docker-provider", global = true, value_enum)]
     pub docker_provider: Option<backend::DockerProvider>,
 
     /// Named hops-managed kind cluster (`kind create --name`). Default `hops`
@@ -131,28 +123,26 @@ pub struct LocalArgs {
 
     /// Dory desktop integration name (kube context + docker context).
     /// Defaults to `hops-dory`. Persisted under `~/.hops/local/dory-name`.
-    /// Only used with cluster-provider/backend dory.
+    /// Only used with cluster-provider dory.
     ///
     /// Named `--dory-name` (not `--name`) so it never collides with workspace
-    /// `--name` on `hops local up|down|status|open|gitops worktree`.
+    /// `--name` on `hops local down|status|open|gitops worktree`.
     #[arg(long = "dory-name", global = true, value_name = "NAME")]
     pub dory_name: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum LocalCommands {
-    /// Install the local cluster backend (colima or kind) via Homebrew
+    /// Install local cluster-provider tools via Homebrew
     Install,
     /// Reset local Kubernetes state (colima: k8s reset; kind: recreate cluster)
     Reset,
     /// Start local k8s and ensure Crossplane control plane (skips helm when already healthy)
     Start(start::StartArgs),
-    /// Resize the local cluster VM without destroying cluster state (colima only)
+    /// Resize the local cluster VM without destroying cluster state (colima cluster provider only)
     Resize(resize::ResizeArgs),
     /// Check what `hops local start` set up and report drift
     Doctor,
-    /// Bring up a local workbench workspace (env Applications + host access)
-    Up(up::UpArgs),
     /// Bring down a local workbench workspace
     Down(down::DownArgs),
     /// Show local workbench workspace status and app URLs
@@ -175,7 +165,7 @@ pub enum LocalCommands {
     Stop,
     /// Destroy the local cluster
     Destroy,
-    /// Uninstall the local cluster backend
+    /// Uninstall local cluster-provider tools
     Uninstall(uninstall::UninstallArgs),
 }
 
@@ -190,18 +180,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
     }
 
     let explicit_context = args.context.as_deref().filter(|ctx| !ctx.is_empty());
-    // Install with no provider flags uses platform default (same as before).
-    let backend_flag = if matches!(&args.command, LocalCommands::Install)
-        && args.backend.is_none()
-        && args.cluster_provider.is_none()
-        && args.docker_provider.is_none()
-    {
-        Some(backend::platform_default())
-    } else {
-        args.backend
-    };
     let backend = backend::activate_with_providers(
-        backend_flag,
         args.cluster_provider,
         args.docker_provider,
         args.cluster_name.as_deref(),
@@ -214,7 +193,6 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Start(start_args) => start::run(backend, start_args),
         LocalCommands::Resize(resize_args) => resize::run(backend, resize_args),
         LocalCommands::Doctor => doctor::run(),
-        LocalCommands::Up(up_args) => up::run(up_args),
         LocalCommands::Down(down_args) => down::run(down_args),
         LocalCommands::Status(status_args) => status::run(status_args),
         LocalCommands::Open(open_args) => open::run(open_args),
@@ -466,8 +444,6 @@ mod tests {
     }
 
     /// Regression: workspace `--name` must not populate Dory's `--dory-name`.
-    /// Dual workspaces (`up --name alice` then `up --name bob`) used to rewrite
-    /// the desktop kube/docker context and delete the real `dory` context.
     #[test]
     fn workspace_name_does_not_set_dory_name() {
         use clap::Parser;
@@ -481,26 +457,28 @@ mod tests {
 
         let parsed = Cli::try_parse_from([
             "hops-local-test",
-            "up",
+            "gitops",
+            "worktree",
             "./gitops/envs/local",
             "--name",
             "alice",
             "--once",
-            "--no-cluster",
         ])
-        .expect("parse up --name alice");
+        .expect("parse gitops worktree --name alice");
         assert!(
             parsed.local.dory_name.is_none(),
             "workspace --name must not set dory_name; got {:?}",
             parsed.local.dory_name
         );
         match parsed.local.command {
-            LocalCommands::Up(up) => {
-                assert_eq!(up.name.as_deref(), Some("alice"));
-                assert!(up.once);
-                assert!(up.no_cluster);
-            }
-            other => panic!("expected Up, got {other:?}"),
+            LocalCommands::Gitops(gitops) => match gitops.command {
+                gitops::GitopsCommands::Worktree(worktree) => {
+                    assert_eq!(worktree.name.as_deref(), Some("alice"));
+                    assert!(worktree.once);
+                }
+                other => panic!("expected gitops worktree, got {other:?}"),
+            },
+            other => panic!("expected Gitops, got {other:?}"),
         }
     }
 
@@ -519,16 +497,22 @@ mod tests {
             "hops-local-test",
             "--dory-name",
             "mine",
-            "up",
+            "gitops",
+            "worktree",
             "./env",
             "--name",
             "bob",
         ])
-        .expect("parse --dory-name mine up --name bob");
+        .expect("parse --dory-name mine gitops worktree --name bob");
         assert_eq!(parsed.local.dory_name.as_deref(), Some("mine"));
         match parsed.local.command {
-            LocalCommands::Up(up) => assert_eq!(up.name.as_deref(), Some("bob")),
-            other => panic!("expected Up, got {other:?}"),
+            LocalCommands::Gitops(gitops) => match gitops.command {
+                gitops::GitopsCommands::Worktree(worktree) => {
+                    assert_eq!(worktree.name.as_deref(), Some("bob"));
+                }
+                other => panic!("expected gitops worktree, got {other:?}"),
+            },
+            other => panic!("expected Gitops, got {other:?}"),
         }
     }
 }

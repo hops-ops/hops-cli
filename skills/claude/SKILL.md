@@ -44,7 +44,8 @@ For detailed reference on each area, see the bundled references:
 ## Local control plane + platform packages (dogfood)
 
 ```bash
-hops local start --backend dory --gitops ./gitops/cluster
+hops local start --cluster-provider kind --docker-provider dory \
+  --cluster-name hops --gitops ./gitops/cluster
 # bootstrap writes helm/k8s providers + ProviderConfigs (default) into the tree,
 # then runs cluster gitops (apply + watch)
 

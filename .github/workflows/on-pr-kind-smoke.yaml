@@ -34,8 +34,8 @@ jobs:
       - name: Build hops
         run: cargo build
 
-      - name: hops local start --backend kind
-        run: ./target/debug/hops-cli local start --backend kind
+      - name: hops local start with kind + Docker
+        run: ./target/debug/hops-cli local start --cluster-provider kind --docker-provider docker
 
       - name: hops local doctor
         run: ./target/debug/hops-cli local doctor
@@ -84,7 +84,7 @@ jobs:
           test -d "$FIXTURE"
           test -f "$FIXTURE/upbound.yaml"
 
-          ./target/debug/hops-cli config install --path "$FIXTURE" --backend kind
+          ./target/debug/hops-cli config install --path "$FIXTURE" --cluster-provider kind --docker-provider docker
 
           for i in $(seq 1 90); do
             healthy="$(kubectl --context kind-hops get configuration.pkg.crossplane.io hops-ops-config-smoke \

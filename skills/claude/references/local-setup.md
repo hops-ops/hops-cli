@@ -4,8 +4,8 @@
 
 ```bash
 # 1. Start local k8s + Crossplane + providers + registry
-#    (backend preference is user-local: ~/.hops/local/backend)
-hops local start --backend dory
+#    (provider selection is user-local: ~/.hops/local/providers.json)
+hops local start --cluster-provider kind --docker-provider dory --cluster-name hops
 
 # 2. Install platform packages into the CP *and* pin them in cluster gitops
 hops config install --repo hops-ops/psql-stack --version v0.9.1 \
@@ -45,7 +45,8 @@ With **`--gitops PATH`** (e.g. `./gitops/cluster`):
 2. Runs `hops local gitops cluster PATH` (apply + watch) so day-to-day CP state is gitops-owned
 
 ```bash
-hops local start --backend dory --gitops ./gitops/cluster
+hops local start --cluster-provider kind --docker-provider dory \
+  --cluster-name hops --gitops ./gitops/cluster
 ```
 
 **Version bumps:** Renovate owns these pins (`cli/renovate.json` customManagers →

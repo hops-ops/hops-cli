@@ -6,9 +6,7 @@ use super::workbench::net::{
     discover_workspace_endpoints, ensure_host_access, format_status_card_with_listen,
     host_access_status_line, load_host_access_runtime, plan_host_access, url_listen_status,
 };
-use super::workbench::registry::{
-    activate_workspace_cluster, list_workspaces, load_workspace,
-};
+use super::workbench::registry::{activate_workspace_cluster, list_workspaces, load_workspace};
 use super::{local_state_dir, run_cmd_output};
 use clap::Args;
 use std::error::Error;
@@ -35,12 +33,7 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
     let workspaces = if let Some(name) = &args.name {
         match load_workspace(&state_dir, name)? {
             Some(r) => vec![r],
-            None => {
-                return Err(format!(
-                    "Workspace `{name}` not found. Run hops local up first."
-                )
-                .into())
-            }
+            None => return Err(format!("Workspace `{name}` is not registered.").into()),
         }
     } else {
         list_workspaces(&state_dir)?
@@ -48,7 +41,7 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
 
     if workspaces.is_empty() {
         println!("No local workspaces registered.");
-        println!("Start one with: hops local up <env-path> [--name <workspace>]");
+        println!("Apply one with: hops local gitops worktree <env-path> --name <workspace>");
         return Ok(());
     }
 
@@ -125,7 +118,7 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         } else if services.is_empty() {
             println!("note:     no services listed yet — is the workspace up?");
         } else {
-            println!("access processes: not recorded (re-run hops local up to start them)");
+            println!("access processes: not recorded");
         }
 
         // URL listen summary for --check (cluster FQDN endpoints)
@@ -175,7 +168,9 @@ fn discover_pods(namespace: &str) -> Result<Vec<PodStatus>, Box<dyn Error>> {
                 .to_string();
             let mut ready_containers = 0u32;
             let mut total_containers = 0u32;
-            if let Some(cs) = item.pointer("/status/containerStatuses").and_then(|v| v.as_array())
+            if let Some(cs) = item
+                .pointer("/status/containerStatuses")
+                .and_then(|v| v.as_array())
             {
                 total_containers = cs.len() as u32;
                 for c in cs {
@@ -184,7 +179,8 @@ fn discover_pods(namespace: &str) -> Result<Vec<PodStatus>, Box<dyn Error>> {
                     }
                 }
             }
-            let ready = phase == "Running" && ready_containers == total_containers && total_containers > 0;
+            let ready =
+                phase == "Running" && ready_containers == total_containers && total_containers > 0;
             out.push(PodStatus {
                 name,
                 phase,
@@ -230,9 +226,12 @@ fn delivery_status_line(state_dir: &Path, workspace: &str) -> String {
         .filter(|p| super::workbench::net::pid_is_alive(*p))
         .collect();
     if mutagen > 0 {
-        format!("delivery processes: {mutagen} mutagen session(s); tar watchers alive={}", alive.len())
+        format!(
+            "delivery processes: {mutagen} mutagen session(s); tar watchers alive={}",
+            alive.len()
+        )
     } else if alive.is_empty() {
-        "delivery processes: watcher not running (re-run hops local up --delivery sync)".into()
+        "delivery processes: watcher not running".into()
     } else {
         format!(
             "delivery processes: tar watcher alive (pids {})",

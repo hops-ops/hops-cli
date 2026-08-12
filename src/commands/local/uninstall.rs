@@ -5,7 +5,7 @@ use std::io::{self, Write};
 
 #[derive(Args, Debug)]
 pub struct UninstallArgs {
-    /// Uninstall the backend binary even if its local cluster still exists.
+    /// Uninstall the cluster-provider binary even if its local cluster still exists.
     #[arg(long)]
     pub force: bool,
 }
@@ -36,7 +36,7 @@ where
     Confirm: FnOnce(Backend) -> Result<bool, Box<dyn Error>>,
 {
     if !force && cluster_exists(backend) {
-        return Err("destroy the cluster first: `hops local destroy` (or pass --force to uninstall the backend binary anyway)".into());
+        return Err("destroy the cluster first: `hops local destroy` (or pass --force to uninstall the cluster-provider binary anyway)".into());
     }
 
     if confirm(backend)? {

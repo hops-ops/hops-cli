@@ -85,8 +85,8 @@ impl Default for SyncPolicy {
 
 /// Parse a single Application document from YAML text.
 pub fn parse_application_yaml(yaml: &str) -> Result<Application, Box<dyn Error>> {
-    let app: Application = serde_yaml::from_str(yaml)
-        .map_err(|e| format!("failed to parse Application YAML: {e}"))?;
+    let app: Application =
+        serde_yaml::from_str(yaml).map_err(|e| format!("failed to parse Application YAML: {e}"))?;
     if app.api_version != APPLICATION_API_VERSION {
         return Err(format!(
             "unsupported apiVersion {:?} (expected {})",
@@ -244,8 +244,8 @@ pub fn load_applications(env_path: &Path) -> Result<Vec<(PathBuf, Application)>,
 
     let mut apps = Vec::new();
     for path in entries {
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
         // Skip non-Application docs quietly if kind mismatches after parse attempt.
         match parse_application_yaml(&text) {
             Ok(app) => apps.push((path, app)),
@@ -300,7 +300,7 @@ spec:
 
     #[test]
     fn resolve_source_path_relative_to_application_file() {
-        let app_file = Path::new("/proj/gitops/env/local/api.yaml");
+        let app_file = Path::new("/proj/gitops/envs/local/api.yaml");
         let resolved = resolve_source_path(app_file, "../../../api/.gitops/deploy").unwrap();
         assert_eq!(resolved, PathBuf::from("/proj/api/.gitops/deploy"));
     }
@@ -319,7 +319,7 @@ spec:
 
     #[test]
     fn resolve_delivery_host_path_honors_explicit_override() {
-        let app_file = Path::new("/proj/gitops/env/local/ui.yaml");
+        let app_file = Path::new("/proj/gitops/envs/local/ui.yaml");
         let ui = parse_application_yaml(
             r#"
 apiVersion: hops.local/v1alpha1
@@ -366,10 +366,7 @@ spec:
     #[test]
     fn load_applications_from_directory() {
         let dir = tempfile_dir("lwb-apps");
-        write_file(
-            &dir.join("api.yaml"),
-            SAMPLE,
-        );
+        write_file(&dir.join("api.yaml"), SAMPLE);
         write_file(
             &dir.join("ui.yaml"),
             &SAMPLE.replace("e2e-ui-api", "e2e-ui-ui"),

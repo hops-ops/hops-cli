@@ -16,8 +16,7 @@ const REGISTRY_YAML: &str = include_str!("../../../bootstrap/registry/registry.y
 pub const REGISTRY_PUSH: &str = "localhost:30500";
 
 /// Cluster-internal address used in Crossplane package references (all backends).
-pub const REGISTRY_PULL_INCLUSTER: &str =
-    "registry.crossplane-system.svc.cluster.local:5000";
+pub const REGISTRY_PULL_INCLUSTER: &str = "registry.crossplane-system.svc.cluster.local:5000";
 pub const REGISTRY_HOSTNAME: &str = "registry.crossplane-system.svc.cluster.local";
 
 /// Back-compat alias — prefer [`registry_pull`] when the backend is known.
@@ -256,10 +255,7 @@ fn ensure_registry_tls_secret() -> Result<(), Box<dyn Error>> {
     }
 
     log::info!("Generating self-signed TLS for local package registry...");
-    let dir = std::env::temp_dir().join(format!(
-        "hops-registry-tls-{}",
-        unique_suffix()
-    ));
+    let dir = std::env::temp_dir().join(format!("hops-registry-tls-{}", unique_suffix()));
     fs::create_dir_all(&dir)?;
     let ca_key = dir.join("ca.key");
     let ca_crt = dir.join("ca.crt");
@@ -399,7 +395,10 @@ pub fn ensure_crossplane_trusts_local_registry_ca() -> Result<(), Box<dyn Error>
         ],
     )
     .unwrap_or_default();
-    if has_init.split_whitespace().any(|n| n == "hops-merge-registry-ca") {
+    if has_init
+        .split_whitespace()
+        .any(|n| n == "hops-merge-registry-ca")
+    {
         return Ok(());
     }
 

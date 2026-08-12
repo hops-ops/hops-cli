@@ -35,9 +35,7 @@ pub fn should_ignore_watch_path(path: &Path) -> bool {
 }
 
 /// Build the set of roots to watch: env dir + each Application chart path.
-pub fn watch_roots_for_applications(
-    env_path: &Path,
-) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+pub fn watch_roots_for_applications(env_path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut roots = Vec::new();
     let env_canon = env_path
         .canonicalize()
@@ -126,7 +124,9 @@ mod tests {
         assert!(should_ignore_watch_path(Path::new(
             "/proj/ui/node_modules/foo/index.js"
         )));
-        assert!(should_ignore_watch_path(Path::new("/proj/api/target/debug/x")));
+        assert!(should_ignore_watch_path(Path::new(
+            "/proj/api/target/debug/x"
+        )));
         assert!(should_ignore_watch_path(Path::new("/proj/.git/objects/aa")));
         assert!(!should_ignore_watch_path(Path::new(
             "/proj/ui/src/routes/+page.svelte"
@@ -135,14 +135,14 @@ mod tests {
 
     #[test]
     fn chart_and_env_trigger_reconcile_source_does_not() {
-        let env = PathBuf::from("/proj/gitops/env/local");
+        let env = PathBuf::from("/proj/gitops/envs/local");
         let charts = vec![
             PathBuf::from("/proj/api/.gitops/deploy"),
             PathBuf::from("/proj/ui/.gitops/deploy"),
         ];
 
         assert!(should_reconcile_on_change(
-            Path::new("/proj/gitops/env/local/api.yaml"),
+            Path::new("/proj/gitops/envs/local/api.yaml"),
             &env,
             &charts
         ));
@@ -169,11 +169,7 @@ mod tests {
         ));
         // Ignored even if under chart-ish names
         assert_eq!(
-            is_chart_or_env_path(
-                Path::new("/proj/ui/node_modules/x"),
-                &env,
-                &charts
-            ),
+            is_chart_or_env_path(Path::new("/proj/ui/node_modules/x"), &env, &charts),
             WatchPathClass::Ignored
         );
     }

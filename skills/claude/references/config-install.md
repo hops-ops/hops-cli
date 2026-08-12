@@ -65,7 +65,7 @@ gitops (not only as one-shot kubectl applies).
 
 ```bash
 # 1. Bootstrap CP (creates helm/k8s ProviderConfigs named "default")
-hops local start --backend dory
+hops local start --cluster-provider kind --docker-provider dory --cluster-name hops
 
 # 2. Install published stacks + write package YAML under gitops/cluster
 hops config install --repo hops-ops/psql-stack --version v0.9.1 \
@@ -76,7 +76,7 @@ hops config install --repo hops-ops/auth-stack --version v1.6.0 \
 
 # 3. Day-to-day: apply/watch the tree (packages + XRs)
 hops local gitops cluster ./gitops/cluster
-# or: hops local start --backend dory --gitops ./gitops/cluster
+# or: hops local start --cluster-provider kind --docker-provider dory --cluster-name hops --gitops ./gitops/cluster
 ```
 
 | Flag | Effect |

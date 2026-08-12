@@ -1,8 +1,8 @@
-use crate::commands::local::backend::{self, Backend};
+use crate::commands::local::backend::{self, Backend, ClusterProvider, DockerProvider};
 use crate::commands::local::package_install::{
-    docker_arch, ensure_cached_repo_checkout_at, ensure_registry, parse_repo_spec,
-    resolve_repo_install_target, run_watch, sanitize_name_component, RepoInstallTarget, RepoSpec,
-    registry_pull, registry_push,
+    docker_arch, ensure_cached_repo_checkout_at, ensure_registry, parse_repo_spec, registry_pull,
+    registry_push, resolve_repo_install_target, run_watch, sanitize_name_component,
+    RepoInstallTarget, RepoSpec,
 };
 use crate::commands::local::{
     kubectl_apply_stdin, run_cmd, run_cmd_output, MANAGED_BY_LABEL, PROVIDER_INSTALL_MANAGED_BY,
@@ -53,9 +53,17 @@ pub struct ProviderInstallArgs {
     #[arg(long)]
     pub context: Option<String>,
 
-    /// Local cluster backend whose node should be wired for local package pulls.
-    #[arg(long, value_enum)]
-    pub backend: Option<Backend>,
+    /// How Kubernetes nodes are provisioned: `kind`, `dory`, or `colima`.
+    #[arg(long = "cluster-provider", value_enum)]
+    pub cluster_provider: Option<ClusterProvider>,
+
+    /// Container engine for kind/tools: `dory`, `colima`, or `docker`.
+    #[arg(long = "docker-provider", value_enum)]
+    pub docker_provider: Option<DockerProvider>,
+
+    /// Named hops-managed kind cluster. Default `hops` uses context `kind-hops`.
+    #[arg(long = "cluster-name", value_name = "NAME")]
+    pub cluster_name: Option<String>,
 
     /// Watch the project directory for changes and re-run install automatically
     #[arg(long, conflicts_with = "repo")]
@@ -77,7 +85,13 @@ struct PackageMetadata {
 }
 
 pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
-    let backend = backend::activate(args.backend, args.context.as_deref());
+    let provider_selected = args.cluster_provider.is_some() || args.docker_provider.is_some();
+    let backend = backend::activate_with_providers(
+        args.cluster_provider,
+        args.docker_provider,
+        args.cluster_name.as_deref(),
+        args.context.as_deref(),
+    )?;
 
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => {
@@ -89,13 +103,13 @@ pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
             args.version_prefix.as_deref(),
             args.branch.as_deref(),
             backend,
-            args.backend,
+            provider_selected,
             args.context.as_deref(),
         ),
         (None, _) => {
             let path = args.path.as_deref().unwrap_or(".");
             let prefix = args.version_prefix.clone();
-            prepare_local_registry(backend, args.backend, args.context.as_deref())?;
+            prepare_local_registry(backend, provider_selected, args.context.as_deref())?;
             run_local_path(path, args.skip_dependency_resolution, prefix.as_deref())?;
 
             if args.watch {
@@ -118,14 +132,14 @@ fn run_repo_install(
     version_prefix: Option<&str>,
     branch: Option<&str>,
     backend: Backend,
-    backend_flag: Option<Backend>,
+    provider_selected: bool,
     context: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let spec = parse_repo_spec(repo)?;
     match resolve_repo_install_target(&spec)? {
         RepoInstallTarget::SourceBuild => {
             let cache_path = ensure_cached_repo_checkout_at(&spec, branch)?;
-            prepare_local_registry(backend, backend_flag, context)?;
+            prepare_local_registry(backend, provider_selected, context)?;
             run_local_path(
                 &cache_path.to_string_lossy(),
                 skip_dependency_resolution,
@@ -140,11 +154,11 @@ fn run_repo_install(
 
 fn prepare_local_registry(
     backend: Backend,
-    backend_flag: Option<Backend>,
+    provider_selected: bool,
     context: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     ensure_registry()?;
-    backend::wire_local_registry_for_target(backend, backend_flag, context)
+    backend::wire_local_registry_for_target(backend, provider_selected, context)
 }
 
 fn apply_repo_version(
@@ -1123,19 +1137,19 @@ mod tests {
     }
 
     #[test]
-    fn local_runtime_image_ref_uses_nodeport_registry() {
+    fn local_runtime_image_ref_uses_selected_nodeport_registry() {
         let image = local_runtime_image_ref("provider-helm", "arm64", "v1.999.3");
         assert_eq!(
             image,
-            "localhost:30500/hops-ops/provider-helm-arm64:v1.999.3"
+            format!("{}/hops-ops/provider-helm-arm64:v1.999.3", registry_push())
         );
         assert!(!image.contains(registry_pull()));
     }
 
     #[test]
-    fn local_registry_wiring_skips_foreign_context_without_backend_flag() {
+    fn local_registry_wiring_skips_foreign_context_without_provider_selection() {
         assert!(!backend::should_wire_local_registry(
-            None,
+            false,
             Some("kind-hops"),
             Backend::Colima
         ));
