@@ -83,20 +83,21 @@ jobs:
           FIXTURE=tests/fixtures/config-smoke
           test -d "$FIXTURE"
           test -f "$FIXTURE/upbound.yaml"
+          CONFIGURATION=config-smoke
 
           ./target/debug/hops-cli config install --path "$FIXTURE" --cluster-provider kind --docker-provider docker
 
           for i in $(seq 1 90); do
-            healthy="$(kubectl --context kind-hops get configuration.pkg.crossplane.io hops-ops-config-smoke \
+            healthy="$(kubectl --context kind-hops get configuration.pkg.crossplane.io "$CONFIGURATION" \
               -o jsonpath='{.status.conditions[?(@.type=="Healthy")].status}' 2>/dev/null || true)"
-            installed="$(kubectl --context kind-hops get configuration.pkg.crossplane.io hops-ops-config-smoke \
+            installed="$(kubectl --context kind-hops get configuration.pkg.crossplane.io "$CONFIGURATION" \
               -o jsonpath='{.status.conditions[?(@.type=="Installed")].status}' 2>/dev/null || true)"
             if [ "$healthy" = "True" ] && [ "$installed" = "True" ]; then
-              echo "Configuration hops-ops-config-smoke Healthy after ${i} attempts"
+              echo "Configuration $CONFIGURATION Healthy after ${i} attempts"
               break
             fi
             if [ "$i" -eq 90 ]; then
-              kubectl --context kind-hops get configuration.pkg.crossplane.io hops-ops-config-smoke -o yaml || true
+              kubectl --context kind-hops get configuration.pkg.crossplane.io "$CONFIGURATION" -o yaml || true
               kubectl --context kind-hops get configurationrevisions.pkg.crossplane.io -o wide || true
               kubectl --context kind-hops get functions.pkg.crossplane.io -o wide || true
               exit 1
