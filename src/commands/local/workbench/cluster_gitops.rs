@@ -6,10 +6,10 @@
 //!
 //! ```text
 //! <meta>/                           # meta root
-//!   gitops/cluster/                 # CP: PSQLStack, AuthStack, packages…
+//!   .gitops/cluster/                # CP: PSQLStack, AuthStack, packages…
 //!   clients/foo/.gitops/deploy/     # per-project charts
 //!   platform/api/.gitops/deploy/
-//!   gitops/envs/local/              # Application YAMLs → namespace = --name
+//!   environment.yaml                # reusable checkout Environment
 //! ```
 //!
 //! Env Applications only isolate **app** namespaces. Cluster YAML is applied
@@ -34,8 +34,11 @@ pub struct ClusterReconcileResult {
 /// Order:
 /// 1. Explicit `override_path` (`--cluster`)
 /// 2. Env var `HOPS_LOCAL_CLUSTER`
-/// 3. Walk up from `env_path` looking for `gitops/cluster` or `cluster`
-/// 4. Walk up from cwd looking for `gitops/cluster`
+/// 3. Walk up from `env_path` looking for `.gitops/cluster`
+/// 4. Walk up from cwd looking for `.gitops/cluster`
+///
+/// The former `gitops/cluster` and `cluster` layouts remain migration
+/// fallbacks after the committed `.gitops/cluster` convention.
 ///
 /// Returns the first existing directory. Explicit override that does not exist
 /// is left to the caller to error on canonicalize.
@@ -66,9 +69,9 @@ pub fn resolve_cluster_path(
 /// Discover a cluster tree near an env path (or walk to meta root).
 ///
 /// ```text
-/// gitops/envs/local     → sibling gitops/cluster
-/// some/deep/project     → walk up → <meta>/gitops/cluster
-/// <meta>/gitops         → <meta>/gitops/cluster
+/// environment.yaml      → walk up → <project>/.gitops/cluster
+/// some/deep/project     → walk up → <meta>/.gitops/cluster
+/// <meta>/.gitops        → <meta>/.gitops/cluster
 /// ```
 pub fn discover_cluster_path(env_path: &Path) -> Option<PathBuf> {
     let env = env_path
@@ -100,15 +103,20 @@ pub fn discover_cluster_path(env_path: &Path) -> Option<PathBuf> {
         }
     }
 
-    // Meta-root walk: any ancestor with gitops/cluster or cluster/
+    // Meta-root walk: prefer the committed .gitops/cluster convention, then
+    // retain the old paths as migration fallbacks.
     walk_up_for_cluster(&env)
 }
 
-/// Walk from `start` toward filesystem root for `gitops/cluster` or `cluster`.
+/// Walk from `start` toward filesystem root for `.gitops/cluster` and legacy layouts.
 fn walk_up_for_cluster(start: &Path) -> Option<PathBuf> {
     let mut cur = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
     loop {
-        for candidate in [cur.join("gitops").join("cluster"), cur.join("cluster")] {
+        for candidate in [
+            cur.join(".gitops").join("cluster"),
+            cur.join("gitops").join("cluster"),
+            cur.join("cluster"),
+        ] {
             if candidate.is_dir() {
                 return Some(candidate);
             }
@@ -414,6 +422,32 @@ mod tests {
         fs::create_dir_all(&other).unwrap();
         let resolved = resolve_cluster_path(Some(&deep_env), Some(&other)).unwrap();
         assert_eq!(resolved, other);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_prefers_dot_gitops_cluster() {
+        let dir = std::env::temp_dir().join(format!(
+            "hops-cg-dot-meta-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let preferred = dir.join(".gitops/cluster");
+        let legacy = dir.join("gitops/cluster");
+        let environment = dir.join("apps/api/environment.yaml");
+        fs::create_dir_all(&preferred).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(environment.parent().unwrap()).unwrap();
+        fs::write(&environment, "kind: Environment\n").unwrap();
+
+        let found = discover_cluster_path(&environment).unwrap();
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            preferred.canonicalize().unwrap()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

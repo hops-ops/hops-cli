@@ -1,4 +1,4 @@
-//! Write non-secret provider manifests under a gitops/cluster directory.
+//! Write non-secret provider manifests under a .gitops/cluster directory.
 //!
 //! Credential Secrets stay live-only until a local external-secrets story exists.
 //! `--gitops` writers intentionally omit Secret data.

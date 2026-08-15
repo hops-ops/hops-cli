@@ -1,4 +1,4 @@
-//! Kubernetes-shaped Cluster and Environment definition loading.
+//! Kubernetes-shaped Cluster and independently reusable Environment loading.
 //!
 //! This module intentionally stops at a validated, immutable handoff. The
 //! long-running controller consumes [`LoadedDefinition`] in the next rollout
@@ -43,7 +43,12 @@ pub struct UpOverrides<'a> {
 pub struct LoadedDefinition {
     pub source: PathBuf,
     pub cluster: ClusterDefinition,
-    pub environments: Vec<EnvironmentDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedEnvironment {
+    pub source: PathBuf,
+    pub environment: EnvironmentDefinition,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -221,15 +226,9 @@ pub fn run_up(args: &UpArgs, overrides: UpOverrides<'_>) -> Result<(), Box<dyn E
         "Validated shared manifests: {}",
         definition.cluster.manifests_path.display()
     );
-    for environment in &definition.environments {
-        log::info!(
-            "Environment '{}' namespace={} root={} deploys={} (controller handoff)",
-            environment.name,
-            environment.namespace,
-            environment.root.display(),
-            environment.deploys.len()
-        );
-    }
+    log::info!(
+        "Cluster definition contains no worktree inventory; register each checkout with `hops local gitops worktree <environment.yaml> --name <environment>`"
+    );
 
     Ok(())
 }
@@ -264,7 +263,6 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
     })?;
 
     let mut clusters = Vec::<ClusterDocument>::new();
-    let mut environments = Vec::<EnvironmentDocument>::new();
     for (index, document) in serde_yaml::Deserializer::from_str(&yaml).enumerate() {
         let number = index + 1;
         let value = Value::deserialize(document).map_err(|error| {
@@ -287,12 +285,18 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
         }
         match probe.kind.as_str() {
             "Cluster" => clusters.push(parse_document(value, &source, number)?),
-            "Environment" => environments.push(parse_document(value, &source, number)?),
+            "Environment" => {
+                return Err(format!(
+                    "{} document {number}: Environment instances must not be committed in cluster.yaml; pass a separate Environment file to `hops local gitops worktree`",
+                    source.display()
+                )
+                .into())
+            }
             other => {
                 return Err(format!(
-                "{} document {number}: unsupported kind {other:?}; expected Cluster or Environment",
-                source.display()
-            )
+                    "{} document {number}: unsupported kind {other:?}; expected Cluster",
+                    source.display()
+                )
                 .into())
             }
         }
@@ -353,90 +357,162 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
         })
         .transpose()?;
 
-    let cluster_name = raw_cluster.metadata.name;
-    let mut seen_environment_names = BTreeSet::new();
-    let mut resolved_environments = Vec::with_capacity(environments.len());
-    for raw_environment in environments {
-        debug_assert_eq!(raw_environment.api_version, API_VERSION);
-        debug_assert_eq!(raw_environment.kind, "Environment");
-        let name = raw_environment.metadata.name;
-        validate_dns_label("Environment.metadata.name", &name)?;
-        if !seen_environment_names.insert(name.clone()) {
-            return Err(format!("duplicate Environment metadata.name {name:?}").into());
-        }
-        if raw_environment.spec.cluster_ref.name != cluster_name {
-            return Err(format!(
-                "Environment {name:?} references unknown Cluster {:?}; this definition contains {:?}",
-                raw_environment.spec.cluster_ref.name, cluster_name
-            )
-            .into());
-        }
-
-        let namespace = raw_environment
-            .spec
-            .namespace
-            .unwrap_or_else(|| name.clone());
-        validate_dns_label("Environment.spec.namespace", &namespace)?;
-        let root = resolve_bounded_path(
-            &mount_root,
-            &mount_root,
-            &raw_environment.spec.root,
-            &format!("Environment {name:?} spec.root"),
-            true,
-        )?;
-
-        let mut seen_deploys = BTreeSet::new();
-        let mut deploys = Vec::with_capacity(raw_environment.spec.deploys.len());
-        for raw_deploy in raw_environment.spec.deploys {
-            let application_root = resolve_bounded_path(
-                &mount_root,
-                &root,
-                &raw_deploy.path,
-                &format!("Environment {name:?} deploys[].path"),
-                true,
-            )?;
-            if !seen_deploys.insert(application_root.clone()) {
-                return Err(format!(
-                    "Environment {name:?} contains duplicate deploy application root {}",
-                    application_root.display()
-                )
-                .into());
-            }
-            let promote_chart = resolve_bounded_path(
-                &mount_root,
-                &application_root,
-                Path::new(PROMOTE_CHART_PATH),
-                &format!("Environment {name:?} deploy promote chart"),
-                false,
-            )?;
-            deploys.push(DeployDefinition {
-                application_root,
-                promote_chart,
-                values: raw_deploy.values,
-            });
-        }
-
-        resolved_environments.push(EnvironmentDefinition {
-            name,
-            namespace,
-            cluster_ref: raw_environment.spec.cluster_ref.name,
-            root,
-            values: raw_environment.spec.values,
-            deploys,
-        });
-    }
-
     Ok(LoadedDefinition {
         source,
         cluster: ClusterDefinition {
-            name: cluster_name,
+            name: raw_cluster.metadata.name,
             cluster_provider: raw_cluster.spec.cluster_provider,
             docker_provider: raw_cluster.spec.docker_provider,
             mount_root,
             manifests_path,
             secret_sync,
         },
-        environments: resolved_environments,
+    })
+}
+
+pub fn load_environment_definition(
+    path: &Path,
+    cluster: &LoadedDefinition,
+    name_override: Option<&str>,
+    namespace_override: Option<&str>,
+) -> Result<LoadedEnvironment, Box<dyn Error>> {
+    let source = path.canonicalize().map_err(|error| {
+        format!(
+            "unable to resolve Environment definition {}: {error}",
+            path.display()
+        )
+    })?;
+    if !source.is_file() {
+        return Err(format!("Environment definition is not a file: {}", source.display()).into());
+    }
+    ensure_within(
+        &cluster.cluster.mount_root,
+        &source,
+        "Environment definition",
+    )?;
+    let definition_root = source
+        .parent()
+        .ok_or_else(|| format!("Environment definition has no parent: {}", source.display()))?
+        .canonicalize()?;
+    let yaml = fs::read_to_string(&source).map_err(|error| {
+        format!(
+            "unable to read Environment definition {}: {error}",
+            source.display()
+        )
+    })?;
+
+    let mut environments = Vec::<EnvironmentDocument>::new();
+    for (index, document) in serde_yaml::Deserializer::from_str(&yaml).enumerate() {
+        let number = index + 1;
+        let value = Value::deserialize(document).map_err(|error| {
+            format!(
+                "{} document {number}: invalid YAML: {error}",
+                source.display()
+            )
+        })?;
+        if value.is_null() {
+            continue;
+        }
+        let probe: DocumentProbe = parse_document(value.clone(), &source, number)?;
+        if probe.api_version != API_VERSION {
+            return Err(format!(
+                "{} document {number}: unsupported apiVersion {:?}; expected {API_VERSION}",
+                source.display(),
+                probe.api_version
+            )
+            .into());
+        }
+        if probe.kind != "Environment" {
+            return Err(format!(
+                "{} document {number}: unsupported kind {:?}; expected Environment",
+                source.display(),
+                probe.kind
+            )
+            .into());
+        }
+        environments.push(parse_document(value, &source, number)?);
+    }
+    if environments.len() != 1 {
+        return Err(format!(
+            "{}: expected exactly one {API_VERSION} Environment document, found {}",
+            source.display(),
+            environments.len()
+        )
+        .into());
+    }
+
+    let raw = environments.remove(0);
+    debug_assert_eq!(raw.api_version, API_VERSION);
+    debug_assert_eq!(raw.kind, "Environment");
+    let name = name_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&raw.metadata.name)
+        .to_string();
+    validate_dns_label("Environment runtime name", &name)?;
+    if raw.spec.cluster_ref.name != cluster.cluster.name {
+        return Err(format!(
+            "Environment {name:?} references Cluster {:?}, but the selected definition contains {:?}",
+            raw.spec.cluster_ref.name, cluster.cluster.name
+        )
+        .into());
+    }
+    let namespace = namespace_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or(raw.spec.namespace)
+        .unwrap_or_else(|| name.clone());
+    validate_dns_label("Environment namespace", &namespace)?;
+    let root = resolve_bounded_path(
+        &cluster.cluster.mount_root,
+        &definition_root,
+        &raw.spec.root,
+        &format!("Environment {name:?} spec.root"),
+        true,
+    )?;
+
+    let mut seen_deploys = BTreeSet::new();
+    let mut deploys = Vec::with_capacity(raw.spec.deploys.len());
+    for deploy in raw.spec.deploys {
+        let application_root = resolve_bounded_path(
+            &cluster.cluster.mount_root,
+            &root,
+            &deploy.path,
+            &format!("Environment {name:?} deploys[].path"),
+            true,
+        )?;
+        if !seen_deploys.insert(application_root.clone()) {
+            return Err(format!(
+                "Environment {name:?} contains duplicate deploy application root {}",
+                application_root.display()
+            )
+            .into());
+        }
+        let promote_chart = resolve_bounded_path(
+            &cluster.cluster.mount_root,
+            &application_root,
+            Path::new(PROMOTE_CHART_PATH),
+            &format!("Environment {name:?} deploy promote chart"),
+            false,
+        )?;
+        deploys.push(DeployDefinition {
+            application_root,
+            promote_chart,
+            values: deploy.values,
+        });
+    }
+
+    Ok(LoadedEnvironment {
+        source,
+        environment: EnvironmentDefinition {
+            name,
+            namespace,
+            cluster_ref: raw.spec.cluster_ref.name,
+            root,
+            values: raw.spec.values,
+            deploys,
+        },
     })
 }
 
@@ -704,13 +780,18 @@ mod tests {
             fs::create_dir_all(root.join(".gitops/cluster")).unwrap();
             fs::create_dir_all(root.join("apps/gateway")).unwrap();
             fs::create_dir_all(root.join("services/api")).unwrap();
-            fs::create_dir_all(root.join(".worktrees/feature-auth/apps/gateway")).unwrap();
             let root = root.canonicalize().unwrap();
             Self { root }
         }
 
         fn write(&self, yaml: &str) -> PathBuf {
             let path = self.root.join(DEFAULT_DEFINITION_FILE);
+            fs::write(&path, yaml).unwrap();
+            path
+        }
+
+        fn write_environment(&self, yaml: &str) -> PathBuf {
+            let path = self.root.join("environment.yaml");
             fs::write(&path, yaml).unwrap();
             path
         }
@@ -733,11 +814,14 @@ spec:
   mountRoot: .
   manifests:
     path: .gitops/cluster
----
-apiVersion: hops.local/v1alpha1
+"#
+    }
+
+    fn valid_environment_yaml() -> &'static str {
+        r#"apiVersion: hops.local/v1alpha1
 kind: Environment
 metadata:
-  name: main
+  name: local
 spec:
   clusterRef:
     name: project-dev
@@ -749,36 +833,39 @@ spec:
       values:
         preview: false
     - path: services/api
----
-apiVersion: hops.local/v1alpha1
-kind: Environment
-metadata:
-  name: feature-auth
-spec:
-  clusterRef:
-    name: project-dev
-  namespace: auth-preview
-  root: .worktrees/feature-auth
-  deploys:
-    - path: apps/gateway
 "#
     }
 
     #[test]
-    fn parses_one_cluster_and_two_environments() {
+    fn parses_cluster_only_and_reusable_environment() {
         let fixture = Fixture::new();
         let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
-
         assert_eq!(loaded.cluster.name, "project-dev");
         assert_eq!(loaded.cluster.cluster_provider, ClusterProvider::Kind);
         assert_eq!(loaded.cluster.docker_provider, DockerProvider::Dory);
-        assert_eq!(loaded.environments.len(), 2);
-        assert_eq!(loaded.environments[0].namespace, "main");
-        assert_eq!(loaded.environments[1].namespace, "auth-preview");
+
+        let environment = load_environment_definition(
+            &fixture.write_environment(valid_environment_yaml()),
+            &loaded,
+            Some("feature-auth"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(environment.environment.name, "feature-auth");
+        assert_eq!(environment.environment.namespace, "feature-auth");
+        assert_eq!(environment.environment.root, fixture.root);
         assert_eq!(
-            loaded.environments[0].deploys[0].promote_chart,
+            environment.environment.deploys[0].promote_chart,
             fixture.root.join("apps/gateway/.gitops/promote")
         );
+    }
+
+    #[test]
+    fn rejects_embedded_environment() {
+        let fixture = Fixture::new();
+        let yaml = format!("{}\n---\n{}", valid_yaml(), valid_environment_yaml());
+        let error = load_definition(&fixture.write(&yaml)).unwrap_err();
+        assert!(error.to_string().contains("must not be committed"));
     }
 
     #[test]
@@ -797,19 +884,15 @@ spec:
             loaded.cluster.manifests_path,
             worktree.join(".gitops/cluster")
         );
-        assert_eq!(loaded.environments[0].root, fixture.root);
-        assert_eq!(loaded.environments[1].root, worktree);
     }
 
     #[test]
     fn rejects_zero_or_multiple_cluster_documents() {
         let fixture = Fixture::new();
-        let environments_only = valid_yaml().split_once("---\n").unwrap().1;
-        let error = load_definition(&fixture.write(environments_only)).unwrap_err();
+        let error = load_definition(&fixture.write("\n")).unwrap_err();
         assert!(error.to_string().contains("exactly one"));
 
-        let cluster = valid_yaml().split_once("---\n").unwrap().0;
-        let duplicate = format!("{cluster}\n---\n{cluster}\n");
+        let duplicate = format!("{}\n---\n{}\n", valid_yaml(), valid_yaml());
         let error = load_definition(&fixture.write(&duplicate)).unwrap_err();
         assert!(error.to_string().contains("found 2"));
     }
@@ -839,40 +922,55 @@ spec:
             .to_string()
             .contains("unsupported kind"));
 
-        let reference =
-            valid_yaml().replacen("name: project-dev\n  root", "name: other\n  root", 1);
-        assert!(load_definition(&fixture.write(&reference))
-            .unwrap_err()
-            .to_string()
-            .contains("references unknown Cluster"));
+        let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
+        let reference = valid_environment_yaml().replacen(
+            "name: project-dev\n  root",
+            "name: other\n  root",
+            1,
+        );
+        assert!(load_environment_definition(
+            &fixture.write_environment(&reference),
+            &loaded,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("references Cluster"));
     }
 
     #[test]
-    fn rejects_duplicate_environment_and_deploy_identity() {
+    fn rejects_duplicate_deploy_identity() {
         let fixture = Fixture::new();
-        let duplicate_environment = valid_yaml().replace("name: feature-auth", "name: main");
-        assert!(load_definition(&fixture.write(&duplicate_environment))
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate Environment"));
-
-        let duplicate_deploy =
-            valid_yaml().replace("    - path: services/api", "    - path: apps/gateway");
-        assert!(load_definition(&fixture.write(&duplicate_deploy))
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate deploy"));
+        let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
+        let duplicate = valid_environment_yaml()
+            .replace("    - path: services/api", "    - path: apps/gateway");
+        assert!(load_environment_definition(
+            &fixture.write_environment(&duplicate),
+            &loaded,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate deploy"));
     }
 
     #[test]
     fn rejects_non_mapping_values_and_invalid_names() {
         let fixture = Fixture::new();
+        let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
         let scalar_values =
-            valid_yaml().replacen("  values:\n    local: true", "  values: true", 1);
-        assert!(load_definition(&fixture.write(&scalar_values))
-            .unwrap_err()
-            .to_string()
-            .contains("schema error"));
+            valid_environment_yaml().replacen("  values:\n    local: true", "  values: true", 1);
+        assert!(load_environment_definition(
+            &fixture.write_environment(&scalar_values),
+            &loaded,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("schema error"));
 
         let invalid_name = valid_yaml().replacen("name: project-dev", "name: Project_Dev", 1);
         assert!(load_definition(&fixture.write(&invalid_name))
@@ -900,12 +998,17 @@ spec:
             .to_string()
             .contains("must be relative"));
 
-        let traversal =
-            valid_yaml().replacen("root: .worktrees/feature-auth", "root: ../outside", 1);
-        assert!(load_definition(&fixture.write(&traversal))
-            .unwrap_err()
-            .to_string()
-            .contains("forbidden traversal"));
+        let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
+        let traversal = valid_environment_yaml().replacen("root: .", "root: ../outside", 1);
+        assert!(load_environment_definition(
+            &fixture.write_environment(&traversal),
+            &loaded,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("forbidden traversal"));
 
         #[cfg(unix)]
         {
@@ -917,8 +1020,14 @@ spec:
                 .join(format!("outside-definition-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&outside).unwrap();
             symlink(&outside, fixture.root.join("escape")).unwrap();
-            let escaped = valid_yaml().replacen("root: .worktrees/feature-auth", "root: escape", 1);
-            let error = load_definition(&fixture.write(&escaped)).unwrap_err();
+            let escaped = valid_environment_yaml().replacen("root: .", "root: escape", 1);
+            let error = load_environment_definition(
+                &fixture.write_environment(&escaped),
+                &loaded,
+                None,
+                None,
+            )
+            .unwrap_err();
             assert!(error.to_string().contains("escapes Cluster.spec.mountRoot"));
 
             symlink(&outside, fixture.root.join("secret-link")).unwrap();

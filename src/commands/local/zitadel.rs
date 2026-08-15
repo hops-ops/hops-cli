@@ -75,7 +75,7 @@ pub struct ZitadelArgs {
     pub refresh: bool,
 
     /// Write non-secret Provider / ProviderConfig YAML under this directory
-    /// (e.g. `./gitops/cluster`). Credential Secrets are not written.
+    /// (e.g. `./.gitops/cluster`). Credential Secrets are not written.
     #[arg(long)]
     pub gitops: Option<PathBuf>,
 }

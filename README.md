@@ -84,9 +84,9 @@ hops xr --help
 ## Local workbench definition
 
 Keep one Kubernetes-shaped `cluster.yaml` at the project root. The Cluster
-owns the local control plane and shared `.gitops/cluster` manifests;
-Environments name namespaces and point to application roots below the mounted
-project/meta root.
+owns the local control plane and shared `.gitops/cluster` manifests. Keep a
+separate reusable `environment.yaml` in every checkout; it names the deploys
+that make up that checkout's environment.
 
 ```yaml
 apiVersion: hops.local/v1alpha1
@@ -99,17 +99,20 @@ spec:
   mountRoot: .
   manifests:
     path: .gitops/cluster
----
+```
+
+```yaml
 apiVersion: hops.local/v1alpha1
 kind: Environment
 metadata:
-  name: feature-auth
+  name: local
 spec:
   clusterRef:
     name: project-dev
-  root: .worktrees/feature-auth
+  root: .
   values:
     local: true
+    preview: false
   deploys:
     - path: apps/gateway
 ```
@@ -118,15 +121,29 @@ From that project root:
 
 ```bash
 hops local up
-hops local up -f ./cluster.yaml
+hops local gitops cluster ./.gitops/cluster
+hops local gitops worktree ./environment.yaml --name main
 ```
 
-`up` validates every document and bounded filesystem path before starting or
-reusing the named Cluster. An existing kind Cluster with a different exact
-`mountRoot` fails with an explicit reset/recreate instruction and is never
-silently deleted. The long-running Environment/deploy controller is being
-landed as the next rollout layer; the legacy `gitops cluster/worktree`
-commands remain migration-only in this intermediate branch.
+From another checkout of the same project:
+
+```bash
+hops local gitops worktree ./environment.yaml --name feature-auth
+```
+
+`up` validates the Cluster before starting or reusing it. `gitops cluster`
+watches shared `.gitops/cluster` manifests. `worktree` validates the
+Environment against that Cluster, renders each deploy's `.gitops/promote`
+chart, applies the resulting local Applications to the runtime namespace, and
+watches `environment.yaml` plus the referenced `.gitops/promote` and
+`.gitops/deploy` charts.
+The runtime name, namespace, checkout path, and Cluster binding are local state;
+they are not committed to `cluster.yaml`.
+
+An existing kind Cluster with a different exact `mountRoot` fails with an
+explicit reset/recreate instruction and is never silently deleted. A legacy
+directory of pre-rendered Application YAMLs is still accepted by `worktree`
+during migration.
 
 ## Command Areas
 

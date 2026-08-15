@@ -15,28 +15,18 @@ spec:
   mountRoot: .
   manifests:
     path: .gitops/cluster
----
-apiVersion: hops.local/v1alpha1
+"#;
+
+const ENVIRONMENT_DEFINITION: &str = r#"apiVersion: hops.local/v1alpha1
 kind: Environment
 metadata:
-  name: main
+  name: local
 spec:
   clusterRef:
     name: project-dev
   root: .
   deploys:
     - path: apps/gateway
----
-apiVersion: hops.local/v1alpha1
-kind: Environment
-metadata:
-  name: feature-auth
-spec:
-  clusterRef:
-    name: project-dev
-  root: .worktrees/feature-auth
-  deploys:
-    - path: clients/gateway
 "#;
 
 const FAKE_TOOL: &str = r#"#!/bin/sh
@@ -114,7 +104,6 @@ impl Fixture {
         ));
         fs::create_dir_all(root.join(".gitops/cluster")).unwrap();
         fs::create_dir_all(root.join("apps/gateway")).unwrap();
-        fs::create_dir_all(root.join(".worktrees/feature-auth/clients/gateway")).unwrap();
         fs::create_dir_all(root.join("home")).unwrap();
         let bin = root.join("fake-bin");
         fs::create_dir_all(&bin).unwrap();
@@ -207,7 +196,7 @@ fn output_text(output: &Output) -> String {
 }
 
 #[test]
-fn parses_two_environments() {
+fn parses_cluster_only() {
     let fixture = Fixture::new();
     let first = fixture.run();
     assert!(first.status.success(), "{}", output_text(&first));
@@ -215,11 +204,7 @@ fn parses_two_environments() {
     assert!(first_log.contains("kind create cluster --name project-dev --config -"));
     assert!(first_log.contains(&format!("hostPath: \"{}\"", fixture.root.display())));
     let text = output_text(&first);
-    assert!(text.contains("Environment 'main' namespace=main"), "{text}");
-    assert!(
-        text.contains("Environment 'feature-auth' namespace=feature-auth"),
-        "{text}"
-    );
+    assert!(text.contains("contains no worktree inventory"), "{text}");
     let provider_state = fs::read_to_string(fixture.root.join("home/.hops/local/providers.json"))
         .expect("successful up persists provider identity");
     assert!(provider_state.contains(r#""clusterProvider": "kind""#));
@@ -238,18 +223,32 @@ fn parses_two_environments() {
 #[test]
 fn rejects_zero_or_multiple_clusters() {
     let fixture = Fixture::new();
-    let environment_only = VALID_DEFINITION.split_once("---\n").unwrap().1;
-    fixture.write_definition(environment_only);
+    fixture.write_definition("\n");
     let zero = fixture.run();
     assert!(!zero.status.success());
     assert!(output_text(&zero).contains("exactly one"));
     fixture.assert_no_mutation();
 
-    let cluster = VALID_DEFINITION.split_once("---\n").unwrap().0;
-    fixture.write_definition(&format!("{cluster}\n---\n{cluster}\n"));
+    fixture.write_definition(&format!(
+        "{}\n---\n{}\n",
+        VALID_DEFINITION, VALID_DEFINITION
+    ));
     let multiple = fixture.run();
     assert!(!multiple.status.success());
     assert!(output_text(&multiple).contains("found 2"));
+    fixture.assert_no_mutation();
+}
+
+#[test]
+fn rejects_embedded_environment_before_mutation() {
+    let fixture = Fixture::new();
+    fixture.write_definition(&format!(
+        "{}\n---\n{}",
+        VALID_DEFINITION, ENVIRONMENT_DEFINITION
+    ));
+    let output = fixture.run();
+    assert!(!output.status.success());
+    assert!(output_text(&output).contains("must not be committed"));
     fixture.assert_no_mutation();
 }
 
@@ -267,11 +266,11 @@ fn rejects_unknown_fields_and_escaping_paths_before_mutation() {
     assert!(output_text(&output).contains("unknown field"));
     fixture.assert_no_mutation();
 
-    let escape = VALID_DEFINITION.replacen("root: .worktrees/feature-auth", "root: ../outside", 1);
+    let escape = VALID_DEFINITION.replacen("mountRoot: .", "mountRoot: /tmp/outside", 1);
     fixture.write_definition(&escape);
     let output = fixture.run();
     assert!(!output.status.success());
-    assert!(output_text(&output).contains("forbidden traversal"));
+    assert!(output_text(&output).contains("must be relative"));
     fixture.assert_no_mutation();
 }
 
