@@ -36,6 +36,25 @@ const KIND_CLUSTER_NAME_ENV: &str = "HOPS_KIND_CLUSTER_NAME";
 const KIND_REGISTRY_HOST_PORT_ENV: &str = "HOPS_KIND_REGISTRY_HOST_PORT";
 const REGISTRY_HOST_PORT_START: u16 = 30500;
 const REGISTRY_HOST_PORT_END: u16 = 30599;
+const INOTIFY_SYSCTL_PATH: &str = "/etc/sysctl.d/99-hops-local-inotify.conf";
+const INOTIFY_MAX_USER_INSTANCES: u32 = 8192;
+const INOTIFY_MAX_USER_WATCHES: u32 = 1_048_576;
+const INSTALL_INOTIFY_SYSCTL_SCRIPT: &str = r#"set -eu
+target="$1"
+expected_instances="$2"
+expected_watches="$3"
+tmp="${target}.tmp"
+trap 'rm -f "${tmp}"' EXIT
+cat > "${tmp}"
+chmod 0644 "${tmp}"
+mv "${tmp}" "${target}"
+trap - EXIT
+sysctl -p "${target}" >/dev/null
+instances="$(sysctl -n fs.inotify.max_user_instances)"
+watches="$(sysctl -n fs.inotify.max_user_watches)"
+test "${instances}" -ge "${expected_instances}"
+test "${watches}" -ge "${expected_watches}"
+"#;
 
 /// Active hops kind cluster name (`kind create --name`).
 pub fn active_cluster_name() -> String {
@@ -478,7 +497,7 @@ pub fn start(size: &SizeArgs) -> Result<(), Box<dyn Error>> {
     let node = node_container_name();
     if node_running() {
         log::info!("kind cluster '{name}' is already running");
-        raise_node_inotify_limits();
+        ensure_node_inotify_limits()?;
         log_mount_hint();
         return Ok(());
     }
@@ -487,7 +506,7 @@ pub fn start(size: &SizeArgs) -> Result<(), Box<dyn Error>> {
     // single-node cluster is reliable in practice but not guaranteed by kind.
     log::info!("Starting stopped kind node '{node}'...");
     docker_run(&["start", &node])?;
-    raise_node_inotify_limits();
+    ensure_node_inotify_limits()?;
     normalize_dory_kubeconfig_endpoint()?;
     wait_for_api_after_restart()
 }
@@ -644,7 +663,7 @@ fn create_cluster() -> Result<(), Box<dyn Error>> {
     }
     // Raise inotify limits: mounting large host trees (even $HOME/dev) can make
     // kube-proxy fail with "too many open files" under default instance caps.
-    raise_node_inotify_limits();
+    ensure_node_inotify_limits()?;
     Ok(())
 }
 
@@ -712,13 +731,53 @@ fn normalized_dory_server(current_server: &str, api_port: u16) -> Option<String>
         .map(|_| format!("https://127.0.0.1:{api_port}"))
 }
 
-fn raise_node_inotify_limits() {
+fn inotify_sysctl_config() -> String {
+    format!(
+        "# Managed by hops local; reapplied by systemd-sysctl on kind node boot.\n\
+fs.inotify.max_user_instances = {INOTIFY_MAX_USER_INSTANCES}\n\
+fs.inotify.max_user_watches = {INOTIFY_MAX_USER_WATCHES}\n"
+    )
+}
+
+fn ensure_node_inotify_limits() -> Result<(), Box<dyn Error>> {
     let node = node_container_name();
-    let script = "sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=1048576 >/dev/null 2>&1 || true";
-    match docker_output(&["exec", &node, "sh", "-c", script]) {
-        Ok(_) => log::info!("raised kind node inotify limits for host mounts"),
-        Err(e) => log::debug!("inotify sysctl skipped: {e}"),
+    let expected_instances = INOTIFY_MAX_USER_INSTANCES.to_string();
+    let expected_watches = INOTIFY_MAX_USER_WATCHES.to_string();
+    let mut child = docker_cmd(&[
+        "exec",
+        "-i",
+        &node,
+        "sh",
+        "-c",
+        INSTALL_INOTIFY_SYSCTL_SCRIPT,
+        "hops-inotify-sysctl",
+        INOTIFY_SYSCTL_PATH,
+        &expected_instances,
+        &expected_watches,
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or("failed to open stdin for kind node inotify configuration")?;
+    stdin.write_all(inotify_sysctl_config().as_bytes())?;
+    drop(stdin);
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to persist required kind node inotify limits in {INOTIFY_SYSCTL_PATH}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
     }
+
+    log::info!(
+        "kind node inotify limits active and persistent: max_user_instances={INOTIFY_MAX_USER_INSTANCES}, max_user_watches={INOTIFY_MAX_USER_WATCHES} ({INOTIFY_SYSCTL_PATH})"
+    );
+    Ok(())
 }
 
 fn verify_node_mount(host_path: &Path) -> Result<(), Box<dyn Error>> {
@@ -908,6 +967,22 @@ mod tests {
         assert!(cfg.contains("hostPath: \"/Users/test\""));
         assert!(cfg.contains("containerPath: \"/Users/test\""));
         assert!(cfg.contains("readOnly: false"));
+    }
+
+    #[test]
+    fn kind_inotify_limits_are_persisted_for_node_restarts() {
+        assert!(INOTIFY_SYSCTL_PATH.starts_with("/etc/sysctl.d/"));
+        assert_eq!(
+            inotify_sysctl_config(),
+            "# Managed by hops local; reapplied by systemd-sysctl on kind node boot.\n\
+fs.inotify.max_user_instances = 8192\n\
+fs.inotify.max_user_watches = 1048576\n"
+        );
+        assert!(INSTALL_INOTIFY_SYSCTL_SCRIPT.contains("sysctl -p \"${target}\""));
+        assert!(INSTALL_INOTIFY_SYSCTL_SCRIPT
+            .contains("test \"${instances}\" -ge \"${expected_instances}\""));
+        assert!(INSTALL_INOTIFY_SYSCTL_SCRIPT
+            .contains("test \"${watches}\" -ge \"${expected_watches}\""));
     }
 
     #[test]
