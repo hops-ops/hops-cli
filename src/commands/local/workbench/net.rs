@@ -27,6 +27,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+#[cfg(unix)]
+fn detach_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn detach_process_group(_command: &mut Command) {}
+
 pub const RUNTIME_SUBDIR: &str = "runtime";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +50,10 @@ impl ServiceEndpoint {
     pub fn key(&self) -> String {
         format!("{}/{}", self.namespace, self.name)
     }
+
+    pub fn endpoint_key(&self) -> String {
+        format!("{}:{}", self.key(), self.port)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -50,7 +63,7 @@ pub struct HostAccessPlan {
     pub urls: BTreeMap<String, String>,
     /// service key `ns/name` → loopback IP
     pub ip_map: BTreeMap<String, String>,
-    /// service key → port
+    /// endpoint key `ns/name:port` → port
     pub service_ports: BTreeMap<String, u16>,
 }
 
@@ -61,7 +74,8 @@ pub struct HostAccessRuntime {
     pub pids: Vec<u32>,
     #[serde(default)]
     pub log_path: Option<String>,
-    /// service key `ns/name` → port (preferred). Also accepts bare name for older files.
+    /// endpoint key `ns/name:port` → port. Older single-port runtime files
+    /// using `ns/name` or a bare service name remain accepted.
     #[serde(default)]
     pub service_ports: BTreeMap<String, u16>,
     /// service key `ns/name` → loopback IP
@@ -85,7 +99,7 @@ pub fn plan_host_access_with_ips(
     let mut urls = BTreeMap::new();
     let mut service_ports = BTreeMap::new();
     for svc in services {
-        let key = svc.key();
+        let key = svc.endpoint_key();
         urls.insert(
             key.clone(),
             format_dns_url(&svc.name, &svc.namespace, svc.port),
@@ -132,19 +146,26 @@ pub fn format_status_card_with_listen(
 pub fn host_access_status_line(rt: &HostAccessRuntime) -> String {
     let alive = rt.pids.iter().filter(|p| pid_is_alive(**p)).count();
     let listen = rt
-        .ip_map
+        .service_ports
         .iter()
-        .filter(|(key, ip)| {
-            let port = rt.service_ports.get(*key).copied().unwrap_or(80);
-            ip_port_listening(ip, port)
+        .filter(|(endpoint_key, port)| {
+            let service_key = service_key_from_endpoint_key(endpoint_key);
+            rt.ip_map
+                .get(service_key)
+                .is_some_and(|ip| ip_port_listening(ip, **port))
         })
         .count();
+    let endpoint_count = if rt.service_ports.is_empty() {
+        rt.ip_map.len()
+    } else {
+        rt.service_ports.len()
+    };
     format!(
         "access: dns supervisor {}/{} alive; {}/{} endpoints listening",
         alive,
         rt.pids.len().max(1),
         listen,
-        rt.ip_map.len()
+        endpoint_count
     )
 }
 
@@ -182,9 +203,39 @@ pub fn clear_host_access_runtime(state_dir: &Path, workspace: &str) {
     let _ = fs::remove_file(runtime_path(state_dir, workspace));
 }
 
-/// Services in `namespace` (first TCP port each).
+/// Services in `namespace` (all TCP ports).
 pub fn discover_services(namespace: &str) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
     discover_services_in_namespace(namespace)
+}
+
+fn service_endpoints_from_value(namespace: &str, item: &serde_json::Value) -> Vec<ServiceEndpoint> {
+    let name = item["metadata"]["name"].as_str().unwrap_or("");
+    if name.is_empty() || name == "kubernetes" {
+        return Vec::new();
+    }
+    item["spec"]["ports"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| {
+            let port = p["port"].as_u64().unwrap_or(0) as u16;
+            let protocol = p["protocol"].as_str().unwrap_or("TCP");
+            if port == 0
+                || (protocol != "TCP" && protocol != "tcp")
+                // Skip postgres-ish ports for host browser access.
+                || port == 5432
+            {
+                return None;
+            }
+            Some(ServiceEndpoint {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                port,
+                protocol: "TCP".into(),
+            })
+        })
+        .collect()
 }
 
 fn discover_services_in_namespace(namespace: &str) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
@@ -201,34 +252,9 @@ fn discover_services_in_namespace(namespace: &str) -> Result<Vec<ServiceEndpoint
     let v: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     let mut out = Vec::new();
     for item in v["items"].as_array().cloned().unwrap_or_default() {
-        let name = item["metadata"]["name"].as_str().unwrap_or("").to_string();
-        if name.is_empty() || name == "kubernetes" {
-            continue;
-        }
-        for p in item["spec"]["ports"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-        {
-            let port = p["port"].as_u64().unwrap_or(0) as u16;
-            let protocol = p["protocol"].as_str().unwrap_or("TCP");
-            if port == 0 || (protocol != "TCP" && protocol != "tcp") {
-                continue;
-            }
-            // Skip postgres-ish ports for host browser access.
-            if port == 5432 {
-                continue;
-            }
-            out.push(ServiceEndpoint {
-                namespace: namespace.to_string(),
-                name: name.clone(),
-                port,
-                protocol: "TCP".into(),
-            });
-            break;
-        }
+        out.extend(service_endpoints_from_value(namespace, &item));
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.port.cmp(&b.port)));
     Ok(out)
 }
 
@@ -239,58 +265,50 @@ pub fn discover_workspace_endpoints(
 ) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
     let mut by_key: BTreeMap<String, ServiceEndpoint> = BTreeMap::new();
     for svc in discover_services_in_namespace(namespace)? {
-        by_key.insert(svc.key(), svc);
+        by_key.insert(svc.endpoint_key(), svc);
     }
 
     for (ref_ns, ref_name, port_hint) in scan_pod_cluster_dns_refs(namespace)? {
-        if ref_ns == namespace && by_key.contains_key(&format!("{ref_ns}/{ref_name}")) {
+        let service_key = format!("{ref_ns}/{ref_name}");
+        if ref_ns == namespace && by_key.values().any(|svc| svc.key() == service_key) {
             continue;
         }
-        let key = format!("{ref_ns}/{ref_name}");
-        if by_key.contains_key(&key) {
-            continue;
+        // A referenced Service is one DNS endpoint with potentially many
+        // useful ports. Expose every live TCP port on the same loopback IP.
+        let discovered = discover_named_service(&ref_ns, &ref_name).unwrap_or_default();
+        if !discovered.is_empty() {
+            for svc in discovered {
+                by_key.insert(svc.endpoint_key(), svc);
+            }
+        } else {
+            let port = port_hint.unwrap_or(80);
+            if port != 5432 {
+                let svc = ServiceEndpoint {
+                    namespace: ref_ns,
+                    name: ref_name,
+                    port,
+                    protocol: "TCP".into(),
+                };
+                by_key.insert(svc.endpoint_key(), svc);
+            }
         }
-        // Resolve live service port when possible.
-        let port = match service_port(&ref_ns, &ref_name) {
-            Ok(p) => p,
-            Err(_) => port_hint.unwrap_or(80),
-        };
-        if port == 5432 {
-            continue;
-        }
-        by_key.insert(
-            key,
-            ServiceEndpoint {
-                namespace: ref_ns,
-                name: ref_name,
-                port,
-                protocol: "TCP".into(),
-            },
-        );
     }
 
     Ok(by_key.into_values().collect())
 }
 
-fn service_port(namespace: &str, name: &str) -> Result<u16, Box<dyn Error>> {
-    let output = kubectl_command(&[
-        "get",
-        "svc",
-        name,
-        "-n",
-        namespace,
-        "-o",
-        "jsonpath={.spec.ports[0].port}",
-    ])
-    .output()
-    .map_err(|e| format!("kubectl get svc {name}: {e}"))?;
+fn discover_named_service(
+    namespace: &str,
+    name: &str,
+) -> Result<Vec<ServiceEndpoint>, Box<dyn Error>> {
+    let output = kubectl_command(&["get", "svc", name, "-n", namespace, "-o", "json"])
+        .output()
+        .map_err(|e| format!("kubectl get svc {name}: {e}"))?;
     if !output.status.success() {
         return Err("service not found".into());
     }
-    let s = String::from_utf8_lossy(&output.stdout);
-    s.trim()
-        .parse()
-        .map_err(|_| format!("bad port for {namespace}/{name}").into())
+    let item: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    Ok(service_endpoints_from_value(namespace, &item))
 }
 
 /// Parse pod env for `http(s)://svc.ns.svc.cluster.local:port` references.
@@ -613,11 +631,14 @@ if __name__ == '__main__':
         .append(true)
         .open(&log_path)?;
     let log_err = log_out.try_clone()?;
-    let child = Command::new("python3")
+    let mut command = Command::new("python3");
+    command
         .arg(&script)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_out))
-        .stderr(Stdio::from(log_err))
+        .stderr(Stdio::from(log_err));
+    detach_process_group(&mut command);
+    let child = command
         .spawn()
         .map_err(|e| format!("failed to spawn macOS stub DNS: {e}"))?;
     let pid = child.id();
@@ -677,19 +698,26 @@ fn start_dns_supervisor(
     let config_path = log_dir.join(format!("{workspace}.dns-forwards.tsv"));
     let script_path = log_dir.join(format!("{workspace}.dns-sup.sh"));
     let piddir = log_dir.join(format!("{workspace}.dns-pf-pids"));
+    fs::create_dir_all(&piddir)?;
+    for entry in fs::read_dir(&piddir)?.flatten() {
+        if entry.path().extension().and_then(|ext| ext.to_str()) == Some("pid") {
+            fs::remove_file(entry.path())?;
+        }
+    }
 
     // TSV: NS \t SVC \t IP \t PORT \t KEY
     let mut tsv = String::new();
     for svc in services {
-        let key = svc.key();
+        let service_key = svc.key();
+        let endpoint_key = svc.endpoint_key();
         let ip = plan
             .ip_map
-            .get(&key)
+            .get(&service_key)
             .cloned()
             .unwrap_or_else(|| "127.0.0.1".into());
         tsv.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\n",
-            svc.namespace, svc.name, ip, svc.port, key
+            svc.namespace, svc.name, ip, svc.port, endpoint_key
         ));
     }
     fs::write(&config_path, &tsv)?;
@@ -700,7 +728,9 @@ fn start_dns_supervisor(
 set -u
 CONFIG='{config}'
 LOG='{log}'
-PIDDIR='{piddir}'
+PIDROOT='{piddir}'
+OWNER="$PIDROOT/supervisor.pid"
+PIDDIR="$PIDROOT/$$"
 export KUBECONFIG="${{KUBECONFIG:-}}"
 KCTX="${{HOPS_KUBE_CONTEXT:-}}"
 k() {{
@@ -710,6 +740,9 @@ k() {{
     command kubectl "$@"
   fi
 }}
+port_listening() {{
+  (exec 3<>"/dev/tcp/$1/$2") >/dev/null 2>&1
+}}
 mkdir -p "$PIDDIR"
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) supervisor start" >>"$LOG"
 cleanup() {{
@@ -717,10 +750,34 @@ cleanup() {{
     [ -f "$f" ] || continue
     kill "$(cat "$f")" 2>/dev/null || true
   done
+  rm -rf "$PIDDIR"
+  if [ "$(cat "$OWNER" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$OWNER"
+  fi
   exit 0
 }}
 trap cleanup TERM INT HUP
-while true; do
+owned=false
+for _ in $(seq 1 40); do
+  if [ "$(cat "$OWNER" 2>/dev/null || true)" = "$$" ]; then
+    owned=true
+    break
+  fi
+  sleep 0.05
+done
+if [ "$owned" != true ]; then
+  cleanup
+fi
+for stale_dir in "$PIDROOT"/*; do
+  [ -d "$stale_dir" ] || continue
+  [ "$stale_dir" = "$PIDDIR" ] && continue
+  for f in "$stale_dir"/*.pid; do
+    [ -f "$f" ] || continue
+    kill "$(cat "$f")" 2>/dev/null || true
+  done
+  rm -rf "$stale_dir"
+done
+while [ "$(cat "$OWNER" 2>/dev/null || true)" = "$$" ]; do
   while IFS=$'\t' read -r NS SVC IP PORT KEY; do
     [ -z "${{NS:-}}" ] && continue
     safe=$(echo "$KEY" | tr '/:' '__')
@@ -737,6 +794,12 @@ while true; do
     if [ -n "$pid" ]; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
+    fi
+    if port_listening "$IP" "$PORT"; then
+      rm -f "$pf"
+      continue
+    fi
+    if [ -n "$pid" ]; then
       echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) restart $KEY" >>"$LOG"
     else
       echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) start $KEY $IP:$PORT" >>"$LOG"
@@ -746,6 +809,7 @@ while true; do
   done < "$CONFIG"
   sleep 2
 done
+cleanup
 "#,
         config = q(&config_path.to_string_lossy()),
         log = q(&log_path.to_string_lossy()),
@@ -770,13 +834,45 @@ done
     if let Ok(ctx) = std::env::var(HOPS_KUBE_CONTEXT_ENV) {
         cmd.env(HOPS_KUBE_CONTEXT_ENV, ctx);
     }
+    detach_process_group(&mut cmd);
     let child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn dns supervisor: {e}"))?;
-    let pid = child.id();
+    let spawned_pid = child.id();
+    let owner_path = piddir.join("supervisor.pid");
+    if let Err(error) = fs::write(&owner_path, spawned_pid.to_string()) {
+        let _ = Command::new("kill")
+            .args(["-TERM", &spawned_pid.to_string()])
+            .status();
+        return Err(format!("failed to claim dns supervisor ownership: {error}").into());
+    }
     std::mem::forget(child);
+    std::thread::sleep(Duration::from_millis(150));
+    let pid = fs::read_to_string(&owner_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .ok_or("dns supervisor ownership disappeared during startup")?;
+    if pid != spawned_pid {
+        let _ = Command::new("kill")
+            .args(["-TERM", &spawned_pid.to_string()])
+            .status();
+        for _ in 0..20 {
+            if !pid_is_alive(spawned_pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if pid_is_alive(spawned_pid) {
+            let _ = Command::new("kill")
+                .args(["-KILL", &spawned_pid.to_string()])
+                .status();
+        }
+    }
 
-    let service_ports: BTreeMap<String, u16> = services.iter().map(|s| (s.key(), s.port)).collect();
+    let service_ports: BTreeMap<String, u16> = services
+        .iter()
+        .map(|s| (s.endpoint_key(), s.port))
+        .collect();
     let runtime = HostAccessRuntime {
         namespace: plan.namespace.clone(),
         pids: vec![pid],
@@ -835,13 +931,32 @@ pub fn host_access_needs_heal(rt: &HostAccessRuntime) -> bool {
     if !rt.pids.iter().any(|p| pid_is_alive(*p)) {
         return true;
     }
-    for (key, ip) in &rt.ip_map {
-        let port = rt.service_ports.get(key).copied().unwrap_or(80);
-        if !ip_port_listening(ip, port) {
+    for (endpoint_key, port) in &rt.service_ports {
+        let service_key = service_key_from_endpoint_key(endpoint_key);
+        let Some(ip) = rt.ip_map.get(service_key) else {
+            return true;
+        };
+        if !ip_port_listening(ip, *port) {
             return true;
         }
     }
     false
+}
+
+fn host_access_runtime_matches_services(
+    rt: &HostAccessRuntime,
+    services: &[ServiceEndpoint],
+) -> bool {
+    let expected: BTreeMap<String, u16> = services
+        .iter()
+        .map(|service| (service.endpoint_key(), service.port))
+        .collect();
+    let expected_services: BTreeSet<String> = services.iter().map(ServiceEndpoint::key).collect();
+    rt.service_ports == expected
+        && rt.ip_map.len() == expected_services.len()
+        && expected_services
+            .iter()
+            .all(|key| rt.ip_map.contains_key(key))
 }
 
 pub fn ensure_host_access(
@@ -852,10 +967,10 @@ pub fn ensure_host_access(
 ) -> Result<(HostAccessPlan, HostAccessRuntime, bool), Box<dyn Error>> {
     let prior = load_host_access_runtime(state_dir, workspace)?;
     if let Some(rt) = &prior {
-        if !host_access_needs_heal(rt) {
+        if !host_access_needs_heal(rt) && host_access_runtime_matches_services(rt, services) {
             return Ok((plan_from_runtime(rt), rt.clone(), false));
         }
-        log::info!("host access unhealthy; restarting dns supervisor");
+        log::info!("host access unhealthy or endpoints changed; restarting dns supervisor");
     }
     let services = if services.is_empty() {
         prior
@@ -866,15 +981,21 @@ pub fn ensure_host_access(
         services.to_vec()
     };
     let (plan, rt) = start_host_access(namespace, &services, state_dir, workspace)?;
-    std::thread::sleep(Duration::from_millis(400));
+    for _ in 0..30 {
+        if !host_access_needs_heal(&rt) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     Ok((plan, rt, true))
 }
 
 fn plan_from_runtime(rt: &HostAccessRuntime) -> HostAccessPlan {
     let mut urls = BTreeMap::new();
-    for (key, port) in &rt.service_ports {
-        let (ns, name) = split_service_key(key, &rt.namespace);
-        urls.insert(key.clone(), format_dns_url(&name, &ns, *port));
+    for (endpoint_key, port) in &rt.service_ports {
+        let service_key = service_key_from_endpoint_key(endpoint_key);
+        let (ns, name) = split_service_key(service_key, &rt.namespace);
+        urls.insert(endpoint_key.clone(), format_dns_url(&name, &ns, *port));
     }
     if urls.is_empty() {
         for key in rt.ip_map.keys() {
@@ -898,19 +1019,38 @@ fn split_service_key(key: &str, default_ns: &str) -> (String, String) {
     }
 }
 
+fn service_key_from_endpoint_key(key: &str) -> &str {
+    match key.rsplit_once(':') {
+        Some((service_key, port)) if port.parse::<u16>().is_ok() => service_key,
+        _ => key,
+    }
+}
+
 fn services_from_runtime(rt: &HostAccessRuntime) -> Vec<ServiceEndpoint> {
-    let keys: Vec<String> = if !rt.service_ports.is_empty() {
-        rt.service_ports.keys().cloned().collect()
-    } else {
-        rt.ip_map.keys().cloned().collect()
-    };
-    keys.into_iter()
+    if !rt.service_ports.is_empty() {
+        return rt
+            .service_ports
+            .iter()
+            .map(|(endpoint_key, port)| {
+                let service_key = service_key_from_endpoint_key(endpoint_key);
+                let (ns, name) = split_service_key(service_key, &rt.namespace);
+                ServiceEndpoint {
+                    namespace: ns,
+                    name,
+                    port: *port,
+                    protocol: "TCP".into(),
+                }
+            })
+            .collect();
+    }
+    rt.ip_map
+        .keys()
         .map(|key| {
-            let (ns, name) = split_service_key(&key, &rt.namespace);
+            let (ns, name) = split_service_key(key, &rt.namespace);
             ServiceEndpoint {
                 namespace: ns,
                 name,
-                port: rt.service_ports.get(&key).copied().unwrap_or(80),
+                port: 80,
                 protocol: "TCP".into(),
             }
         })
@@ -919,9 +1059,13 @@ fn services_from_runtime(rt: &HostAccessRuntime) -> Vec<ServiceEndpoint> {
 
 pub fn url_listen_status(plan: &HostAccessPlan) -> BTreeMap<String, bool> {
     let mut out = BTreeMap::new();
-    for (key, ip) in &plan.ip_map {
-        let port = plan.service_ports.get(key).copied().unwrap_or(80);
-        out.insert(key.clone(), ip_port_listening(ip, port));
+    for (endpoint_key, port) in &plan.service_ports {
+        let service_key = service_key_from_endpoint_key(endpoint_key);
+        let listening = plan
+            .ip_map
+            .get(service_key)
+            .is_some_and(|ip| ip_port_listening(ip, *port));
+        out.insert(endpoint_key.clone(), listening);
     }
     out
 }
@@ -940,9 +1084,14 @@ fn stop_host_access_processes_only(
                     .status();
             }
         }
-        std::thread::sleep(Duration::from_millis(200));
+        for _ in 0..30 {
+            if rt.pids.iter().all(|pid| !pid_is_alive(*pid)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         for pid in &rt.pids {
-            if pid_command_contains_all(*pid, &[&supervisor_marker]) {
+            if pid_is_alive(*pid) && pid_command_contains_all(*pid, &[&supervisor_marker]) {
                 let _ = Command::new("kill")
                     .args(["-KILL", &pid.to_string()])
                     .status();
@@ -1105,9 +1254,108 @@ mod tests {
         }];
         let plan = plan_host_access("dogfood", &svcs);
         assert_eq!(
-            plan.urls.get("dogfood/e2e-ui-ui").map(String::as_str),
+            plan.urls.get("dogfood/e2e-ui-ui:5180").map(String::as_str),
             Some("http://e2e-ui-ui.dogfood.svc.cluster.local:5180")
         );
+    }
+
+    #[test]
+    fn service_discovery_keeps_every_tcp_port() {
+        let service = serde_json::json!({
+            "metadata": { "name": "mailpit" },
+            "spec": {
+                "ports": [
+                    { "port": 1025, "protocol": "TCP" },
+                    { "port": 8025, "protocol": "TCP" },
+                    { "port": 8125, "protocol": "UDP" },
+                    { "port": 5432, "protocol": "TCP" }
+                ]
+            }
+        });
+        let endpoints = service_endpoints_from_value("harmony-system", &service);
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.endpoint_key())
+                .collect::<Vec<_>>(),
+            vec!["harmony-system/mailpit:1025", "harmony-system/mailpit:8025"]
+        );
+    }
+
+    #[test]
+    fn host_access_runtime_must_match_discovered_service_keys_and_ports() {
+        let services = vec![
+            ServiceEndpoint {
+                namespace: "harmony".into(),
+                name: "api".into(),
+                port: 8080,
+                protocol: "TCP".into(),
+            },
+            ServiceEndpoint {
+                namespace: "harmony-auth".into(),
+                name: "zitadel".into(),
+                port: 8080,
+                protocol: "TCP".into(),
+            },
+        ];
+        let runtime = HostAccessRuntime {
+            namespace: "harmony".into(),
+            service_ports: BTreeMap::from([
+                ("harmony/api:8080".into(), 8080),
+                ("auth/zitadel:8080".into(), 8080),
+            ]),
+            ip_map: BTreeMap::from([
+                ("harmony/api".into(), "127.53.0.2".into()),
+                ("auth/zitadel".into(), "127.53.0.3".into()),
+            ]),
+            ..Default::default()
+        };
+
+        assert!(!host_access_runtime_matches_services(&runtime, &services));
+
+        let current = HostAccessRuntime {
+            service_ports: BTreeMap::from([
+                ("harmony/api:8080".into(), 8080),
+                ("harmony-auth/zitadel:8080".into(), 8080),
+            ]),
+            ip_map: BTreeMap::from([
+                ("harmony/api".into(), "127.53.0.2".into()),
+                ("harmony-auth/zitadel".into(), "127.53.0.3".into()),
+            ]),
+            ..runtime
+        };
+        assert!(host_access_runtime_matches_services(&current, &services));
+    }
+
+    #[test]
+    fn runtime_tracks_multiple_ports_on_one_service_ip() {
+        let services = vec![
+            ServiceEndpoint {
+                namespace: "harmony-system".into(),
+                name: "mailpit".into(),
+                port: 1025,
+                protocol: "TCP".into(),
+            },
+            ServiceEndpoint {
+                namespace: "harmony-system".into(),
+                name: "mailpit".into(),
+                port: 8025,
+                protocol: "TCP".into(),
+            },
+        ];
+        let runtime = HostAccessRuntime {
+            namespace: "harmony".into(),
+            service_ports: BTreeMap::from([
+                ("harmony-system/mailpit:1025".into(), 1025),
+                ("harmony-system/mailpit:8025".into(), 8025),
+            ]),
+            ip_map: BTreeMap::from([("harmony-system/mailpit".into(), "127.53.0.20".into())]),
+            ..Default::default()
+        };
+
+        assert!(host_access_runtime_matches_services(&runtime, &services));
+        let restored = services_from_runtime(&runtime);
+        assert_eq!(restored, services);
     }
 
     #[test]

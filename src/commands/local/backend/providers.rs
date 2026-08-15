@@ -166,6 +166,30 @@ pub fn resolve_provider_pair(
     Ok(Some(pair))
 }
 
+/// Translate the deprecated one-dimensional `--backend` flag into the
+/// provider pair used by the current CLI.
+///
+/// `kind` retains the platform default that was already used when only one
+/// provider dimension was supplied: Dory on macOS and the default Docker
+/// engine elsewhere. Product Dory and Colima remain self-paired.
+pub fn provider_pair_for_legacy_backend(backend: Backend) -> ProviderPair {
+    match backend {
+        Backend::Kind if cfg!(target_os = "macos") => ProviderPair::kind_on_dory(),
+        Backend::Kind => ProviderPair {
+            cluster: ClusterProvider::Kind,
+            docker: DockerProvider::Docker,
+        },
+        Backend::Dory => ProviderPair {
+            cluster: ClusterProvider::Dory,
+            docker: DockerProvider::Dory,
+        },
+        Backend::Colima => ProviderPair {
+            cluster: ClusterProvider::Colima,
+            docker: DockerProvider::Colima,
+        },
+    }
+}
+
 /// Apply docker-provider to process env for kind (and docker CLI).
 ///
 /// - `dory`: set DOCKER_HOST to `unix://$HOME/.dory/dory.sock` when unset
@@ -261,5 +285,138 @@ mod tests {
     #[test]
     fn resolve_neither_returns_none() {
         assert!(resolve_provider_pair(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn provider_pair_matrix_preserves_baseline_acceptance() {
+        let accepted = [
+            (ClusterProvider::Kind, DockerProvider::Dory),
+            (ClusterProvider::Kind, DockerProvider::Colima),
+            (ClusterProvider::Kind, DockerProvider::Docker),
+            (ClusterProvider::Dory, DockerProvider::Dory),
+            (ClusterProvider::Colima, DockerProvider::Colima),
+        ];
+        let rejected = [
+            (ClusterProvider::Dory, DockerProvider::Colima),
+            (ClusterProvider::Dory, DockerProvider::Docker),
+            (ClusterProvider::Colima, DockerProvider::Dory),
+            (ClusterProvider::Colima, DockerProvider::Docker),
+        ];
+
+        for (cluster, docker) in accepted {
+            let pair = ProviderPair { cluster, docker };
+            assert_eq!(
+                resolve_provider_pair(Some(cluster), Some(docker))
+                    .unwrap()
+                    .unwrap(),
+                pair,
+                "expected {cluster}+{docker} accepted"
+            );
+        }
+        for (cluster, docker) in rejected {
+            let error = resolve_provider_pair(Some(cluster), Some(docker)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "cluster-provider {cluster} requires docker-provider {cluster} (got {docker})"
+                ),
+                "expected {cluster}+{docker} rejected with the baseline diagnostic"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_partial_input_matrix_preserves_platform_defaults() {
+        let default_docker = if cfg!(target_os = "macos") {
+            DockerProvider::Dory
+        } else {
+            DockerProvider::Docker
+        };
+
+        assert_eq!(
+            resolve_provider_pair(Some(ClusterProvider::Kind), None)
+                .unwrap()
+                .unwrap(),
+            ProviderPair {
+                cluster: ClusterProvider::Kind,
+                docker: default_docker,
+            }
+        );
+        assert_eq!(
+            resolve_provider_pair(None, Some(DockerProvider::Dory))
+                .unwrap()
+                .unwrap(),
+            ProviderPair::kind_on_dory()
+        );
+        assert_eq!(
+            resolve_provider_pair(None, Some(DockerProvider::Colima))
+                .unwrap()
+                .unwrap(),
+            ProviderPair {
+                cluster: ClusterProvider::Kind,
+                docker: DockerProvider::Colima,
+            }
+        );
+        assert_eq!(
+            resolve_provider_pair(None, Some(DockerProvider::Docker))
+                .unwrap()
+                .unwrap(),
+            ProviderPair {
+                cluster: ClusterProvider::Kind,
+                docker: DockerProvider::Docker,
+            }
+        );
+
+        let colima_error = resolve_provider_pair(Some(ClusterProvider::Colima), None).unwrap_err();
+        assert_eq!(
+            colima_error.to_string(),
+            format!(
+                "cluster-provider colima requires docker-provider colima (got {default_docker})"
+            )
+        );
+
+        let dory = resolve_provider_pair(Some(ClusterProvider::Dory), None);
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                dory.unwrap().unwrap(),
+                ProviderPair {
+                    cluster: ClusterProvider::Dory,
+                    docker: DockerProvider::Dory,
+                }
+            );
+        } else {
+            assert_eq!(
+                dory.unwrap_err().to_string(),
+                "cluster-provider dory requires docker-provider dory (got docker)"
+            );
+        }
+    }
+
+    #[test]
+    fn deprecated_backend_maps_to_provider_defaults() {
+        let kind = provider_pair_for_legacy_backend(Backend::Kind);
+        assert_eq!(kind.cluster, ClusterProvider::Kind);
+        assert_eq!(
+            kind.docker,
+            if cfg!(target_os = "macos") {
+                DockerProvider::Dory
+            } else {
+                DockerProvider::Docker
+            }
+        );
+        assert_eq!(
+            provider_pair_for_legacy_backend(Backend::Dory),
+            ProviderPair {
+                cluster: ClusterProvider::Dory,
+                docker: DockerProvider::Dory,
+            }
+        );
+        assert_eq!(
+            provider_pair_for_legacy_backend(Backend::Colima),
+            ProviderPair {
+                cluster: ClusterProvider::Colima,
+                docker: DockerProvider::Colima,
+            }
+        );
     }
 }

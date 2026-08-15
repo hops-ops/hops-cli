@@ -81,21 +81,52 @@ hops validate --help
 hops xr --help
 ```
 
-## Local workbench (happy path)
+## Local workbench definition
 
-Multi-workspace local GitOps on the laptop control plane:
+Keep one Kubernetes-shaped `cluster.yaml` at the project root. The Cluster
+owns the local control plane and shared `.gitops/cluster` manifests;
+Environments name namespaces and point to application roots below the mounted
+project/meta root.
 
-```bash
-# shared control-plane tree (terminal 1)
-hops local gitops cluster ./gitops/cluster \
-  --cluster-provider kind --docker-provider dory --cluster-name hops
-
-# per-workspace tree (terminal 2)
-hops local gitops worktree ./gitops/envs/local --name alice \
-  --cluster-provider kind --docker-provider dory --cluster-name hops
+```yaml
+apiVersion: hops.local/v1alpha1
+kind: Cluster
+metadata:
+  name: project-dev
+spec:
+  clusterProvider: kind
+  dockerProvider: dory
+  mountRoot: .
+  manifests:
+    path: .gitops/cluster
+---
+apiVersion: hops.local/v1alpha1
+kind: Environment
+metadata:
+  name: feature-auth
+spec:
+  clusterRef:
+    name: project-dev
+  root: .worktrees/feature-auth
+  values:
+    local: true
+  deploys:
+    - path: apps/gateway
 ```
 
-Use `--name` for concurrent worktrees (`<name>` namespaces). Full guide: [skills/claude/references/local-workbench.md](skills/claude/references/local-workbench.md).
+From that project root:
+
+```bash
+hops local up
+hops local up -f ./cluster.yaml
+```
+
+`up` validates every document and bounded filesystem path before starting or
+reusing the named Cluster. An existing kind Cluster with a different exact
+`mountRoot` fails with an explicit reset/recreate instruction and is never
+silently deleted. The long-running Environment/deploy controller is being
+landed as the next rollout layer; the legacy `gitops cluster/worktree`
+commands remain migration-only in this intermediate branch.
 
 ## Command Areas
 

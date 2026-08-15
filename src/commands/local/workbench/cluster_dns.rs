@@ -94,6 +94,10 @@ pub fn allocate_service_ips(
     let mut out = BTreeMap::new();
     let mut used: Vec<String> = existing.values().cloned().collect();
     for svc in services {
+        // A multi-port Service still owns one DNS name and one loopback IP.
+        if out.contains_key(&svc.name) {
+            continue;
+        }
         let key = alloc_key(namespace, &svc.name);
         if let Some(ip) = existing.get(&key) {
             out.insert(svc.name.clone(), ip.clone());
@@ -259,7 +263,9 @@ pub fn save_ip_alloc(state_dir: &Path, alloc: &DnsIpAlloc) -> Result<(), Box<dyn
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_string_pretty(alloc)?)?;
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(&tmp, serde_json::to_string_pretty(alloc)?)?;
+    fs::rename(tmp, path)?;
     Ok(())
 }
 
@@ -708,6 +714,27 @@ mod tests {
     }
 
     #[test]
+    fn allocate_multi_port_service_once() {
+        let services = vec![
+            ServiceEndpoint {
+                namespace: "x".into(),
+                name: "mailpit".into(),
+                port: 1025,
+                protocol: "TCP".into(),
+            },
+            ServiceEndpoint {
+                namespace: "x".into(),
+                name: "mailpit".into(),
+                port: 8025,
+                protocol: "TCP".into(),
+            },
+        ];
+        let ips = allocate_service_ips("x", &services, &BTreeMap::new());
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips.get("mailpit").map(String::as_str), Some("127.53.0.2"));
+    }
+
+    #[test]
     fn merge_hosts_replaces_block() {
         let existing = "127.0.0.1 localhost\n# BEGIN hops-local-dns (managed by hops local — do not edit)\nold\n# END hops-local-dns\n";
         let lines =
@@ -752,5 +779,43 @@ mod tests {
         assert!(args.contains(&"127.53.0.2".into()));
         assert!(args.contains(&"8791:8791".into()));
         assert!(args.contains(&"svc/api".into()));
+    }
+
+    #[test]
+    fn concurrent_namespace_syncs_preserve_every_binding() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hops-dns-alloc-concurrency-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let mut workers = Vec::new();
+
+        for index in 0..16 {
+            let state_dir = state_dir.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let namespace = format!("worktree-{index}");
+                let service = ServiceEndpoint {
+                    namespace: namespace.clone(),
+                    name: "api".into(),
+                    port: 8080,
+                    protocol: "TCP".into(),
+                };
+                barrier.wait();
+                sync_alloc_for_namespace(&state_dir, &namespace, &[service]).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let alloc = load_ip_alloc(&state_dir);
+        let unique_ips = alloc
+            .bindings
+            .values()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(alloc.bindings.len(), 16);
+        assert_eq!(unique_ips.len(), 16);
+        fs::remove_dir_all(state_dir).unwrap();
     }
 }

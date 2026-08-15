@@ -129,6 +129,11 @@ pub struct LocalArgs {
     /// `--name` on `hops local down|status|open|gitops worktree`.
     #[arg(long = "dory-name", global = true, value_name = "NAME")]
     pub dory_name: Option<String>,
+
+    /// Deprecated one-dimensional provider selection. Use
+    /// --cluster-provider and --docker-provider instead.
+    #[arg(long, global = true, value_enum)]
+    pub backend: Option<backend::Backend>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -139,6 +144,8 @@ pub enum LocalCommands {
     Reset,
     /// Start local k8s and ensure Crossplane control plane (skips helm when already healthy)
     Start(start::StartArgs),
+    /// Start or reuse the Cluster declared by cluster.yaml
+    Up(workbench::definition::UpArgs),
     /// Resize the local cluster VM without destroying cluster state (colima cluster provider only)
     Resize(resize::ResizeArgs),
     /// Check what `hops local start` set up and report drift
@@ -170,6 +177,20 @@ pub enum LocalCommands {
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
+    if let LocalCommands::Up(up_args) = &args.command {
+        return workbench::definition::run_up(
+            up_args,
+            workbench::definition::UpOverrides {
+                cluster_provider: args.cluster_provider,
+                docker_provider: args.docker_provider,
+                legacy_backend: args.backend,
+                cluster_name: args.cluster_name.as_deref(),
+                context: args.context.as_deref(),
+                dory_name: args.dory_name.as_deref(),
+            },
+        );
+    }
+
     if let Some(name) = args
         .dory_name
         .as_deref()
@@ -179,10 +200,29 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         backend::persist_dory_context_name(name)?;
     }
 
+    let (cluster_provider, docker_provider) = match args.backend {
+        Some(_) if args.cluster_provider.is_some() || args.docker_provider.is_some() => {
+            return Err(
+                "deprecated --backend cannot be combined with --cluster-provider or --docker-provider"
+                    .into(),
+            );
+        }
+        Some(legacy) => {
+            let pair = backend::providers::provider_pair_for_legacy_backend(legacy);
+            log::warn!(
+                "--backend is deprecated; use --cluster-provider {} --docker-provider {}",
+                pair.cluster,
+                pair.docker
+            );
+            (Some(pair.cluster), Some(pair.docker))
+        }
+        None => (args.cluster_provider, args.docker_provider),
+    };
+
     let explicit_context = args.context.as_deref().filter(|ctx| !ctx.is_empty());
     let backend = backend::activate_with_providers(
-        args.cluster_provider,
-        args.docker_provider,
+        cluster_provider,
+        docker_provider,
         args.cluster_name.as_deref(),
         explicit_context,
     )?;
@@ -191,6 +231,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Install => install::run(backend),
         LocalCommands::Reset => reset::run(backend),
         LocalCommands::Start(start_args) => start::run(backend, start_args),
+        LocalCommands::Up(_) => unreachable!("up dispatch returns before generic activation"),
         LocalCommands::Resize(resize_args) => resize::run(backend, resize_args),
         LocalCommands::Doctor => doctor::run(),
         LocalCommands::Down(down_args) => down::run(down_args),

@@ -19,7 +19,9 @@ use super::workbench::delivery::{
 use super::workbench::reconcile::{
     reconcile_applications, ReconcileOptions, SystemHelm, SystemKubectl,
 };
-use super::workbench::registry::{activate_workspace_cluster, load_workspace};
+use super::workbench::registry::{
+    activate_workspace_cluster, load_workspace, save_workspace, WorkspaceRecord,
+};
 use super::workbench::watch::{
     is_chart_or_env_path, should_ignore_watch_path, watch_roots_for_applications, WatchPathClass,
 };
@@ -185,11 +187,12 @@ fn run_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| namespace_for_name(&workspace_name));
 
     // Sticky workspace→cluster: use bound kube context when registered.
-    if let Ok(state_dir) = local_state_dir() {
-        if let Ok(Some(rec)) = load_workspace(&state_dir, &workspace_name) {
-            if let Some((cluster, ctx)) = activate_workspace_cluster(&rec) {
-                log::info!("worktree gitops: bound cluster `{cluster}` (context {ctx})");
-            }
+    let existing_workspace = local_state_dir()
+        .ok()
+        .and_then(|state_dir| load_workspace(&state_dir, &workspace_name).ok().flatten());
+    if let Some(rec) = existing_workspace.as_ref() {
+        if let Some((cluster, ctx)) = activate_workspace_cluster(rec) {
+            log::info!("worktree gitops: bound cluster `{cluster}` (context {ctx})");
         }
     }
 
@@ -266,11 +269,65 @@ fn run_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
     };
 
     do_once()?;
+    if !args.dry_run {
+        register_worktree(
+            &env_path,
+            &workspace_name,
+            &namespace,
+            delivery_strategy,
+            existing_workspace.as_ref(),
+        )?;
+    }
     if args.once || args.dry_run {
         return Ok(());
     }
 
     run_worktree_watch(&env_path, args.debounce, do_once)
+}
+
+fn register_worktree(
+    env_path: &Path,
+    workspace_name: &str,
+    namespace: &str,
+    delivery_strategy: DeliveryStrategy,
+    existing: Option<&WorkspaceRecord>,
+) -> Result<(), Box<dyn Error>> {
+    let cluster_name = existing
+        .and_then(|record| record.cluster_name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(super::backend::kind::active_cluster_name);
+    let kube_context = existing
+        .and_then(|record| record.kube_context.clone())
+        .filter(|context| !context.is_empty())
+        .or_else(super::kube_context_from_env)
+        .or_else(|| Some(format!("kind-{cluster_name}")));
+    let project_root = discover_project_root(env_path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|| existing.and_then(|record| record.project_root.clone()));
+
+    let record = WorkspaceRecord {
+        name: workspace_name.to_string(),
+        namespace: namespace.to_string(),
+        env_path: env_path.to_string_lossy().into_owned(),
+        project_root,
+        delivery_mode: Some(delivery_strategy.as_str().to_string()),
+        updated_at: None,
+        cluster_name: Some(cluster_name),
+        kube_context,
+    };
+    let path = save_workspace(&local_state_dir()?, &record)?;
+    log::info!(
+        "worktree gitops: registered workspace `{workspace_name}` at {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn discover_project_root(env_path: &Path) -> Option<PathBuf> {
+    env_path
+        .ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 fn resolve_worktree_delivery(
@@ -440,5 +497,42 @@ fn wait_for_quiet(rx: &mpsc::Receiver<()>, debounce: Duration) -> Result<(), Box
                 return Err("watcher channel closed".into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn discovers_project_root_from_git_ancestor() {
+        let root = std::env::temp_dir().join(format!(
+            "hops-gitops-root-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let env_path = root.join("gitops/envs/local");
+        fs::create_dir_all(&env_path).unwrap();
+        fs::write(root.join(".git"), "gitdir: /tmp/example\n").unwrap();
+
+        assert_eq!(discover_project_root(&env_path), Some(root.clone()));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_root_is_unknown_without_git_ancestor() {
+        let root = std::env::temp_dir().join(format!(
+            "hops-gitops-no-root-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let env_path = root.join("gitops/envs/local");
+        fs::create_dir_all(&env_path).unwrap();
+
+        assert_eq!(discover_project_root(&env_path), None);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
