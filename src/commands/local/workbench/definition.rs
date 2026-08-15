@@ -230,7 +230,7 @@ pub fn run_up(args: &UpArgs, overrides: UpOverrides<'_>) -> Result<(), Box<dyn E
         definition.cluster.manifests_path.display()
     );
     log::info!(
-        "Cluster definition contains no worktree inventory; register each checkout with `hops local gitops worktree .gitops/local/environment.yaml --name <environment>`"
+        "Cluster definition contains no Environment inventory; register each checkout with `hops local gitops environment .gitops/local/environment.yaml --name <environment>`"
     );
 
     Ok(())
@@ -303,7 +303,7 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
             "Cluster" => clusters.push(parse_document(value, &source, number)?),
             "Environment" => {
                 return Err(format!(
-                    "{} document {number}: Environment instances must not be committed in the Cluster definition; pass .gitops/local/environment.yaml to `hops local gitops worktree`",
+                    "{} document {number}: Environment instances must not be committed in the Cluster definition; pass .gitops/local/environment.yaml to `hops local gitops environment`",
                     source.display()
                 )
                 .into())

@@ -1,8 +1,8 @@
-//! `hops local gitops` — control-plane and worktree Application reconcile.
+//! `hops local gitops` — control-plane and Environment reconcile.
 //!
 //! ```text
 //! hops local gitops cluster  [PATH]   # shared CP (.gitops/local/cluster)
-//! hops local gitops worktree <PATH>   # per-worktree apps (envs → namespace = --name)
+//! hops local gitops environment <PATH> # Environment apps → namespace = --name
 //! ```
 //!
 //! Both **watch by default**; pass `--once` for a single reconcile (CI/scripts).
@@ -51,8 +51,9 @@ pub struct GitopsArgs {
 pub enum GitopsCommands {
     /// Shared control-plane gitops (packages, PSQLStack, AuthStack → local CP)
     Cluster(ClusterArgs),
-    /// Per-worktree app Applications (charts → namespace = --name)
-    Worktree(WorktreeArgs),
+    /// Reconcile an Environment's Applications (charts → namespace = --name)
+    #[command(alias = "worktree")]
+    Environment(EnvironmentArgs),
 }
 
 #[derive(Args, Debug)]
@@ -80,7 +81,7 @@ pub struct ClusterArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct WorktreeArgs {
+pub struct EnvironmentArgs {
     /// Reusable Environment YAML, or a legacy directory of Application YAMLs.
     #[arg(value_name = "PATH")]
     pub path: PathBuf,
@@ -113,7 +114,7 @@ pub struct WorktreeArgs {
 pub fn run(args: &GitopsArgs) -> Result<(), Box<dyn Error>> {
     match &args.command {
         GitopsCommands::Cluster(a) => run_cluster(a),
-        GitopsCommands::Worktree(a) => run_worktree(a),
+        GitopsCommands::Environment(a) => run_environment(a),
     }
 }
 
@@ -168,16 +169,16 @@ pub fn run_cluster(args: &ClusterArgs) -> Result<(), Box<dyn Error>> {
     run_cluster_watch(&cluster, args.debounce, do_once)
 }
 
-// ── worktree ─────────────────────────────────────────────────────────────────
+// ── environment ──────────────────────────────────────────────────────────────
 
-fn run_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
+fn run_environment(args: &EnvironmentArgs) -> Result<(), Box<dyn Error>> {
     if args.path.is_file() && yaml_kind(&args.path)?.as_deref() == Some("Environment") {
-        return run_environment_worktree(args);
+        return run_environment_definition(args);
     }
     run_application_worktree(args)
 }
 
-fn run_environment_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
+fn run_environment_definition(args: &EnvironmentArgs) -> Result<(), Box<dyn Error>> {
     let source = args
         .path
         .canonicalize()
@@ -201,7 +202,7 @@ fn run_environment_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
     let mut chart_watch_roots = BTreeSet::new();
     for deploy in &loaded.environment.deploys {
         chart_watch_roots.insert(deploy.promote_chart.clone());
-        chart_watch_roots.insert(deploy.application_root.join(".gitops/deploy"));
+        chart_watch_roots.insert(deploy.application_root.join(".gitops/local"));
     }
     let chart_watch_roots: Vec<_> = chart_watch_roots.into_iter().collect();
     super::backend::kind::set_active_cluster_name(&cluster.cluster.name);
@@ -223,7 +224,7 @@ fn run_environment_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
             &workspace_name,
             &namespace,
         )?;
-        let legacy = WorktreeArgs {
+        let legacy = EnvironmentArgs {
             path: generated.clone(),
             namespace: Some(namespace.clone()),
             name: Some(workspace_name.clone()),
@@ -513,7 +514,7 @@ fn is_environment_watch_path(path: &Path, source: &Path, chart_roots: &[PathBuf]
     path == source || chart_roots.iter().any(|root| path.starts_with(root))
 }
 
-fn run_application_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
+fn run_application_worktree(args: &EnvironmentArgs) -> Result<(), Box<dyn Error>> {
     let env_path = args
         .path
         .canonicalize()
@@ -542,7 +543,7 @@ fn run_application_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
         .and_then(|state_dir| load_workspace(&state_dir, &workspace_name).ok().flatten());
     if let Some(rec) = existing_workspace.as_ref() {
         if let Some((cluster, ctx)) = activate_workspace_cluster(rec) {
-            log::info!("worktree gitops: bound cluster `{cluster}` (context {ctx})");
+            log::info!("environment gitops: bound cluster `{cluster}` (context {ctx})");
         }
     }
 
@@ -554,7 +555,7 @@ fn run_application_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
     let (delivery_strategy, delivery_detail) =
         resolve_worktree_delivery(&app_delivery_host_paths, &SystemNodeProber)?;
     log::info!(
-        "worktree gitops: source delivery {} ({})",
+        "environment gitops: source delivery {} ({})",
         delivery_strategy.as_str(),
         delivery_detail
     );
@@ -570,7 +571,7 @@ fn run_application_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
 
     let do_once = || -> Result<(), Box<dyn Error>> {
         log::info!(
-            "worktree gitops: Applications from {} → namespace {}",
+            "environment gitops: Applications from {} → namespace {}",
             env_path.display(),
             opts.namespace
         );
@@ -667,7 +668,7 @@ fn register_worktree(
     };
     let path = save_workspace(&local_state_dir()?, &record)?;
     log::info!(
-        "worktree gitops: registered workspace `{workspace_name}` at {}",
+        "environment gitops: registered Environment `{workspace_name}` at {}",
         path.display()
     );
     Ok(())
@@ -685,7 +686,7 @@ fn resolve_worktree_delivery(
     prober: &dyn NodePathProber,
 ) -> Result<(DeliveryStrategy, String), Box<dyn Error>> {
     if app_paths.is_empty() {
-        return Err("worktree gitops found no Application source paths".into());
+        return Err("environment gitops found no Application source paths".into());
     }
 
     let mut all_visible = true;
@@ -768,7 +769,7 @@ where
         }
     }
     log::info!(
-        "Worktree gitops watch active (debounce {}s). Env YAML + charts only. Ctrl+C to stop.",
+        "Environment gitops watch active (debounce {}s). Environment YAML + charts only. Ctrl+C to stop.",
         debounce_secs
     );
 
@@ -776,7 +777,7 @@ where
         rx.recv().map_err(|_| "watcher channel closed")?;
         wait_for_quiet(&rx, debounce)?;
         log::info!("──────────────────────────────────────────────");
-        log::info!("Worktree gitops change, reconciling...");
+        log::info!("Environment gitops change, reconciling...");
         match rebuild() {
             Ok(()) => log::info!("Reconcile succeeded."),
             Err(e) => log::error!("Reconcile failed: {e}"),
@@ -891,7 +892,7 @@ metadata:
   name: gateway
 spec:
   source:
-    path: {}/.gitops/deploy
+    path: {}/.gitops/local
   destination:
     namespace: ignored
 "#,
@@ -943,7 +944,7 @@ spec:
         let root = root.canonicalize().unwrap();
         let promote = root.join("apps/gateway/.gitops/promote");
         fs::create_dir_all(root.join(".gitops/local/cluster")).unwrap();
-        fs::create_dir_all(root.join("apps/gateway/.gitops/deploy")).unwrap();
+        fs::create_dir_all(root.join("apps/gateway/.gitops/local")).unwrap();
         fs::create_dir_all(&promote).unwrap();
         fs::write(
             promote.join("Chart.yaml"),
@@ -1039,7 +1040,7 @@ spec:
         let source = Path::new("/project/.gitops/local/environment.yaml");
         let chart_roots = vec![
             PathBuf::from("/project/apps/api/.gitops/promote"),
-            PathBuf::from("/project/apps/api/.gitops/deploy"),
+            PathBuf::from("/project/apps/api/.gitops/local"),
         ];
         assert!(is_environment_watch_path(source, source, &chart_roots));
         assert!(is_environment_watch_path(
@@ -1048,12 +1049,17 @@ spec:
             &chart_roots,
         ));
         assert!(is_environment_watch_path(
-            Path::new("/project/apps/api/.gitops/deploy/values.yaml"),
+            Path::new("/project/apps/api/.gitops/local/values.yaml"),
             source,
             &chart_roots,
         ));
         assert!(!is_environment_watch_path(
             Path::new("/project/apps/api/src/main.rs"),
+            source,
+            &chart_roots,
+        ));
+        assert!(!is_environment_watch_path(
+            Path::new("/project/apps/api/.gitops/deploy/values.yaml"),
             source,
             &chart_roots,
         ));

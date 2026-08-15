@@ -8,8 +8,8 @@
 //! <project>/                        # checkout root
 //!   .gitops/local/cluster/          # CP: PSQLStack, AuthStack, packages…
 //!   .gitops/local/environment.yaml  # reusable checkout Environment
-//!   clients/foo/.gitops/deploy/     # application charts
-//!   platform/api/.gitops/deploy/
+//!   clients/foo/.gitops/local/      # editable local application charts
+//!   platform/api/.gitops/local/
 //! ```
 //!
 //! Env Applications only isolate **app** namespaces. Cluster YAML is applied

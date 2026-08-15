@@ -206,7 +206,7 @@ fn parses_cluster_only() {
     assert!(first_log.contains("kind create cluster --name project-dev --config -"));
     assert!(first_log.contains(&format!("hostPath: \"{}\"", fixture.root.display())));
     let text = output_text(&first);
-    assert!(text.contains("contains no worktree inventory"), "{text}");
+    assert!(text.contains("contains no Environment inventory"), "{text}");
     let provider_state = fs::read_to_string(fixture.root.join("home/.hops/local/providers.json"))
         .expect("successful up persists provider identity");
     assert!(provider_state.contains(r#""clusterProvider": "kind""#));

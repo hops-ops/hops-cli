@@ -15,8 +15,8 @@ tree copy). You do not need to learn volume types.
 
 ```bash
 # Dory app running (engine healthy). Product Dory Kubernetes is optional.
-hops local start --cluster-provider kind --docker-provider dory \
-  --cluster-name hops --gitops ./gitops/cluster
+hops local up
+hops local gitops cluster ./.gitops/local/cluster
 ```
 
 Context is typically `kind-hops`. Confirm mounts:
@@ -36,18 +36,17 @@ Stock Dory k8s (`--cluster-provider dory --docker-provider dory`) is fine for pl
 **cannot** hostPath-mount Mac paths into the node; delivery falls back to sync.
 
 ```bash
-hops local start --cluster-provider dory --docker-provider dory \
-  --gitops ./gitops/cluster
+hops local up --cluster-provider dory --docker-provider dory
 ```
 
 ## Daily loop
 
 ```bash
 # Shared CP watch (if start did not use --gitops, or after Ctrl+C)
-hops local gitops cluster ./gitops/cluster
+hops local gitops cluster ./.gitops/local/cluster
 
-# Per-worktree apps (Application YAMLs → namespace = --name) — watches by default
-hops local gitops worktree ./gitops/envs/local --name dogfood
+# One Environment per checkout (namespace = --name) — watches by default
+hops local gitops environment ./.gitops/local/environment.yaml --name dogfood
 
 # Stop either watcher with Ctrl+C.
 ```
@@ -60,10 +59,10 @@ Use a distinct name per worktree so namespaces and URLs stay isolated:
 
 ```bash
 # Terminal A
-hops local gitops worktree ./gitops/envs/local --name alice
+hops local gitops environment ./.gitops/local/environment.yaml --name alice
 
 # Terminal B
-hops local gitops worktree ./gitops/envs/local --name bob
+hops local gitops environment ./.gitops/local/environment.yaml --name bob
 
 ```
 
@@ -74,24 +73,25 @@ Each name maps to namespace `<name>`.
 ```bash
 cd distributed/tests/e2e-ui
 # Prefer kind-on-Dory for hostPath HMR (see One-time prerequisite)
-hops local start --cluster-provider kind --docker-provider dory \
-  --cluster-name hops --gitops ./gitops/cluster
-hops local gitops cluster ./gitops/cluster
-hops local gitops worktree ./gitops/envs/local --name dogfood
+hops local up
+hops local gitops cluster ./.gitops/local/cluster
+hops local gitops environment ./.gitops/local/environment.yaml --name dogfood
 ```
 
-Charts live under `api/.gitops/deploy` and `ui/.gitops/deploy`. You can also render them without hops:
+Editable charts live under `api/.gitops/local` and `ui/.gitops/local`;
+`.gitops/deploy` is reserved for independent cloud charts. You can render the
+local charts without Hops:
 
 ```bash
-helm template api ./api/.gitops/deploy --set local=true --set appRuntime=cluster-dev
-helm template ui ./ui/.gitops/deploy --set local=true --set appRuntime=cluster-dev
+helm template api ./api/.gitops/local
+helm template ui ./ui/.gitops/local
 ```
 
 ### Agent rules (do not skip)
 
-Dogfood apps run as **`appRuntime: cluster-dev`** in namespace `= --name` with
-source delivery into the pods. The site you must fix is **that** stack — not a
-host `make run` you invent.
+Dogfood apps run from their **`.gitops/local` charts** in namespace `= --name`
+with source delivery into the pods. The site you must fix is **that** stack —
+not a host `make run` you invent.
 
 **When the dogfood site is broken:**
 
@@ -134,11 +134,11 @@ host `make run` you invent.
 ```text
 gitops/
   cluster/          # shared CP (one per machine) — hops local gitops cluster
-  envs/local/       # app Applications — hops local gitops worktree
+  .gitops/local/environment.yaml # reusable Environment definition
 ```
 
 - **cluster** — not per-worktree; packages + platform XRs on the local CP
-- **worktree** — env Application YAMLs into namespace `= --name`
+- **environment** — promoted local applications into namespace `= --name`
 
 ## Developing configs & providers on this CP
 

@@ -756,7 +756,7 @@ pub fn attach_sync_delivery(
         result
             .messages
             .push(
-                "no Running pods to sync into yet; re-run `hops local gitops worktree` after pods are Ready"
+                "no Running pods to sync into yet; re-run `hops local gitops environment` after pods are Ready"
                     .into(),
             );
         return Ok(result);
@@ -981,7 +981,7 @@ fn spawn_tar_sync_watcher(targets: Vec<SyncPodTarget>) -> Result<u32, Box<dyn Er
         .stdout(stdout)
         .stderr(stderr);
     // Pass through hops' selected context so the watcher targets the same cluster
-    // as `hops local gitops worktree` (see HOPS_KUBE_CONTEXT_ENV).
+    // as `hops local gitops environment` (see HOPS_KUBE_CONTEXT_ENV).
     if let Ok(ctx) = std::env::var(crate::commands::local::HOPS_KUBE_CONTEXT_ENV) {
         if !ctx.is_empty() {
             child.env(crate::commands::local::HOPS_KUBE_CONTEXT_ENV, ctx);
