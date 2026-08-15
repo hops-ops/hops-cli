@@ -1,7 +1,7 @@
 //! `hops local gitops` — control-plane and worktree Application reconcile.
 //!
 //! ```text
-//! hops local gitops cluster  [PATH]   # shared CP (meta .gitops/cluster)
+//! hops local gitops cluster  [PATH]   # shared CP (.gitops/local/cluster)
 //! hops local gitops worktree <PATH>   # per-worktree apps (envs → namespace = --name)
 //! ```
 //!
@@ -58,7 +58,7 @@ pub enum GitopsCommands {
 #[derive(Args, Debug)]
 pub struct ClusterArgs {
     /// Path to cluster gitops directory (PSQLStack, AuthStack, packages, …).
-    /// Default: `$HOPS_LOCAL_CLUSTER`, else walk up from cwd for `.gitops/cluster`.
+    /// Default: `$HOPS_LOCAL_CLUSTER`, else walk up from cwd for `.gitops/local/cluster`.
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 
@@ -132,8 +132,8 @@ pub fn run_cluster(args: &ClusterArgs) -> Result<(), Box<dyn Error>> {
 
     let cluster = resolve_cluster_path(None, args.path.as_deref()).ok_or_else(|| {
         "no cluster gitops directory found.\n\
-         Pass a path: hops local gitops cluster ./.gitops/cluster\n\
-         Or set HOPS_LOCAL_CLUSTER, or create .gitops/cluster at the meta repo root."
+         Pass a path: hops local gitops cluster ./.gitops/local/cluster\n\
+         Or set HOPS_LOCAL_CLUSTER, or create .gitops/local/cluster at the project root."
             .to_string()
     })?;
     let cluster = cluster
@@ -184,7 +184,7 @@ fn run_environment_worktree(args: &WorktreeArgs) -> Result<(), Box<dyn Error>> {
         .map_err(|error| format!("Environment path {}: {error}", args.path.display()))?;
     let cluster_path = discover_cluster_definition(&source).ok_or_else(|| {
         format!(
-            "no cluster.yaml found above Environment definition {}",
+            "no sibling or ancestor Cluster definition found for {}",
             source.display()
         )
     })?;
@@ -942,7 +942,7 @@ spec:
         fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
         let promote = root.join("apps/gateway/.gitops/promote");
-        fs::create_dir_all(root.join(".gitops/cluster")).unwrap();
+        fs::create_dir_all(root.join(".gitops/local/cluster")).unwrap();
         fs::create_dir_all(root.join("apps/gateway/.gitops/deploy")).unwrap();
         fs::create_dir_all(&promote).unwrap();
         fs::write(
@@ -951,7 +951,7 @@ spec:
         )
         .unwrap();
         fs::write(
-            root.join("cluster.yaml"),
+            root.join(".gitops/local/cluster.yaml"),
             r#"apiVersion: hops.local/v1alpha1
 kind: Cluster
 metadata:
@@ -959,14 +959,14 @@ metadata:
 spec:
   clusterProvider: kind
   dockerProvider: dory
-  mountRoot: .
+  mountRoot: ../..
   manifests:
-    path: .gitops/cluster
+    path: .gitops/local/cluster
 "#,
         )
         .unwrap();
         fs::write(
-            root.join("environment.yaml"),
+            root.join(".gitops/local/environment.yaml"),
             r#"apiVersion: hops.local/v1alpha1
 kind: Environment
 metadata:
@@ -993,8 +993,8 @@ spec:
         let generated = root.join("generated");
         let helm = PromotionHelm::new();
         render_environment_applications_with(
-            &root.join("environment.yaml"),
-            &root.join("cluster.yaml"),
+            &root.join(".gitops/local/environment.yaml"),
+            &root.join(".gitops/local/cluster.yaml"),
             &generated,
             "feature-auth",
             "feature-auth-ns",
@@ -1036,7 +1036,7 @@ spec:
 
     #[test]
     fn environment_watch_filters_to_definition_and_referenced_charts() {
-        let source = Path::new("/project/environment.yaml");
+        let source = Path::new("/project/.gitops/local/environment.yaml");
         let chart_roots = vec![
             PathBuf::from("/project/apps/api/.gitops/promote"),
             PathBuf::from("/project/apps/api/.gitops/deploy"),

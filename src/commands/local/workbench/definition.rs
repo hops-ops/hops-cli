@@ -18,13 +18,16 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 pub const API_VERSION: &str = "hops.local/v1alpha1";
-pub const DEFAULT_DEFINITION_FILE: &str = "cluster.yaml";
-pub const CLUSTER_MANIFESTS_PATH: &str = ".gitops/cluster";
+pub const DEFAULT_DEFINITION_FILE: &str = ".gitops/local/cluster.yaml";
+pub const LEGACY_DEFINITION_FILE: &str = "cluster.yaml";
+pub const DEFAULT_ENVIRONMENT_FILE: &str = ".gitops/local/environment.yaml";
+pub const CLUSTER_MANIFESTS_PATH: &str = ".gitops/local/cluster";
+pub const LEGACY_CLUSTER_MANIFESTS_PATH: &str = ".gitops/cluster";
 pub const PROMOTE_CHART_PATH: &str = ".gitops/promote";
 
 #[derive(Args, Debug, Clone)]
 pub struct UpArgs {
-    /// Cluster definition. Defaults to ./cluster.yaml.
+    /// Cluster definition. Defaults to ./.gitops/local/cluster.yaml.
     #[arg(short = 'f', long = "file", value_name = "PATH")]
     pub file: Option<PathBuf>,
 }
@@ -227,7 +230,7 @@ pub fn run_up(args: &UpArgs, overrides: UpOverrides<'_>) -> Result<(), Box<dyn E
         definition.cluster.manifests_path.display()
     );
     log::info!(
-        "Cluster definition contains no worktree inventory; register each checkout with `hops local gitops worktree <environment.yaml> --name <environment>`"
+        "Cluster definition contains no worktree inventory; register each checkout with `hops local gitops worktree .gitops/local/environment.yaml --name <environment>`"
     );
 
     Ok(())
@@ -237,7 +240,20 @@ pub fn definition_path(file: Option<&Path>, cwd: &Path) -> PathBuf {
     match file {
         Some(path) if path.is_absolute() => path.to_path_buf(),
         Some(path) => cwd.join(path),
-        None => cwd.join(DEFAULT_DEFINITION_FILE),
+        None => {
+            let preferred = cwd.join(DEFAULT_DEFINITION_FILE);
+            let legacy = cwd.join(LEGACY_DEFINITION_FILE);
+            if preferred.is_file() || !legacy.is_file() {
+                preferred
+            } else {
+                log::warn!(
+                    "using legacy Cluster definition {}; move it to {}",
+                    legacy.display(),
+                    preferred.display()
+                );
+                legacy
+            }
+        }
     }
 }
 
@@ -287,7 +303,7 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
             "Cluster" => clusters.push(parse_document(value, &source, number)?),
             "Environment" => {
                 return Err(format!(
-                    "{} document {number}: Environment instances must not be committed in cluster.yaml; pass a separate Environment file to `hops local gitops worktree`",
+                    "{} document {number}: Environment instances must not be committed in the Cluster definition; pass .gitops/local/environment.yaml to `hops local gitops worktree`",
                     source.display()
                 )
                 .into())
@@ -328,17 +344,30 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
         "Cluster.spec.mountRoot",
     )?;
     ensure_within(&mount_root, &definition_root, "Cluster definition")?;
-    if raw_cluster.spec.manifests.path != Path::new(CLUSTER_MANIFESTS_PATH) {
+    let manifests_relative = &raw_cluster.spec.manifests.path;
+    if manifests_relative != Path::new(CLUSTER_MANIFESTS_PATH)
+        && manifests_relative != Path::new(LEGACY_CLUSTER_MANIFESTS_PATH)
+    {
         return Err(format!(
-            "Cluster.spec.manifests.path must be exactly {CLUSTER_MANIFESTS_PATH:?}; got {:?}",
+            "Cluster.spec.manifests.path must be {CLUSTER_MANIFESTS_PATH:?} (or legacy {LEGACY_CLUSTER_MANIFESTS_PATH:?}); got {:?}",
             raw_cluster.spec.manifests.path.display().to_string()
         )
         .into());
     }
+    if manifests_relative == Path::new(LEGACY_CLUSTER_MANIFESTS_PATH) {
+        log::warn!(
+            "using legacy Cluster manifest path {LEGACY_CLUSTER_MANIFESTS_PATH}; move it to {CLUSTER_MANIFESTS_PATH}"
+        );
+    }
+    let manifests_base = if source.ends_with(DEFAULT_DEFINITION_FILE) {
+        &mount_root
+    } else {
+        &definition_root
+    };
     let manifests_path = resolve_bounded_path(
         &mount_root,
-        &definition_root,
-        &raw_cluster.spec.manifests.path,
+        manifests_base,
+        manifests_relative,
         "Cluster.spec.manifests.path",
         true,
     )?;
@@ -464,9 +493,14 @@ pub fn load_environment_definition(
         .or(raw.spec.namespace)
         .unwrap_or_else(|| name.clone());
     validate_dns_label("Environment namespace", &namespace)?;
+    let root_base = if source.ends_with(DEFAULT_ENVIRONMENT_FILE) {
+        &cluster.cluster.mount_root
+    } else {
+        &definition_root
+    };
     let root = resolve_bounded_path(
         &cluster.cluster.mount_root,
-        &definition_root,
+        root_base,
         &raw.spec.root,
         &format!("Environment {name:?} spec.root"),
         true,
@@ -777,7 +811,7 @@ mod tests {
                 std::process::id(),
                 uuid::Uuid::new_v4()
             ));
-            fs::create_dir_all(root.join(".gitops/cluster")).unwrap();
+            fs::create_dir_all(root.join(CLUSTER_MANIFESTS_PATH)).unwrap();
             fs::create_dir_all(root.join("apps/gateway")).unwrap();
             fs::create_dir_all(root.join("services/api")).unwrap();
             let root = root.canonicalize().unwrap();
@@ -791,7 +825,7 @@ mod tests {
         }
 
         fn write_environment(&self, yaml: &str) -> PathBuf {
-            let path = self.root.join("environment.yaml");
+            let path = self.root.join(DEFAULT_ENVIRONMENT_FILE);
             fs::write(&path, yaml).unwrap();
             path
         }
@@ -811,9 +845,9 @@ metadata:
 spec:
   clusterProvider: kind
   dockerProvider: dory
-  mountRoot: .
+  mountRoot: ../..
   manifests:
-    path: .gitops/cluster
+    path: .gitops/local/cluster
 "#
     }
 
@@ -861,6 +895,19 @@ spec:
     }
 
     #[test]
+    fn default_definition_prefers_local_layout_then_legacy_root() {
+        let fixture = Fixture::new();
+        let preferred = fixture.write(valid_yaml());
+        let legacy = fixture.root.join(LEGACY_DEFINITION_FILE);
+        fs::write(&legacy, valid_yaml()).unwrap();
+
+        assert_eq!(definition_path(None, &fixture.root), preferred);
+
+        fs::remove_file(&preferred).unwrap();
+        assert_eq!(definition_path(None, &fixture.root), legacy);
+    }
+
+    #[test]
     fn rejects_embedded_environment() {
         let fixture = Fixture::new();
         let yaml = format!("{}\n---\n{}", valid_yaml(), valid_environment_yaml());
@@ -869,20 +916,19 @@ spec:
     }
 
     #[test]
-    fn nested_worktree_definition_can_mount_its_meta_root() {
+    fn copied_worktree_definition_mounts_its_checkout_root() {
         let fixture = Fixture::new();
         let worktree = fixture.root.join(".worktrees/feature-auth");
-        fs::create_dir_all(worktree.join(".gitops/cluster")).unwrap();
+        fs::create_dir_all(worktree.join(CLUSTER_MANIFESTS_PATH)).unwrap();
         let source = worktree.join(DEFAULT_DEFINITION_FILE);
-        let yaml = valid_yaml().replacen("mountRoot: .", "mountRoot: ../..", 1);
-        fs::write(&source, yaml).unwrap();
+        fs::write(&source, valid_yaml()).unwrap();
 
         let loaded = load_definition(&source).unwrap();
 
-        assert_eq!(loaded.cluster.mount_root, fixture.root);
+        assert_eq!(loaded.cluster.mount_root, worktree);
         assert_eq!(
             loaded.cluster.manifests_path,
-            worktree.join(".gitops/cluster")
+            worktree.join(CLUSTER_MANIFESTS_PATH)
         );
     }
 
@@ -901,8 +947,8 @@ spec:
     fn rejects_unknown_fields_versions_kinds_and_cluster_refs() {
         let fixture = Fixture::new();
         let unknown = valid_yaml().replacen(
-            "  mountRoot: .",
-            "  mountRoot: .\n  unexpectedField: true",
+            "  mountRoot: ../..",
+            "  mountRoot: ../..\n  unexpectedField: true",
             1,
         );
         assert!(load_definition(&fixture.write(&unknown))
@@ -982,17 +1028,40 @@ spec:
     #[test]
     fn requires_explicit_hidden_cluster_manifest_path() {
         let fixture = Fixture::new();
-        for path in ["gitops/cluster", ".gitops/deploy", "./.gitops/cluster"] {
-            let yaml = valid_yaml().replacen(".gitops/cluster", path, 1);
+        for path in [
+            "gitops/cluster",
+            ".gitops/deploy",
+            "./.gitops/local/cluster",
+        ] {
+            let yaml = valid_yaml().replacen(CLUSTER_MANIFESTS_PATH, path, 1);
             let error = load_definition(&fixture.write(&yaml)).unwrap_err();
-            assert!(error.to_string().contains("must be exactly"), "{error}");
+            assert!(error.to_string().contains("must be"), "{error}");
         }
+    }
+
+    #[test]
+    fn accepts_legacy_root_definition_and_manifest_layout() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.root.join(LEGACY_CLUSTER_MANIFESTS_PATH)).unwrap();
+        let legacy = valid_yaml()
+            .replacen("mountRoot: ../..", "mountRoot: .", 1)
+            .replacen(CLUSTER_MANIFESTS_PATH, LEGACY_CLUSTER_MANIFESTS_PATH, 1);
+        let source = fixture.root.join(LEGACY_DEFINITION_FILE);
+        fs::write(&source, legacy).unwrap();
+
+        let loaded = load_definition(&source).unwrap();
+
+        assert_eq!(loaded.cluster.mount_root, fixture.root);
+        assert_eq!(
+            loaded.cluster.manifests_path,
+            fixture.root.join(LEGACY_CLUSTER_MANIFESTS_PATH)
+        );
     }
 
     #[test]
     fn rejects_absolute_traversal_and_symlink_escape() {
         let fixture = Fixture::new();
-        let absolute = valid_yaml().replacen("mountRoot: .", "mountRoot: /tmp", 1);
+        let absolute = valid_yaml().replacen("mountRoot: ../..", "mountRoot: /tmp", 1);
         assert!(load_definition(&fixture.write(&absolute))
             .unwrap_err()
             .to_string()
@@ -1032,8 +1101,8 @@ spec:
 
             symlink(&outside, fixture.root.join("secret-link")).unwrap();
             let escaped_secret = valid_yaml().replacen(
-                "  manifests:\n    path: .gitops/cluster",
-                "  manifests:\n    path: .gitops/cluster\n  secretSync:\n    path: secret-link",
+                "  manifests:\n    path: .gitops/local/cluster",
+                "  manifests:\n    path: .gitops/local/cluster\n  secretSync:\n    path: secret-link",
                 1,
             );
             let error = load_definition(&fixture.write(&escaped_secret)).unwrap_err();

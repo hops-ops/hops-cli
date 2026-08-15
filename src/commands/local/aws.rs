@@ -56,7 +56,7 @@ pub struct AwsArgs {
     pub refresh: bool,
 
     /// Write non-secret Provider / DeploymentRuntimeConfig / ProviderConfig YAML
-    /// under this directory (e.g. `./.gitops/cluster`). Credential Secrets are
+    /// under this directory (e.g. `./.gitops/local/cluster`). Credential Secrets are
     /// **not** written — still applied live only.
     #[arg(long)]
     pub gitops: Option<PathBuf>,

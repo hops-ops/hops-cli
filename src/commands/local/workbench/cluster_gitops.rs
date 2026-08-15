@@ -1,15 +1,15 @@
 //! Reconcile a cluster gitops tree onto the **shared** local control plane.
 //!
-//! One local CP (dory/colima/kind) serves many worktrees/projects. Cluster
-//! config is **not** per-worktree — it lives at the meta repo root (or any
-//! path passed via `--cluster`):
+//! One local CP (dory/colima/kind) serves many worktrees. Every checkout has
+//! the same committed definitions, but only one watcher reconciles the
+//! Cluster-owned tree selected for that control plane:
 //!
 //! ```text
-//! <meta>/                           # meta root
-//!   .gitops/cluster/                # CP: PSQLStack, AuthStack, packages…
-//!   clients/foo/.gitops/deploy/     # per-project charts
+//! <project>/                        # checkout root
+//!   .gitops/local/cluster/          # CP: PSQLStack, AuthStack, packages…
+//!   .gitops/local/environment.yaml  # reusable checkout Environment
+//!   clients/foo/.gitops/deploy/     # application charts
 //!   platform/api/.gitops/deploy/
-//!   environment.yaml                # reusable checkout Environment
 //! ```
 //!
 //! Env Applications only isolate **app** namespaces. Cluster YAML is applied
@@ -34,11 +34,12 @@ pub struct ClusterReconcileResult {
 /// Order:
 /// 1. Explicit `override_path` (`--cluster`)
 /// 2. Env var `HOPS_LOCAL_CLUSTER`
-/// 3. Walk up from `env_path` looking for `.gitops/cluster`
-/// 4. Walk up from cwd looking for `.gitops/cluster`
+/// 3. Walk up from `env_path` looking for `.gitops/local/cluster`
+/// 4. Walk up from cwd looking for `.gitops/local/cluster`
 ///
-/// The former `gitops/cluster` and `cluster` layouts remain migration
-/// fallbacks after the committed `.gitops/cluster` convention.
+/// The former `.gitops/cluster`, `gitops/cluster`, and `cluster` layouts
+/// remain migration fallbacks after the committed `.gitops/local/cluster`
+/// convention.
 ///
 /// Returns the first existing directory. Explicit override that does not exist
 /// is left to the caller to error on canonicalize.
@@ -69,9 +70,9 @@ pub fn resolve_cluster_path(
 /// Discover a cluster tree near an env path (or walk to meta root).
 ///
 /// ```text
-/// environment.yaml      → walk up → <project>/.gitops/cluster
-/// some/deep/project     → walk up → <meta>/.gitops/cluster
-/// <meta>/.gitops        → <meta>/.gitops/cluster
+/// .gitops/local/environment.yaml → sibling .gitops/local/cluster
+/// some/deep/project              → walk up → <meta>/.gitops/local/cluster
+/// <meta>/.gitops/local           → <meta>/.gitops/local/cluster
 /// ```
 pub fn discover_cluster_path(env_path: &Path) -> Option<PathBuf> {
     let env = env_path
@@ -103,16 +104,17 @@ pub fn discover_cluster_path(env_path: &Path) -> Option<PathBuf> {
         }
     }
 
-    // Meta-root walk: prefer the committed .gitops/cluster convention, then
-    // retain the old paths as migration fallbacks.
+    // Meta-root walk: prefer the committed .gitops/local/cluster convention,
+    // then retain the old paths as migration fallbacks.
     walk_up_for_cluster(&env)
 }
 
-/// Walk from `start` toward filesystem root for `.gitops/cluster` and legacy layouts.
+/// Walk from `start` toward filesystem root for `.gitops/local/cluster` and legacy layouts.
 fn walk_up_for_cluster(start: &Path) -> Option<PathBuf> {
     let mut cur = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
     loop {
         for candidate in [
+            cur.join(".gitops").join("local").join("cluster"),
             cur.join(".gitops").join("cluster"),
             cur.join("gitops").join("cluster"),
             cur.join("cluster"),
@@ -435,9 +437,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let preferred = dir.join(".gitops/cluster");
-        let legacy = dir.join("gitops/cluster");
-        let environment = dir.join("apps/api/environment.yaml");
+        let preferred = dir.join(".gitops/local/cluster");
+        let legacy = dir.join(".gitops/cluster");
+        let environment = dir.join(".gitops/local/environment.yaml");
         fs::create_dir_all(&preferred).unwrap();
         fs::create_dir_all(&legacy).unwrap();
         fs::create_dir_all(environment.parent().unwrap()).unwrap();

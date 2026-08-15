@@ -83,10 +83,10 @@ hops xr --help
 
 ## Local workbench definition
 
-Keep one Kubernetes-shaped `cluster.yaml` at the project root. The Cluster
-owns the local control plane and shared `.gitops/cluster` manifests. Keep a
-separate reusable `environment.yaml` in every checkout; it names the deploys
-that make up that checkout's environment.
+Keep the Kubernetes-shaped local workbench definitions together under
+`.gitops/local/`. The Cluster owns the local control plane and shared
+`.gitops/local/cluster/` manifests. The reusable Environment names the deploys
+that make up the current checkout's environment.
 
 ```yaml
 apiVersion: hops.local/v1alpha1
@@ -96,9 +96,9 @@ metadata:
 spec:
   clusterProvider: kind
   dockerProvider: dory
-  mountRoot: .
+  mountRoot: ../..
   manifests:
-    path: .gitops/cluster
+    path: .gitops/local/cluster
 ```
 
 ```yaml
@@ -121,24 +121,24 @@ From that project root:
 
 ```bash
 hops local up
-hops local gitops cluster ./.gitops/cluster
-hops local gitops worktree ./environment.yaml --name main
+hops local gitops cluster ./.gitops/local/cluster
+hops local gitops worktree ./.gitops/local/environment.yaml --name main
 ```
 
 From another checkout of the same project:
 
 ```bash
-hops local gitops worktree ./environment.yaml --name feature-auth
+hops local gitops worktree ./.gitops/local/environment.yaml --name feature-auth
 ```
 
 `up` validates the Cluster before starting or reusing it. `gitops cluster`
-watches shared `.gitops/cluster` manifests. `worktree` validates the
+watches shared `.gitops/local/cluster` manifests. `worktree` validates the
 Environment against that Cluster, renders each deploy's `.gitops/promote`
 chart, applies the resulting local Applications to the runtime namespace, and
-watches `environment.yaml` plus the referenced `.gitops/promote` and
-`.gitops/deploy` charts.
+watches `.gitops/local/environment.yaml` plus the referenced
+`.gitops/promote` and `.gitops/deploy` charts.
 The runtime name, namespace, checkout path, and Cluster binding are local state;
-they are not committed to `cluster.yaml`.
+they are not committed to the Cluster definition.
 
 An existing kind Cluster with a different exact `mountRoot` fails with an
 explicit reset/recreate instruction and is never silently deleted. A legacy

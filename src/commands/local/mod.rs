@@ -144,7 +144,7 @@ pub enum LocalCommands {
     Reset,
     /// Start local k8s and ensure Crossplane control plane (skips helm when already healthy)
     Start(start::StartArgs),
-    /// Start or reuse the Cluster declared by cluster.yaml
+    /// Start or reuse the Cluster declared by .gitops/local/cluster.yaml
     Up(workbench::definition::UpArgs),
     /// Resize the local cluster VM without destroying cluster state (colima cluster provider only)
     Resize(resize::ResizeArgs),

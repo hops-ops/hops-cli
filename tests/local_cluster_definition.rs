@@ -12,10 +12,12 @@ metadata:
 spec:
   clusterProvider: kind
   dockerProvider: dory
-  mountRoot: .
+  mountRoot: ../..
   manifests:
-    path: .gitops/cluster
+    path: .gitops/local/cluster
 "#;
+
+const DEFINITION_PATH: &str = ".gitops/local/cluster.yaml";
 
 const ENVIRONMENT_DEFINITION: &str = r#"apiVersion: hops.local/v1alpha1
 kind: Environment
@@ -102,7 +104,7 @@ impl Fixture {
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        fs::create_dir_all(root.join(".gitops/cluster")).unwrap();
+        fs::create_dir_all(root.join(".gitops/local/cluster")).unwrap();
         fs::create_dir_all(root.join("apps/gateway")).unwrap();
         fs::create_dir_all(root.join("home")).unwrap();
         let bin = root.join("fake-bin");
@@ -110,7 +112,7 @@ impl Fixture {
         for tool in ["kind", "docker", "kubectl"] {
             write_executable(&bin.join(tool), FAKE_TOOL);
         }
-        fs::write(root.join("cluster.yaml"), VALID_DEFINITION).unwrap();
+        fs::write(root.join(DEFINITION_PATH), VALID_DEFINITION).unwrap();
         let root = root.canonicalize().unwrap();
         Self {
             bin: root.join("fake-bin"),
@@ -121,7 +123,7 @@ impl Fixture {
     }
 
     fn write_definition(&self, yaml: &str) {
-        fs::write(self.root.join("cluster.yaml"), yaml).unwrap();
+        fs::write(self.root.join(DEFINITION_PATH), yaml).unwrap();
     }
 
     fn command(&self) -> Command {
@@ -256,8 +258,8 @@ fn rejects_embedded_environment_before_mutation() {
 fn rejects_unknown_fields_and_escaping_paths_before_mutation() {
     let fixture = Fixture::new();
     let unknown = VALID_DEFINITION.replacen(
-        "  mountRoot: .",
-        "  mountRoot: .\n  unexpectedField: true",
+        "  mountRoot: ../..",
+        "  mountRoot: ../..\n  unexpectedField: true",
         1,
     );
     fixture.write_definition(&unknown);
@@ -266,7 +268,7 @@ fn rejects_unknown_fields_and_escaping_paths_before_mutation() {
     assert!(output_text(&output).contains("unknown field"));
     fixture.assert_no_mutation();
 
-    let escape = VALID_DEFINITION.replacen("mountRoot: .", "mountRoot: /tmp/outside", 1);
+    let escape = VALID_DEFINITION.replacen("mountRoot: ../..", "mountRoot: /tmp/outside", 1);
     fixture.write_definition(&escape);
     let output = fixture.run();
     assert!(!output.status.success());
