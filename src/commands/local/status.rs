@@ -41,7 +41,7 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
 
     if workspaces.is_empty() {
         println!("No local workspaces registered.");
-        println!("Apply one with: hops local gitops worktree <env-path> --name <workspace>");
+        println!("Apply one with: hops local gitops environment <env-path> --name <environment>");
         return Ok(());
     }
 

@@ -21,8 +21,10 @@
 use super::SizeArgs;
 use crate::commands::local::package_install::{REGISTRY_PULL, REGISTRY_PUSH};
 use crate::commands::local::{command_exists, run_cmd, run_cmd_output};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::io::Write;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -31,6 +33,28 @@ use std::time::Duration;
 /// Default kind cluster name (and historical hard-coded value).
 pub const DEFAULT_CLUSTER_NAME: &str = "hops";
 const KIND_CLUSTER_NAME_ENV: &str = "HOPS_KIND_CLUSTER_NAME";
+const KIND_REGISTRY_HOST_PORT_ENV: &str = "HOPS_KIND_REGISTRY_HOST_PORT";
+const REGISTRY_HOST_PORT_START: u16 = 30500;
+const REGISTRY_HOST_PORT_END: u16 = 30599;
+const INOTIFY_SYSCTL_PATH: &str = "/etc/sysctl.d/99-hops-local-inotify.conf";
+const INOTIFY_MAX_USER_INSTANCES: u32 = 8192;
+const INOTIFY_MAX_USER_WATCHES: u32 = 1_048_576;
+const INSTALL_INOTIFY_SYSCTL_SCRIPT: &str = r#"set -eu
+target="$1"
+expected_instances="$2"
+expected_watches="$3"
+tmp="${target}.tmp"
+trap 'rm -f "${tmp}"' EXIT
+cat > "${tmp}"
+chmod 0644 "${tmp}"
+mv "${tmp}" "${target}"
+trap - EXIT
+sysctl -p "${target}" >/dev/null
+instances="$(sysctl -n fs.inotify.max_user_instances)"
+watches="$(sysctl -n fs.inotify.max_user_watches)"
+test "${instances}" -ge "${expected_instances}"
+test "${watches}" -ge "${expected_watches}"
+"#;
 
 /// Active hops kind cluster name (`kind create --name`).
 pub fn active_cluster_name() -> String {
@@ -49,6 +73,13 @@ pub fn set_active_cluster_name(name: &str) {
     } else {
         std::env::set_var(KIND_CLUSTER_NAME_ENV, n);
     }
+}
+
+/// Bind the configured Cluster.mountRoot into the kind node at the same
+/// absolute path. The definition loader validates and canonicalizes the path
+/// before calling this process-scoped adapter.
+pub fn set_extra_mount_root(path: &Path) {
+    std::env::set_var("HOPS_KIND_EXTRA_MOUNT", path);
 }
 
 /// kubeconfig context kind creates for the active name (`kind-<name>`).
@@ -71,25 +102,141 @@ const MIN_KIND_VERSION: (u32, u32) = (0, 27);
 
 /// Pure registry hostPort selection (testable without docker).
 ///
-/// When kind shares a docker engine with product Dory k8s, host 30500 is often
-/// already bound — use 30501 so create succeeds (LWB-REQ-254).
-pub fn pick_registry_host_port(env_override: Option<u16>, dory_k8s_present: bool) -> u16 {
-    if let Some(p) = env_override {
-        return p;
-    }
-    if dory_k8s_present {
-        return 30501;
-    }
-    30500
+/// An existing cluster's published port is authoritative. New clusters honor
+/// an explicit override, then take the first port not reserved by another
+/// container or host process.
+pub fn pick_registry_host_port(
+    existing_port: Option<u16>,
+    env_override: Option<u16>,
+    unavailable: &BTreeSet<u16>,
+) -> Option<u16> {
+    existing_port.or(env_override).or_else(|| {
+        (REGISTRY_HOST_PORT_START..=REGISTRY_HOST_PORT_END).find(|port| !unavailable.contains(port))
+    })
 }
 
 /// Host port published for the in-cluster registry NodePort (container 30500).
+///
+/// Once a named cluster exists, read its Docker binding rather than deriving a
+/// process-global answer. This keeps package pushes and doctor checks targeted
+/// at the selected cluster even when several kind clusters coexist.
 pub fn registry_host_port() -> u16 {
-    let env_override = std::env::var("HOPS_KIND_REGISTRY_HOST_PORT")
+    resolve_registry_host_port().unwrap_or_else(|error| {
+        log::warn!(
+            "unable to resolve kind registry host port ({error}); falling back to {REGISTRY_HOST_PORT_START}"
+        );
+        REGISTRY_HOST_PORT_START
+    })
+}
+
+fn resolve_registry_host_port() -> Result<u16, Box<dyn Error>> {
+    if let Some(port) = published_host_port(&node_container_name(), "30500/tcp") {
+        return Ok(port);
+    }
+
+    let env_override = match std::env::var(KIND_REGISTRY_HOST_PORT_ENV) {
+        Ok(raw) if raw.trim().is_empty() => None,
+        Ok(raw) => Some(raw.trim().parse::<u16>().map_err(|_| {
+            format!(
+                "{KIND_REGISTRY_HOST_PORT_ENV} must be a valid TCP port, got {:?}",
+                raw.trim()
+            )
+        })?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    let unavailable = unavailable_registry_host_ports()?;
+    if let Some(port) = env_override {
+        if unavailable.contains(&port) {
+            return Err(format!(
+                "{KIND_REGISTRY_HOST_PORT_ENV}={port} is already reserved; choose another port"
+            )
+            .into());
+        }
+    }
+
+    pick_registry_host_port(None, env_override, &unavailable).ok_or_else(|| {
+        format!(
+            "no free kind registry host port in {REGISTRY_HOST_PORT_START}-{REGISTRY_HOST_PORT_END}; \
+             free a port or set {KIND_REGISTRY_HOST_PORT_ENV}"
+        )
+        .into()
+    })
+}
+
+/// Read a container's configured host binding. HostConfig works for both
+/// running and stopped containers, so stopped named clusters still reserve
+/// their ports and can be restarted later.
+fn published_host_port(container: &str, container_port: &str) -> Option<u16> {
+    let template = format!(
+        "{{{{(index (index .HostConfig.PortBindings {:?}) 0).HostPort}}}}",
+        container_port
+    );
+    docker_output(&["inspect", "-f", &template, container])
         .ok()
-        .and_then(|raw| raw.trim().parse::<u16>().ok());
-    let dory_k8s = docker_output(&["inspect", "-f", "{{.Id}}", "dory-k8s"]).is_ok();
-    pick_registry_host_port(env_override, dory_k8s)
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+}
+
+fn unavailable_registry_host_ports() -> Result<BTreeSet<u16>, Box<dyn Error>> {
+    let mut unavailable = docker_reserved_host_ports()?;
+
+    // Docker reservations do not include native host processes. Probe the
+    // bounded allocation range as well; the listener is dropped immediately.
+    for port in REGISTRY_HOST_PORT_START..=REGISTRY_HOST_PORT_END {
+        if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err() {
+            unavailable.insert(port);
+        }
+    }
+
+    Ok(unavailable)
+}
+
+fn docker_reserved_host_ports() -> Result<BTreeSet<u16>, Box<dyn Error>> {
+    let mut reserved = BTreeSet::new();
+    let container_ids = docker_output(&["ps", "-aq"])?;
+
+    for container_id in container_ids
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let Ok(raw) = docker_output(&[
+            "inspect",
+            "-f",
+            "{{json .HostConfig.PortBindings}}",
+            container_id,
+        ]) else {
+            // Containers can disappear between `ps` and `inspect`.
+            continue;
+        };
+        let Ok(bindings) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+            log::debug!("ignoring malformed Docker port bindings for {container_id}");
+            continue;
+        };
+        let Some(bindings) = bindings.as_object() else {
+            continue;
+        };
+
+        for host_binding in bindings
+            .values()
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+        {
+            let Some(port) = host_binding
+                .get("HostPort")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|port| port.parse::<u16>().ok())
+            else {
+                continue;
+            };
+            if port != 0 {
+                reserved.insert(port);
+            }
+        }
+    }
+
+    Ok(reserved)
 }
 
 /// Result of checking whether the kind node can see the projects-root mount.
@@ -153,6 +300,43 @@ pub fn report_projects_root_on_kind_node() -> NodeMountReport {
 pub fn node_sees_path(path: &str) -> bool {
     let node = node_container_name();
     docker_output(&["exec", &node, "test", "-d", path]).is_ok()
+}
+
+/// Fail closed when an existing named kind Cluster was created with a
+/// different mountRoot. Recreating it is destructive and remains an explicit
+/// user action; this check performs only `docker inspect`.
+pub fn ensure_configured_mount_root(expected: &Path) -> Result<(), Box<dyn Error>> {
+    let node = node_container_name();
+    let raw = docker_output(&["inspect", "-f", "{{json .Mounts}}", &node])?;
+    if mount_inventory_has_same_path(&raw, expected)? {
+        return Ok(());
+    }
+
+    let name = active_cluster_name();
+    Err(format!(
+        "kind cluster '{name}' exists with a different or missing mountRoot; expected the exact same-path mount {}. No resources were deleted. Recreate explicitly with `hops local reset --cluster-provider kind --docker-provider dory --cluster-name {name}` after confirming cluster recreation is safe",
+        expected.display()
+    )
+    .into())
+}
+
+fn mount_inventory_has_same_path(raw: &str, expected: &Path) -> Result<bool, Box<dyn Error>> {
+    #[derive(serde::Deserialize)]
+    struct DockerMount {
+        #[serde(rename = "Source")]
+        source: String,
+        #[serde(rename = "Destination")]
+        destination: String,
+        #[serde(rename = "RW", default)]
+        read_write: bool,
+    }
+
+    let expected = expected.to_string_lossy();
+    let mounts: Vec<DockerMount> = serde_json::from_str(raw.trim())
+        .map_err(|error| format!("unable to inspect kind node mount inventory: {error}"))?;
+    Ok(mounts
+        .iter()
+        .any(|mount| mount.read_write && mount.source == expected && mount.destination == expected))
 }
 
 /// Build the kind cluster config YAML.
@@ -313,6 +497,7 @@ pub fn start(size: &SizeArgs) -> Result<(), Box<dyn Error>> {
     let node = node_container_name();
     if node_running() {
         log::info!("kind cluster '{name}' is already running");
+        ensure_node_inotify_limits()?;
         log_mount_hint();
         return Ok(());
     }
@@ -321,6 +506,8 @@ pub fn start(size: &SizeArgs) -> Result<(), Box<dyn Error>> {
     // single-node cluster is reliable in practice but not guaranteed by kind.
     log::info!("Starting stopped kind node '{node}'...");
     docker_run(&["start", &node])?;
+    ensure_node_inotify_limits()?;
+    normalize_dory_kubeconfig_endpoint()?;
     wait_for_api_after_restart()
 }
 
@@ -436,12 +623,12 @@ fn preflight() -> Result<(), Box<dyn Error>> {
 
 fn create_cluster() -> Result<(), Box<dyn Error>> {
     let mount = default_extra_mount_root();
-    let reg_port = registry_host_port();
+    let reg_port = resolve_registry_host_port()?;
     let config = build_kind_config(mount.as_deref(), reg_port);
     if reg_port != 30500 {
         log::info!(
-            "kind registry hostPort={reg_port} (30500 busy or HOPS_KIND_REGISTRY_HOST_PORT set; \
-             package push may need the same port)"
+            "kind registry hostPort={reg_port} ({REGISTRY_HOST_PORT_START} is already reserved or \
+             {KIND_REGISTRY_HOST_PORT_ENV} was set)"
         );
     }
     let name = active_cluster_name();
@@ -470,22 +657,127 @@ fn create_cluster() -> Result<(), Box<dyn Error>> {
         return Err(format!("kind create cluster exited with {}", status).into());
     }
 
+    normalize_dory_kubeconfig_endpoint()?;
     if let Some(ref m) = mount {
         verify_node_mount(m)?;
     }
     // Raise inotify limits: mounting large host trees (even $HOME/dev) can make
     // kube-proxy fail with "too many open files" under default instance caps.
-    raise_node_inotify_limits();
+    ensure_node_inotify_limits()?;
     Ok(())
 }
 
-fn raise_node_inotify_limits() {
-    let node = node_container_name();
-    let script = "sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=1048576 >/dev/null 2>&1 || true";
-    match docker_output(&["exec", &node, "sh", "-c", script]) {
-        Ok(_) => log::info!("raised kind node inotify limits for host mounts"),
-        Err(e) => log::debug!("inotify sysctl skipped: {e}"),
+/// kind writes the Docker engine's published address into kubeconfig. Dory's
+/// engine reports `0.0.0.0`, which is reachable through its local proxy but is
+/// not present in the API server certificate. Rewrite only that Dory-specific
+/// wildcard endpoint to the certificate's loopback SAN.
+fn normalize_dory_kubeconfig_endpoint() -> Result<(), Box<dyn Error>> {
+    let Some(docker_host) = resolve_docker_host() else {
+        return Ok(());
+    };
+    if !docker_host.ends_with("/.dory/dory.sock") {
+        return Ok(());
     }
+
+    let config = run_cmd_output("kubectl", &["config", "view", "--raw", "-o", "json"])?;
+    let config: serde_json::Value = serde_json::from_str(&config)?;
+    let cluster_name = kube_context_name();
+    let Some(current_server) = config
+        .get("clusters")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|clusters| {
+            clusters.iter().find_map(|cluster| {
+                (cluster.get("name").and_then(serde_json::Value::as_str)
+                    == Some(cluster_name.as_str()))
+                .then(|| {
+                    cluster
+                        .get("cluster")
+                        .and_then(|cluster| cluster.get("server"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .flatten()
+            })
+        })
+    else {
+        return Ok(());
+    };
+    let Some(api_port) = published_host_port(&node_container_name(), "6443/tcp") else {
+        return Ok(());
+    };
+    let Some(server) = normalized_dory_server(current_server, api_port) else {
+        return Ok(());
+    };
+
+    log::info!("Rewriting Dory kind API endpoint {current_server} -> {server}");
+    run_cmd(
+        "kubectl",
+        &[
+            "config",
+            "set-cluster",
+            &cluster_name,
+            &format!("--server={server}"),
+        ],
+    )
+}
+
+fn normalized_dory_server(current_server: &str, api_port: u16) -> Option<String> {
+    let wildcard = current_server
+        .strip_prefix("https://0.0.0.0:")
+        .or_else(|| current_server.strip_prefix("https://[::]:"))?;
+    wildcard
+        .parse::<u16>()
+        .ok()
+        .filter(|current_port| *current_port == api_port)
+        .map(|_| format!("https://127.0.0.1:{api_port}"))
+}
+
+fn inotify_sysctl_config() -> String {
+    format!(
+        "# Managed by hops local; reapplied by systemd-sysctl on kind node boot.\n\
+fs.inotify.max_user_instances = {INOTIFY_MAX_USER_INSTANCES}\n\
+fs.inotify.max_user_watches = {INOTIFY_MAX_USER_WATCHES}\n"
+    )
+}
+
+fn ensure_node_inotify_limits() -> Result<(), Box<dyn Error>> {
+    let node = node_container_name();
+    let expected_instances = INOTIFY_MAX_USER_INSTANCES.to_string();
+    let expected_watches = INOTIFY_MAX_USER_WATCHES.to_string();
+    let mut child = docker_cmd(&[
+        "exec",
+        "-i",
+        &node,
+        "sh",
+        "-c",
+        INSTALL_INOTIFY_SYSCTL_SCRIPT,
+        "hops-inotify-sysctl",
+        INOTIFY_SYSCTL_PATH,
+        &expected_instances,
+        &expected_watches,
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or("failed to open stdin for kind node inotify configuration")?;
+    stdin.write_all(inotify_sysctl_config().as_bytes())?;
+    drop(stdin);
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to persist required kind node inotify limits in {INOTIFY_SYSCTL_PATH}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+
+    log::info!(
+        "kind node inotify limits active and persistent: max_user_instances={INOTIFY_MAX_USER_INSTANCES}, max_user_watches={INOTIFY_MAX_USER_WATCHES} ({INOTIFY_SYSCTL_PATH})"
+    );
+    Ok(())
 }
 
 fn verify_node_mount(host_path: &Path) -> Result<(), Box<dyn Error>> {
@@ -617,10 +909,28 @@ mod tests {
     }
 
     #[test]
-    fn pick_registry_host_port_shifts_when_dory_k8s_present() {
-        assert_eq!(pick_registry_host_port(None, false), 30500);
-        assert_eq!(pick_registry_host_port(None, true), 30501);
-        assert_eq!(pick_registry_host_port(Some(30555), true), 30555);
+    fn pick_registry_host_port_uses_existing_binding_then_override_then_free_port() {
+        let unavailable = BTreeSet::from([30500, 30501]);
+
+        assert_eq!(
+            pick_registry_host_port(Some(30542), Some(30555), &unavailable),
+            Some(30542)
+        );
+        assert_eq!(
+            pick_registry_host_port(None, Some(30555), &unavailable),
+            Some(30555)
+        );
+        assert_eq!(
+            pick_registry_host_port(None, None, &unavailable),
+            Some(30502)
+        );
+    }
+
+    #[test]
+    fn pick_registry_host_port_reports_exhausted_range() {
+        let unavailable = (REGISTRY_HOST_PORT_START..=REGISTRY_HOST_PORT_END).collect();
+
+        assert_eq!(pick_registry_host_port(None, None, &unavailable), None);
     }
 
     #[test]
@@ -657,6 +967,22 @@ mod tests {
         assert!(cfg.contains("hostPath: \"/Users/test\""));
         assert!(cfg.contains("containerPath: \"/Users/test\""));
         assert!(cfg.contains("readOnly: false"));
+    }
+
+    #[test]
+    fn kind_inotify_limits_are_persisted_for_node_restarts() {
+        assert!(INOTIFY_SYSCTL_PATH.starts_with("/etc/sysctl.d/"));
+        assert_eq!(
+            inotify_sysctl_config(),
+            "# Managed by hops local; reapplied by systemd-sysctl on kind node boot.\n\
+fs.inotify.max_user_instances = 8192\n\
+fs.inotify.max_user_watches = 1048576\n"
+        );
+        assert!(INSTALL_INOTIFY_SYSCTL_SCRIPT.contains("sysctl -p \"${target}\""));
+        assert!(INSTALL_INOTIFY_SYSCTL_SCRIPT
+            .contains("test \"${instances}\" -ge \"${expected_instances}\""));
+        assert!(INSTALL_INOTIFY_SYSCTL_SCRIPT
+            .contains("test \"${watches}\" -ge \"${expected_watches}\""));
     }
 
     #[test]
@@ -718,5 +1044,34 @@ mod tests {
         // build_kind_config + extra mounts are the contract under test here.
         let cfg = build_kind_config(Some(Path::new("/home/ci")), 30500);
         assert!(cfg.contains("/home/ci"));
+    }
+
+    #[test]
+    fn existing_kind_mount_requires_exact_same_path_read_write_binding() {
+        let exact = r#"[{"Source":"/workspace","Destination":"/workspace","RW":true}]"#;
+        let broader = r#"[{"Source":"/","Destination":"/","RW":true}]"#;
+        let read_only = r#"[{"Source":"/workspace","Destination":"/workspace","RW":false}]"#;
+
+        assert!(mount_inventory_has_same_path(exact, Path::new("/workspace")).unwrap());
+        assert!(!mount_inventory_has_same_path(broader, Path::new("/workspace")).unwrap());
+        assert!(!mount_inventory_has_same_path(read_only, Path::new("/workspace")).unwrap());
+        assert!(mount_inventory_has_same_path("not-json", Path::new("/workspace")).is_err());
+    }
+
+    #[test]
+    fn dory_wildcard_kubeconfig_endpoint_is_rewritten_to_certificate_san() {
+        assert_eq!(
+            normalized_dory_server("https://0.0.0.0:63903", 63903),
+            Some("https://127.0.0.1:63903".into())
+        );
+        assert_eq!(
+            normalized_dory_server("https://[::]:63903", 63903),
+            Some("https://127.0.0.1:63903".into())
+        );
+        assert_eq!(
+            normalized_dory_server("https://127.0.0.1:63903", 63903),
+            None
+        );
+        assert_eq!(normalized_dory_server("https://0.0.0.0:63903", 6443), None);
     }
 }

@@ -785,7 +785,7 @@ mod tests {
         let app = serde_yaml::from_str::<Value>(
             r#"
 local: true
-appRuntime: cluster-dev
+preview: false
 image:
   tag: app
 "#,
@@ -793,10 +793,10 @@ image:
         .unwrap();
         let mut runtime = BTreeMap::new();
         runtime.insert("namespace".into(), Value::String("alice".into()));
-        runtime.insert("appRuntime".into(), Value::String("host".into()));
+        runtime.insert("preview".into(), Value::Bool(true));
         let merged = merge_helm_values(Some(&app), &runtime);
         assert_eq!(merged["local"], Value::Bool(true));
-        assert_eq!(merged["appRuntime"], Value::String("host".into()));
+        assert_eq!(merged["preview"], Value::Bool(true));
         assert_eq!(merged["namespace"], Value::String("alice".into()));
         assert_eq!(merged["image"]["tag"], Value::String("app".into()));
     }

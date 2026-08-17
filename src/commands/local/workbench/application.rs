@@ -274,7 +274,7 @@ spec:
     helm:
       values:
         local: true
-        appRuntime: cluster-dev
+        preview: false
   syncPolicy:
     prune: false
 "#;
@@ -289,7 +289,7 @@ spec:
         assert!(!app.spec.sync_policy.prune);
         let values = app.spec.source.helm.values.unwrap();
         assert_eq!(values["local"], Value::Bool(true));
-        assert_eq!(values["appRuntime"], Value::String("cluster-dev".into()));
+        assert_eq!(values["preview"], Value::Bool(false));
     }
 
     #[test]

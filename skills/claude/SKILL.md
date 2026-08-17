@@ -17,7 +17,7 @@ control planes, configuration packages, providers, secrets, and live infrastruct
 
 | Command area | Purpose |
 |-------------|---------|
-| `hops local` | Local CP (dory/colima/kind), gitops cluster/worktree, workbench |
+| `hops local` | Local CP (dory/colima/kind), gitops Cluster/Environment, workbench |
 | `hops config` | Install Configuration packages (published **or** source + gitops) |
 | `hops provider` | Install/patch Providers (published **or** source + SemVer-safe tags + gitops) |
 | `hops secrets` | SOPS encrypt/decrypt, sync to AWS Secrets Manager or GitHub |
@@ -31,7 +31,7 @@ For detailed reference on each area, see the bundled references:
 
 - **[Local source packages & providers](references/local-source-packages.md)** — **read this** when developing configs/providers on a laptop CP
 - [Config install modes and gitops](references/config-install.md)
-- [Local workbench (gitops cluster / worktree)](references/local-workbench.md)
+- [Local workbench (gitops Cluster / Environment)](references/local-workbench.md)
 - [Local control plane setup](references/local-setup.md)
 - [XR observe → adopt → manage workflow](references/xr-workflow.md)
 - [Secrets management](references/secrets.md)
@@ -55,7 +55,7 @@ hops config install --repo hops-ops/auth-stack --version v1.6.0 \
   --gitops ./gitops/cluster --local
 
 hops local gitops cluster ./gitops/cluster          # watches by default; --once for CI
-hops local gitops worktree ./gitops/envs/local --name dogfood
+hops local gitops environment ./.gitops/local/environment.yaml --name dogfood
 ```
 
 - **`--gitops`** materializes pins under the cluster tree (not one-shot-only kubectl)

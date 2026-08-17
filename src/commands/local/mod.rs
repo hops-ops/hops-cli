@@ -126,9 +126,14 @@ pub struct LocalArgs {
     /// Only used with cluster-provider dory.
     ///
     /// Named `--dory-name` (not `--name`) so it never collides with workspace
-    /// `--name` on `hops local down|status|open|gitops worktree`.
+    /// `--name` on `hops local down|status|open|gitops environment`.
     #[arg(long = "dory-name", global = true, value_name = "NAME")]
     pub dory_name: Option<String>,
+
+    /// Deprecated one-dimensional provider selection. Use
+    /// --cluster-provider and --docker-provider instead.
+    #[arg(long, global = true, value_enum)]
+    pub backend: Option<backend::Backend>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -139,6 +144,8 @@ pub enum LocalCommands {
     Reset,
     /// Start local k8s and ensure Crossplane control plane (skips helm when already healthy)
     Start(start::StartArgs),
+    /// Start or reuse the Cluster declared by .gitops/local/cluster.yaml
+    Up(workbench::definition::UpArgs),
     /// Resize the local cluster VM without destroying cluster state (colima cluster provider only)
     Resize(resize::ResizeArgs),
     /// Check what `hops local start` set up and report drift
@@ -149,7 +156,7 @@ pub enum LocalCommands {
     Status(status::StatusArgs),
     /// Open the workspace UI URL in a browser
     Open(open::OpenArgs),
-    /// Local gitops: `cluster` (shared CP) or `worktree` (app namespaces)
+    /// Local gitops: `cluster` (shared CP) or `environment` (app namespaces)
     Gitops(gitops::GitopsArgs),
     /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
     Aws(aws::AwsArgs),
@@ -170,6 +177,20 @@ pub enum LocalCommands {
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
+    if let LocalCommands::Up(up_args) = &args.command {
+        return workbench::definition::run_up(
+            up_args,
+            workbench::definition::UpOverrides {
+                cluster_provider: args.cluster_provider,
+                docker_provider: args.docker_provider,
+                legacy_backend: args.backend,
+                cluster_name: args.cluster_name.as_deref(),
+                context: args.context.as_deref(),
+                dory_name: args.dory_name.as_deref(),
+            },
+        );
+    }
+
     if let Some(name) = args
         .dory_name
         .as_deref()
@@ -179,10 +200,29 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         backend::persist_dory_context_name(name)?;
     }
 
+    let (cluster_provider, docker_provider) = match args.backend {
+        Some(_) if args.cluster_provider.is_some() || args.docker_provider.is_some() => {
+            return Err(
+                "deprecated --backend cannot be combined with --cluster-provider or --docker-provider"
+                    .into(),
+            );
+        }
+        Some(legacy) => {
+            let pair = backend::providers::provider_pair_for_legacy_backend(legacy);
+            log::warn!(
+                "--backend is deprecated; use --cluster-provider {} --docker-provider {}",
+                pair.cluster,
+                pair.docker
+            );
+            (Some(pair.cluster), Some(pair.docker))
+        }
+        None => (args.cluster_provider, args.docker_provider),
+    };
+
     let explicit_context = args.context.as_deref().filter(|ctx| !ctx.is_empty());
     let backend = backend::activate_with_providers(
-        args.cluster_provider,
-        args.docker_provider,
+        cluster_provider,
+        docker_provider,
         args.cluster_name.as_deref(),
         explicit_context,
     )?;
@@ -191,6 +231,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Install => install::run(backend),
         LocalCommands::Reset => reset::run(backend),
         LocalCommands::Start(start_args) => start::run(backend, start_args),
+        LocalCommands::Up(_) => unreachable!("up dispatch returns before generic activation"),
         LocalCommands::Resize(resize_args) => resize::run(backend, resize_args),
         LocalCommands::Doctor => doctor::run(),
         LocalCommands::Down(down_args) => down::run(down_args),
@@ -494,13 +535,13 @@ mod tests {
         let parsed = Cli::try_parse_from([
             "hops-local-test",
             "gitops",
-            "worktree",
+            "environment",
             "./gitops/envs/local",
             "--name",
             "alice",
             "--once",
         ])
-        .expect("parse gitops worktree --name alice");
+        .expect("parse gitops environment --name alice");
         assert!(
             parsed.local.dory_name.is_none(),
             "workspace --name must not set dory_name; got {:?}",
@@ -508,11 +549,11 @@ mod tests {
         );
         match parsed.local.command {
             LocalCommands::Gitops(gitops) => match gitops.command {
-                gitops::GitopsCommands::Worktree(worktree) => {
-                    assert_eq!(worktree.name.as_deref(), Some("alice"));
-                    assert!(worktree.once);
+                gitops::GitopsCommands::Environment(environment) => {
+                    assert_eq!(environment.name.as_deref(), Some("alice"));
+                    assert!(environment.once);
                 }
-                other => panic!("expected gitops worktree, got {other:?}"),
+                other => panic!("expected gitops environment, got {other:?}"),
             },
             other => panic!("expected Gitops, got {other:?}"),
         }
@@ -534,19 +575,19 @@ mod tests {
             "--dory-name",
             "mine",
             "gitops",
-            "worktree",
+            "environment",
             "./env",
             "--name",
             "bob",
         ])
-        .expect("parse --dory-name mine gitops worktree --name bob");
+        .expect("parse --dory-name mine gitops environment --name bob");
         assert_eq!(parsed.local.dory_name.as_deref(), Some("mine"));
         match parsed.local.command {
             LocalCommands::Gitops(gitops) => match gitops.command {
-                gitops::GitopsCommands::Worktree(worktree) => {
-                    assert_eq!(worktree.name.as_deref(), Some("bob"));
+                gitops::GitopsCommands::Environment(environment) => {
+                    assert_eq!(environment.name.as_deref(), Some("bob"));
                 }
-                other => panic!("expected gitops worktree, got {other:?}"),
+                other => panic!("expected gitops environment, got {other:?}"),
             },
             other => panic!("expected Gitops, got {other:?}"),
         }

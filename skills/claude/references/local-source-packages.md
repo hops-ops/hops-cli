@@ -140,7 +140,7 @@ Day-to-day:
 
 ```bash
 hops local gitops cluster ./gitops/cluster          # watches by default
-hops local gitops worktree ./gitops/envs/local --name dogfood
+hops local gitops environment ./.gitops/local/environment.yaml --name dogfood
 ```
 
 ## Do / don’t
@@ -161,5 +161,5 @@ hops local gitops worktree ./gitops/envs/local --name dogfood
 ## See also
 
 - [config-install.md](./config-install.md) — flags and mode details  
-- [local-workbench.md](./local-workbench.md) — cluster vs worktree gitops  
+- [local-workbench.md](./local-workbench.md) — Cluster vs Environment gitops
 - [local-setup.md](./local-setup.md) — `hops local start` bootstrap  

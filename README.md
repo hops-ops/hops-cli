@@ -81,21 +81,71 @@ hops validate --help
 hops xr --help
 ```
 
-## Local workbench (happy path)
+## Local workbench definition
 
-Multi-workspace local GitOps on the laptop control plane:
+Keep the Kubernetes-shaped local workbench definitions together under
+`.gitops/local/`. The Cluster owns the local control plane and shared
+`.gitops/local/cluster/` manifests. The reusable Environment names the deploys
+that make up the current checkout's environment.
 
-```bash
-# shared control-plane tree (terminal 1)
-hops local gitops cluster ./gitops/cluster \
-  --cluster-provider kind --docker-provider dory --cluster-name hops
-
-# per-workspace tree (terminal 2)
-hops local gitops worktree ./gitops/envs/local --name alice \
-  --cluster-provider kind --docker-provider dory --cluster-name hops
+```yaml
+apiVersion: hops.local/v1alpha1
+kind: Cluster
+metadata:
+  name: project-dev
+spec:
+  clusterProvider: kind
+  dockerProvider: dory
+  mountRoot: ../..
+  manifests:
+    path: .gitops/local/cluster
 ```
 
-Use `--name` for concurrent worktrees (`<name>` namespaces). Full guide: [skills/claude/references/local-workbench.md](skills/claude/references/local-workbench.md).
+```yaml
+apiVersion: hops.local/v1alpha1
+kind: Environment
+metadata:
+  name: local
+spec:
+  clusterRef:
+    name: project-dev
+  root: .
+  values:
+    local: true
+    preview: false
+  deploys:
+    - path: apps/gateway
+```
+
+From that project root:
+
+```bash
+hops local up
+hops local gitops cluster ./.gitops/local/cluster
+hops local gitops environment ./.gitops/local/environment.yaml --name main
+```
+
+From another checkout of the same project:
+
+```bash
+hops local gitops environment ./.gitops/local/environment.yaml --name feature-auth
+```
+
+`up` validates the Cluster before starting or reusing it. `gitops cluster`
+watches shared `.gitops/local/cluster` manifests. `environment` validates the
+Environment against that Cluster, renders each deploy's `.gitops/promote`
+chart, applies the resulting local Applications to the runtime namespace, and
+watches `.gitops/local/environment.yaml` plus the referenced
+`.gitops/promote` and `.gitops/local` charts. Each application's
+`.gitops/local` chart owns its editable local workload; `.gitops/deploy` is a
+separate cloud workload chart selected by promotion outside local mode.
+The runtime name, namespace, checkout path, and Cluster binding are local state;
+they are not committed to the Cluster definition.
+
+An existing kind Cluster with a different exact `mountRoot` fails with an
+explicit reset/recreate instruction and is never silently deleted. A legacy
+directory of pre-rendered Application YAMLs is still accepted by `environment`
+during migration.
 
 ## Command Areas
 
@@ -291,7 +341,7 @@ export DOCKER_HOST=unix://$HOME/.dory/dory.sock
 ```bash
 hops local start --cluster-provider dory --docker-provider dory
 hops local start --cluster-provider dory --docker-provider dory --dory-name mine
-hops local gitops worktree ./gitops/envs/local --name alice
+hops local gitops environment ./.gitops/local/environment.yaml --name alice
 
 kubectl get nodes          # context hops-dory
 docker info                # context hops-dory
