@@ -120,8 +120,7 @@ spec:
 From that project root:
 
 ```bash
-hops local up
-hops local gitops cluster ./.gitops/local/cluster
+hops local gitops cluster ./.gitops/local/cluster.yaml
 hops local gitops environment ./.gitops/local/environment.yaml --name main
 ```
 
@@ -131,16 +130,26 @@ From another checkout of the same project:
 hops local gitops environment ./.gitops/local/environment.yaml --name feature-auth
 ```
 
-`up` validates the Cluster before starting or reusing it. `gitops cluster`
-watches shared `.gitops/local/cluster` manifests. `environment` validates the
-Environment against that Cluster, renders each deploy's `.gitops/promote`
-chart, applies the resulting local Applications to the runtime namespace, and
-watches `.gitops/local/environment.yaml` plus the referenced
-`.gitops/promote` and `.gitops/local` charts. Each application's
+`gitops cluster` validates the Cluster, starts or resumes it, bootstraps the
+local control plane, and watches the declared shared manifests.
+`environment` validates the Environment against that Cluster, turns each
+deploy's `.gitops/local` chart (or explicit `deploys[].chart`) into a local
+Application, applies it to the runtime namespace, and watches
+`.gitops/local/environment.yaml` plus those chart roots. Each application's
 `.gitops/local` chart owns its editable local workload; `.gitops/deploy` is a
 separate cloud workload chart selected by promotion outside local mode.
 The runtime name, namespace, checkout path, and Cluster binding are local state;
 they are not committed to the Cluster definition.
+
+Use the same commands for teardown:
+
+```bash
+hops local gitops environment --name feature-auth --down
+hops local gitops cluster ./.gitops/local/cluster.yaml --down
+```
+
+Deleting a watched Environment definition also purges and unregisters its
+runtime Environment.
 
 An existing kind Cluster with a different exact `mountRoot` fails with an
 explicit reset/recreate instruction and is never silently deleted. A legacy

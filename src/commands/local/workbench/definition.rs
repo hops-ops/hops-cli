@@ -1,12 +1,9 @@
 //! Kubernetes-shaped Cluster and independently reusable Environment loading.
 //!
-//! This module intentionally stops at a validated, immutable handoff. The
-//! long-running controller consumes [`LoadedDefinition`] in the next rollout
-//! task; `hops local up` currently owns definition validation and named local
-//! cluster create/reuse only.
+//! The GitOps cluster command consumes the validated definition to select the
+//! backend, mount the project root, and start or resume the named cluster.
 
-use crate::commands::local::backend::{self, Backend, ClusterProvider, DockerProvider, SizeArgs};
-use clap::Args;
+use crate::commands::local::backend::{self, Backend, ClusterProvider, DockerProvider};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
@@ -23,17 +20,10 @@ pub const LEGACY_DEFINITION_FILE: &str = "cluster.yaml";
 pub const DEFAULT_ENVIRONMENT_FILE: &str = ".gitops/local/environment.yaml";
 pub const CLUSTER_MANIFESTS_PATH: &str = ".gitops/local/cluster";
 pub const LEGACY_CLUSTER_MANIFESTS_PATH: &str = ".gitops/cluster";
-pub const PROMOTE_CHART_PATH: &str = ".gitops/promote";
-
-#[derive(Args, Debug, Clone)]
-pub struct UpArgs {
-    /// Cluster definition. Defaults to ./.gitops/local/cluster.yaml.
-    #[arg(short = 'f', long = "file", value_name = "PATH")]
-    pub file: Option<PathBuf>,
-}
+pub const DEFAULT_DEPLOY_CHART_PATH: &str = ".gitops/local";
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct UpOverrides<'a> {
+pub struct ClusterOverrides<'a> {
     pub cluster_provider: Option<ClusterProvider>,
     pub docker_provider: Option<DockerProvider>,
     pub legacy_backend: Option<Backend>,
@@ -84,7 +74,7 @@ pub struct EnvironmentDefinition {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeployDefinition {
     pub application_root: PathBuf,
-    pub promote_chart: PathBuf,
+    pub chart_path: PathBuf,
     pub values: Mapping,
 }
 
@@ -165,12 +155,21 @@ struct ClusterReference {
 struct DeploySpec {
     path: PathBuf,
     #[serde(default)]
+    chart: Option<PathBuf>,
+    #[serde(default)]
     values: Mapping,
 }
 
-pub fn run_up(args: &UpArgs, overrides: UpOverrides<'_>) -> Result<(), Box<dyn Error>> {
+/// Validate and activate a Cluster definition without starting or stopping it.
+///
+/// Keeping lifecycle mutation in `gitops cluster` lets `--down` use the same
+/// definition and guarantees invalid definitions fail before touching Docker.
+pub fn prepare_cluster(
+    file: Option<&Path>,
+    overrides: ClusterOverrides<'_>,
+) -> Result<(LoadedDefinition, Backend), Box<dyn Error>> {
     let cwd = std::env::current_dir()?;
-    let source = definition_path(args.file.as_deref(), &cwd);
+    let source = definition_path(file, &cwd);
 
     // All parsing, identity, provider, and filesystem validation happens
     // before process state, local state, or the cluster can be mutated.
@@ -207,7 +206,6 @@ pub fn run_up(args: &UpArgs, overrides: UpOverrides<'_>) -> Result<(), Box<dyn E
         Some(&definition.cluster.name),
         explicit_context,
     )?;
-    active_backend.start(&SizeArgs::default(), false)?;
     backend::persist_providers(
         backend::providers::ProviderPair {
             cluster: definition.cluster.cluster_provider,
@@ -217,7 +215,7 @@ pub fn run_up(args: &UpArgs, overrides: UpOverrides<'_>) -> Result<(), Box<dyn E
     )?;
 
     log::info!(
-        "Cluster '{}' ready: context={} clusterProvider={} dockerProvider={} mountRoot={} definition={}",
+        "Cluster '{}' selected: context={} clusterProvider={} dockerProvider={} mountRoot={} definition={}",
         definition.cluster.name,
         expected_context(&definition, overrides),
         definition.cluster.cluster_provider,
@@ -225,15 +223,7 @@ pub fn run_up(args: &UpArgs, overrides: UpOverrides<'_>) -> Result<(), Box<dyn E
         definition.cluster.mount_root.display(),
         definition.source.display()
     );
-    log::info!(
-        "Validated shared manifests: {}",
-        definition.cluster.manifests_path.display()
-    );
-    log::info!(
-        "Cluster definition contains no Environment inventory; register each checkout with `hops local gitops environment .gitops/local/environment.yaml --name <environment>`"
-    );
-
-    Ok(())
+    Ok((definition, active_backend))
 }
 
 pub fn definition_path(file: Option<&Path>, cwd: &Path) -> PathBuf {
@@ -345,11 +335,11 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
     )?;
     ensure_within(&mount_root, &definition_root, "Cluster definition")?;
     let manifests_relative = &raw_cluster.spec.manifests.path;
-    if manifests_relative != Path::new(CLUSTER_MANIFESTS_PATH)
+    if !manifests_relative.ends_with(CLUSTER_MANIFESTS_PATH)
         && manifests_relative != Path::new(LEGACY_CLUSTER_MANIFESTS_PATH)
     {
         return Err(format!(
-            "Cluster.spec.manifests.path must be {CLUSTER_MANIFESTS_PATH:?} (or legacy {LEGACY_CLUSTER_MANIFESTS_PATH:?}); got {:?}",
+            "Cluster.spec.manifests.path must end with {CLUSTER_MANIFESTS_PATH:?} (or equal legacy {LEGACY_CLUSTER_MANIFESTS_PATH:?}); got {:?}",
             raw_cluster.spec.manifests.path.display().to_string()
         )
         .into());
@@ -516,23 +506,28 @@ pub fn load_environment_definition(
             &format!("Environment {name:?} deploys[].path"),
             true,
         )?;
-        if !seen_deploys.insert(application_root.clone()) {
+        let chart_relative = deploy
+            .chart
+            .as_deref()
+            .unwrap_or_else(|| Path::new(DEFAULT_DEPLOY_CHART_PATH));
+        let chart_path = resolve_bounded_path(
+            &cluster.cluster.mount_root,
+            &application_root,
+            chart_relative,
+            &format!("Environment {name:?} deploys[].chart"),
+            true,
+        )?;
+        if !seen_deploys.insert((application_root.clone(), chart_path.clone())) {
             return Err(format!(
-                "Environment {name:?} contains duplicate deploy application root {}",
-                application_root.display()
+                "Environment {name:?} contains duplicate deploy for application root {} and chart {}",
+                application_root.display(),
+                chart_path.display()
             )
             .into());
         }
-        let promote_chart = resolve_bounded_path(
-            &cluster.cluster.mount_root,
-            &application_root,
-            Path::new(PROMOTE_CHART_PATH),
-            &format!("Environment {name:?} deploy promote chart"),
-            false,
-        )?;
         deploys.push(DeployDefinition {
             application_root,
-            promote_chart,
+            chart_path,
             values: deploy.values,
         });
     }
@@ -566,7 +561,7 @@ fn parse_document<T: DeserializeOwned>(
 
 fn validate_overrides(
     definition: &LoadedDefinition,
-    overrides: UpOverrides<'_>,
+    overrides: ClusterOverrides<'_>,
 ) -> Result<(), Box<dyn Error>> {
     if overrides.legacy_backend.is_some()
         && (overrides.cluster_provider.is_some() || overrides.docker_provider.is_some())
@@ -652,7 +647,7 @@ fn validate_overrides(
     Ok(())
 }
 
-fn expected_context(definition: &LoadedDefinition, overrides: UpOverrides<'_>) -> String {
+fn expected_context(definition: &LoadedDefinition, overrides: ClusterOverrides<'_>) -> String {
     match definition.cluster.cluster_provider {
         ClusterProvider::Kind => format!("kind-{}", definition.cluster.name),
         ClusterProvider::Colima => "colima".to_string(),
@@ -812,8 +807,9 @@ mod tests {
                 uuid::Uuid::new_v4()
             ));
             fs::create_dir_all(root.join(CLUSTER_MANIFESTS_PATH)).unwrap();
-            fs::create_dir_all(root.join("apps/gateway")).unwrap();
-            fs::create_dir_all(root.join("services/api")).unwrap();
+            fs::create_dir_all(root.join("apps/gateway/.gitops/local")).unwrap();
+            fs::create_dir_all(root.join("apps/gateway/.gitops/test-users")).unwrap();
+            fs::create_dir_all(root.join("services/api/.gitops/local")).unwrap();
             let root = root.canonicalize().unwrap();
             Self { root }
         }
@@ -889,8 +885,8 @@ spec:
         assert_eq!(environment.environment.namespace, "feature-auth");
         assert_eq!(environment.environment.root, fixture.root);
         assert_eq!(
-            environment.environment.deploys[0].promote_chart,
-            fixture.root.join("apps/gateway/.gitops/promote")
+            environment.environment.deploys[0].chart_path,
+            fixture.root.join("apps/gateway/.gitops/local")
         );
     }
 
@@ -1003,6 +999,25 @@ spec:
     }
 
     #[test]
+    fn allows_distinct_charts_for_the_same_application_root() {
+        let fixture = Fixture::new();
+        let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
+        let multiple = valid_environment_yaml().replace(
+            "    - path: services/api",
+            "    - path: apps/gateway\n      chart: .gitops/test-users",
+        );
+        let environment =
+            load_environment_definition(&fixture.write_environment(&multiple), &loaded, None, None)
+                .unwrap();
+
+        assert_eq!(environment.environment.deploys.len(), 2);
+        assert_eq!(
+            environment.environment.deploys[1].chart_path,
+            fixture.root.join("apps/gateway/.gitops/test-users")
+        );
+    }
+
+    #[test]
     fn rejects_non_mapping_values_and_invalid_names() {
         let fixture = Fixture::new();
         let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
@@ -1026,17 +1041,25 @@ spec:
     }
 
     #[test]
-    fn requires_explicit_hidden_cluster_manifest_path() {
+    fn requires_cluster_manifest_path_to_end_in_the_local_convention() {
         let fixture = Fixture::new();
-        for path in [
-            "gitops/cluster",
-            ".gitops/deploy",
-            "./.gitops/local/cluster",
-        ] {
+        for path in ["gitops/cluster", ".gitops/deploy"] {
             let yaml = valid_yaml().replacen(CLUSTER_MANIFESTS_PATH, path, 1);
             let error = load_definition(&fixture.write(&yaml)).unwrap_err();
-            assert!(error.to_string().contains("must be"), "{error}");
+            assert!(error.to_string().contains("must end with"), "{error}");
         }
+    }
+
+    #[test]
+    fn accepts_nested_project_cluster_manifest_path() {
+        let fixture = Fixture::new();
+        let nested = "tests/e2e-ui/.gitops/local/cluster";
+        fs::create_dir_all(fixture.root.join(nested)).unwrap();
+        let yaml = valid_yaml().replacen(CLUSTER_MANIFESTS_PATH, nested, 1);
+
+        let loaded = load_definition(&fixture.write(&yaml)).unwrap();
+
+        assert_eq!(loaded.cluster.manifests_path, fixture.root.join(nested));
     }
 
     #[test]
@@ -1117,21 +1140,21 @@ spec:
         let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
         validate_overrides(
             &loaded,
-            UpOverrides {
+            ClusterOverrides {
                 cluster_provider: Some(ClusterProvider::Kind),
                 docker_provider: Some(DockerProvider::Dory),
                 cluster_name: Some("project-dev"),
                 context: Some("kind-project-dev"),
-                ..UpOverrides::default()
+                ..ClusterOverrides::default()
             },
         )
         .unwrap();
 
         let error = validate_overrides(
             &loaded,
-            UpOverrides {
+            ClusterOverrides {
                 docker_provider: Some(DockerProvider::Colima),
-                ..UpOverrides::default()
+                ..ClusterOverrides::default()
             },
         )
         .unwrap_err();

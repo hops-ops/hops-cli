@@ -57,6 +57,8 @@ case "$tool" in
   docker)
     if test "$1" = "info"; then echo "27.0.0"; exit 0; fi
     if test "$1" = "ps"; then exit 0; fi
+    if test "$1" = "pull"; then exit 0; fi
+    if test "$1" = "volume"; then exit 0; fi
     if test "$1" = "inspect"; then
       case "$*" in
         *'{{json .Mounts}}'*)
@@ -78,13 +80,20 @@ case "$tool" in
           ;;
       esac
     fi
-    if test "$1" = "exec" || test "$1" = "start"; then exit 0; fi
+    if test "$1" = "exec"; then cat >/dev/null; exit 0; fi
+    if test "$1" = "start" || test "$1" = "stop"; then exit 0; fi
     exit 0
     ;;
   kubectl)
     if test "$1" = "config" && test "$2" = "get-contexts"; then
       echo kind-project-dev
+      exit 0
     fi
+    case "$*" in
+      *availableReplicas*) echo 1 ;;
+      *status.conditions*) echo True ;;
+      *'get svc registry '*'spec.clusterIP'*) echo 10.96.0.50 ;;
+    esac
     exit 0
     ;;
 esac
@@ -135,7 +144,7 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hops-cli"));
         command
             .current_dir(&self.root)
-            .args(["local", "up"])
+            .args(["local", "gitops", "cluster", DEFINITION_PATH, "--once"])
             .env("PATH", path)
             .env("HOME", self.root.join("home"))
             .env("DOCKER_HOST", "unix:///contract-test.sock")
@@ -206,7 +215,7 @@ fn parses_cluster_only() {
     assert!(first_log.contains("kind create cluster --name project-dev --config -"));
     assert!(first_log.contains(&format!("hostPath: \"{}\"", fixture.root.display())));
     let text = output_text(&first);
-    assert!(text.contains("contains no Environment inventory"), "{text}");
+    assert!(text.contains("Cluster 'project-dev' selected"), "{text}");
     let provider_state = fs::read_to_string(fixture.root.join("home/.hops/local/providers.json"))
         .expect("successful up persists provider identity");
     assert!(provider_state.contains(r#""clusterProvider": "kind""#));
@@ -337,4 +346,21 @@ fn mount_drift_is_non_destructive() {
     assert!(!log.contains("kind create cluster"));
     assert!(!log.contains("kind delete cluster"));
     assert!(!log.contains("docker start"));
+}
+
+#[test]
+fn cluster_down_stops_the_declared_node_without_destroying_it() {
+    let fixture = Fixture::new();
+    fs::write(&fixture.cluster_exists, "existing").unwrap();
+
+    let output = fixture.command().arg("--down").output().unwrap();
+
+    assert!(output.status.success(), "{}", output_text(&output));
+    let log = fixture.log();
+    assert!(
+        log.contains("docker stop project-dev-control-plane"),
+        "{log}"
+    );
+    assert!(!log.contains("kind delete cluster"), "{log}");
+    assert!(!log.contains("docker volume rm"), "{log}");
 }

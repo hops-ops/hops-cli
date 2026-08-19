@@ -9,13 +9,11 @@ mod gitops;
 pub mod gitops_write;
 mod install;
 mod listmonk;
-mod open;
 pub mod package_install;
 mod reset;
 mod resize;
 mod start;
 mod status;
-mod stop;
 mod uninstall;
 pub mod workbench;
 mod zitadel;
@@ -126,7 +124,7 @@ pub struct LocalArgs {
     /// Only used with cluster-provider dory.
     ///
     /// Named `--dory-name` (not `--name`) so it never collides with workspace
-    /// `--name` on `hops local down|status|open|gitops environment`.
+    /// `--name` on `hops local down|status|gitops environment`.
     #[arg(long = "dory-name", global = true, value_name = "NAME")]
     pub dory_name: Option<String>,
 
@@ -144,8 +142,6 @@ pub enum LocalCommands {
     Reset,
     /// Start local k8s and ensure Crossplane control plane (skips helm when already healthy)
     Start(start::StartArgs),
-    /// Start or reuse the Cluster declared by .gitops/local/cluster.yaml
-    Up(workbench::definition::UpArgs),
     /// Resize the local cluster VM without destroying cluster state (colima cluster provider only)
     Resize(resize::ResizeArgs),
     /// Check what `hops local start` set up and report drift
@@ -154,8 +150,6 @@ pub enum LocalCommands {
     Down(down::DownArgs),
     /// Show local workbench workspace status and app URLs
     Status(status::StatusArgs),
-    /// Open the workspace UI URL in a browser
-    Open(open::OpenArgs),
     /// Local gitops: `cluster` (shared CP) or `environment` (app namespaces)
     Gitops(gitops::GitopsArgs),
     /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
@@ -168,8 +162,6 @@ pub enum LocalCommands {
     Zitadel(zitadel::ZitadelArgs),
     /// Configure hops-ops/provider-listmonk and Listmonk ProviderConfig
     Listmonk(listmonk::ListmonkArgs),
-    /// Stop the local cluster
-    Stop,
     /// Destroy the local cluster
     Destroy,
     /// Uninstall local cluster-provider tools
@@ -177,10 +169,13 @@ pub enum LocalCommands {
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
-    if let LocalCommands::Up(up_args) = &args.command {
-        return workbench::definition::run_up(
-            up_args,
-            workbench::definition::UpOverrides {
+    if let LocalCommands::Gitops(gitops::GitopsArgs {
+        command: gitops::GitopsCommands::Cluster(cluster),
+    }) = &args.command
+    {
+        return gitops::run_cluster(
+            cluster,
+            workbench::definition::ClusterOverrides {
                 cluster_provider: args.cluster_provider,
                 docker_provider: args.docker_provider,
                 legacy_backend: args.backend,
@@ -231,19 +226,16 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Install => install::run(backend),
         LocalCommands::Reset => reset::run(backend),
         LocalCommands::Start(start_args) => start::run(backend, start_args),
-        LocalCommands::Up(_) => unreachable!("up dispatch returns before generic activation"),
         LocalCommands::Resize(resize_args) => resize::run(backend, resize_args),
         LocalCommands::Doctor => doctor::run(),
         LocalCommands::Down(down_args) => down::run(down_args),
         LocalCommands::Status(status_args) => status::run(status_args),
-        LocalCommands::Open(open_args) => open::run(open_args),
-        LocalCommands::Gitops(gitops_args) => gitops::run(gitops_args),
+        LocalCommands::Gitops(gitops_args) => gitops::run_environment_command(gitops_args),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Cloudflare(cloudflare_args) => cloudflare::run(cloudflare_args),
         LocalCommands::Github(github_args) => github::run(github_args),
         LocalCommands::Zitadel(zitadel_args) => zitadel::run(zitadel_args),
         LocalCommands::Listmonk(listmonk_args) => listmonk::run(listmonk_args),
-        LocalCommands::Stop => stop::run(backend),
         LocalCommands::Destroy => destroy::run(backend),
         LocalCommands::Uninstall(uninstall_args) => uninstall::run(backend, uninstall_args),
     }
@@ -590,6 +582,59 @@ mod tests {
                 other => panic!("expected gitops environment, got {other:?}"),
             },
             other => panic!("expected Gitops, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gitops_lifecycle_flags_parse_without_interim_commands() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        #[command(name = "hops-local-test")]
+        struct Cli {
+            #[command(flatten)]
+            local: LocalArgs,
+        }
+
+        let environment = Cli::try_parse_from([
+            "hops-local-test",
+            "gitops",
+            "environment",
+            "--name",
+            "feature-auth",
+            "--down",
+        ])
+        .expect("parse Environment teardown without a definition path");
+        match environment.local.command {
+            LocalCommands::Gitops(gitops::GitopsArgs {
+                command: gitops::GitopsCommands::Environment(environment),
+            }) => {
+                assert!(environment.down);
+                assert!(environment.path.is_none());
+            }
+            other => panic!("expected GitOps Environment, got {other:?}"),
+        }
+
+        let cluster = Cli::try_parse_from([
+            "hops-local-test",
+            "gitops",
+            "cluster",
+            ".gitops/local/cluster.yaml",
+            "--down",
+        ])
+        .expect("parse Cluster teardown");
+        match cluster.local.command {
+            LocalCommands::Gitops(gitops::GitopsArgs {
+                command: gitops::GitopsCommands::Cluster(cluster),
+            }) => assert!(cluster.down),
+            other => panic!("expected GitOps Cluster, got {other:?}"),
+        }
+
+        for removed in ["up", "open", "stop"] {
+            assert!(
+                Cli::try_parse_from(["hops-local-test", removed]).is_err(),
+                "interim command {removed:?} must stay removed"
+            );
         }
     }
 }
