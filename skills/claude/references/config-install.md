@@ -165,10 +165,13 @@ The CLI handles cleanup automatically when switching modes:
 
 ## Configuration Naming
 
-Configurations are named `<org>-<repo>`, e.g. `hops-ops-aws-secret-stack`.
-This matches both local and published installs. Gitops package **filenames** use
+Configurations are named `<org>-<package>`, e.g. `hops-ops-secret-stack`.
+This matches source, published, and GitOps installs. GitOps package **filenames** use
 the short package name (`psql-stack.yaml`); `metadata.name` matches the applied
-Configuration.
+Configuration. The package's internal metadata may also remain short, but the
+installed `Configuration.metadata.name` must use the canonical OCI-derived
+name. Never create a short alias beside it: Crossplane rejects duplicate package
+sources in its lock.
 
 ## Uninstall
 
@@ -182,6 +185,11 @@ hops config uninstall --repo hops-ops/aws-auto-eks-cluster
 # By path (derives names from build artifacts)
 hops config uninstall --path /path/to/project
 ```
+
+`--repo` uses the package identity in cached `_output/*.uppkg` artifacts when
+available. This supports source repositories whose packaged OCI name differs from
+the repository name. Without cached artifacts, it assumes the published package
+is `ghcr.io/<org>/<repo>`. `--path` always derives names from its build artifacts.
 
 Uninstall waits for lock reconciliation and prunes orphaned packages (Configurations,
 Functions, Providers) and ImageConfig rewrites.

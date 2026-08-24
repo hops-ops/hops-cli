@@ -1,7 +1,7 @@
 //! `hops local gitops` — control-plane and Environment reconcile.
 //!
 //! ```text
-//! hops local gitops cluster  [PATH]   # shared CP (.gitops/local/cluster)
+//! hops local gitops cluster [cluster.yaml] # lifecycle + shared CP manifests
 //! hops local gitops environment <PATH> # Environment apps → namespace = --name
 //! ```
 //!
@@ -9,19 +9,21 @@
 
 use super::local_state_dir;
 use super::workbench::application::{
-    load_applications, resolve_delivery_host_path, Application, APPLICATION_API_VERSION,
+    load_applications, resolve_delivery_host_path, Application, ApplicationMetadata,
+    ApplicationSpec, Destination, HelmSource, Source, SyncPolicy, APPLICATION_API_VERSION,
     APPLICATION_KIND,
 };
-use super::workbench::cluster_gitops::{
-    reconcile_cluster_dir, resolve_cluster_path, should_reconcile_cluster_change,
+use super::workbench::cluster_gitops::{reconcile_cluster_dir, should_reconcile_cluster_change};
+use super::workbench::definition::{
+    load_definition, load_environment_definition, prepare_cluster, prepare_cluster_for_stop,
+    ClusterOverrides, DeployDefinition, DEFAULT_DEPLOY_CHART_PATH,
 };
-use super::workbench::definition::{load_definition, load_environment_definition};
 use super::workbench::delivery::{
     attach_sync_delivery, discover_sync_targets, save_delivery_runtime, stop_delivery_runtime,
     DeliveryStrategy, NodePathProber, SystemNodeProber,
 };
 use super::workbench::reconcile::{
-    reconcile_applications, HelmRunner, ReconcileOptions, SystemHelm, SystemKubectl,
+    reconcile_applications, ReconcileOptions, SystemHelm, SystemKubectl,
 };
 use super::workbench::registry::{
     activate_workspace_cluster, load_workspace, save_workspace, WorkspaceRecord,
@@ -58,10 +60,13 @@ pub enum GitopsCommands {
 
 #[derive(Args, Debug)]
 pub struct ClusterArgs {
-    /// Path to cluster gitops directory (PSQLStack, AuthStack, packages, …).
-    /// Default: `$HOPS_LOCAL_CLUSTER`, else walk up from cwd for `.gitops/local/cluster`.
+    /// Kubernetes-shaped Cluster definition. Defaults to .gitops/local/cluster.yaml.
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
+
+    /// Stop the declared Cluster instead of starting and watching it.
+    #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
+    pub down: bool,
 
     /// Run a single reconcile and exit (disables the default watch).
     #[arg(long, default_value_t = false)]
@@ -82,9 +87,14 @@ pub struct ClusterArgs {
 
 #[derive(Args, Debug)]
 pub struct EnvironmentArgs {
-    /// Reusable Environment YAML, or a legacy directory of Application YAMLs.
+    /// Reusable Environment YAML, or a legacy Application directory.
+    /// Optional with --down, which resolves the registered Environment by name.
     #[arg(value_name = "PATH")]
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
+
+    /// Purge and unregister this Environment instead of reconciling it.
+    #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
+    pub down: bool,
 
     /// Destination namespace override (workspace isolation).
     #[arg(long, short = 'n')]
@@ -111,35 +121,59 @@ pub struct EnvironmentArgs {
     pub dry_run: bool,
 }
 
-pub fn run(args: &GitopsArgs) -> Result<(), Box<dyn Error>> {
+pub fn run_environment_command(
+    args: &GitopsArgs,
+    overrides: ClusterOverrides<'_>,
+) -> Result<(), Box<dyn Error>> {
     match &args.command {
-        GitopsCommands::Cluster(a) => run_cluster(a),
-        GitopsCommands::Environment(a) => run_environment(a),
+        GitopsCommands::Environment(a) => run_environment(a, overrides),
+        GitopsCommands::Cluster(_) => Err(
+            "internal dispatch error: Cluster must be activated before generic local dispatch"
+                .into(),
+        ),
     }
 }
 
-/// Run cluster gitops (same as `hops local gitops cluster`).
-/// Used by `hops local start --gitops` so start is not a special code path.
-pub fn run_cluster(args: &ClusterArgs) -> Result<(), Box<dyn Error>> {
-    if !args.dry_run {
-        if let Err(e) = super::run_cmd_output("kubectl", &["cluster-info"]) {
-            return Err(format!(
-                "Local control plane is not reachable ({e}).\n\
-                 Ensure the selected control plane is Ready, then run `hops local start` with matching --cluster-provider and --docker-provider values."
-            )
-            .into());
+/// Start or resume the declared control plane, then reconcile its shared
+/// manifests. The Cluster definition is the single lifecycle entry point.
+pub fn run_cluster(
+    args: &ClusterArgs,
+    overrides: ClusterOverrides<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let (definition, backend) = if args.down {
+        prepare_cluster_for_stop(args.path.as_deref(), overrides)?
+    } else {
+        prepare_cluster(args.path.as_deref(), overrides)?
+    };
+
+    if args.down {
+        if definition.cluster.cluster_provider == super::backend::ClusterProvider::Kind
+            && !super::backend::kind::cluster_exists()
+        {
+            log::info!("Cluster '{}' is already down", definition.cluster.name);
+            return Ok(());
         }
+        backend.stop()?;
+        return Ok(());
     }
 
-    let cluster = resolve_cluster_path(None, args.path.as_deref()).ok_or_else(|| {
-        "no cluster gitops directory found.\n\
-         Pass a path: hops local gitops cluster ./.gitops/local/cluster\n\
-         Or set HOPS_LOCAL_CLUSTER, or create .gitops/local/cluster at the project root."
-            .to_string()
-    })?;
-    let cluster = cluster
-        .canonicalize()
-        .map_err(|e| format!("cluster path {}: {e}", cluster.display()))?;
+    if args.dry_run {
+        log::info!(
+            "Dry-run uses the declared Cluster '{}' without changing its lifecycle",
+            definition.cluster.name
+        );
+    } else {
+        super::start::run(
+            backend,
+            &super::start::StartArgs {
+                size: super::backend::SizeArgs::default(),
+                yes: false,
+                bootstrap: false,
+            },
+        )?;
+    }
+
+    let cluster = definition.cluster.manifests_path;
 
     let dry_run = args.dry_run;
     let do_once = || -> Result<(), Box<dyn Error>> {
@@ -171,25 +205,42 @@ pub fn run_cluster(args: &ClusterArgs) -> Result<(), Box<dyn Error>> {
 
 // ── environment ──────────────────────────────────────────────────────────────
 
-fn run_environment(args: &EnvironmentArgs) -> Result<(), Box<dyn Error>> {
-    if args.path.is_file() && yaml_kind(&args.path)?.as_deref() == Some("Environment") {
-        return run_environment_definition(args);
+fn run_environment(
+    args: &EnvironmentArgs,
+    overrides: ClusterOverrides<'_>,
+) -> Result<(), Box<dyn Error>> {
+    if args.down {
+        return super::down::run(&super::down::DownArgs {
+            name: args.name.clone(),
+            purge: true,
+        });
     }
-    run_application_worktree(args)
+
+    let path = args
+        .path
+        .as_deref()
+        .ok_or("Environment PATH is required unless --down is used with a registered --name")?;
+    if path.is_file() && yaml_kind(path)?.as_deref() == Some("Environment") {
+        return run_environment_definition(args, path, overrides);
+    }
+    run_application_worktree(args, path, None)
 }
 
-fn run_environment_definition(args: &EnvironmentArgs) -> Result<(), Box<dyn Error>> {
-    let source = args
-        .path
+fn run_environment_definition(
+    args: &EnvironmentArgs,
+    path: &Path,
+    overrides: ClusterOverrides<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let source = path
         .canonicalize()
-        .map_err(|error| format!("Environment path {}: {error}", args.path.display()))?;
+        .map_err(|error| format!("Environment path {}: {error}", path.display()))?;
     let cluster_path = discover_cluster_definition(&source).ok_or_else(|| {
         format!(
             "no sibling or ancestor Cluster definition found for {}",
             source.display()
         )
     })?;
-    let cluster = load_definition(&cluster_path)?;
+    let (cluster, _) = prepare_cluster(Some(&cluster_path), overrides)?;
     let loaded = load_environment_definition(
         &source,
         &cluster,
@@ -201,12 +252,17 @@ fn run_environment_definition(args: &EnvironmentArgs) -> Result<(), Box<dyn Erro
     let worktree_root = loaded.environment.root.clone();
     let mut chart_watch_roots = BTreeSet::new();
     for deploy in &loaded.environment.deploys {
-        chart_watch_roots.insert(deploy.promote_chart.clone());
-        chart_watch_roots.insert(deploy.application_root.join(".gitops/local"));
+        chart_watch_roots.insert(deploy.chart_path.clone());
     }
     let chart_watch_roots: Vec<_> = chart_watch_roots.into_iter().collect();
-    super::backend::kind::set_active_cluster_name(&cluster.cluster.name);
-
+    let kube_context = super::kube_context_from_env().ok_or_else(|| {
+        format!(
+            "declared Cluster {:?} has no available kube context; start it with `hops local gitops cluster {}` first",
+            cluster.cluster.name,
+            cluster_path.display()
+        )
+    })?;
+    let declared_cluster = (cluster.cluster.name.as_str(), kube_context.as_str());
     let generated = if args.dry_run {
         std::env::temp_dir().join(format!(
             "hops-local-environment-{}-{workspace_name}",
@@ -225,7 +281,8 @@ fn run_environment_definition(args: &EnvironmentArgs) -> Result<(), Box<dyn Erro
             &namespace,
         )?;
         let legacy = EnvironmentArgs {
-            path: generated.clone(),
+            path: Some(generated.clone()),
+            down: false,
             namespace: Some(namespace.clone()),
             name: Some(workspace_name.clone()),
             once: true,
@@ -233,13 +290,14 @@ fn run_environment_definition(args: &EnvironmentArgs) -> Result<(), Box<dyn Erro
             debounce: args.debounce,
             dry_run: args.dry_run,
         };
-        run_application_worktree(&legacy)?;
+        run_application_worktree(&legacy, &generated, Some(declared_cluster))?;
         if !args.dry_run {
             persist_environment_registration(
                 &workspace_name,
                 &source,
                 &worktree_root,
                 &cluster.cluster.name,
+                &kube_context,
             )?;
         }
         Ok(())
@@ -257,6 +315,7 @@ fn run_environment_definition(args: &EnvironmentArgs) -> Result<(), Box<dyn Erro
         &source,
         &worktree_root,
         &chart_watch_roots,
+        &workspace_name,
         args.debounce,
         reconcile,
     )
@@ -295,17 +354,15 @@ fn render_environment_applications(
         generated,
         workspace_name,
         namespace,
-        &SystemHelm,
     )
 }
 
-fn render_environment_applications_with<H: HelmRunner>(
+fn render_environment_applications_with(
     environment_file: &Path,
     cluster_file: &Path,
     generated: &Path,
     workspace_name: &str,
     namespace: &str,
-    helm: &H,
 ) -> Result<(), Box<dyn Error>> {
     let cluster = load_definition(cluster_file)?;
     let loaded = load_environment_definition(
@@ -328,7 +385,7 @@ fn render_environment_applications_with<H: HelmRunner>(
     }
 
     let mut rendered_apps = BTreeMap::<String, Application>::new();
-    for (index, deploy) in loaded.environment.deploys.iter().enumerate() {
+    for deploy in &loaded.environment.deploys {
         let mut values = loaded.environment.values.clone();
         merge_mapping(&mut values, &deploy.values);
         values.insert(Value::String("local".into()), Value::Bool(true));
@@ -343,42 +400,30 @@ fn render_environment_applications_with<H: HelmRunner>(
             Value::String("source".into()),
             string_mapping(&[("localPath", &deploy.application_root.to_string_lossy())]),
         );
-        let values_yaml = serde_yaml::to_string(&Value::Mapping(values))?;
-        let output = helm.template(
-            &format!("{}-promote-{index}", sanitize_name(workspace_name)),
-            &deploy.promote_chart,
-            &loaded.environment.namespace,
-            &values_yaml,
-        )?;
-        for document in serde_yaml::Deserializer::from_str(&output) {
-            let value = Value::deserialize(document)?;
-            if value.is_null() {
-                continue;
-            }
-            let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
-            if kind != APPLICATION_KIND {
-                return Err(format!(
-                    "promotion chart {} emitted unsupported local kind {kind:?}; direct KRM reconciliation belongs to the Cluster controller task",
-                    deploy.promote_chart.display()
-                )
-                .into());
-            }
-            let mut application: Application = serde_yaml::from_value(value)?;
-            if application.api_version != APPLICATION_API_VERSION {
-                return Err(format!(
-                    "promotion chart {} emitted Application apiVersion {:?}; expected {APPLICATION_API_VERSION}",
-                    deploy.promote_chart.display(),
-                    application.api_version
-                )
-                .into());
-            }
-            application.spec.source.delivery_path =
-                Some(loaded.environment.root.to_string_lossy().into_owned());
-            application.spec.destination.namespace = Some(loaded.environment.namespace.clone());
-            let name = application.metadata.name.clone();
-            if rendered_apps.insert(name.clone(), application).is_some() {
-                return Err(format!("duplicate promoted Application name {name:?}").into());
-            }
+        let name = local_application_name(deploy);
+        let application = Application {
+            api_version: APPLICATION_API_VERSION.to_string(),
+            kind: APPLICATION_KIND.to_string(),
+            metadata: ApplicationMetadata {
+                name: name.clone(),
+                labels: None,
+            },
+            spec: ApplicationSpec {
+                source: Source {
+                    path: deploy.chart_path.to_string_lossy().into_owned(),
+                    delivery_path: Some(cluster.cluster.mount_root.to_string_lossy().into_owned()),
+                    helm: HelmSource {
+                        values: Some(Value::Mapping(values)),
+                    },
+                },
+                destination: Destination {
+                    namespace: Some(loaded.environment.namespace.clone()),
+                },
+                sync_policy: SyncPolicy { prune: true },
+            },
+        };
+        if rendered_apps.insert(name.clone(), application).is_some() {
+            return Err(format!("duplicate local Application name {name:?}").into());
         }
     }
     if rendered_apps.is_empty() {
@@ -393,6 +438,31 @@ fn render_environment_applications_with<H: HelmRunner>(
         fs::write(path, serde_yaml::to_string(&application)?)?;
     }
     Ok(())
+}
+
+fn local_application_name(deploy: &DeployDefinition) -> String {
+    let application = deploy
+        .application_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("application");
+    let default_chart = deploy.application_root.join(DEFAULT_DEPLOY_CHART_PATH);
+    let raw = if deploy.chart_path == default_chart {
+        application.to_string()
+    } else {
+        let chart = deploy
+            .chart_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("chart");
+        format!("{application}-{chart}")
+    };
+    let name = sanitize_name(&raw);
+    if name.is_empty() {
+        "application".to_string()
+    } else {
+        name
+    }
 }
 
 fn merge_mapping(base: &mut Mapping, overlay: &Mapping) {
@@ -439,6 +509,7 @@ fn persist_environment_registration(
     source: &Path,
     worktree_root: &Path,
     cluster_name: &str,
+    kube_context: &str,
 ) -> Result<(), Box<dyn Error>> {
     let state_dir = local_state_dir()?;
     let Some(mut record) = load_workspace(&state_dir, workspace_name)? else {
@@ -447,6 +518,7 @@ fn persist_environment_registration(
     record.env_path = source.to_string_lossy().into_owned();
     record.project_root = Some(worktree_root.to_string_lossy().into_owned());
     record.cluster_name = Some(cluster_name.to_string());
+    record.kube_context = Some(kube_context.to_string());
     save_workspace(&state_dir, &record)?;
     Ok(())
 }
@@ -455,6 +527,7 @@ fn run_environment_watch<F>(
     environment_file: &Path,
     worktree_root: &Path,
     chart_roots: &[PathBuf],
+    workspace_name: &str,
     debounce_secs: u64,
     mut rebuild: F,
 ) -> Result<(), Box<dyn Error>>
@@ -493,7 +566,7 @@ where
         }
     }
     log::info!(
-        "Watching Environment {} and {} referenced promotion/deploy chart roots under {} (debounce {}s). Ctrl+C to stop.",
+        "Watching Environment {} and {} referenced local chart roots under {} (debounce {}s). Ctrl+C to stop.",
         environment_file.display(),
         chart_roots.len(),
         worktree_root.display(),
@@ -503,6 +576,17 @@ where
         rx.recv()
             .map_err(|_| "Environment watcher channel closed")?;
         wait_for_quiet(&rx, debounce)?;
+        if !environment_file.exists() {
+            log::info!(
+                "Environment definition {} was removed; purging Environment `{}`",
+                environment_file.display(),
+                workspace_name
+            );
+            return super::down::run(&super::down::DownArgs {
+                name: Some(workspace_name.to_string()),
+                purge: true,
+            });
+        }
         match rebuild() {
             Ok(()) => log::info!("Environment reconcile succeeded."),
             Err(error) => log::error!("Environment reconcile failed: {error}"),
@@ -514,11 +598,14 @@ fn is_environment_watch_path(path: &Path, source: &Path, chart_roots: &[PathBuf]
     path == source || chart_roots.iter().any(|root| path.starts_with(root))
 }
 
-fn run_application_worktree(args: &EnvironmentArgs) -> Result<(), Box<dyn Error>> {
-    let env_path = args
-        .path
+fn run_application_worktree(
+    args: &EnvironmentArgs,
+    path: &Path,
+    declared_cluster: Option<(&str, &str)>,
+) -> Result<(), Box<dyn Error>> {
+    let env_path = path
         .canonicalize()
-        .map_err(|e| format!("env path {}: {e}", args.path.display()))?;
+        .map_err(|e| format!("env path {}: {e}", path.display()))?;
 
     let workspace_name = args
         .name
@@ -541,7 +628,11 @@ fn run_application_worktree(args: &EnvironmentArgs) -> Result<(), Box<dyn Error>
     let existing_workspace = local_state_dir()
         .ok()
         .and_then(|state_dir| load_workspace(&state_dir, &workspace_name).ok().flatten());
-    if let Some(rec) = existing_workspace.as_ref() {
+    if let Some((cluster, context)) = declared_cluster {
+        std::env::set_var(super::HOPS_KUBE_CONTEXT_ENV, context);
+        super::backend::kind::set_active_cluster_name(cluster);
+        log::info!("environment gitops: declared cluster `{cluster}` (context {context})");
+    } else if let Some(rec) = existing_workspace.as_ref() {
         if let Some((cluster, ctx)) = activate_workspace_cluster(rec) {
             log::info!("environment gitops: bound cluster `{cluster}` (context {ctx})");
         }
@@ -627,6 +718,7 @@ fn run_application_worktree(args: &EnvironmentArgs) -> Result<(), Box<dyn Error>
             &namespace,
             delivery_strategy,
             existing_workspace.as_ref(),
+            declared_cluster,
         )?;
     }
     if args.once || args.dry_run {
@@ -642,14 +734,23 @@ fn register_worktree(
     namespace: &str,
     delivery_strategy: DeliveryStrategy,
     existing: Option<&WorkspaceRecord>,
+    declared_cluster: Option<(&str, &str)>,
 ) -> Result<(), Box<dyn Error>> {
-    let cluster_name = existing
-        .and_then(|record| record.cluster_name.clone())
-        .filter(|name| !name.is_empty())
+    let cluster_name = declared_cluster
+        .map(|(cluster, _)| cluster.to_string())
+        .or_else(|| {
+            existing
+                .and_then(|record| record.cluster_name.clone())
+                .filter(|name| !name.is_empty())
+        })
         .unwrap_or_else(super::backend::kind::active_cluster_name);
-    let kube_context = existing
-        .and_then(|record| record.kube_context.clone())
-        .filter(|context| !context.is_empty())
+    let kube_context = declared_cluster
+        .map(|(_, context)| context.to_string())
+        .or_else(|| {
+            existing
+                .and_then(|record| record.kube_context.clone())
+                .filter(|context| !context.is_empty())
+        })
         .or_else(super::kube_context_from_env)
         .or_else(|| Some(format!("kind-{cluster_name}")));
     let project_root = discover_project_root(env_path)
@@ -855,52 +956,6 @@ fn wait_for_quiet(rx: &mpsc::Receiver<()>, debounce: Duration) -> Result<(), Box
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
-
-    struct PromotionHelm {
-        values: Mutex<Vec<Value>>,
-    }
-
-    impl PromotionHelm {
-        fn new() -> Self {
-            Self {
-                values: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl HelmRunner for PromotionHelm {
-        fn template(
-            &self,
-            _release: &str,
-            chart_path: &Path,
-            namespace: &str,
-            values_yaml: &str,
-        ) -> Result<String, Box<dyn Error>> {
-            self.values
-                .lock()
-                .unwrap()
-                .push(serde_yaml::from_str(values_yaml)?);
-            let application_root = chart_path
-                .parent()
-                .and_then(Path::parent)
-                .ok_or("promotion chart has no application root")?;
-            Ok(format!(
-                r#"apiVersion: hops.local/v1alpha1
-kind: Application
-metadata:
-  name: gateway
-spec:
-  source:
-    path: {}/.gitops/local
-  destination:
-    namespace: ignored
-"#,
-                application_root.display()
-            )
-            .replace("namespace: ignored", &format!("namespace: {namespace}")))
-        }
-    }
 
     #[test]
     fn discovers_project_root_from_git_ancestor() {
@@ -942,15 +997,8 @@ spec:
         ));
         fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
-        let promote = root.join("apps/gateway/.gitops/promote");
         fs::create_dir_all(root.join(".gitops/local/cluster")).unwrap();
         fs::create_dir_all(root.join("apps/gateway/.gitops/local")).unwrap();
-        fs::create_dir_all(&promote).unwrap();
-        fs::write(
-            promote.join("Chart.yaml"),
-            "apiVersion: v2\nname: gateway-promote\nversion: 0.1.0\n",
-        )
-        .unwrap();
         fs::write(
             root.join(".gitops/local/cluster.yaml"),
             r#"apiVersion: hops.local/v1alpha1
@@ -992,19 +1040,27 @@ spec:
         .unwrap();
 
         let generated = root.join("generated");
-        let helm = PromotionHelm::new();
         render_environment_applications_with(
             &root.join(".gitops/local/environment.yaml"),
             &root.join(".gitops/local/cluster.yaml"),
             &generated,
             "feature-auth",
             "feature-auth-ns",
-            &helm,
         )
         .unwrap();
 
-        let values = helm.values.lock().unwrap();
-        let values = values[0].as_mapping().unwrap();
+        let applications = load_applications(&generated).unwrap();
+        assert_eq!(applications.len(), 1);
+        let application = &applications[0].1;
+        let values = application
+            .spec
+            .source
+            .helm
+            .values
+            .as_ref()
+            .unwrap()
+            .as_mapping()
+            .unwrap();
         assert_eq!(values["local"], Value::Bool(true));
         assert_eq!(values["preview"], Value::Bool(false));
         assert_eq!(values["feature"]["enabled"], Value::Bool(true));
@@ -1018,9 +1074,6 @@ spec:
             Value::String("feature-auth-ns".into())
         );
 
-        let applications = load_applications(&generated).unwrap();
-        assert_eq!(applications.len(), 1);
-        let application = &applications[0].1;
         assert_eq!(application.metadata.name, "gateway");
         assert_eq!(
             application.spec.destination.namespace.as_deref(),
@@ -1031,6 +1084,13 @@ spec:
             application.spec.source.delivery_path.as_deref(),
             Some(expected_delivery_path.as_str())
         );
+        assert_eq!(
+            application.spec.source.path,
+            root.join("apps/gateway/.gitops/local")
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert!(application.spec.sync_policy.prune);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1038,16 +1098,8 @@ spec:
     #[test]
     fn environment_watch_filters_to_definition_and_referenced_charts() {
         let source = Path::new("/project/.gitops/local/environment.yaml");
-        let chart_roots = vec![
-            PathBuf::from("/project/apps/api/.gitops/promote"),
-            PathBuf::from("/project/apps/api/.gitops/local"),
-        ];
+        let chart_roots = vec![PathBuf::from("/project/apps/api/.gitops/local")];
         assert!(is_environment_watch_path(source, source, &chart_roots));
-        assert!(is_environment_watch_path(
-            Path::new("/project/apps/api/.gitops/promote/templates/application.yaml"),
-            source,
-            &chart_roots,
-        ));
         assert!(is_environment_watch_path(
             Path::new("/project/apps/api/.gitops/local/values.yaml"),
             source,

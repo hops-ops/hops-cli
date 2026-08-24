@@ -115,6 +115,12 @@ Full detail: [local-source-packages.md](references/local-source-packages.md).
 
 - **Crossplane 2+**: Use `managementPolicies`, never `deletionPolicy` on managed resources
 - **Packages**: Prefer `crossplane-contrib` packages over Upbound-hosted ones (paid-account restrictions)
+- **Package object names**: Name every Crossplane package-manager object Hops creates
+  (`Configuration`, `Provider`, or explicit `Function`) from its OCI identity as
+  `<org>-<package>`—for example, `hops-ops-secret-stack`. Source, published, and
+  GitOps installs must target that same object. Package metadata and GitOps filenames
+  may use the short package name, but the installed object's `metadata.name` must not;
+  a short alias creates duplicate package-source conflicts in the Crossplane lock.
 - **Commits**: Conventional Commits (`feat:`, `fix:`, `chore:`) with subjects under 72 chars
 - **XRD projects**: Use Upbound-format projects with `upbound.yaml`, `apis/`, `functions/`, `tests/`
 - **Testing**: `make render` for quick validation, `up test run tests/test-render` for unit tests, `up test run tests/e2etest-* --e2e` for E2E

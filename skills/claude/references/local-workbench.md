@@ -15,8 +15,7 @@ tree copy). You do not need to learn volume types.
 
 ```bash
 # Dory app running (engine healthy). Product Dory Kubernetes is optional.
-hops local up
-hops local gitops cluster ./.gitops/local/cluster
+hops local gitops cluster ./.gitops/local/cluster.yaml
 ```
 
 Context is typically `kind-hops`. Confirm mounts:
@@ -36,14 +35,15 @@ Stock Dory k8s (`--cluster-provider dory --docker-provider dory`) is fine for pl
 **cannot** hostPath-mount Mac paths into the node; delivery falls back to sync.
 
 ```bash
-hops local up --cluster-provider dory --docker-provider dory
+hops local gitops cluster ./.gitops/local/cluster.yaml \
+  --cluster-provider dory --docker-provider dory
 ```
 
 ## Daily loop
 
 ```bash
-# Shared CP watch (if start did not use --gitops, or after Ctrl+C)
-hops local gitops cluster ./.gitops/local/cluster
+# Start/resume the Cluster and watch its shared control-plane manifests
+hops local gitops cluster ./.gitops/local/cluster.yaml
 
 # One Environment per checkout (namespace = --name) — watches by default
 hops local gitops environment ./.gitops/local/environment.yaml --name dogfood
@@ -52,6 +52,9 @@ hops local gitops environment ./.gitops/local/environment.yaml --name dogfood
 ```
 
 Watch is the default for both gitops commands. Use `--once` for a single reconcile (CI/scripts).
+Use `environment --name <name> --down` to purge one Environment and
+`cluster <cluster.yaml> --down` to stop the control plane while preserving its
+named node volume.
 
 ## Concurrent worktrees
 
@@ -73,8 +76,7 @@ Each name maps to namespace `<name>`.
 ```bash
 cd distributed/tests/e2e-ui
 # Prefer kind-on-Dory for hostPath HMR (see One-time prerequisite)
-hops local up
-hops local gitops cluster ./.gitops/local/cluster
+hops local gitops cluster ./.gitops/local/cluster.yaml
 hops local gitops environment ./.gitops/local/environment.yaml --name dogfood
 ```
 

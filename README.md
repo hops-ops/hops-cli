@@ -120,8 +120,7 @@ spec:
 From that project root:
 
 ```bash
-hops local up
-hops local gitops cluster ./.gitops/local/cluster
+hops local gitops cluster ./.gitops/local/cluster.yaml
 hops local gitops environment ./.gitops/local/environment.yaml --name main
 ```
 
@@ -131,16 +130,26 @@ From another checkout of the same project:
 hops local gitops environment ./.gitops/local/environment.yaml --name feature-auth
 ```
 
-`up` validates the Cluster before starting or reusing it. `gitops cluster`
-watches shared `.gitops/local/cluster` manifests. `environment` validates the
-Environment against that Cluster, renders each deploy's `.gitops/promote`
-chart, applies the resulting local Applications to the runtime namespace, and
-watches `.gitops/local/environment.yaml` plus the referenced
-`.gitops/promote` and `.gitops/local` charts. Each application's
+`gitops cluster` validates the Cluster, starts or resumes it, bootstraps the
+local control plane, and watches the declared shared manifests.
+`environment` validates the Environment against that Cluster, turns each
+deploy's `.gitops/local` chart (or explicit `deploys[].chart`) into a local
+Application, applies it to the runtime namespace, and watches
+`.gitops/local/environment.yaml` plus those chart roots. Each application's
 `.gitops/local` chart owns its editable local workload; `.gitops/deploy` is a
 separate cloud workload chart selected by promotion outside local mode.
 The runtime name, namespace, checkout path, and Cluster binding are local state;
 they are not committed to the Cluster definition.
+
+Use the same commands for teardown:
+
+```bash
+hops local gitops environment --name feature-auth --down
+hops local gitops cluster ./.gitops/local/cluster.yaml --down
+```
+
+Deleting a watched Environment definition also purges and unregisters its
+runtime Environment.
 
 An existing kind Cluster with a different exact `mountRoot` fails with an
 explicit reset/recreate instruction and is never silently deleted. A legacy
@@ -633,7 +642,7 @@ Notes:
 - `config install --repo ...` now prompts in interactive terminals to choose between cloning/building from source or applying a published package version. Published-version prompts suggest the latest discovered tag by default and still accept arbitrary tags such as `pr-<gitsha>`.
 - Non-interactive `config install --repo ...` keeps the previous default behavior and builds from source.
 - `config install --repo ... --version ...` skips clone/build and applies the remote package directly.
-- `config uninstall --repo ...` derives the configuration name as `<org>-<repo>`.
+- `config uninstall --repo ...` uses the cached `_output/*.uppkg` package identity when available. Without cached artifacts, it assumes the published OCI package is `ghcr.io/<org>/<repo>`.
 
 ## Commands
 
@@ -676,7 +685,7 @@ Notes:
 - `config install --repo <org/repo> --version <tag>`
   - Remote-package mode that can target any connected cluster
   - Skips clone/build and applies `Configuration` with package `ghcr.io/<org>/<repo>:<tag>`
-  - Uses configuration name `<org>-<repo>` (for example `hops-ops-aws-auto-eks-cluster`)
+  - Uses configuration name `<org>-<package>` (for example `hops-ops-aws-auto-eks-cluster`)
   - Does not support `--reload`
   - Supports `--skip-dependency-resolution`
 - `config uninstall --name <configuration-name>`
@@ -685,8 +694,9 @@ Notes:
   - Prunes orphaned `Configuration`/`Function`/`Provider` packages and revisions no longer present in lock
   - Prunes orphaned `ImageConfig` rewrites for removed render functions
 - `config uninstall --repo <org/repo>`
-  - Targets configuration name `<org>-<repo>`
-  - If cached repo exists at `~/.hops/local/repo-cache/<org>/<repo>`, derives source hints from it for additional package pruning
+  - Uses package identity from cached `_output/*.uppkg` artifacts when available, so the repository and packaged OCI names may differ
+  - Without cached artifacts, assumes the published OCI package is `ghcr.io/<org>/<repo>`
+  - If cached repo exists at `~/.hops/local/repo-cache/<org>/<repo>`, also derives source hints from it for additional package pruning
 - `config uninstall --path <PATH>`
   - Derives target configuration names from `<PATH>/_output/*.uppkg` image tags
   - Also derives package sources from those artifacts and prunes matching package resources (including Functions) if they remain

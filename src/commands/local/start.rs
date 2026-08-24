@@ -93,6 +93,67 @@ fn control_plane_healthy() -> bool {
         && deployment_available("crossplane-system", "registry")
         && provider_healthy(PROVIDER_K8S_NAME)
         && provider_healthy(PROVIDER_HELM_NAME)
+        && deployment_resource_policy_applied("crossplane-system", "crossplane", "crossplane")
+        && deployment_resource_policy_applied(
+            "crossplane-system",
+            "crossplane-rbac-manager",
+            "crossplane",
+        )
+}
+
+fn deployment_resource_policy_applied(namespace: &str, deployment: &str, container: &str) -> bool {
+    let output = match run_cmd_output(
+        "kubectl",
+        &[
+            "get",
+            "deployment",
+            deployment,
+            "-n",
+            namespace,
+            "-o",
+            "json",
+        ],
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            log::debug!(
+                "unable to inspect local resource policy for {namespace}/{deployment}: {error}"
+            );
+            return false;
+        }
+    };
+    let deployment: serde_json::Value = match serde_json::from_str(&output) {
+        Ok(deployment) => deployment,
+        Err(error) => {
+            log::debug!(
+                "unable to parse local resource policy for {namespace}/{deployment}: {error}"
+            );
+            return false;
+        }
+    };
+    container_resource_policy_applied(&deployment, container)
+}
+
+fn container_resource_policy_applied(deployment: &serde_json::Value, container: &str) -> bool {
+    let Some(container) = deployment
+        .pointer("/spec/template/spec/containers")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|containers| {
+            containers.iter().find(|candidate| {
+                candidate.get("name").and_then(serde_json::Value::as_str) == Some(container)
+            })
+        })
+    else {
+        return false;
+    };
+
+    ["limits", "requests"].into_iter().all(|section| {
+        ["cpu", "memory"].into_iter().all(|resource| {
+            container
+                .pointer(&format!("/resources/{section}/{resource}"))
+                .is_none_or(serde_json::Value::is_null)
+        })
+    })
 }
 
 fn deployment_available(namespace: &str, name: &str) -> bool {
@@ -155,17 +216,7 @@ fn bootstrap_control_plane() -> Result<(), Box<dyn Error>> {
     // still timing out (helm validate fails). Retry helm with API re-probes.
     log::info!("Installing Crossplane...");
     {
-        let helm_args = [
-            "upgrade",
-            "--install",
-            "crossplane",
-            "crossplane-stable/crossplane",
-            "-n",
-            "crossplane-system",
-            "--create-namespace",
-            "--timeout",
-            "5m",
-        ];
+        let helm_args = crossplane_helm_args();
         let mut last_err: Option<Box<dyn Error>> = None;
         for attempt in 1..=6 {
             wait_for_kubernetes()?;
@@ -236,6 +287,38 @@ fn bootstrap_control_plane() -> Result<(), Box<dyn Error>> {
     wait_for_provider_healthy(PROVIDER_HELM_NAME)?;
 
     Ok(())
+}
+
+/// The local control plane is a single-node developer appliance. Kubernetes
+/// resource limits only throttle its controllers against each other and do not
+/// provide meaningful tenant isolation, so local bootstrap removes the chart's
+/// upstream requests and limits. The Dory/Colima VM remains the capacity
+/// boundary.
+fn crossplane_helm_args() -> Vec<&'static str> {
+    let mut args = vec![
+        "upgrade",
+        "--install",
+        "crossplane",
+        "crossplane-stable/crossplane",
+        "-n",
+        "crossplane-system",
+        "--create-namespace",
+        "--timeout",
+        "5m",
+    ];
+    for value in [
+        "resourcesCrossplane.limits.cpu=null",
+        "resourcesCrossplane.limits.memory=null",
+        "resourcesCrossplane.requests.cpu=null",
+        "resourcesCrossplane.requests.memory=null",
+        "resourcesRBACManager.limits.cpu=null",
+        "resourcesRBACManager.limits.memory=null",
+        "resourcesRBACManager.requests.cpu=null",
+        "resourcesRBACManager.requests.memory=null",
+    ] {
+        args.extend(["--set", value]);
+    }
+    args
 }
 
 /// In-cluster package registry + backend node/engine wiring.
@@ -458,5 +541,66 @@ mod tests {
             }
             .bootstrap
         );
+    }
+
+    #[test]
+    fn local_crossplane_bootstrap_removes_resource_constraints() {
+        let args = crossplane_helm_args();
+        for value in [
+            "resourcesCrossplane.limits.cpu=null",
+            "resourcesCrossplane.limits.memory=null",
+            "resourcesCrossplane.requests.cpu=null",
+            "resourcesCrossplane.requests.memory=null",
+            "resourcesRBACManager.limits.cpu=null",
+            "resourcesRBACManager.limits.memory=null",
+            "resourcesRBACManager.requests.cpu=null",
+            "resourcesRBACManager.requests.memory=null",
+        ] {
+            assert!(args.contains(&value), "missing local Helm override {value}");
+        }
+    }
+
+    #[test]
+    fn healthy_fast_path_requires_local_resource_policy() {
+        let unconstrained = serde_json::json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{
+                            "name": "crossplane",
+                            "resources": {
+                                "limits": {},
+                                "requests": {"ephemeral-storage": "100Mi"}
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        assert!(container_resource_policy_applied(
+            &unconstrained,
+            "crossplane"
+        ));
+
+        let constrained = serde_json::json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{
+                            "name": "crossplane",
+                            "resources": {"requests": {"cpu": "100m"}}
+                        }]
+                    }
+                }
+            }
+        });
+        assert!(!container_resource_policy_applied(
+            &constrained,
+            "crossplane"
+        ));
+        assert!(!container_resource_policy_applied(
+            &unconstrained,
+            "crossplane-rbac-manager"
+        ));
     }
 }

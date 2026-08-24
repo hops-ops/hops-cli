@@ -23,12 +23,14 @@ use crate::commands::local::package_install::{REGISTRY_PULL, REGISTRY_PUSH};
 use crate::commands::local::{command_exists, run_cmd, run_cmd_output};
 use std::collections::BTreeSet;
 use std::error::Error;
+use std::fs;
 use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default kind cluster name (and historical hard-coded value).
 pub const DEFAULT_CLUSTER_NAME: &str = "hops";
@@ -39,6 +41,102 @@ const REGISTRY_HOST_PORT_END: u16 = 30599;
 const INOTIFY_SYSCTL_PATH: &str = "/etc/sysctl.d/99-hops-local-inotify.conf";
 const INOTIFY_MAX_USER_INSTANCES: u32 = 8192;
 const INOTIFY_MAX_USER_WATCHES: u32 = 1_048_576;
+const KIND_VOLUME_MANAGED_LABEL: &str = "dev.hops.local.managed";
+const KIND_VOLUME_CLUSTER_LABEL: &str = "dev.hops.local.kind.cluster";
+const KIND_VOLUME_NODE_LABEL: &str = "dev.hops.local.kind.node";
+static KIND_DOCKER_PROXY_COUNTER: AtomicU64 = AtomicU64::new(0);
+const KIND_DOCKER_PROXY: &str = r#"#!/bin/sh
+set -eu
+
+real_docker="${HOPS_KIND_REAL_DOCKER:?HOPS_KIND_REAL_DOCKER is required}"
+
+if [ "${1-}" != "run" ]; then
+  exec "$real_docker" "$@"
+fi
+
+previous=""
+node_name=""
+cluster_name=""
+node_role=""
+for argument in "$@"; do
+  if [ "$previous" = "--name" ]; then
+    node_name="$argument"
+  elif [ "$previous" = "--label" ]; then
+    case "$argument" in
+      io.x-k8s.kind.cluster=*) cluster_name=${argument#*=} ;;
+      io.x-k8s.kind.role=*) node_role=${argument#*=} ;;
+    esac
+  fi
+  previous="$argument"
+done
+
+case "$node_role" in
+  control-plane|worker) ;;
+  *) exec "$real_docker" "$@" ;;
+esac
+
+if [ -z "$node_name" ] || [ -z "$cluster_name" ]; then
+  echo "hops kind docker adapter: node name and cluster label are required" >&2
+  exit 1
+fi
+
+volume_name="hops-kind-${node_name}-data"
+if "$real_docker" volume inspect "$volume_name" >/dev/null 2>&1; then
+  managed=$("$real_docker" volume inspect --format '{{ index .Labels "dev.hops.local.managed" }}' "$volume_name")
+  owner=$("$real_docker" volume inspect --format '{{ index .Labels "dev.hops.local.kind.cluster" }}' "$volume_name")
+  if [ "$managed" != "true" ] || [ "$owner" != "$cluster_name" ]; then
+    echo "hops kind docker adapter: refusing non-Hops volume name collision: $volume_name" >&2
+    exit 1
+  fi
+else
+  "$real_docker" volume create \
+    --label "dev.hops.local.managed=true" \
+    --label "dev.hops.local.kind.cluster=$cluster_name" \
+    --label "dev.hops.local.kind.node=$node_name" \
+    "$volume_name" >/dev/null
+fi
+
+shift
+original_count=$#
+processed=0
+var_mounts=0
+while [ "$processed" -lt "$original_count" ]; do
+  argument=$1
+  shift
+  processed=$((processed + 1))
+  case "$argument" in
+    --volume|-v)
+      if [ "$processed" -ge "$original_count" ]; then
+        echo "hops kind docker adapter: $argument requires a value" >&2
+        exit 1
+      fi
+      mount=$1
+      shift
+      processed=$((processed + 1))
+      if [ "$mount" = "/var" ]; then
+        var_mounts=$((var_mounts + 1))
+        mount="$volume_name:/var"
+      fi
+      set -- "$@" "$argument" "$mount"
+      ;;
+    --volume=/var|-v=/var)
+      var_mounts=$((var_mounts + 1))
+      flag=${argument%%=*}
+      set -- "$@" "$flag=$volume_name:/var"
+      ;;
+    *)
+      set -- "$@" "$argument"
+      ;;
+  esac
+done
+
+if [ "$var_mounts" -ne 1 ]; then
+  echo "hops kind docker adapter: expected exactly one anonymous /var mount, found $var_mounts" >&2
+  exit 1
+fi
+
+exec "$real_docker" run "$@"
+"#;
 const INSTALL_INOTIFY_SYSCTL_SCRIPT: &str = r#"set -eu
 target="$1"
 expected_instances="$2"
@@ -439,6 +537,85 @@ fn kind_cmd(args: &[&str]) -> Command {
     c
 }
 
+/// A PATH-scoped Docker adapter used only while `kind create cluster` runs.
+///
+/// Stock kind deliberately passes `--volume /var`, which makes Docker create
+/// an opaque anonymous volume for every node. Docker accepts a second named
+/// mount for the same destination and selects the named mount. The adapter
+/// recognizes kind node runs from their labels and adds a deterministic,
+/// Hops-labeled volume while delegating every other Docker invocation.
+struct KindDockerProxy {
+    dir: PathBuf,
+    real_docker: PathBuf,
+}
+
+impl KindDockerProxy {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        let real_docker = executable_in_path("docker")
+            .ok_or("docker executable is not available on PATH for kind")?;
+        Self::with_real_docker(real_docker)
+    }
+
+    fn with_real_docker(real_docker: PathBuf) -> Result<Self, Box<dyn Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let counter = KIND_DOCKER_PROXY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "hops-kind-docker-{}-{nonce}-{counter}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir)?;
+        let proxy = dir.join("docker");
+        fs::write(&proxy, KIND_DOCKER_PROXY)?;
+        set_executable(&proxy)?;
+        Ok(Self { dir, real_docker })
+    }
+
+    fn apply(&self, command: &mut Command) -> Result<(), Box<dyn Error>> {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(self.dir.clone()).chain(std::env::split_paths(&existing)),
+        )?;
+        command
+            .env("PATH", path)
+            .env("HOPS_KIND_REAL_DOCKER", &self.real_docker);
+        Ok(())
+    }
+}
+
+impl Drop for KindDockerProxy {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.dir) {
+            log::debug!(
+                "unable to remove temporary kind docker adapter {}: {error}",
+                self.dir.display()
+            );
+        }
+    }
+}
+
+fn executable_in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|entry| entry.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<(), Box<dyn Error>> {
+    Err("named kind node volumes currently require a Unix-compatible Docker CLI".into())
+}
+
 fn docker_output(args: &[&str]) -> Result<String, Box<dyn Error>> {
     let output = docker_cmd(args).output()?;
     if !output.status.success() {
@@ -530,6 +707,7 @@ pub fn destroy() -> Result<(), Box<dyn Error>> {
     if !status.success() {
         return Err(format!("kind delete cluster exited with {}", status).into());
     }
+    remove_cluster_node_data_volumes(&name)?;
     log::info!("kind cluster deleted");
     Ok(())
 }
@@ -632,6 +810,10 @@ fn create_cluster() -> Result<(), Box<dyn Error>> {
         );
     }
     let name = active_cluster_name();
+    // A missing kind node with an owned volume is residue from an interrupted
+    // create or external container cleanup. Starting a fresh kind node on old
+    // etcd/containerd state is unsupported, so recreate only Hops-owned data.
+    remove_cluster_node_data_volumes(&name)?;
     if let Some(ref m) = mount {
         log::info!(
             "Creating kind cluster '{name}' with extraMounts {} → {} (hostPath delivery)...",
@@ -644,7 +826,10 @@ fn create_cluster() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let mut child = kind_cmd(&["create", "cluster", "--name", &name, "--config", "-"])
+    let docker_proxy = KindDockerProxy::new()?;
+    let mut command = kind_cmd(&["create", "cluster", "--name", &name, "--config", "-"]);
+    docker_proxy.apply(&mut command)?;
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -654,6 +839,9 @@ fn create_cluster() -> Result<(), Box<dyn Error>> {
     }
     let status = child.wait()?;
     if !status.success() {
+        if let Err(error) = remove_cluster_node_data_volumes(&name) {
+            log::warn!("unable to clean named kind volumes after failed create: {error}");
+        }
         return Err(format!("kind create cluster exited with {}", status).into());
     }
 
@@ -664,6 +852,44 @@ fn create_cluster() -> Result<(), Box<dyn Error>> {
     // Raise inotify limits: mounting large host trees (even $HOME/dev) can make
     // kube-proxy fail with "too many open files" under default instance caps.
     ensure_node_inotify_limits()?;
+    Ok(())
+}
+
+fn remove_cluster_node_data_volumes(cluster_name: &str) -> Result<(), Box<dyn Error>> {
+    let managed_filter = format!("label={KIND_VOLUME_MANAGED_LABEL}=true");
+    let cluster_filter = format!("label={KIND_VOLUME_CLUSTER_LABEL}={cluster_name}");
+    let volumes = docker_output(&[
+        "volume",
+        "ls",
+        "--quiet",
+        "--filter",
+        &managed_filter,
+        "--filter",
+        &cluster_filter,
+    ])?;
+
+    for volume in volumes
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let node = docker_output(&[
+            "volume",
+            "inspect",
+            "--format",
+            &format!("{{{{ index .Labels {:?} }}}}", KIND_VOLUME_NODE_LABEL),
+            volume,
+        ])?;
+        let expected = format!("hops-kind-{}-data", node.trim());
+        if volume != expected {
+            return Err(format!(
+                "refusing to remove Hops-labeled kind volume {volume}: expected {expected} from its node label"
+            )
+            .into());
+        }
+        docker_run(&["volume", "rm", volume])?;
+        log::info!("removed kind node data volume {volume}");
+    }
     Ok(())
 }
 
@@ -889,6 +1115,7 @@ fn parse_kind_version(output: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -1073,5 +1300,148 @@ fs.inotify.max_user_watches = 1048576\n"
             None
         );
         assert_eq!(normalized_dory_server("https://0.0.0.0:63903", 6443), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kind_docker_proxy_names_node_volume_and_delegates_other_calls() {
+        let root = test_dir("kind-docker-proxy");
+        let fake_docker = root.join("real-docker");
+        let calls = root.join("calls");
+        fs::write(
+            &fake_docker,
+            r#"#!/bin/sh
+set -eu
+printf 'CALL' >> "$HOPS_TEST_DOCKER_CALLS"
+for argument in "$@"; do
+  printf '\t%s' "$argument" >> "$HOPS_TEST_DOCKER_CALLS"
+done
+printf '\n' >> "$HOPS_TEST_DOCKER_CALLS"
+if [ "${1-}" = "volume" ] && [ "${2-}" = "inspect" ]; then
+  exit 1
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        set_executable(&fake_docker).unwrap();
+
+        let proxy = KindDockerProxy::with_real_docker(fake_docker).unwrap();
+        let mut node = Command::new("docker");
+        proxy.apply(&mut node).unwrap();
+        let node_status = node
+            .env("HOPS_TEST_DOCKER_CALLS", &calls)
+            .args([
+                "run",
+                "--name",
+                "dogfood-control-plane",
+                "--label",
+                "io.x-k8s.kind.role=control-plane",
+                "--label",
+                "io.x-k8s.kind.cluster=dogfood",
+                "--volume",
+                "/var",
+                "kindest/node:v1.36.1",
+            ])
+            .status()
+            .unwrap();
+        assert!(node_status.success());
+
+        let mut unrelated = Command::new("docker");
+        proxy.apply(&mut unrelated).unwrap();
+        let unrelated_status = unrelated
+            .env("HOPS_TEST_DOCKER_CALLS", &calls)
+            .args(["ps", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(unrelated_status.success());
+
+        let calls = fs::read_to_string(&calls).unwrap();
+        assert!(calls.contains(
+            "CALL\tvolume\tcreate\t--label\tdev.hops.local.managed=true\t--label\tdev.hops.local.kind.cluster=dogfood\t--label\tdev.hops.local.kind.node=dogfood-control-plane\thops-kind-dogfood-control-plane-data"
+        ));
+        assert!(calls.contains("\t--volume\thops-kind-dogfood-control-plane-data:/var\t"));
+        let node_call = calls
+            .lines()
+            .find(|line| line.starts_with("CALL\trun\t"))
+            .expect("node docker run was recorded");
+        assert_eq!(
+            node_call.matches(":/var").count(),
+            1,
+            "node run must contain exactly one named /var destination: {node_call}"
+        );
+        assert!(
+            !node_call.split('\t').any(|argument| argument == "/var"),
+            "anonymous /var mount must be replaced, not retained: {node_call}"
+        );
+        assert!(calls.contains("CALL\tps\t--quiet"));
+
+        drop(proxy);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kind_docker_proxy_rejects_non_hops_volume_name_collision() {
+        let root = test_dir("kind-docker-proxy-collision");
+        let fake_docker = root.join("real-docker");
+        let calls = root.join("calls");
+        fs::write(
+            &fake_docker,
+            r#"#!/bin/sh
+set -eu
+printf 'CALL' >> "$HOPS_TEST_DOCKER_CALLS"
+for argument in "$@"; do
+  printf '\t%s' "$argument" >> "$HOPS_TEST_DOCKER_CALLS"
+done
+printf '\n' >> "$HOPS_TEST_DOCKER_CALLS"
+if [ "${1-}" = "volume" ] && [ "${2-}" = "inspect" ]; then
+  if [ "${3-}" = "--format" ]; then
+    printf 'false\n'
+  fi
+  exit 0
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        set_executable(&fake_docker).unwrap();
+
+        let proxy = KindDockerProxy::with_real_docker(fake_docker).unwrap();
+        let mut node = Command::new("docker");
+        proxy.apply(&mut node).unwrap();
+        let output = node
+            .env("HOPS_TEST_DOCKER_CALLS", &calls)
+            .args([
+                "run",
+                "--name",
+                "dogfood-control-plane",
+                "--label",
+                "io.x-k8s.kind.role=control-plane",
+                "--label",
+                "io.x-k8s.kind.cluster=dogfood",
+                "kindest/node:v1.36.1",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("refusing non-Hops volume name collision"));
+        assert!(!fs::read_to_string(&calls).unwrap().contains("CALL\trun"));
+
+        drop(proxy);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn test_dir(prefix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("hops-{prefix}-{}-{nonce}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        path
     }
 }

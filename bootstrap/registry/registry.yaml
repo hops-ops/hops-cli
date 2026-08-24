@@ -55,6 +55,11 @@ spec:
               scheme: HTTPS
             initialDelaySeconds: 2
             periodSeconds: 5
+            # A laptop resuming several local control planes can briefly take
+            # seconds to service TLS. Do not turn CPU contention into a
+            # destructive registry restart loop.
+            timeoutSeconds: 15
+            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /v2/
@@ -62,6 +67,8 @@ spec:
               scheme: HTTPS
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 15
+            failureThreshold: 6
       volumes:
         - name: registry-data
           persistentVolumeClaim:

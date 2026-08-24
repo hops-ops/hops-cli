@@ -3,18 +3,17 @@
 ## Quick Start
 
 ```bash
-# 1. Start local k8s + Crossplane + providers + registry
-#    (provider selection is user-local: ~/.hops/local/providers.json)
-hops local start --cluster-provider kind --docker-provider dory --cluster-name hops
+# 1. Start/resume the declared cluster and watch shared GitOps manifests
+hops local gitops cluster ./.gitops/local/cluster.yaml
 
-# 2. Install platform packages into the CP *and* pin them in cluster gitops
+# 2. Add or update platform packages in .gitops/local/cluster when needed
 hops config install --repo hops-ops/psql-stack --version v0.9.1 \
-  --gitops ./gitops/cluster --local
+  --gitops ./.gitops/local/cluster --local
 hops config install --repo hops-ops/auth-stack --version v1.6.0 \
-  --gitops ./gitops/cluster --local
+  --gitops ./.gitops/local/cluster --local
 
-# 3. Watch/apply cluster gitops (packages + XRs). Or pass --gitops on start.
-hops local gitops cluster ./gitops/cluster
+# 3. Register this checkout as an Environment
+hops local gitops environment ./.gitops/local/environment.yaml --name main
 
 # 4. Optional cloud provider auth (writes live Secrets; use --gitops for non-secret YAML)
 hops local aws --profile hops
@@ -31,7 +30,13 @@ to `default` (scaffolded by `config install --gitops --local`). See
 ### `hops local install`
 Installs Colima via Homebrew.
 
-### `hops local start`
+### `hops local gitops cluster <cluster.yaml>`
+
+This is the normal lifecycle command. It validates the Kubernetes-shaped
+Cluster definition, invokes the local start/bootstrap pipeline, and applies +
+watches the definition's `spec.manifests.path`.
+
+The underlying `hops local start` command:
 - Starts the chosen backend (colima / kind / dory)
 - Installs **pinned** Crossplane Helm chart (`CROSSPLANE_CHART_VERSION` in `start.rs`)
 - Applies bootstrap Providers (pinned tags in `bootstrap/providers/`):
@@ -40,13 +45,9 @@ Installs Colima via Homebrew.
 - Applies ProviderConfigs named `default`, local registry, DRCs
 - Configures node trust for the in-cluster registry
 
-With **`--gitops PATH`** (e.g. `./gitops/cluster`):
-1. Writes the same helm/k8s bootstrap into the tree (`providers/`, `providerconfigs/`, `runtime/`)
-2. Runs `hops local gitops cluster PATH` (apply + watch) so day-to-day CP state is gitops-owned
-
 ```bash
-hops local start --cluster-provider kind --docker-provider dory \
-  --cluster-name hops --gitops ./gitops/cluster
+hops local gitops cluster ./.gitops/local/cluster.yaml
+hops local gitops cluster ./.gitops/local/cluster.yaml --down
 ```
 
 **Version bumps:** Renovate owns these pins (`cli/renovate.json` customManagers →
@@ -62,8 +63,11 @@ hops provider install --path /path/to/provider-helm --gitops ./gitops/cluster
 
 See [local-source-packages.md](./local-source-packages.md).
 
-### `hops local stop` / `hops local destroy` / `hops local uninstall`
-Stop, delete, or uninstall Colima respectively.
+### Cluster teardown
+
+`hops local gitops cluster <cluster.yaml> --down` stops the declared Cluster
+while preserving its data. `hops local destroy` remains the explicit,
+destructive cluster deletion command; `hops local uninstall` removes tooling.
 
 ### `hops local aws --profile <PROFILE>`
 
