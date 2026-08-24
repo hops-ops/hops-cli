@@ -642,7 +642,7 @@ Notes:
 - `config install --repo ...` now prompts in interactive terminals to choose between cloning/building from source or applying a published package version. Published-version prompts suggest the latest discovered tag by default and still accept arbitrary tags such as `pr-<gitsha>`.
 - Non-interactive `config install --repo ...` keeps the previous default behavior and builds from source.
 - `config install --repo ... --version ...` skips clone/build and applies the remote package directly.
-- `config uninstall --repo ...` derives the configuration name as `<org>-<repo>`.
+- `config uninstall --repo ...` derives the configuration name as `<org>-<package>`.
 
 ## Commands
 
@@ -685,7 +685,7 @@ Notes:
 - `config install --repo <org/repo> --version <tag>`
   - Remote-package mode that can target any connected cluster
   - Skips clone/build and applies `Configuration` with package `ghcr.io/<org>/<repo>:<tag>`
-  - Uses configuration name `<org>-<repo>` (for example `hops-ops-aws-auto-eks-cluster`)
+  - Uses configuration name `<org>-<package>` (for example `hops-ops-aws-auto-eks-cluster`)
   - Does not support `--reload`
   - Supports `--skip-dependency-resolution`
 - `config uninstall --name <configuration-name>`
@@ -694,7 +694,7 @@ Notes:
   - Prunes orphaned `Configuration`/`Function`/`Provider` packages and revisions no longer present in lock
   - Prunes orphaned `ImageConfig` rewrites for removed render functions
 - `config uninstall --repo <org/repo>`
-  - Targets configuration name `<org>-<repo>`
+  - Targets configuration name `<org>-<package>`
   - If cached repo exists at `~/.hops/local/repo-cache/<org>/<repo>`, derives source hints from it for additional package pruning
 - `config uninstall --path <PATH>`
   - Derives target configuration names from `<PATH>/_output/*.uppkg` image tags

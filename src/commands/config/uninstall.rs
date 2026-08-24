@@ -16,7 +16,7 @@ pub struct UnconfigArgs {
     #[arg(long, conflicts_with_all = ["repo", "path"])]
     pub name: Option<String>,
 
-    /// GitHub repository in <org>/<repo> format (derives name as <org>-<repo>)
+    /// GitHub repository in <org>/<repo> format (derives name as <org>-<package>)
     #[arg(long, conflicts_with_all = ["name", "path"])]
     pub repo: Option<String>,
 

@@ -107,11 +107,6 @@ struct PackageMetadataName {
 }
 
 #[derive(Debug, Deserialize)]
-struct ConfigurationPackageMetadata {
-    metadata: PackageMetadataName,
-}
-
-#[derive(Debug, Deserialize)]
 struct PackageSpec {
     #[serde(rename = "package")]
     package_ref: Option<String>,
@@ -416,7 +411,7 @@ spec:
         );
         let mut source_to_push = img.source.clone();
         let package_yaml = extract_package_yaml_from_uppkg(&img.uppkg_path, &img.source)?;
-        let configuration_name = configuration_name_from_package_yaml(&package_yaml, &pull_ref);
+        let configuration_name = configuration_name_from_pull_ref(&pull_ref);
         configurations.push((configuration_name, pull_ref.clone()));
         let (patched_yaml, changed) =
             rewrite_render_dependency_digests(&package_yaml, &render_rewrites);
@@ -627,19 +622,16 @@ fn is_configuration_image(image: &str) -> bool {
     split_ref(image).1 == "configuration"
 }
 
-/// Prefer the package author's declared metadata.name so a source install
-/// updates the same Configuration object as a published GitOps pin. Fall back
-/// to the historical registry-path name for older packages without metadata.
-fn configuration_name_from_package_yaml(package_yaml: &str, pull_ref: &str) -> String {
-    serde_yaml::Deserializer::from_str(package_yaml)
-        .next()
-        .and_then(|document| ConfigurationPackageMetadata::deserialize(document).ok())
-        .map(|package| sanitize_name_component(&package.metadata.name))
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| {
-            let (image_path, _) = split_ref(pull_ref);
-            strip_registry(image_path).replace('/', "-")
-        })
+/// Use the OCI package identity for the Configuration object in every install
+/// mode. This keeps source, published, and GitOps installs on the same
+/// `<org>-<package>` name even when the package's internal metadata is shorter.
+fn configuration_name_from_pull_ref(pull_ref: &str) -> String {
+    let (image_path, _) = split_ref(pull_ref);
+    strip_registry(image_path)
+        .split('/')
+        .map(sanitize_name_component)
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn extract_package_yaml_from_uppkg(
@@ -1131,32 +1123,20 @@ spec:
     }
 
     #[test]
-    fn source_install_uses_declared_configuration_name() {
-        let package_yaml = r#"apiVersion: meta.pkg.crossplane.io/v1
-kind: Configuration
-metadata:
-  name: secret-stack
----
-apiVersion: apiextensions.crossplane.io/v1
-kind: Composition
-metadata:
-  name: secretstores.hops.ops.com.ai
-"#;
+    fn source_install_uses_registry_package_identity() {
         assert_eq!(
-            configuration_name_from_package_yaml(
-                package_yaml,
+            configuration_name_from_pull_ref(
                 "registry.crossplane-system.svc.cluster.local:5000/hops-ops/secret-stack:dev-abc"
             ),
-            "secret-stack"
+            "hops-ops-secret-stack"
         );
     }
 
     #[test]
-    fn source_install_name_falls_back_to_registry_path() {
+    fn source_install_name_sanitizes_registry_path_components() {
         assert_eq!(
-            configuration_name_from_package_yaml(
-                "apiVersion: meta.pkg.crossplane.io/v1\nkind: Configuration\n",
-                "registry.crossplane-system.svc.cluster.local:5000/hops-ops/secret-stack:dev-abc"
+            configuration_name_from_pull_ref(
+                "registry.crossplane-system.svc.cluster.local:5000/Hops_Ops/Secret.Stack:dev-abc"
             ),
             "hops-ops-secret-stack"
         );

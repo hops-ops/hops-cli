@@ -165,10 +165,13 @@ The CLI handles cleanup automatically when switching modes:
 
 ## Configuration Naming
 
-Configurations are named `<org>-<repo>`, e.g. `hops-ops-aws-secret-stack`.
-This matches both local and published installs. Gitops package **filenames** use
+Configurations are named `<org>-<package>`, e.g. `hops-ops-secret-stack`.
+This matches source, published, and GitOps installs. GitOps package **filenames** use
 the short package name (`psql-stack.yaml`); `metadata.name` matches the applied
-Configuration.
+Configuration. The package's internal metadata may also remain short, but the
+installed `Configuration.metadata.name` must use the canonical OCI-derived
+name. Never create a short alias beside it: Crossplane rejects duplicate package
+sources in its lock.
 
 ## Uninstall
 
