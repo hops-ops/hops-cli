@@ -230,7 +230,17 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Doctor => doctor::run(),
         LocalCommands::Down(down_args) => down::run(down_args),
         LocalCommands::Status(status_args) => status::run(status_args),
-        LocalCommands::Gitops(gitops_args) => gitops::run_environment_command(gitops_args),
+        LocalCommands::Gitops(gitops_args) => gitops::run_environment_command(
+            gitops_args,
+            workbench::definition::ClusterOverrides {
+                cluster_provider: args.cluster_provider,
+                docker_provider: args.docker_provider,
+                legacy_backend: args.backend,
+                cluster_name: args.cluster_name.as_deref(),
+                context: args.context.as_deref(),
+                dory_name: args.dory_name.as_deref(),
+            },
+        ),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Cloudflare(cloudflare_args) => cloudflare::run(cloudflare_args),
         LocalCommands::Github(github_args) => github::run(github_args),

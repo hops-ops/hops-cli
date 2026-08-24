@@ -97,7 +97,45 @@ else
 fi
 
 shift
-exec "$real_docker" run --volume "$volume_name:/var" "$@"
+original_count=$#
+processed=0
+var_mounts=0
+while [ "$processed" -lt "$original_count" ]; do
+  argument=$1
+  shift
+  processed=$((processed + 1))
+  case "$argument" in
+    --volume|-v)
+      if [ "$processed" -ge "$original_count" ]; then
+        echo "hops kind docker adapter: $argument requires a value" >&2
+        exit 1
+      fi
+      mount=$1
+      shift
+      processed=$((processed + 1))
+      if [ "$mount" = "/var" ]; then
+        var_mounts=$((var_mounts + 1))
+        mount="$volume_name:/var"
+      fi
+      set -- "$@" "$argument" "$mount"
+      ;;
+    --volume=/var|-v=/var)
+      var_mounts=$((var_mounts + 1))
+      flag=${argument%%=*}
+      set -- "$@" "$flag=$volume_name:/var"
+      ;;
+    *)
+      set -- "$@" "$argument"
+      ;;
+  esac
+done
+
+if [ "$var_mounts" -ne 1 ]; then
+  echo "hops kind docker adapter: expected exactly one anonymous /var mount, found $var_mounts" >&2
+  exit 1
+fi
+
+exec "$real_docker" run "$@"
 "#;
 const INSTALL_INOTIFY_SYSCTL_SCRIPT: &str = r#"set -eu
 target="$1"
@@ -1322,9 +1360,20 @@ exit 0
         assert!(calls.contains(
             "CALL\tvolume\tcreate\t--label\tdev.hops.local.managed=true\t--label\tdev.hops.local.kind.cluster=dogfood\t--label\tdev.hops.local.kind.node=dogfood-control-plane\thops-kind-dogfood-control-plane-data"
         ));
-        assert!(calls.contains(
-            "CALL\trun\t--volume\thops-kind-dogfood-control-plane-data:/var\t--name\tdogfood-control-plane"
-        ));
+        assert!(calls.contains("\t--volume\thops-kind-dogfood-control-plane-data:/var\t"));
+        let node_call = calls
+            .lines()
+            .find(|line| line.starts_with("CALL\trun\t"))
+            .expect("node docker run was recorded");
+        assert_eq!(
+            node_call.matches(":/var").count(),
+            1,
+            "node run must contain exactly one named /var destination: {node_call}"
+        );
+        assert!(
+            !node_call.split('\t').any(|argument| argument == "/var"),
+            "anonymous /var mount must be replaced, not retained: {node_call}"
+        );
         assert!(calls.contains("CALL\tps\t--quiet"));
 
         drop(proxy);

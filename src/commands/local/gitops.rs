@@ -15,8 +15,8 @@ use super::workbench::application::{
 };
 use super::workbench::cluster_gitops::{reconcile_cluster_dir, should_reconcile_cluster_change};
 use super::workbench::definition::{
-    load_definition, load_environment_definition, prepare_cluster, ClusterOverrides,
-    DeployDefinition, DEFAULT_DEPLOY_CHART_PATH,
+    load_definition, load_environment_definition, prepare_cluster, prepare_cluster_for_stop,
+    ClusterOverrides, DeployDefinition, DEFAULT_DEPLOY_CHART_PATH,
 };
 use super::workbench::delivery::{
     attach_sync_delivery, discover_sync_targets, save_delivery_runtime, stop_delivery_runtime,
@@ -65,7 +65,7 @@ pub struct ClusterArgs {
     pub path: Option<PathBuf>,
 
     /// Stop the declared Cluster instead of starting and watching it.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
     pub down: bool,
 
     /// Run a single reconcile and exit (disables the default watch).
@@ -93,7 +93,7 @@ pub struct EnvironmentArgs {
     pub path: Option<PathBuf>,
 
     /// Purge and unregister this Environment instead of reconciling it.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
     pub down: bool,
 
     /// Destination namespace override (workspace isolation).
@@ -121,9 +121,12 @@ pub struct EnvironmentArgs {
     pub dry_run: bool,
 }
 
-pub fn run_environment_command(args: &GitopsArgs) -> Result<(), Box<dyn Error>> {
+pub fn run_environment_command(
+    args: &GitopsArgs,
+    overrides: ClusterOverrides<'_>,
+) -> Result<(), Box<dyn Error>> {
     match &args.command {
-        GitopsCommands::Environment(a) => run_environment(a),
+        GitopsCommands::Environment(a) => run_environment(a, overrides),
         GitopsCommands::Cluster(_) => Err(
             "internal dispatch error: Cluster must be activated before generic local dispatch"
                 .into(),
@@ -137,7 +140,11 @@ pub fn run_cluster(
     args: &ClusterArgs,
     overrides: ClusterOverrides<'_>,
 ) -> Result<(), Box<dyn Error>> {
-    let (definition, backend) = prepare_cluster(args.path.as_deref(), overrides)?;
+    let (definition, backend) = if args.down {
+        prepare_cluster_for_stop(args.path.as_deref(), overrides)?
+    } else {
+        prepare_cluster(args.path.as_deref(), overrides)?
+    };
 
     if args.down {
         if definition.cluster.cluster_provider == super::backend::ClusterProvider::Kind
@@ -198,7 +205,10 @@ pub fn run_cluster(
 
 // ── environment ──────────────────────────────────────────────────────────────
 
-fn run_environment(args: &EnvironmentArgs) -> Result<(), Box<dyn Error>> {
+fn run_environment(
+    args: &EnvironmentArgs,
+    overrides: ClusterOverrides<'_>,
+) -> Result<(), Box<dyn Error>> {
     if args.down {
         return super::down::run(&super::down::DownArgs {
             name: args.name.clone(),
@@ -211,12 +221,16 @@ fn run_environment(args: &EnvironmentArgs) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .ok_or("Environment PATH is required unless --down is used with a registered --name")?;
     if path.is_file() && yaml_kind(path)?.as_deref() == Some("Environment") {
-        return run_environment_definition(args, path);
+        return run_environment_definition(args, path, overrides);
     }
-    run_application_worktree(args, path)
+    run_application_worktree(args, path, None)
 }
 
-fn run_environment_definition(args: &EnvironmentArgs, path: &Path) -> Result<(), Box<dyn Error>> {
+fn run_environment_definition(
+    args: &EnvironmentArgs,
+    path: &Path,
+    overrides: ClusterOverrides<'_>,
+) -> Result<(), Box<dyn Error>> {
     let source = path
         .canonicalize()
         .map_err(|error| format!("Environment path {}: {error}", path.display()))?;
@@ -226,7 +240,7 @@ fn run_environment_definition(args: &EnvironmentArgs, path: &Path) -> Result<(),
             source.display()
         )
     })?;
-    let cluster = load_definition(&cluster_path)?;
+    let (cluster, _) = prepare_cluster(Some(&cluster_path), overrides)?;
     let loaded = load_environment_definition(
         &source,
         &cluster,
@@ -241,8 +255,14 @@ fn run_environment_definition(args: &EnvironmentArgs, path: &Path) -> Result<(),
         chart_watch_roots.insert(deploy.chart_path.clone());
     }
     let chart_watch_roots: Vec<_> = chart_watch_roots.into_iter().collect();
-    super::backend::kind::set_active_cluster_name(&cluster.cluster.name);
-
+    let kube_context = super::kube_context_from_env().ok_or_else(|| {
+        format!(
+            "declared Cluster {:?} has no available kube context; start it with `hops local gitops cluster {}` first",
+            cluster.cluster.name,
+            cluster_path.display()
+        )
+    })?;
+    let declared_cluster = (cluster.cluster.name.as_str(), kube_context.as_str());
     let generated = if args.dry_run {
         std::env::temp_dir().join(format!(
             "hops-local-environment-{}-{workspace_name}",
@@ -270,13 +290,14 @@ fn run_environment_definition(args: &EnvironmentArgs, path: &Path) -> Result<(),
             debounce: args.debounce,
             dry_run: args.dry_run,
         };
-        run_application_worktree(&legacy, &generated)?;
+        run_application_worktree(&legacy, &generated, Some(declared_cluster))?;
         if !args.dry_run {
             persist_environment_registration(
                 &workspace_name,
                 &source,
                 &worktree_root,
                 &cluster.cluster.name,
+                &kube_context,
             )?;
         }
         Ok(())
@@ -488,6 +509,7 @@ fn persist_environment_registration(
     source: &Path,
     worktree_root: &Path,
     cluster_name: &str,
+    kube_context: &str,
 ) -> Result<(), Box<dyn Error>> {
     let state_dir = local_state_dir()?;
     let Some(mut record) = load_workspace(&state_dir, workspace_name)? else {
@@ -496,6 +518,7 @@ fn persist_environment_registration(
     record.env_path = source.to_string_lossy().into_owned();
     record.project_root = Some(worktree_root.to_string_lossy().into_owned());
     record.cluster_name = Some(cluster_name.to_string());
+    record.kube_context = Some(kube_context.to_string());
     save_workspace(&state_dir, &record)?;
     Ok(())
 }
@@ -575,7 +598,11 @@ fn is_environment_watch_path(path: &Path, source: &Path, chart_roots: &[PathBuf]
     path == source || chart_roots.iter().any(|root| path.starts_with(root))
 }
 
-fn run_application_worktree(args: &EnvironmentArgs, path: &Path) -> Result<(), Box<dyn Error>> {
+fn run_application_worktree(
+    args: &EnvironmentArgs,
+    path: &Path,
+    declared_cluster: Option<(&str, &str)>,
+) -> Result<(), Box<dyn Error>> {
     let env_path = path
         .canonicalize()
         .map_err(|e| format!("env path {}: {e}", path.display()))?;
@@ -601,7 +628,11 @@ fn run_application_worktree(args: &EnvironmentArgs, path: &Path) -> Result<(), B
     let existing_workspace = local_state_dir()
         .ok()
         .and_then(|state_dir| load_workspace(&state_dir, &workspace_name).ok().flatten());
-    if let Some(rec) = existing_workspace.as_ref() {
+    if let Some((cluster, context)) = declared_cluster {
+        std::env::set_var(super::HOPS_KUBE_CONTEXT_ENV, context);
+        super::backend::kind::set_active_cluster_name(cluster);
+        log::info!("environment gitops: declared cluster `{cluster}` (context {context})");
+    } else if let Some(rec) = existing_workspace.as_ref() {
         if let Some((cluster, ctx)) = activate_workspace_cluster(rec) {
             log::info!("environment gitops: bound cluster `{cluster}` (context {ctx})");
         }
@@ -687,6 +718,7 @@ fn run_application_worktree(args: &EnvironmentArgs, path: &Path) -> Result<(), B
             &namespace,
             delivery_strategy,
             existing_workspace.as_ref(),
+            declared_cluster,
         )?;
     }
     if args.once || args.dry_run {
@@ -702,14 +734,23 @@ fn register_worktree(
     namespace: &str,
     delivery_strategy: DeliveryStrategy,
     existing: Option<&WorkspaceRecord>,
+    declared_cluster: Option<(&str, &str)>,
 ) -> Result<(), Box<dyn Error>> {
-    let cluster_name = existing
-        .and_then(|record| record.cluster_name.clone())
-        .filter(|name| !name.is_empty())
+    let cluster_name = declared_cluster
+        .map(|(cluster, _)| cluster.to_string())
+        .or_else(|| {
+            existing
+                .and_then(|record| record.cluster_name.clone())
+                .filter(|name| !name.is_empty())
+        })
         .unwrap_or_else(super::backend::kind::active_cluster_name);
-    let kube_context = existing
-        .and_then(|record| record.kube_context.clone())
-        .filter(|context| !context.is_empty())
+    let kube_context = declared_cluster
+        .map(|(_, context)| context.to_string())
+        .or_else(|| {
+            existing
+                .and_then(|record| record.kube_context.clone())
+                .filter(|context| !context.is_empty())
+        })
         .or_else(super::kube_context_from_env)
         .or_else(|| Some(format!("kind-{cluster_name}")));
     let project_root = discover_project_root(env_path)

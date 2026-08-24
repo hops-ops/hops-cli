@@ -168,6 +168,24 @@ pub fn prepare_cluster(
     file: Option<&Path>,
     overrides: ClusterOverrides<'_>,
 ) -> Result<(LoadedDefinition, Backend), Box<dyn Error>> {
+    prepare_cluster_with_mount_validation(file, overrides, true)
+}
+
+/// Validate and activate a Cluster for teardown without requiring its current
+/// node mount to match the definition. A moved checkout must not make the
+/// declared cluster impossible to stop.
+pub fn prepare_cluster_for_stop(
+    file: Option<&Path>,
+    overrides: ClusterOverrides<'_>,
+) -> Result<(LoadedDefinition, Backend), Box<dyn Error>> {
+    prepare_cluster_with_mount_validation(file, overrides, false)
+}
+
+fn prepare_cluster_with_mount_validation(
+    file: Option<&Path>,
+    overrides: ClusterOverrides<'_>,
+    validate_existing_mount: bool,
+) -> Result<(LoadedDefinition, Backend), Box<dyn Error>> {
     let cwd = std::env::current_dir()?;
     let source = definition_path(file, &cwd);
 
@@ -191,7 +209,7 @@ pub fn prepare_cluster(
         && backend::kind::cluster_exists();
     if definition.cluster.cluster_provider == ClusterProvider::Kind {
         backend::kind::set_extra_mount_root(&definition.cluster.mount_root);
-        if existing_kind {
+        if existing_kind && validate_existing_mount {
             backend::kind::ensure_configured_mount_root(&definition.cluster.mount_root)?;
         }
     }
