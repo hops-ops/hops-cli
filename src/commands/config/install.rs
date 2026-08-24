@@ -1,11 +1,11 @@
+use crate::commands::config::configuration_name_from_package_ref;
 use crate::commands::local::backend::{self, Backend, ClusterProvider, DockerProvider};
 use crate::commands::local::package_install::run_watch;
 use crate::commands::local::package_install::{
     docker_arch, ensure_cached_repo_checkout, ensure_registry, image_config_name,
     parse_docker_push_digest, parse_repo_spec, registry_pull, registry_push,
-    resolve_repo_install_target, rewrite_registry, rewrite_registry_with_tag,
-    sanitize_name_component, short_hash, split_ref, strip_registry, unique_suffix,
-    RepoInstallTarget, RepoSpec,
+    resolve_repo_install_target, rewrite_registry, rewrite_registry_with_tag, short_hash,
+    split_ref, strip_registry, unique_suffix, RepoInstallTarget, RepoSpec,
 };
 use crate::commands::local::{kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output};
 use clap::Args;
@@ -210,11 +210,7 @@ fn apply_repo_version_spec(
     }
 
     let package_ref = format!("ghcr.io/{}/{}:{}", spec.org, spec.repo, version);
-    let config_name = format!(
-        "{}-{}",
-        sanitize_name_component(&spec.org),
-        sanitize_name_component(&spec.repo)
-    );
+    let config_name = configuration_name_from_package_ref(&package_ref);
 
     // Delete any existing render Function so Crossplane re-resolves with the
     // correct digest for this version (avoids conflicts when switching between
@@ -411,7 +407,7 @@ spec:
         );
         let mut source_to_push = img.source.clone();
         let package_yaml = extract_package_yaml_from_uppkg(&img.uppkg_path, &img.source)?;
-        let configuration_name = configuration_name_from_pull_ref(&pull_ref);
+        let configuration_name = configuration_name_from_package_ref(&pull_ref);
         configurations.push((configuration_name, pull_ref.clone()));
         let (patched_yaml, changed) =
             rewrite_render_dependency_digests(&package_yaml, &render_rewrites);
@@ -620,18 +616,6 @@ spec:
 
 fn is_configuration_image(image: &str) -> bool {
     split_ref(image).1 == "configuration"
-}
-
-/// Use the OCI package identity for the Configuration object in every install
-/// mode. This keeps source, published, and GitOps installs on the same
-/// `<org>-<package>` name even when the package's internal metadata is shorter.
-fn configuration_name_from_pull_ref(pull_ref: &str) -> String {
-    let (image_path, _) = split_ref(pull_ref);
-    strip_registry(image_path)
-        .split('/')
-        .map(sanitize_name_component)
-        .collect::<Vec<_>>()
-        .join("-")
 }
 
 fn extract_package_yaml_from_uppkg(
@@ -1125,7 +1109,7 @@ spec:
     #[test]
     fn source_install_uses_registry_package_identity() {
         assert_eq!(
-            configuration_name_from_pull_ref(
+            configuration_name_from_package_ref(
                 "registry.crossplane-system.svc.cluster.local:5000/hops-ops/secret-stack:dev-abc"
             ),
             "hops-ops-secret-stack"
@@ -1135,7 +1119,7 @@ spec:
     #[test]
     fn source_install_name_sanitizes_registry_path_components() {
         assert_eq!(
-            configuration_name_from_pull_ref(
+            configuration_name_from_package_ref(
                 "registry.crossplane-system.svc.cluster.local:5000/Hops_Ops/Secret.Stack:dev-abc"
             ),
             "hops-ops-secret-stack"

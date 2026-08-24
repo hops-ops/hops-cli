@@ -642,7 +642,7 @@ Notes:
 - `config install --repo ...` now prompts in interactive terminals to choose between cloning/building from source or applying a published package version. Published-version prompts suggest the latest discovered tag by default and still accept arbitrary tags such as `pr-<gitsha>`.
 - Non-interactive `config install --repo ...` keeps the previous default behavior and builds from source.
 - `config install --repo ... --version ...` skips clone/build and applies the remote package directly.
-- `config uninstall --repo ...` derives the configuration name as `<org>-<package>`.
+- `config uninstall --repo ...` uses the cached `_output/*.uppkg` package identity when available. Without cached artifacts, it assumes the published OCI package is `ghcr.io/<org>/<repo>`.
 
 ## Commands
 
@@ -694,8 +694,9 @@ Notes:
   - Prunes orphaned `Configuration`/`Function`/`Provider` packages and revisions no longer present in lock
   - Prunes orphaned `ImageConfig` rewrites for removed render functions
 - `config uninstall --repo <org/repo>`
-  - Targets configuration name `<org>-<package>`
-  - If cached repo exists at `~/.hops/local/repo-cache/<org>/<repo>`, derives source hints from it for additional package pruning
+  - Uses package identity from cached `_output/*.uppkg` artifacts when available, so the repository and packaged OCI names may differ
+  - Without cached artifacts, assumes the published OCI package is `ghcr.io/<org>/<repo>`
+  - If cached repo exists at `~/.hops/local/repo-cache/<org>/<repo>`, also derives source hints from it for additional package pruning
 - `config uninstall --path <PATH>`
   - Derives target configuration names from `<PATH>/_output/*.uppkg` image tags
   - Also derives package sources from those artifacts and prunes matching package resources (including Functions) if they remain

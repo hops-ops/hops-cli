@@ -1,3 +1,4 @@
+use super::configuration_name_from_package_ref;
 use crate::commands::local::{repo_cache_path, run_cmd, run_cmd_output};
 use clap::Args;
 use serde::Deserialize;
@@ -16,7 +17,7 @@ pub struct UnconfigArgs {
     #[arg(long, conflicts_with_all = ["repo", "path"])]
     pub name: Option<String>,
 
-    /// GitHub repository in <org>/<repo> format (derives name as <org>-<package>)
+    /// GitHub repository in <org>/<repo> format (uses cached package identity when available)
     #[arg(long, conflicts_with_all = ["name", "path"])]
     pub repo: Option<String>,
 
@@ -173,12 +174,12 @@ fn resolve_configuration_names(args: &UnconfigArgs) -> Result<Vec<String>, Box<d
 
     if let Some(repo) = args.repo.as_deref() {
         let spec = parse_repo_spec(repo)?;
-        let name = format!(
-            "{}-{}",
-            sanitize_name_component(&spec.org),
-            sanitize_name_component(&spec.repo)
-        );
-        return Ok(vec![name]);
+        let cache_path = repo_cache_path(&spec.org, &spec.repo)?;
+        if cache_path.join("_output").is_dir() {
+            return resolve_names_from_path(&cache_path.to_string_lossy());
+        }
+        let package_ref = format!("ghcr.io/{}/{}:configuration", spec.org, spec.repo);
+        return Ok(vec![configuration_name_from_package_ref(&package_ref)]);
     }
 
     if let Some(path) = args.path.as_deref() {
@@ -500,25 +501,6 @@ fn parse_repo_spec(repo: &str) -> Result<RepoSpec, Box<dyn Error>> {
     })
 }
 
-fn sanitize_name_component(input: &str) -> String {
-    let mut out = input
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>();
-
-    while out.contains("--") {
-        out = out.replace("--", "-");
-    }
-
-    out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        "xrd".to_string()
-    } else {
-        out
-    }
-}
-
 fn resolve_names_from_path(path: &str) -> Result<Vec<String>, Box<dyn Error>> {
     let dir = Path::new(path);
     if !dir.is_dir() {
@@ -579,7 +561,11 @@ fn resolve_sources_from_path(path: &str) -> Result<HashSet<String>, Box<dyn Erro
 
 fn names_from_uppkg_manifest(uppkg_path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     let manifest_bytes = read_entry_from_tar(uppkg_path, "manifest.json")?;
-    let entries: Vec<DockerSaveManifestEntry> = serde_json::from_slice(&manifest_bytes)?;
+    names_from_docker_manifest(&manifest_bytes)
+}
+
+fn names_from_docker_manifest(manifest_bytes: &[u8]) -> Result<Vec<String>, Box<dyn Error>> {
+    let entries: Vec<DockerSaveManifestEntry> = serde_json::from_slice(manifest_bytes)?;
 
     let mut names = HashSet::new();
     for entry in entries {
@@ -587,12 +573,12 @@ fn names_from_uppkg_manifest(uppkg_path: &Path) -> Result<Vec<String>, Box<dyn E
             continue;
         };
         for tag in tags {
-            let Some(path) = tag.strip_suffix(":configuration") else {
+            if !tag.ends_with(":configuration") {
                 continue;
-            };
-            let name = path.rsplit('/').next().unwrap_or(path).trim();
+            }
+            let name = configuration_name_from_package_ref(&tag);
             if !name.is_empty() {
-                names.insert(name.to_string());
+                names.insert(name);
             }
         }
     }
@@ -677,9 +663,17 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_name_component_normalizes_name() {
-        assert_eq!(sanitize_name_component("Hops_Ops"), "hops-ops");
-        assert_eq!(sanitize_name_component("aws.auto.eks"), "aws-auto-eks");
-        assert_eq!(sanitize_name_component("---"), "xrd");
+    fn package_manifest_name_does_not_assume_source_repo_name() {
+        let source_repo = parse_repo_spec("hops-ops/aws-auto-eks-cluster").unwrap();
+        let repo_fallback = configuration_name_from_package_ref(&format!(
+            "ghcr.io/{}/{}:configuration",
+            source_repo.org, source_repo.repo
+        ));
+        let manifest = br#"[{"RepoTags":["ghcr.io/hops-ops/secret-stack:configuration"]}]"#;
+        let package_names = names_from_docker_manifest(manifest).unwrap();
+
+        assert_eq!(repo_fallback, "hops-ops-aws-auto-eks-cluster");
+        assert_eq!(package_names, vec!["hops-ops-secret-stack"]);
+        assert_ne!(package_names[0], repo_fallback);
     }
 }

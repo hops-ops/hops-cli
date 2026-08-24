@@ -186,6 +186,11 @@ hops config uninstall --repo hops-ops/aws-auto-eks-cluster
 hops config uninstall --path /path/to/project
 ```
 
+`--repo` uses the package identity in cached `_output/*.uppkg` artifacts when
+available. This supports source repositories whose packaged OCI name differs from
+the repository name. Without cached artifacts, it assumes the published package
+is `ghcr.io/<org>/<repo>`. `--path` always derives names from its build artifacts.
+
 Uninstall waits for lock reconciliation and prunes orphaned packages (Configurations,
 Functions, Providers) and ImageConfig rewrites.
 
