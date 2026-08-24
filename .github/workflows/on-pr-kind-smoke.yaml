@@ -83,7 +83,7 @@ jobs:
           FIXTURE=tests/fixtures/config-smoke
           test -d "$FIXTURE"
           test -f "$FIXTURE/upbound.yaml"
-          CONFIGURATION=config-smoke
+          CONFIGURATION=hops-ops-config-smoke
 
           ./target/debug/hops-cli config install --path "$FIXTURE" --cluster-provider kind --docker-provider docker
 
