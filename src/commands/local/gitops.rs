@@ -8,15 +8,17 @@
 //! Both **watch by default**; pass `--once` for a single reconcile (CI/scripts).
 
 use super::local_state_dir;
-use super::workbench::application::{
-    load_applications, resolve_delivery_host_path, Application, ApplicationMetadata,
-    ApplicationSpec, Destination, HelmSource, Source, SyncPolicy, APPLICATION_API_VERSION,
-    APPLICATION_KIND,
+use super::workbench::application::{load_applications, resolve_delivery_host_path};
+use super::workbench::cluster_gitops::{
+    reconcile_cluster_dir_with_inventory, should_reconcile_cluster_change,
 };
-use super::workbench::cluster_gitops::{reconcile_cluster_dir, should_reconcile_cluster_change};
+use super::workbench::controller::{
+    acquire_controller, controller_lock_path, down_environment, list_environment_snapshots,
+    reconcile_environment, release_controller_for_down, save_environment_snapshot,
+};
 use super::workbench::definition::{
-    load_definition, load_environment_definition, prepare_cluster, prepare_cluster_for_stop,
-    ClusterOverrides, DeployDefinition, DEFAULT_DEPLOY_CHART_PATH,
+    load_environment_definition, prepare_cluster, prepare_cluster_for_stop, ClusterOverrides,
+    DeployDefinition, DEFAULT_DEPLOY_CHART_PATH,
 };
 use super::workbench::delivery::{
     attach_sync_delivery, discover_sync_targets, save_delivery_runtime, stop_delivery_runtime,
@@ -35,7 +37,7 @@ use super::workbench::{namespace_for_name, slugify_name};
 use clap::{Args, Subcommand};
 use notify::{RecursiveMode, Watcher};
 use serde::Deserialize;
-use serde_yaml::{Mapping, Value};
+use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
@@ -147,6 +149,8 @@ pub fn run_cluster(
     };
 
     if args.down {
+        release_controller_for_down(&definition.cluster.name, &definition.source)?;
+        stop_cluster_environment_runtime(&definition.cluster.name)?;
         if definition.cluster.cluster_provider == super::backend::ClusterProvider::Kind
             && !super::backend::kind::cluster_exists()
         {
@@ -157,31 +161,94 @@ pub fn run_cluster(
         return Ok(());
     }
 
+    let cluster = definition.cluster.manifests_path.clone();
+    let inventory = local_state_dir()?
+        .join("clusters")
+        .join(slugify_name(&definition.cluster.name))
+        .join("cluster-inventory.json");
+
     if args.dry_run {
         log::info!(
             "Dry-run uses the declared Cluster '{}' without changing its lifecycle",
             definition.cluster.name
         );
     } else {
-        super::start::run(
+        let context = super::kube_context_from_env()
+            .unwrap_or_else(|| format!("kind-{}", definition.cluster.name));
+        let controller = acquire_controller(
+            &definition.cluster.name,
+            &definition.source,
+            &context,
+            false,
+        )?;
+        if controller.reused {
+            log::info!(
+                "Cluster '{}' is already reconciled by controller pid {}; reusing that owner",
+                definition.cluster.name,
+                controller.lease.pid
+            );
+            return Ok(());
+        }
+        super::start::run_gitops_seed(
             backend,
             &super::start::StartArgs {
                 size: super::backend::SizeArgs::default(),
                 yes: false,
                 bootstrap: false,
             },
+            &definition.cluster.control_plane.crossplane.chart,
+            &definition.cluster.control_plane.crossplane.version,
+            &definition.cluster.control_plane.crossplane.values,
         )?;
+
+        // Keep the lease alive through the foreground watcher. The guard is
+        // intentionally scoped to this command so Ctrl-C releases only this
+        // controller's lock; the Kubernetes inventory remains last-known-good.
+        let _controller = controller;
+        return run_cluster_reconcile_loop(
+            args,
+            definition,
+            cluster,
+            inventory,
+            false,
+            _controller,
+        );
     }
 
-    let cluster = definition.cluster.manifests_path;
+    unreachable!("non-dry-run Cluster path returns after seed")
+}
 
-    let dry_run = args.dry_run;
+fn stop_cluster_environment_runtime(cluster_name: &str) -> Result<(), Box<dyn Error>> {
+    let state_dir = local_state_dir()?;
+    for snapshot in list_environment_snapshots(cluster_name)? {
+        if let Err(error) = super::workbench::net::stop_host_access(&state_dir, &snapshot.name) {
+            log::warn!(
+                "Cluster {} Environment {} host-access cleanup: {}",
+                cluster_name,
+                snapshot.name,
+                error
+            );
+        }
+        stop_delivery_runtime(&state_dir, &snapshot.name);
+    }
+    Ok(())
+}
+
+fn run_cluster_reconcile_loop(
+    args: &ClusterArgs,
+    definition: super::workbench::definition::LoadedDefinition,
+    cluster: PathBuf,
+    inventory: PathBuf,
+    dry_run: bool,
+    _controller: super::workbench::controller::ControllerHandle,
+) -> Result<(), Box<dyn Error>> {
     let do_once = || -> Result<(), Box<dyn Error>> {
         log::info!("cluster gitops → local CP: {}", cluster.display());
-        let r = reconcile_cluster_dir(&cluster, dry_run)?;
+        let r = reconcile_cluster_dir_with_inventory(&cluster, &inventory, dry_run)?;
         log::info!(
-            "cluster gitops: {} applied, {} error(s)",
+            "cluster gitops: {} applied, {} pruned, {} error(s)",
             r.applied.len(),
+            r.pruned.len(),
             r.errors.len()
         );
         if !r.errors.is_empty() && r.applied.is_empty() {
@@ -192,6 +259,7 @@ pub fn run_cluster(
             )
             .into());
         }
+        reconcile_cluster_environments_with_retry(&definition, dry_run)?;
         Ok(())
     };
 
@@ -200,7 +268,222 @@ pub fn run_cluster(
         return Ok(());
     }
 
-    run_cluster_watch(&cluster, args.debounce, do_once)
+    run_cluster_watch(
+        &cluster,
+        &definition.cluster.mount_root,
+        args.debounce,
+        do_once,
+    )
+}
+
+fn reconcile_cluster_environments(
+    definition: &super::workbench::definition::LoadedDefinition,
+    dry_run: bool,
+) -> Result<(), Box<dyn Error>> {
+    let environment_files = discover_environment_definitions(&definition.cluster.mount_root)?;
+    let kube_context = super::kube_context_from_env()
+        .unwrap_or_else(|| format!("kind-{}", definition.cluster.name));
+    let mut errors = Vec::new();
+    let mut loaded_environments = Vec::new();
+    let mut names = BTreeSet::new();
+    for environment_file in environment_files {
+        let loaded = match load_environment_definition(&environment_file, definition, None, None) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                errors.push(format!("{}: {error}", environment_file.display()));
+                continue;
+            }
+        };
+        if !names.insert(loaded.environment.name.clone()) {
+            errors.push(format!(
+                "{}: duplicate Environment runtime name {:?}",
+                environment_file.display(),
+                loaded.environment.name
+            ));
+            continue;
+        }
+        loaded_environments.push(loaded);
+    }
+    if !errors.is_empty() {
+        return Err(format!(
+            "controller Environment validation failed for {} source(s):\n  - {}",
+            errors.len(),
+            errors.join("\n  - ")
+        )
+        .into());
+    }
+    for loaded in &loaded_environments {
+        let mut hosts = BTreeMap::new();
+        for deploy in &loaded.environment.deploys {
+            hosts.insert(
+                local_application_name(deploy),
+                definition.cluster.mount_root.clone(),
+            );
+        }
+        let (delivery_strategy, detail) = match resolve_worktree_delivery(&hosts, &SystemNodeProber)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                errors.push(format!(
+                    "{}: source delivery: {error}",
+                    loaded.source.display()
+                ));
+                continue;
+            }
+        };
+        log::info!(
+            "controller Environment {}: source delivery {} ({})",
+            loaded.environment.name,
+            delivery_strategy.as_str(),
+            detail
+        );
+        let opts = ReconcileOptions {
+            namespace: loaded.environment.namespace.clone(),
+            workspace_name: loaded.environment.name.clone(),
+            runtime_values: BTreeMap::new(),
+            app_delivery_host_paths: hosts,
+            delivery_mode: Some(delivery_strategy.as_str().into()),
+            dry_run,
+        };
+        match reconcile_environment(loaded, &opts, &SystemHelm, &SystemKubectl) {
+            Ok(results) => {
+                if !dry_run {
+                    if let Err(error) = save_environment_snapshot(
+                        &definition.cluster.name,
+                        &kube_context,
+                        &loaded,
+                        &results,
+                    ) {
+                        errors.push(format!(
+                            "{}: save ownership: {error}",
+                            loaded.source.display()
+                        ));
+                        continue;
+                    }
+                    if let Err(error) = persist_environment_registration(
+                        &loaded.environment.name,
+                        &loaded.source,
+                        &loaded.environment.root,
+                        &definition.cluster.name,
+                        &kube_context,
+                    ) {
+                        errors.push(format!(
+                            "{}: save registration: {error}",
+                            loaded.source.display()
+                        ));
+                    }
+                }
+            }
+            Err(error) => errors.push(format!("{}: {error}", loaded.source.display())),
+        }
+    }
+    if errors.is_empty() {
+        let active_names = loaded_environments
+            .iter()
+            .map(|loaded| loaded.environment.name.clone())
+            .collect::<BTreeSet<_>>();
+        for snapshot in list_environment_snapshots(&definition.cluster.name)? {
+            if active_names.contains(&snapshot.name) {
+                continue;
+            }
+            if dry_run {
+                log::info!(
+                    "dry-run would prune removed Environment {} from Cluster {}",
+                    snapshot.name,
+                    definition.cluster.name
+                );
+            } else if let Err(error) = down_environment(&definition.cluster.name, &snapshot.name) {
+                errors.push(format!("removed Environment {}: {error}", snapshot.name));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "controller Environment reconcile failed for {} source(s):\n  - {}",
+            errors.len(),
+            errors.join("\n  - ")
+        )
+        .into())
+    }
+}
+
+fn reconcile_cluster_environments_with_retry(
+    definition: &super::workbench::definition::LoadedDefinition,
+    dry_run: bool,
+) -> Result<(), Box<dyn Error>> {
+    const ATTEMPTS: usize = 6;
+    let mut last_error = None;
+    for attempt in 0..ATTEMPTS {
+        match reconcile_cluster_environments(definition, dry_run) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt + 1 < ATTEMPTS {
+                    let seconds = 1_u64 << attempt.min(3);
+                    log::warn!(
+                        "Environment reconcile is not ready yet; retrying in {}s ({}/{})",
+                        seconds,
+                        attempt + 1,
+                        ATTEMPTS
+                    );
+                    std::thread::sleep(Duration::from_secs(seconds));
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "Environment reconcile failed".into()))
+}
+
+fn discover_environment_definitions(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let mut found = Vec::new();
+    discover_environment_definitions_rec(root, &mut found)?;
+    found.sort();
+    found.dedup();
+    Ok(found)
+}
+
+fn discover_environment_definitions_rec(
+    directory: &Path,
+    found: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if path.is_dir() {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
+            if matches!(name, ".git" | "node_modules" | "target" | "dist" | "build") {
+                continue;
+            }
+            discover_environment_definitions_rec(&path, found)?;
+        } else if path.file_name().and_then(|value| value.to_str()) == Some("environment.yaml")
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str())
+                == Some("local")
+            && path
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str())
+                == Some(".gitops")
+        {
+            found.push(path.canonicalize()?);
+        }
+    }
+    Ok(())
 }
 
 // ── environment ──────────────────────────────────────────────────────────────
@@ -210,10 +493,22 @@ fn run_environment(
     overrides: ClusterOverrides<'_>,
 ) -> Result<(), Box<dyn Error>> {
     if args.down {
-        return super::down::run(&super::down::DownArgs {
-            name: args.name.clone(),
-            purge: true,
-        });
+        let name = args
+            .name
+            .as_deref()
+            .ok_or("gitops environment --down requires --name")?;
+        let state_dir = local_state_dir()?;
+        let record = load_workspace(&state_dir, name)?
+            .ok_or_else(|| format!("Environment {name:?} has no durable registration"))?;
+        let cluster_name = record
+            .cluster_name
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("Environment {name:?} has no bound Cluster"))?;
+        if !down_environment(cluster_name, name)? {
+            log::info!("Environment {name:?} is already down; no ownership snapshot exists");
+        }
+        return Ok(());
     }
 
     let path = args
@@ -262,36 +557,34 @@ fn run_environment_definition(
             cluster_path.display()
         )
     })?;
-    let declared_cluster = (cluster.cluster.name.as_str(), kube_context.as_str());
-    let generated = if args.dry_run {
-        std::env::temp_dir().join(format!(
-            "hops-local-environment-{}-{workspace_name}",
-            std::process::id()
-        ))
-    } else {
-        local_state_dir()?.join("generated").join(&workspace_name)
+    let deploys = loaded.environment.deploys.clone();
+    let mut app_delivery_host_paths = BTreeMap::new();
+    for deploy in &deploys {
+        app_delivery_host_paths.insert(
+            local_application_name(deploy),
+            cluster.cluster.mount_root.clone(),
+        );
+    }
+    let (delivery_strategy, delivery_detail) =
+        resolve_worktree_delivery(&app_delivery_host_paths, &SystemNodeProber)?;
+    log::info!(
+        "environment gitops: source delivery {} ({})",
+        delivery_strategy.as_str(),
+        delivery_detail
+    );
+    let opts = ReconcileOptions {
+        namespace: namespace.clone(),
+        workspace_name: workspace_name.clone(),
+        runtime_values: BTreeMap::new(),
+        app_delivery_host_paths,
+        delivery_mode: Some(delivery_strategy.as_str().into()),
+        dry_run: args.dry_run,
     };
 
     let reconcile = || -> Result<(), Box<dyn Error>> {
-        render_environment_applications(
-            &source,
-            &cluster_path,
-            &generated,
-            &workspace_name,
-            &namespace,
-        )?;
-        let legacy = EnvironmentArgs {
-            path: Some(generated.clone()),
-            down: false,
-            namespace: Some(namespace.clone()),
-            name: Some(workspace_name.clone()),
-            once: true,
-            watch: false,
-            debounce: args.debounce,
-            dry_run: args.dry_run,
-        };
-        run_application_worktree(&legacy, &generated, Some(declared_cluster))?;
+        let results = reconcile_environment(&loaded, &opts, &SystemHelm, &SystemKubectl)?;
         if !args.dry_run {
+            save_environment_snapshot(&cluster.cluster.name, &kube_context, &loaded, &results)?;
             persist_environment_registration(
                 &workspace_name,
                 &source,
@@ -305,9 +598,14 @@ fn run_environment_definition(
 
     reconcile()?;
     if args.once || args.dry_run {
-        if args.dry_run {
-            let _ = fs::remove_dir_all(&generated);
-        }
+        return Ok(());
+    }
+
+    if controller_lock_path(&cluster.cluster.name)?.is_file() {
+        log::info!(
+            "Cluster controller owns Environment watch for {}; reconcile completed without starting a second watcher",
+            workspace_name
+        );
         return Ok(());
     }
 
@@ -341,105 +639,6 @@ fn discover_cluster_definition(environment_file: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn render_environment_applications(
-    environment_file: &Path,
-    cluster_file: &Path,
-    generated: &Path,
-    workspace_name: &str,
-    namespace: &str,
-) -> Result<(), Box<dyn Error>> {
-    render_environment_applications_with(
-        environment_file,
-        cluster_file,
-        generated,
-        workspace_name,
-        namespace,
-    )
-}
-
-fn render_environment_applications_with(
-    environment_file: &Path,
-    cluster_file: &Path,
-    generated: &Path,
-    workspace_name: &str,
-    namespace: &str,
-) -> Result<(), Box<dyn Error>> {
-    let cluster = load_definition(cluster_file)?;
-    let loaded = load_environment_definition(
-        environment_file,
-        &cluster,
-        Some(workspace_name),
-        Some(namespace),
-    )?;
-    fs::create_dir_all(generated)?;
-    for entry in fs::read_dir(generated)? {
-        let path = entry?.path();
-        if path.is_file()
-            && matches!(
-                path.extension().and_then(|value| value.to_str()),
-                Some("yaml" | "yml")
-            )
-        {
-            fs::remove_file(path)?;
-        }
-    }
-
-    let mut rendered_apps = BTreeMap::<String, Application>::new();
-    for deploy in &loaded.environment.deploys {
-        let mut values = loaded.environment.values.clone();
-        merge_mapping(&mut values, &deploy.values);
-        values.insert(Value::String("local".into()), Value::Bool(true));
-        values.insert(
-            Value::String("environment".into()),
-            string_mapping(&[
-                ("name", &loaded.environment.name),
-                ("namespace", &loaded.environment.namespace),
-            ]),
-        );
-        values.insert(
-            Value::String("source".into()),
-            string_mapping(&[("localPath", &deploy.application_root.to_string_lossy())]),
-        );
-        let name = local_application_name(deploy);
-        let application = Application {
-            api_version: APPLICATION_API_VERSION.to_string(),
-            kind: APPLICATION_KIND.to_string(),
-            metadata: ApplicationMetadata {
-                name: name.clone(),
-                labels: None,
-            },
-            spec: ApplicationSpec {
-                source: Source {
-                    path: deploy.chart_path.to_string_lossy().into_owned(),
-                    delivery_path: Some(cluster.cluster.mount_root.to_string_lossy().into_owned()),
-                    helm: HelmSource {
-                        values: Some(Value::Mapping(values)),
-                    },
-                },
-                destination: Destination {
-                    namespace: Some(loaded.environment.namespace.clone()),
-                },
-                sync_policy: SyncPolicy { prune: true },
-            },
-        };
-        if rendered_apps.insert(name.clone(), application).is_some() {
-            return Err(format!("duplicate local Application name {name:?}").into());
-        }
-    }
-    if rendered_apps.is_empty() {
-        return Err(format!(
-            "Environment {} produced no local Applications",
-            loaded.environment.name
-        )
-        .into());
-    }
-    for (name, application) in rendered_apps {
-        let path = generated.join(format!("{}.yaml", sanitize_name(&name)));
-        fs::write(path, serde_yaml::to_string(&application)?)?;
-    }
-    Ok(())
-}
-
 fn local_application_name(deploy: &DeployDefinition) -> String {
     let application = deploy
         .application_root
@@ -465,7 +664,8 @@ fn local_application_name(deploy: &DeployDefinition) -> String {
     }
 }
 
-fn merge_mapping(base: &mut Mapping, overlay: &Mapping) {
+#[cfg(test)]
+fn merge_mapping(base: &mut serde_yaml::Mapping, overlay: &serde_yaml::Mapping) {
     for (key, value) in overlay {
         match (base.get_mut(key), value) {
             (Some(Value::Mapping(base_map)), Value::Mapping(overlay_map)) => {
@@ -478,8 +678,9 @@ fn merge_mapping(base: &mut Mapping, overlay: &Mapping) {
     }
 }
 
+#[cfg(test)]
 fn string_mapping(values: &[(&str, &str)]) -> Value {
-    let mut mapping = Mapping::new();
+    let mut mapping = serde_yaml::Mapping::new();
     for (key, value) in values {
         mapping.insert(
             Value::String((*key).to_string()),
@@ -582,10 +783,19 @@ where
                 environment_file.display(),
                 workspace_name
             );
-            return super::down::run(&super::down::DownArgs {
-                name: Some(workspace_name.to_string()),
-                purge: true,
-            });
+            let state_dir = local_state_dir()?;
+            let record = load_workspace(&state_dir, workspace_name)?;
+            let cluster_name = record
+                .as_ref()
+                .and_then(|record| record.cluster_name.as_deref())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("Environment {workspace_name:?} has no bound Cluster"))?;
+            if !down_environment(cluster_name, workspace_name)? {
+                log::info!(
+                    "Environment {workspace_name:?} has no ownership snapshot; leaving resources untouched"
+                );
+            }
+            return Ok(());
         }
         match rebuild() {
             Ok(()) => log::info!("Environment reconcile succeeded."),
@@ -890,6 +1100,7 @@ where
 
 fn run_cluster_watch<F>(
     cluster: &Path,
+    project_root: &Path,
     debounce_secs: u64,
     mut rebuild: F,
 ) -> Result<(), Box<dyn Error>>
@@ -899,6 +1110,7 @@ where
     let debounce = Duration::from_secs(debounce_secs);
     let (tx, rx) = mpsc::channel();
     let cluster_c = cluster.to_path_buf();
+    let project_root_c = project_root.to_path_buf();
 
     let mut watcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
@@ -907,7 +1119,9 @@ where
                     if should_ignore_watch_path(p) {
                         continue;
                     }
-                    if should_reconcile_cluster_change(p, &cluster_c) {
+                    if should_reconcile_cluster_change(p, &cluster_c)
+                        || is_controller_owned_path(p, &project_root_c)
+                    {
                         let _ = tx.send(());
                         break;
                     }
@@ -917,8 +1131,11 @@ where
         })?;
 
     watcher.watch(cluster, RecursiveMode::Recursive)?;
+    if project_root != cluster && project_root.is_dir() {
+        watcher.watch(project_root, RecursiveMode::Recursive)?;
+    }
     log::info!(
-        "Watching cluster gitops {} (debounce {}s). Crossplane reconciles XRs after apply. Ctrl+C to stop.",
+        "Watching Cluster tree {} and project Environment/local chart paths (debounce {}s). Ctrl+C to stop.",
         cluster.display(),
         debounce_secs
     );
@@ -933,6 +1150,26 @@ where
             Err(e) => log::error!("Cluster reconcile failed: {e}"),
         }
     }
+}
+
+fn is_controller_owned_path(path: &Path, project_root: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(project_root) else {
+        return false;
+    };
+    let components = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    let Some(gitops) = components
+        .iter()
+        .position(|component| *component == ".gitops")
+    else {
+        return false;
+    };
+    let Some(scope) = components.get(gitops + 1) else {
+        return false;
+    };
+    matches!(*scope, "local" | "test-users" | "promote")
 }
 
 fn wait_for_quiet(rx: &mpsc::Receiver<()>, debounce: Duration) -> Result<(), Box<dyn Error>> {
@@ -954,6 +1191,7 @@ fn wait_for_quiet(rx: &mpsc::Receiver<()>, debounce: Duration) -> Result<(), Box
 
 #[cfg(test)]
 mod tests {
+    use super::super::workbench::definition::load_definition;
     use super::*;
     use std::fs;
 
@@ -1039,28 +1277,25 @@ spec:
         )
         .unwrap();
 
-        let generated = root.join("generated");
-        render_environment_applications_with(
+        let cluster = load_definition(&root.join(".gitops/local/cluster.yaml")).unwrap();
+        let loaded = load_environment_definition(
             &root.join(".gitops/local/environment.yaml"),
-            &root.join(".gitops/local/cluster.yaml"),
-            &generated,
-            "feature-auth",
-            "feature-auth-ns",
+            &cluster,
+            Some("feature-auth"),
+            Some("feature-auth-ns"),
         )
         .unwrap();
-
-        let applications = load_applications(&generated).unwrap();
-        assert_eq!(applications.len(), 1);
-        let application = &applications[0].1;
-        let values = application
-            .spec
-            .source
-            .helm
-            .values
-            .as_ref()
-            .unwrap()
-            .as_mapping()
-            .unwrap();
+        let deploy = &loaded.environment.deploys[0];
+        let mut values = loaded.environment.values.clone();
+        merge_mapping(&mut values, &deploy.values);
+        values.insert(Value::String("local".into()), Value::Bool(true));
+        values.insert(
+            Value::String("environment".into()),
+            string_mapping(&[
+                ("name", &loaded.environment.name),
+                ("namespace", &loaded.environment.namespace),
+            ]),
+        );
         assert_eq!(values["local"], Value::Bool(true));
         assert_eq!(values["preview"], Value::Bool(false));
         assert_eq!(values["feature"]["enabled"], Value::Bool(true));
@@ -1073,24 +1308,8 @@ spec:
             values["environment"]["namespace"],
             Value::String("feature-auth-ns".into())
         );
-
-        assert_eq!(application.metadata.name, "gateway");
-        assert_eq!(
-            application.spec.destination.namespace.as_deref(),
-            Some("feature-auth-ns")
-        );
-        let expected_delivery_path = root.to_string_lossy().into_owned();
-        assert_eq!(
-            application.spec.source.delivery_path.as_deref(),
-            Some(expected_delivery_path.as_str())
-        );
-        assert_eq!(
-            application.spec.source.path,
-            root.join("apps/gateway/.gitops/local")
-                .to_string_lossy()
-                .into_owned()
-        );
-        assert!(application.spec.sync_policy.prune);
+        assert_eq!(local_application_name(deploy), "gateway");
+        assert_eq!(deploy.chart_path, root.join("apps/gateway/.gitops/local"));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1120,5 +1339,43 @@ spec:
             source,
             &chart_roots,
         ));
+    }
+
+    #[test]
+    fn controller_discovers_only_project_environment_definitions() {
+        let root = std::env::temp_dir().join(format!(
+            "hops-controller-discovery-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("app/.gitops/local")).unwrap();
+        fs::create_dir_all(root.join("app/.gitops/deploy")).unwrap();
+        fs::write(
+            root.join("app/.gitops/local/environment.yaml"),
+            "kind: Environment\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("app/.gitops/deploy/environment.yaml"),
+            "kind: Environment\n",
+        )
+        .unwrap();
+        let found = discover_environment_definitions(&root).unwrap();
+        assert_eq!(
+            found,
+            vec![root
+                .join("app/.gitops/local/environment.yaml")
+                .canonicalize()
+                .unwrap()]
+        );
+        assert!(is_controller_owned_path(
+            &root.join("app/.gitops/local/values.yaml"),
+            &root
+        ));
+        assert!(!is_controller_owned_path(
+            &root.join("app/.gitops/deploy/values.yaml"),
+            &root
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 }

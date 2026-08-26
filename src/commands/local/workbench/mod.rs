@@ -7,6 +7,7 @@
 pub mod application;
 pub mod cluster_dns;
 pub mod cluster_gitops;
+pub mod controller;
 pub mod definition;
 pub mod delivery;
 pub mod net;

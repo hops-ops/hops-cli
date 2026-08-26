@@ -1,7 +1,9 @@
 use super::backend::{self, SizeArgs};
 use super::{kubectl_apply_stdin, run_cmd, run_cmd_output, wait_for_kubernetes};
 use clap::Args;
+use serde_yaml::Mapping;
 use std::error::Error;
+use std::fs;
 use std::thread;
 use std::time::Duration;
 
@@ -16,6 +18,7 @@ const PC_K8S: &str = include_str!("../../../bootstrap/k8s/pc.yaml");
 
 const PROVIDER_K8S_NAME: &str = "crossplane-contrib-provider-kubernetes";
 const PROVIDER_HELM_NAME: &str = "crossplane-contrib-provider-helm";
+pub const DEFAULT_CROSSPLANE_VERSION: &str = "2.4.0";
 
 #[derive(Args, Debug, Clone)]
 pub struct StartArgs {
@@ -84,6 +87,94 @@ pub fn run(backend: backend::Backend, args: &StartArgs) -> Result<(), Box<dyn Er
 
     log::info!("Local environment is ready");
     Ok(())
+}
+
+/// Start the declared backend and install only the pinned Crossplane seed used
+/// by the GitOps controller. Providers, registry objects, ProviderConfigs, and
+/// all other Kubernetes resources remain file-owned by the Cluster tree.
+pub fn run_gitops_seed(
+    backend: backend::Backend,
+    args: &StartArgs,
+    chart: &str,
+    version: &str,
+    values: &Mapping,
+) -> Result<(), Box<dyn Error>> {
+    backend.start(&args.size, args.yes)?;
+    backend::persist(backend)?;
+    wait_for_kubernetes()?;
+    backend.ensure_registry_trust()?;
+    run_cmd(
+        "kubectl",
+        &[
+            "wait",
+            "--for=condition=Ready",
+            "nodes",
+            "--all",
+            "--timeout=300s",
+        ],
+    )?;
+    seed_crossplane(chart, version, values)
+}
+
+/// Idempotently install/upgrade the exact Crossplane chart selected by the
+/// Cluster definition and wait until its API/core deployment is usable.
+pub fn seed_crossplane(chart: &str, version: &str, values: &Mapping) -> Result<(), Box<dyn Error>> {
+    if chart.trim().is_empty() || version.trim().is_empty() {
+        return Err("Cluster controlPlane.crossplane requires a chart and version".into());
+    }
+    if chart == "crossplane-stable/crossplane" {
+        run_cmd(
+            "helm",
+            &[
+                "repo",
+                "add",
+                "crossplane-stable",
+                "https://charts.crossplane.io/stable",
+            ],
+        )?;
+        run_cmd("helm", &["repo", "update", "crossplane-stable"])?;
+    }
+
+    let values_file = if values.is_empty() {
+        None
+    } else {
+        let path = std::env::temp_dir().join(format!(
+            "hops-crossplane-values-{}-{}.yaml",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&path, serde_yaml::to_string(values)?)?;
+        Some(path)
+    };
+    let mut args = vec![
+        "upgrade".to_string(),
+        "--install".to_string(),
+        "crossplane".to_string(),
+        chart.to_string(),
+        "--version".to_string(),
+        version.to_string(),
+        "-n".to_string(),
+        "crossplane-system".to_string(),
+        "--create-namespace".to_string(),
+        "--timeout".to_string(),
+        "5m".to_string(),
+    ];
+    if let Some(path) = values_file.as_ref() {
+        args.extend(["-f".to_string(), path.to_string_lossy().into_owned()]);
+    }
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let result = run_cmd("helm", &refs);
+    if let Some(path) = values_file {
+        let _ = fs::remove_file(path);
+    }
+    result?;
+    wait_for_deployment_with_diagnostics("crossplane-system", "crossplane")?;
+    // The deployment can be Available before discovery serves Crossplane
+    // package/composition APIs.  Do not hand the Cluster tree to kubectl until
+    // the seed's API surface is established.
+    wait_for_crd("compositions.apiextensions.crossplane.io")?;
+    wait_for_crd("providers.pkg.crossplane.io")?;
+    wait_for_kubernetes()
 }
 
 /// True when Crossplane core, both default providers, and the package registry
@@ -300,6 +391,8 @@ fn crossplane_helm_args() -> Vec<&'static str> {
         "--install",
         "crossplane",
         "crossplane-stable/crossplane",
+        "--version",
+        DEFAULT_CROSSPLANE_VERSION,
         "-n",
         "crossplane-system",
         "--create-namespace",

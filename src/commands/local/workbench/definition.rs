@@ -18,6 +18,8 @@ pub const API_VERSION: &str = "hops.local/v1alpha1";
 pub const DEFAULT_DEFINITION_FILE: &str = ".gitops/local/cluster.yaml";
 pub const LEGACY_DEFINITION_FILE: &str = "cluster.yaml";
 pub const DEFAULT_ENVIRONMENT_FILE: &str = ".gitops/local/environment.yaml";
+pub const DEFAULT_CROSSPLANE_CHART: &str = "crossplane-stable/crossplane";
+pub const DEFAULT_CROSSPLANE_VERSION: &str = "2.4.0";
 pub const CLUSTER_MANIFESTS_PATH: &str = ".gitops/local/cluster";
 pub const LEGACY_CLUSTER_MANIFESTS_PATH: &str = ".gitops/cluster";
 pub const DEFAULT_DEPLOY_CHART_PATH: &str = ".gitops/local";
@@ -51,7 +53,20 @@ pub struct ClusterDefinition {
     pub docker_provider: DockerProvider,
     pub mount_root: PathBuf,
     pub manifests_path: PathBuf,
+    pub control_plane: ControlPlaneDefinition,
     pub secret_sync: Option<SecretSyncDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlPlaneDefinition {
+    pub crossplane: CrossplaneSeedDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrossplaneSeedDefinition {
+    pub chart: String,
+    pub version: String,
+    pub values: Mapping,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,7 +132,24 @@ struct ClusterSpec {
     mount_root: PathBuf,
     manifests: ManifestsSpec,
     #[serde(default)]
+    control_plane: Option<ControlPlaneSpec>,
+    #[serde(default)]
     secret_sync: Option<SecretSyncSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ControlPlaneSpec {
+    crossplane: CrossplaneSeedSpec,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CrossplaneSeedSpec {
+    chart: String,
+    version: String,
+    #[serde(default)]
+    values: Mapping,
 }
 
 #[derive(Debug, Deserialize)]
@@ -393,6 +425,23 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
             .map(|path| SecretSyncDefinition { path })
         })
         .transpose()?;
+    let control_plane = raw_cluster
+        .spec
+        .control_plane
+        .map(|control_plane| ControlPlaneDefinition {
+            crossplane: CrossplaneSeedDefinition {
+                chart: control_plane.crossplane.chart,
+                version: control_plane.crossplane.version,
+                values: control_plane.crossplane.values,
+            },
+        })
+        .unwrap_or_else(|| ControlPlaneDefinition {
+            crossplane: CrossplaneSeedDefinition {
+                chart: DEFAULT_CROSSPLANE_CHART.to_string(),
+                version: DEFAULT_CROSSPLANE_VERSION.to_string(),
+                values: Mapping::new(),
+            },
+        });
 
     Ok(LoadedDefinition {
         source,
@@ -402,6 +451,7 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
             docker_provider: raw_cluster.spec.docker_provider,
             mount_root,
             manifests_path,
+            control_plane,
             secret_sync,
         },
     })
@@ -891,6 +941,14 @@ spec:
         assert_eq!(loaded.cluster.name, "project-dev");
         assert_eq!(loaded.cluster.cluster_provider, ClusterProvider::Kind);
         assert_eq!(loaded.cluster.docker_provider, DockerProvider::Dory);
+        assert_eq!(
+            loaded.cluster.control_plane.crossplane.chart,
+            DEFAULT_CROSSPLANE_CHART
+        );
+        assert_eq!(
+            loaded.cluster.control_plane.crossplane.version,
+            DEFAULT_CROSSPLANE_VERSION
+        );
 
         let environment = load_environment_definition(
             &fixture.write_environment(valid_environment_yaml()),
@@ -905,6 +963,49 @@ spec:
         assert_eq!(
             environment.environment.deploys[0].chart_path,
             fixture.root.join("apps/gateway/.gitops/local")
+        );
+    }
+
+    #[test]
+    fn parses_pinned_crossplane_seed_values() {
+        let fixture = Fixture::new();
+        let source = fixture.write(
+            r#"apiVersion: hops.local/v1alpha1
+kind: Cluster
+metadata:
+  name: project-dev
+spec:
+  clusterProvider: kind
+  dockerProvider: dory
+  mountRoot: ../..
+  manifests:
+    path: .gitops/local/cluster
+  controlPlane:
+    crossplane:
+      chart: crossplane-stable/crossplane
+      version: "2.4.0"
+      values:
+        resourcesCrossplane:
+          limits:
+            cpu: null
+            memory: null
+"#,
+        );
+        let loaded = load_definition(&source).unwrap();
+        assert_eq!(loaded.cluster.control_plane.crossplane.version, "2.4.0");
+        assert_eq!(
+            loaded
+                .cluster
+                .control_plane
+                .crossplane
+                .values
+                .get(Value::String("resourcesCrossplane".into()))
+                .and_then(Value::as_mapping)
+                .and_then(|values| values.get(Value::String("limits".into())))
+                .and_then(Value::as_mapping)
+                .and_then(|values| values.get(Value::String("cpu".into())))
+                .and_then(Value::as_str),
+            None
         );
     }
 

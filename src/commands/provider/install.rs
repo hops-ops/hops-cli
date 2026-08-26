@@ -4,6 +4,7 @@ use crate::commands::local::package_install::{
     registry_push, resolve_repo_install_target, run_watch, sanitize_name_component,
     RepoInstallTarget, RepoSpec,
 };
+use crate::commands::local::workbench::controller::reject_imperative_owner;
 use crate::commands::local::{
     kubectl_apply_stdin, run_cmd, run_cmd_output, MANAGED_BY_LABEL, PROVIDER_INSTALL_MANAGED_BY,
 };
@@ -92,6 +93,7 @@ pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
         args.cluster_name.as_deref(),
         args.context.as_deref(),
     )?;
+    reject_imperative_owner(&backend::kind::active_cluster_name())?;
 
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => {

@@ -598,6 +598,53 @@ pub fn reconcile_applications<H: HelmRunner, K: KubectlApplier>(
     Ok(results)
 }
 
+/// Reconcile one contained Helm chart directly, without materializing a
+/// generated Application YAML file. This is the Local Workbench path: the
+/// `(application root, chart path)` pair is the durable deploy identity and
+/// the chart's rendered KRM is applied under the Environment ownership labels.
+pub fn reconcile_deploy_chart<H: HelmRunner, K: KubectlApplier>(
+    chart_path: &Path,
+    app_name: &str,
+    values: Value,
+    opts: &ReconcileOptions,
+    helm: &H,
+    kubectl: &K,
+) -> Result<ReconcileResult, Box<dyn Error>> {
+    let chart_path = chart_path
+        .canonicalize()
+        .map_err(|error| format!("chart path {}: {error}", chart_path.display()))?;
+    let parent = chart_path
+        .parent()
+        .ok_or_else(|| format!("chart path has no parent: {}", chart_path.display()))?;
+    let source_name = chart_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("chart path has no portable name: {}", chart_path.display()))?;
+    let app_file = parent.join(".hops-direct-application.yaml");
+    let application = Application {
+        api_version: super::application::APPLICATION_API_VERSION.to_string(),
+        kind: super::application::APPLICATION_KIND.to_string(),
+        metadata: super::application::ApplicationMetadata {
+            name: app_name.to_string(),
+            labels: None,
+        },
+        spec: super::application::ApplicationSpec {
+            source: super::application::Source {
+                path: source_name.to_string(),
+                delivery_path: None,
+                helm: super::application::HelmSource {
+                    values: Some(values),
+                },
+            },
+            destination: super::application::Destination {
+                namespace: Some(opts.namespace.clone()),
+            },
+            sync_policy: super::application::SyncPolicy { prune: true },
+        },
+    };
+    reconcile_one(&app_file, &application, opts, helm, kubectl)
+}
+
 fn reconcile_one<H: HelmRunner, K: KubectlApplier>(
     app_file: &Path,
     app: &Application,
@@ -622,6 +669,7 @@ fn reconcile_one<H: HelmRunner, K: KubectlApplier>(
     let values_yaml = values_to_yaml(&merged)?;
     let release = sanitize_release_name(&app.metadata.name);
     let rendered = helm.template(&release, &chart_path, &opts.namespace, &values_yaml)?;
+    reject_cluster_scoped_environment_objects(&rendered)?;
     let labels = inject_labels(&opts.workspace_name, &app.metadata.name);
     let labeled = render_labels_into_manifests(&rendered, &labels)?;
     let labeled = ensure_namespace_on_docs(&labeled, &opts.namespace)?;
@@ -651,6 +699,31 @@ fn reconcile_one<H: HelmRunner, K: KubectlApplier>(
         rendered_yaml: labeled,
         applied,
     })
+}
+
+fn reject_cluster_scoped_environment_objects(yaml: &str) -> Result<(), Box<dyn Error>> {
+    for value in parse_yaml_docs(yaml)? {
+        let Some(root) = value.as_mapping() else {
+            return Err("rendered Environment document must be a mapping".into());
+        };
+        let kind = root
+            .get(Value::String("kind".into()))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if is_cluster_scoped_kind(kind) {
+            let name = root
+                .get(Value::String("metadata".into()))
+                .and_then(Value::as_mapping)
+                .and_then(|metadata| metadata.get(Value::String("name".into())))
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            return Err(format!(
+                "Environment chart rendered cluster-scoped {kind} {name}; declare it in the Cluster tree"
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn sanitize_release_name(name: &str) -> String {
@@ -1093,6 +1166,58 @@ spec:
     }
 
     #[test]
+    fn reconcile_deploy_chart_does_not_materialize_application_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "lwb-direct-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("chart/templates")).unwrap();
+        let chart = dir.join("chart");
+        std::fs::write(
+            chart.join("Chart.yaml"),
+            "apiVersion: v2\nname: direct\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(chart.join("templates/svc.yaml"), "kind: Service\n").unwrap();
+
+        let helm = MockHelm {
+            body: "apiVersion: v1\nkind: Service\nmetadata:\n  name: direct\n".into(),
+        };
+        let kubectl = MockKubectl {
+            applied: Mutex::new(Vec::new()),
+            namespaces: Mutex::new(Vec::new()),
+            pruned: Mutex::new(Vec::new()),
+            inventories: Mutex::new(Vec::new()),
+        };
+        let opts = ReconcileOptions {
+            namespace: "local".into(),
+            workspace_name: "local".into(),
+            runtime_values: BTreeMap::new(),
+            app_delivery_host_paths: BTreeMap::new(),
+            delivery_mode: None,
+            dry_run: true,
+        };
+
+        let result = reconcile_deploy_chart(
+            &chart,
+            "direct-app",
+            serde_yaml::from_str("local: true\npreview: false\n").unwrap(),
+            &opts,
+            &helm,
+            &kubectl,
+        )
+        .unwrap();
+
+        assert_eq!(result.app_name, "direct-app");
+        assert_eq!(result.chart_path, chart.canonicalize().unwrap());
+        assert!(!result.applied);
+        assert!(!dir.join(".hops-direct-application.yaml").exists());
+        assert!(kubectl.applied.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ensure_namespace_stamps_workload_missing_ns_only() {
         let yaml = r#"
 apiVersion: v1
@@ -1176,6 +1301,19 @@ metadata:
         assert!(
             !cr_doc.lines().any(|l| l.trim() == "namespace: alice"),
             "ClusterRole must not get worktree ns"
+        );
+    }
+
+    #[test]
+    fn environment_rejects_cluster_scoped_objects_before_apply() {
+        let error = reject_cluster_scoped_environment_objects(
+            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: forbidden\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("cluster-scoped Namespace forbidden"),
+            "{error}"
         );
     }
 

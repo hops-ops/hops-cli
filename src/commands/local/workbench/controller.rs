@@ -1,0 +1,681 @@
+//! Durable ownership and cleanup primitives for the Local Workbench controller.
+//!
+//! The controller owns a Cluster only after `gitops cluster` acquires its
+//! lease.  The lease is deliberately a small, file-backed record: it is
+//! diagnostic state and conflict protection, not a second desired-state
+//! document.  Secrets and rendered Helm values never enter this state.
+
+use super::definition::LoadedEnvironment;
+use super::reconcile::{HelmRunner, KubectlApplier, ReconcileOptions, ReconcileResult};
+use crate::commands::local::workbench::registry::{remove_workspace, WorkspaceRecord};
+use crate::commands::local::{kubectl_command, local_state_dir};
+use serde::{Deserialize, Serialize};
+use serde_yaml::Value;
+use std::error::Error;
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const CONTROLLER_SCHEMA_VERSION: u32 = 1;
+const CONTROLLER_MODE: &str = "gitops";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControllerLease {
+    pub schema_version: u32,
+    pub mode: String,
+    pub cluster_name: String,
+    pub definition_path: String,
+    pub kube_context: String,
+    pub pid: u32,
+    pub started_at: u64,
+}
+
+#[derive(Debug)]
+pub struct ControllerHandle {
+    lock_path: PathBuf,
+    pub lease: ControllerLease,
+    pub reused: bool,
+}
+
+impl ControllerHandle {
+    pub fn is_owner(&self) -> bool {
+        !self.reused
+    }
+}
+
+impl Drop for ControllerHandle {
+    fn drop(&mut self) {
+        if self.reused {
+            return;
+        }
+        // Do not remove a lock that another process replaced after this
+        // controller stopped.  Read-and-compare is intentionally fail-closed.
+        let Ok(text) = fs::read_to_string(&self.lock_path) else {
+            return;
+        };
+        let Ok(current) = serde_json::from_str::<ControllerLease>(&text) else {
+            return;
+        };
+        if current == self.lease {
+            let _ = fs::remove_file(&self.lock_path);
+        }
+    }
+}
+
+pub fn controller_state_dir(cluster_name: &str) -> Result<PathBuf, Box<dyn Error>> {
+    Ok(local_state_dir()?
+        .join("clusters")
+        .join(super::slugify_name(cluster_name)))
+}
+
+pub fn controller_lock_path(cluster_name: &str) -> Result<PathBuf, Box<dyn Error>> {
+    Ok(controller_state_dir(cluster_name)?.join("controller.lock"))
+}
+
+/// Guard imperative package/provider installers from becoming a second owner
+/// after a Cluster controller has claimed the backend. This deliberately
+/// reports the owner without attempting adoption or stale-lock cleanup.
+pub fn reject_imperative_owner(cluster_name: &str) -> Result<(), Box<dyn Error>> {
+    let path = controller_lock_path(cluster_name)?;
+    if !path.is_file() {
+        return Ok(());
+    }
+    let lease: ControllerLease = serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
+        format!(
+            "GitOps controller lock {} is malformed; refusing imperative apply: {error}",
+            path.display()
+        )
+    })?;
+    Err(format!(
+        "Cluster {:?} is owned by GitOps controller pid {} ({}); use the Cluster tree/controller, or explicitly hand off the backend before running an imperative installer",
+        cluster_name, lease.pid, lease.definition_path
+    )
+    .into())
+}
+
+/// Acquire the single GitOps owner for a Cluster. Existing matching ownership
+/// is reported as `reused`; a different live/unknown owner is rejected rather
+/// than guessed or adopted.
+pub fn acquire_controller(
+    cluster_name: &str,
+    definition_path: &Path,
+    kube_context: &str,
+    dry_run: bool,
+) -> Result<ControllerHandle, Box<dyn Error>> {
+    let lease = ControllerLease {
+        schema_version: CONTROLLER_SCHEMA_VERSION,
+        mode: CONTROLLER_MODE.to_string(),
+        cluster_name: cluster_name.to_string(),
+        definition_path: definition_path.to_string_lossy().into_owned(),
+        kube_context: kube_context.to_string(),
+        pid: std::process::id(),
+        started_at: unix_timestamp(),
+    };
+    let path = controller_lock_path(cluster_name)?;
+    if dry_run {
+        return Ok(ControllerHandle {
+            lock_path: path,
+            lease,
+            reused: true,
+        });
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(_) => {
+            fs::write(&path, serde_json::to_vec_pretty(&lease)?)?;
+            Ok(ControllerHandle {
+                lock_path: path,
+                lease,
+                reused: false,
+            })
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let current_text = fs::read_to_string(&path).map_err(|read_error| {
+                format!(
+                    "GitOps controller lock {} exists but cannot be read: {read_error}",
+                    path.display()
+                )
+            })?;
+            let current: ControllerLease =
+                serde_json::from_str(&current_text).map_err(|parse| {
+                    format!(
+                        "GitOps controller lock {} is malformed; refusing adoption: {parse}",
+                        path.display()
+                    )
+                })?;
+            if current.cluster_name == lease.cluster_name
+                && current.definition_path == lease.definition_path
+                && current.kube_context == lease.kube_context
+                && current.mode == CONTROLLER_MODE
+            {
+                if current.pid != std::process::id() && !controller_pid_is_live(current.pid) {
+                    return Err(format!(
+                        "GitOps controller lock {} belongs to stale pid {}; refusing implicit adoption. Stop the declared Cluster or complete an explicit ownership handoff before retrying",
+                        path.display(), current.pid
+                    )
+                    .into());
+                }
+                return Ok(ControllerHandle {
+                    lock_path: path,
+                    lease: current,
+                    reused: true,
+                });
+            }
+            Err(format!(
+                "Cluster {:?} is already owned by a different GitOps controller (pid {}, definition {}); stop or explicitly hand off that controller before retrying",
+                cluster_name, current.pid, current.definition_path
+            )
+            .into())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Return whether a controller process is still live. A failure to inspect a
+/// process is treated as live so a permission/tooling problem cannot turn into
+/// implicit adoption of another owner's lock.
+fn controller_pid_is_live(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        return Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(true);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Release a Cluster controller as part of an explicit `gitops cluster
+/// --down`. A live owner must be stopped by its owning process first; a stale
+/// lock is removable only when the requested definition matches it.
+pub fn release_controller_for_down(
+    cluster_name: &str,
+    definition_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let path = controller_lock_path(cluster_name)?;
+    if !path.is_file() {
+        return Ok(());
+    }
+    let lease: ControllerLease = serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
+        format!(
+            "GitOps controller lock {} is malformed; refusing Cluster down: {error}",
+            path.display()
+        )
+    })?;
+    let expected = definition_path
+        .canonicalize()
+        .unwrap_or_else(|_| definition_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    if lease.cluster_name != cluster_name || lease.definition_path != expected {
+        return Err(format!(
+            "GitOps controller lock {} does not match Cluster {:?}; refusing implicit handoff",
+            path.display(),
+            cluster_name
+        )
+        .into());
+    }
+    if lease.pid != std::process::id() && controller_pid_is_live(lease.pid) {
+        return Err(format!(
+            "Cluster {:?} is still owned by live GitOps controller pid {}; stop that controller before `gitops cluster --down`",
+            cluster_name, lease.pid
+        )
+        .into());
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedObject {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentDeploySnapshot {
+    pub application_root: String,
+    pub chart_path: String,
+    pub app_name: String,
+    pub objects: Vec<OwnedObject>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentSnapshot {
+    pub schema_version: u32,
+    pub cluster_name: String,
+    pub kube_context: String,
+    pub name: String,
+    pub namespace: String,
+    pub source_path: String,
+    pub root: String,
+    pub deploys: Vec<EnvironmentDeploySnapshot>,
+    /// Namespace deletion is never inferred. This remains false until a
+    /// future explicit exclusivity contract records otherwise.
+    pub namespace_exclusive: bool,
+}
+
+pub fn environment_state_path(
+    cluster_name: &str,
+    environment_name: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    Ok(controller_state_dir(cluster_name)?
+        .join("environments")
+        .join(format!("{}.json", super::slugify_name(environment_name))))
+}
+
+pub fn save_environment_snapshot(
+    cluster_name: &str,
+    kube_context: &str,
+    environment: &LoadedEnvironment,
+    results: &[ReconcileResult],
+) -> Result<PathBuf, Box<dyn Error>> {
+    let deploys = environment
+        .environment
+        .deploys
+        .iter()
+        .zip(results)
+        .map(|(deploy, result)| {
+            Ok(EnvironmentDeploySnapshot {
+                application_root: deploy.application_root.to_string_lossy().into_owned(),
+                chart_path: deploy.chart_path.to_string_lossy().into_owned(),
+                app_name: result.app_name.clone(),
+                objects: owned_objects_from_yaml(&result.rendered_yaml)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    if deploys.len() != environment.environment.deploys.len() {
+        return Err("cannot persist Environment ownership: reconcile result count does not match deploy count".into());
+    }
+    let snapshot = EnvironmentSnapshot {
+        schema_version: CONTROLLER_SCHEMA_VERSION,
+        cluster_name: cluster_name.to_string(),
+        kube_context: kube_context.to_string(),
+        name: environment.environment.name.clone(),
+        namespace: environment.environment.namespace.clone(),
+        source_path: environment.source.to_string_lossy().into_owned(),
+        root: environment.environment.root.to_string_lossy().into_owned(),
+        deploys,
+        namespace_exclusive: false,
+    };
+    let path = environment_state_path(cluster_name, &snapshot.name)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, serde_json::to_vec_pretty(&snapshot)?)?;
+    fs::rename(&temp, &path)?;
+    Ok(path)
+}
+
+/// Render and reconcile every deploy in a validated Environment directly from
+/// its resolved chart pair. This is the controller-owned path: no generated
+/// Application YAML is written and protected identity values are injected
+/// after user values are merged.
+pub fn reconcile_environment<H: HelmRunner, K: KubectlApplier>(
+    loaded: &LoadedEnvironment,
+    opts: &ReconcileOptions,
+    helm: &H,
+    kubectl: &K,
+) -> Result<Vec<ReconcileResult>, Box<dyn Error>> {
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+    for deploy in &loaded.environment.deploys {
+        let mut values = loaded.environment.values.clone();
+        merge_mapping(&mut values, &deploy.values);
+        values.insert(Value::String("local".into()), Value::Bool(true));
+        values.insert(
+            Value::String("environment".into()),
+            string_mapping(&[
+                ("name", &loaded.environment.name),
+                ("namespace", &loaded.environment.namespace),
+            ]),
+        );
+        values.insert(
+            Value::String("source".into()),
+            string_mapping(&[
+                ("localPath", &deploy.application_root.to_string_lossy()),
+                ("chartPath", &deploy.chart_path.to_string_lossy()),
+            ]),
+        );
+        let app_name = local_application_name(deploy);
+        match super::reconcile::reconcile_deploy_chart(
+            &deploy.chart_path,
+            &app_name,
+            Value::Mapping(values),
+            opts,
+            helm,
+            kubectl,
+        ) {
+            Ok(result) => results.push(result),
+            Err(error) => errors.push(format!("{app_name}: {error}")),
+        }
+    }
+    if errors.is_empty() {
+        Ok(results)
+    } else {
+        Err(format!(
+            "reconcile failed for {} deploy(s):\n  - {}",
+            errors.len(),
+            errors.join("\n  - ")
+        )
+        .into())
+    }
+}
+
+fn merge_mapping(base: &mut serde_yaml::Mapping, overlay: &serde_yaml::Mapping) {
+    for (key, value) in overlay {
+        match (base.get_mut(key), value) {
+            (Some(Value::Mapping(base_map)), Value::Mapping(overlay_map)) => {
+                merge_mapping(base_map, overlay_map)
+            }
+            _ => {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn string_mapping(values: &[(&str, &str)]) -> Value {
+    let mut mapping = serde_yaml::Mapping::new();
+    for (key, value) in values {
+        mapping.insert(
+            Value::String((*key).to_string()),
+            Value::String((*value).to_string()),
+        );
+    }
+    Value::Mapping(mapping)
+}
+
+fn local_application_name(deploy: &super::definition::DeployDefinition) -> String {
+    let application = deploy
+        .application_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("application");
+    let default_chart = deploy
+        .application_root
+        .join(super::definition::DEFAULT_DEPLOY_CHART_PATH);
+    let raw = if deploy.chart_path == default_chart {
+        application.to_string()
+    } else {
+        let chart = deploy
+            .chart_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("chart");
+        format!("{application}-{chart}")
+    };
+    let name = raw
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if name.is_empty() {
+        "application".to_string()
+    } else {
+        name
+    }
+}
+
+pub fn load_environment_snapshot(
+    cluster_name: &str,
+    environment_name: &str,
+) -> Result<Option<EnvironmentSnapshot>, Box<dyn Error>> {
+    let path = environment_state_path(cluster_name, environment_name)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let snapshot: EnvironmentSnapshot = serde_json::from_slice(&fs::read(&path)?)?;
+    if snapshot.schema_version != CONTROLLER_SCHEMA_VERSION
+        || snapshot.cluster_name != cluster_name
+        || snapshot.name != environment_name
+    {
+        return Err(format!(
+            "Environment ownership snapshot {} is invalid or mismatched",
+            path.display()
+        )
+        .into());
+    }
+    Ok(Some(snapshot))
+}
+
+/// Load every durable Environment ownership snapshot for a Cluster. Invalid
+/// snapshots fail closed instead of being guessed from filenames or labels.
+pub fn list_environment_snapshots(
+    cluster_name: &str,
+) -> Result<Vec<EnvironmentSnapshot>, Box<dyn Error>> {
+    let directory = controller_state_dir(cluster_name)?.join("environments");
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(&directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut snapshots = Vec::new();
+    for path in paths {
+        let snapshot: EnvironmentSnapshot =
+            serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
+                format!(
+                    "Environment ownership snapshot {} is malformed: {error}",
+                    path.display()
+                )
+            })?;
+        if snapshot.schema_version != CONTROLLER_SCHEMA_VERSION
+            || snapshot.cluster_name != cluster_name
+            || snapshot.name.trim().is_empty()
+        {
+            return Err(format!(
+                "Environment ownership snapshot {} is invalid or mismatched",
+                path.display()
+            )
+            .into());
+        }
+        snapshots.push(snapshot);
+    }
+    Ok(snapshots)
+}
+
+/// Delete only objects proven by the last accepted Environment snapshot. A
+/// missing snapshot is an already-down/no-proven-ownership result and performs
+/// no inferred namespace or label deletion.
+pub fn down_environment(
+    cluster_name: &str,
+    environment_name: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let Some(snapshot) = load_environment_snapshot(cluster_name, environment_name)? else {
+        return Ok(false);
+    };
+    if snapshot.namespace.is_empty() {
+        return Err("Environment ownership snapshot has no namespace; refusing cleanup".into());
+    }
+    if let Ok(state_dir) = local_state_dir() {
+        if let Err(error) = super::net::stop_host_access(&state_dir, environment_name) {
+            log::warn!("Environment host-access cleanup: {error}");
+        }
+        super::delivery::stop_delivery_runtime(&state_dir, environment_name);
+    }
+    let mut objects = snapshot
+        .deploys
+        .iter()
+        .flat_map(|deploy| deploy.objects.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    objects.sort_by(|a, b| {
+        b.kind
+            .cmp(&a.kind)
+            .then_with(|| b.name.cmp(&a.name))
+            .then_with(|| b.namespace.cmp(&a.namespace))
+    });
+    for object in objects {
+        // Cluster-scoped objects must never be owned by an Environment.
+        if object.namespace.is_empty() {
+            return Err(format!(
+                "Environment snapshot contains cluster-scoped {} {}; refusing cleanup",
+                object.kind, object.name
+            )
+            .into());
+        }
+        let kind = object.kind.to_ascii_lowercase();
+        let args = [
+            "delete",
+            kind.as_str(),
+            object.name.as_str(),
+            "--namespace",
+            object.namespace.as_str(),
+            "--ignore-not-found=true",
+            "--wait=true",
+        ];
+        let output = kubectl_command(&args).output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Environment cleanup failed for {} {}: {}",
+                object.kind,
+                object.name,
+                stderr.trim()
+            )
+            .into());
+        }
+    }
+    let path = environment_state_path(cluster_name, environment_name)?;
+    fs::remove_file(path)?;
+    if let Ok(state_dir) = local_state_dir() {
+        let _ = remove_workspace(&state_dir, environment_name)?;
+    }
+    Ok(true)
+}
+
+fn owned_objects_from_yaml(yaml: &str) -> Result<Vec<OwnedObject>, Box<dyn Error>> {
+    let mut objects = Vec::new();
+    for document in serde_yaml::Deserializer::from_str(yaml) {
+        let value = Value::deserialize(document)?;
+        if value.is_null() {
+            continue;
+        }
+        let mapping = value
+            .as_mapping()
+            .ok_or("rendered Environment document must be a mapping")?;
+        let api_version = mapping
+            .get(Value::String("apiVersion".into()))
+            .and_then(Value::as_str)
+            .ok_or("rendered Environment object is missing apiVersion")?;
+        let kind = mapping
+            .get(Value::String("kind".into()))
+            .and_then(Value::as_str)
+            .ok_or("rendered Environment object is missing kind")?;
+        let metadata = mapping
+            .get(Value::String("metadata".into()))
+            .and_then(Value::as_mapping)
+            .ok_or("rendered Environment object is missing metadata")?;
+        let name = metadata
+            .get(Value::String("name".into()))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or("rendered Environment object is missing metadata.name")?;
+        let namespace = metadata
+            .get(Value::String("namespace".into()))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        objects.push(OwnedObject {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+        });
+    }
+    Ok(objects)
+}
+
+/// Validate the durable identity before an Environment operation may mutate
+/// a registered workspace.
+pub fn validate_environment_identity(
+    snapshot: &EnvironmentSnapshot,
+    record: &WorkspaceRecord,
+    cluster_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    if snapshot.cluster_name != cluster_name
+        || record.cluster_name.as_deref() != Some(cluster_name)
+        || record.name != snapshot.name
+        || record.namespace != snapshot.namespace
+    {
+        return Err(format!(
+            "Environment {:?} registration does not match Cluster {:?}; refusing inferred ownership",
+            snapshot.name, cluster_name
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lease_round_trip_and_reuse_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "hops-controller-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let definition = root.join("project/.gitops/local/cluster.yaml");
+        fs::create_dir_all(definition.parent().unwrap()).unwrap();
+        let cluster_name = format!("demo-{}", uuid::Uuid::new_v4().simple());
+        let first = acquire_controller(&cluster_name, &definition, "kind-demo", false).unwrap();
+        assert!(first.is_owner());
+        let second = acquire_controller(&cluster_name, &definition, "kind-demo", false).unwrap();
+        assert!(!second.is_owner());
+        assert_eq!(second.lease.pid, std::process::id());
+        drop(second);
+        drop(first);
+        let lock = controller_lock_path(&cluster_name).unwrap();
+        assert!(!lock.exists());
+        let _ = fs::remove_dir_all(lock.parent().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_objects_reject_cluster_scope() {
+        let error = owned_objects_from_yaml(
+            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: forbidden\n",
+        )
+        .unwrap();
+        assert!(error[0].namespace.is_empty());
+    }
+}
