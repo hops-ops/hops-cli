@@ -104,6 +104,18 @@ struct KubeList<T> {
 #[derive(Debug, Deserialize)]
 struct PackageMetadataName {
     name: String,
+    #[serde(rename = "ownerReferences", default)]
+    owner_references: Vec<PackageOwnerReference>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageOwnerReference {
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+    kind: String,
+    name: String,
+    #[serde(default)]
+    controller: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +128,43 @@ struct PackageSpec {
 struct PackageResource {
     metadata: PackageMetadataName,
     spec: Option<PackageSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageConfigSpec {
+    #[serde(rename = "matchImages", default)]
+    match_images: Vec<ImageMatch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageMatch {
+    prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageConfigResource {
+    metadata: PackageMetadataName,
+    spec: Option<ImageConfigSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigurationRevisionSpec {
+    image: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigurationRevisionResource {
+    metadata: PackageMetadataName,
+    spec: Option<ConfigurationRevisionSpec>,
+}
+
+fn is_owned_by_configuration(metadata: &PackageMetadataName, config_name: &str) -> bool {
+    metadata.owner_references.iter().any(|owner| {
+        owner.api_version == "pkg.crossplane.io/v1"
+            && owner.kind == "Configuration"
+            && owner.name == config_name
+            && owner.controller
+    })
 }
 
 pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
@@ -212,39 +261,42 @@ fn apply_repo_version_spec(
     let package_ref = format!("ghcr.io/{}/{}:{}", spec.org, spec.repo, version);
     let config_name = configuration_name_from_package_ref(&package_ref);
 
-    // Delete any existing render Function so Crossplane re-resolves with the
-    // correct digest for this version (avoids conflicts when switching between
-    // local and published builds).
-    let render_source = format!("ghcr.io/{}/{}_render", spec.org, spec.repo);
-    let sources: HashSet<String> = [render_source.clone()].into_iter().collect();
-    let removed = delete_package_resources_by_source("function.pkg.crossplane.io", &sources)?;
-    if removed > 0 {
+    let package_path = format!("{}/{}", spec.org, spec.repo);
+    let function_path_prefix = format!("{package_path}_");
+
+    // Apply the released Configuration first. The previous dev revision may
+    // still report Active until Crossplane observes this new desired package.
+    apply_configuration(&config_name, &package_ref, skip_dependency_resolution)?;
+
+    // Remove the old dev revision before recreating functions. Otherwise that
+    // revision can immediately recreate a function at its old digest and make
+    // the released revision's digest constraint unsatisfiable.
+    delete_local_registry_config_revisions(&config_name, &package_path)?;
+
+    // A local source build can install multiple functions and one ImageConfig
+    // rewrite per function. Remove every function owned by this exact package
+    // path, regardless of whether its current package reference points at GHCR
+    // or the in-cluster registry, then let the released Configuration recreate
+    // its dependencies.
+    let removed_image_configs = delete_image_configs_by_path_prefix(&function_path_prefix)?;
+    let removed_functions = delete_package_resources_by_path_prefix(
+        "function.pkg.crossplane.io",
+        &function_path_prefix,
+    )?;
+    let removed_function_revisions = delete_package_resources_by_path_prefix(
+        "functionrevision.pkg.crossplane.io",
+        &function_path_prefix,
+    )?;
+    if removed_image_configs > 0 || removed_functions > 0 || removed_function_revisions > 0 {
         log::info!(
-            "Deleted {} stale Function package(s) before version install",
-            removed
+            "Removed {} local ImageConfig rewrite(s), {} Function package(s), and {} FunctionRevision(s) after version install",
+            removed_image_configs,
+            removed_functions,
+            removed_function_revisions
         );
     }
 
-    // Delete any local-registry ImageConfig rewrite left over from a previous
-    // `config install --path` so Crossplane pulls from ghcr.io.
-    let ic_name = image_config_name(&render_source);
-    let ic_check = kubectl_command(&["get", "imageconfig.pkg.crossplane.io", &ic_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    if ic_check.map(|s| s.success()).unwrap_or(false) {
-        run_cmd(
-            "kubectl",
-            &["delete", "imageconfig.pkg.crossplane.io", &ic_name],
-        )?;
-        log::info!("Deleted local ImageConfig rewrite '{}'", ic_name);
-    }
-
-    // Delete stale inactive ConfigurationRevisions pointing at the local
-    // registry so they don't block dependency resolution for the published version.
-    delete_local_registry_config_revisions(&config_name)?;
-
-    apply_configuration(&config_name, &package_ref, skip_dependency_resolution)
+    Ok(())
 }
 
 fn apply_repo_version(
@@ -430,13 +482,13 @@ spec:
         let existing_package_ref = current_configuration_package_ref(&name)?;
         log_existing_install_replacement(&name, existing_package_ref.as_deref(), pull_ref);
 
-        // Delete inactive ConfigurationRevisions pointing at the remote registry.
-        // When switching from a published version to a local build, the old
-        // inactive revision's Function dependency has a stale digest that
-        // conflicts with the locally-pushed render image.
-        delete_remote_registry_config_revisions(&name)?;
-
         apply_configuration(&name, pull_ref, skip_dependency_resolution)?;
+
+        // The local package is now desired, so remove all published revisions
+        // for this exact Configuration. This also catches the previously-active
+        // revision before Crossplane asynchronously marks it Inactive.
+        let (img_path, _) = split_ref(pull_ref);
+        delete_remote_registry_config_revisions(&name, strip_registry(img_path))?;
     }
 
     // Delete existing Function packages only after the new Configuration has
@@ -503,6 +555,83 @@ fn delete_package_resources_by_source(
             &[
                 "delete",
                 resource,
+                &item.metadata.name,
+                "--ignore-not-found",
+            ],
+        )?;
+        deleted += 1;
+    }
+
+    Ok(deleted)
+}
+
+fn package_path_matches_prefix(package_ref: &str, path_prefix: &str) -> bool {
+    strip_registry(&package_source(package_ref)).starts_with(path_prefix)
+}
+
+fn delete_package_resources_by_path_prefix(
+    resource: &str,
+    path_prefix: &str,
+) -> Result<usize, Box<dyn Error>> {
+    let raw = run_cmd_output("kubectl", &["get", resource, "-o", "json"])?;
+    let list: KubeList<PackageResource> = serde_json::from_str(&raw)?;
+
+    let mut deleted = 0usize;
+    for item in list.items {
+        let Some(spec) = item.spec else {
+            continue;
+        };
+        let Some(package_ref) = spec.package_ref else {
+            continue;
+        };
+        if !package_path_matches_prefix(&package_ref, path_prefix) {
+            continue;
+        }
+
+        run_cmd(
+            "kubectl",
+            &[
+                "delete",
+                resource,
+                &item.metadata.name,
+                "--ignore-not-found",
+            ],
+        )?;
+        deleted += 1;
+    }
+
+    Ok(deleted)
+}
+
+fn delete_image_configs_by_path_prefix(path_prefix: &str) -> Result<usize, Box<dyn Error>> {
+    let raw = run_cmd_output(
+        "kubectl",
+        &["get", "imageconfig.pkg.crossplane.io", "-o", "json"],
+    )?;
+    let list: KubeList<ImageConfigResource> = serde_json::from_str(&raw)?;
+
+    let mut deleted = 0usize;
+    for item in list.items {
+        let matches = item
+            .spec
+            .map(|spec| {
+                spec.match_images.iter().any(|image_match| {
+                    image_match
+                        .prefix
+                        .as_deref()
+                        .is_some_and(|prefix| package_path_matches_prefix(prefix, path_prefix))
+                })
+            })
+            .unwrap_or(false);
+        if !matches {
+            continue;
+        }
+
+        run_cmd(
+            "kubectl",
+            &[
+                "delete",
+                "imageconfig.pkg.crossplane.io",
                 &item.metadata.name,
                 "--ignore-not-found",
             ],
@@ -979,39 +1108,41 @@ fn docker_build_from(src: &str, tag: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Delete inactive ConfigurationRevisions whose package points at the local
-/// registry. These are left over from `config install --path` and can block
-/// dependency resolution when switching to a published version.
-fn delete_local_registry_config_revisions(config_name: &str) -> Result<(), Box<dyn Error>> {
-    let output = run_cmd_output(
+/// Delete ConfigurationRevisions for this exact Configuration whose package
+/// points at the local registry.
+fn delete_local_registry_config_revisions(
+    config_name: &str,
+    package_path: &str,
+) -> Result<(), Box<dyn Error>> {
+    let raw = run_cmd_output(
         "kubectl",
         &[
             "get",
             "configurationrevision.pkg.crossplane.io",
             "-o",
-            "jsonpath={range .items[*]}{.metadata.name}|{.spec.image}|{.spec.desiredState}\\n{end}",
+            "json",
         ],
     )?;
+    let list: KubeList<ConfigurationRevisionResource> = serde_json::from_str(&raw)?;
 
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() < 3 {
+    for item in list.items {
+        if !is_owned_by_configuration(&item.metadata, config_name) {
             continue;
         }
-        let rev_name = parts[0].trim();
-        let package = parts[1].trim();
-        let state = parts[2].trim();
-
-        if !rev_name.starts_with(config_name) {
+        let rev_name = item.metadata.name;
+        let Some(package) = item.spec.and_then(|spec| spec.image) else {
             continue;
-        }
-        if package.contains(registry_pull()) && state == "Inactive" {
+        };
+        if package.contains(registry_pull())
+            && strip_registry(&package_source(&package)) == package_path
+        {
             run_cmd(
                 "kubectl",
                 &[
                     "delete",
                     "configurationrevision.pkg.crossplane.io",
-                    rev_name,
+                    &rev_name,
+                    "--ignore-not-found",
                 ],
             )?;
             log::info!("Deleted stale local ConfigurationRevision '{}'", rev_name);
@@ -1020,39 +1151,41 @@ fn delete_local_registry_config_revisions(config_name: &str) -> Result<(), Box<d
     Ok(())
 }
 
-/// Delete inactive ConfigurationRevisions pointing at the remote registry
-/// (ghcr.io). When switching from a published version to a local build,
-/// these old revisions have stale Function digests that conflict.
-fn delete_remote_registry_config_revisions(config_name: &str) -> Result<(), Box<dyn Error>> {
-    let output = run_cmd_output(
+/// Delete ConfigurationRevisions for this exact Configuration whose package
+/// points at a published registry.
+fn delete_remote_registry_config_revisions(
+    config_name: &str,
+    package_path: &str,
+) -> Result<(), Box<dyn Error>> {
+    let raw = run_cmd_output(
         "kubectl",
         &[
             "get",
             "configurationrevision.pkg.crossplane.io",
             "-o",
-            "jsonpath={range .items[*]}{.metadata.name}|{.spec.image}|{.spec.desiredState}\\n{end}",
+            "json",
         ],
     )?;
+    let list: KubeList<ConfigurationRevisionResource> = serde_json::from_str(&raw)?;
 
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() < 3 {
+    for item in list.items {
+        if !is_owned_by_configuration(&item.metadata, config_name) {
             continue;
         }
-        let rev_name = parts[0].trim();
-        let package = parts[1].trim();
-        let state = parts[2].trim();
-
-        if !rev_name.starts_with(config_name) {
+        let rev_name = item.metadata.name;
+        let Some(package) = item.spec.and_then(|spec| spec.image) else {
             continue;
-        }
-        if !package.contains(registry_pull()) && state == "Inactive" {
+        };
+        if !package.contains(registry_pull())
+            && strip_registry(&package_source(&package)) == package_path
+        {
             run_cmd(
                 "kubectl",
                 &[
                     "delete",
                     "configurationrevision.pkg.crossplane.io",
-                    rev_name,
+                    &rev_name,
+                    "--ignore-not-found",
                 ],
             )?;
             log::info!("Deleted stale remote ConfigurationRevision '{}'", rev_name);
@@ -1145,6 +1278,30 @@ spec:
             package_source("ghcr.io/hops-ops/helm-airflow_render@sha256:abc123"),
             "ghcr.io/hops-ops/helm-airflow_render"
         );
+        assert!(package_path_matches_prefix(
+            "registry.crossplane-system.svc.cluster.local:5000/hops-ops/helm-airflow_render@sha256:abc123",
+            "hops-ops/helm-airflow_"
+        ));
+        assert!(!package_path_matches_prefix(
+            "ghcr.io/hops-ops/helm-airflow-pro_render:v1",
+            "hops-ops/helm-airflow_"
+        ));
+    }
+
+    #[test]
+    fn configuration_revision_owner_match_is_exact() {
+        let metadata = PackageMetadataName {
+            name: "team-app-canary-abc123".to_string(),
+            owner_references: vec![PackageOwnerReference {
+                api_version: "pkg.crossplane.io/v1".to_string(),
+                kind: "Configuration".to_string(),
+                name: "team-app-canary".to_string(),
+                controller: true,
+            }],
+        };
+
+        assert!(is_owned_by_configuration(&metadata, "team-app-canary"));
+        assert!(!is_owned_by_configuration(&metadata, "team-app"));
     }
 
     #[test]
