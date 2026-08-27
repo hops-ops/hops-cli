@@ -104,6 +104,18 @@ struct KubeList<T> {
 #[derive(Debug, Deserialize)]
 struct PackageMetadataName {
     name: String,
+    #[serde(rename = "ownerReferences", default)]
+    owner_references: Vec<PackageOwnerReference>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageOwnerReference {
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+    kind: String,
+    name: String,
+    #[serde(default)]
+    controller: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +156,15 @@ struct ConfigurationRevisionSpec {
 struct ConfigurationRevisionResource {
     metadata: PackageMetadataName,
     spec: Option<ConfigurationRevisionSpec>,
+}
+
+fn is_owned_by_configuration(metadata: &PackageMetadataName, config_name: &str) -> bool {
+    metadata.owner_references.iter().any(|owner| {
+        owner.api_version == "pkg.crossplane.io/v1"
+            && owner.kind == "Configuration"
+            && owner.name == config_name
+            && owner.controller
+    })
 }
 
 pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
@@ -1105,13 +1126,13 @@ fn delete_local_registry_config_revisions(
     let list: KubeList<ConfigurationRevisionResource> = serde_json::from_str(&raw)?;
 
     for item in list.items {
+        if !is_owned_by_configuration(&item.metadata, config_name) {
+            continue;
+        }
         let rev_name = item.metadata.name;
         let Some(package) = item.spec.and_then(|spec| spec.image) else {
             continue;
         };
-        if !rev_name.starts_with(&format!("{}-", config_name)) {
-            continue;
-        }
         if package.contains(registry_pull())
             && strip_registry(&package_source(&package)) == package_path
         {
@@ -1148,13 +1169,13 @@ fn delete_remote_registry_config_revisions(
     let list: KubeList<ConfigurationRevisionResource> = serde_json::from_str(&raw)?;
 
     for item in list.items {
+        if !is_owned_by_configuration(&item.metadata, config_name) {
+            continue;
+        }
         let rev_name = item.metadata.name;
         let Some(package) = item.spec.and_then(|spec| spec.image) else {
             continue;
         };
-        if !rev_name.starts_with(&format!("{}-", config_name)) {
-            continue;
-        }
         if !package.contains(registry_pull())
             && strip_registry(&package_source(&package)) == package_path
         {
@@ -1265,6 +1286,22 @@ spec:
             "ghcr.io/hops-ops/helm-airflow-pro_render:v1",
             "hops-ops/helm-airflow_"
         ));
+    }
+
+    #[test]
+    fn configuration_revision_owner_match_is_exact() {
+        let metadata = PackageMetadataName {
+            name: "team-app-canary-abc123".to_string(),
+            owner_references: vec![PackageOwnerReference {
+                api_version: "pkg.crossplane.io/v1".to_string(),
+                kind: "Configuration".to_string(),
+                name: "team-app-canary".to_string(),
+                controller: true,
+            }],
+        };
+
+        assert!(is_owned_by_configuration(&metadata, "team-app-canary"));
+        assert!(!is_owned_by_configuration(&metadata, "team-app"));
     }
 
     #[test]
