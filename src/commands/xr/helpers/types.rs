@@ -134,9 +134,13 @@ pub struct MigrateArgs {
     #[arg(long)]
     pub name: String,
 
-    /// Namespace of the XR and its namespaced composed resources
-    #[arg(long, default_value = "default")]
-    pub namespace: String,
+    /// Namespace of the XR in the source control plane
+    #[arg(long)]
+    pub source_namespace: String,
+
+    /// Namespace of the XR in the target control plane
+    #[arg(long)]
+    pub target_namespace: String,
 
     /// Kubectl context for the control plane that currently owns the resources
     #[arg(long)]

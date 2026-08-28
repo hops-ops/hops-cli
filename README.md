@@ -738,7 +738,7 @@ Notes:
 - `xr orphan --kind <KIND> --name <NAME> --namespace <NAMESPACE>`
   - Renders managed-resource patches that remove `Delete` from management policies
   - Supports `--apply` and `--output`
-- `xr migrate --kind <KIND> --name <NAME> --source-context <CONTEXT> --target-context <CONTEXT>`
+- `xr migrate --kind <KIND> --name <NAME> --source-context <CONTEXT> --source-namespace <NAMESPACE> --target-context <CONTEXT> --target-namespace <NAMESPACE>`
   - Recursively compares the source and target XR composition graphs
   - Requires the target XR and its composed resources to be observe-only
   - Copies existing `crossplane.io/external-name` identities to matching target managed resources
@@ -782,9 +782,10 @@ graph to render. Then inspect the migration plan:
 hops xr migrate \
   --kind RegistryCache \
   --name production \
-  --namespace default \
   --source-context kind-gitkb-aws-bootstrap \
-  --target-context arn:aws:eks:us-east-2:065328823520:cluster/production
+  --source-namespace default \
+  --target-context arn:aws:eks:us-east-2:065328823520:cluster/production \
+  --target-namespace production
 ```
 
 The command matches recursively composed managed resources by their composition
