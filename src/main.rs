@@ -26,7 +26,7 @@ enum Commands {
     Provider(commands::provider::ProviderArgs),
     /// Manage validation helpers for Crossplane projects
     Validate(commands::validate::ValidateArgs),
-    /// Manage live XR observe/manage/adopt workflows
+    /// Manage XR lifecycle and cross-control-plane migration workflows
     Xr(commands::xr::XrArgs),
     /// Install AI agent skills and configuration (Claude Code, Codex)
     Ai(commands::ai::AiArgs),

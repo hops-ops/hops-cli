@@ -8,7 +8,7 @@ This tool supports three related workflows:
 
 - Local cluster setup on colima or kind
 - Configuration package install/uninstall against the connected cluster
-- XR observe/manage/adopt/orphan workflows for existing infrastructure
+- XR observe/manage/adopt/orphan and cross-control-plane migration workflows
 
 For local development, it can also:
 
@@ -738,6 +738,12 @@ Notes:
 - `xr orphan --kind <KIND> --name <NAME> --namespace <NAMESPACE>`
   - Renders managed-resource patches that remove `Delete` from management policies
   - Supports `--apply` and `--output`
+- `xr migrate --kind <KIND> --name <NAME> --source-context <CONTEXT> --target-context <CONTEXT>`
+  - Recursively compares the source and target XR composition graphs
+  - Requires the target XR and its composed resources to be observe-only
+  - Copies existing `crossplane.io/external-name` identities to matching target managed resources
+  - Plans without changing either cluster by default; `--apply` patches only the target
+  - Never orphans, deletes, or changes management policies on the source XR
 
 ## XR workflow
 
@@ -765,6 +771,28 @@ Notes:
 - `xr adopt` only patches resources it can identify for the selected XR kind.
 - A blank `crossplane.io/external-name` is treated as missing.
 - `AutoEKSCluster` adoption currently resolves identities for supported managed kinds such as IAM attachments and KMS keys.
+
+### Cross-control-plane migration staging
+
+Create the same XR in the target control plane with
+`managementPolicies: [Observe, LateInitialize]`, and wait for its composition
+graph to render. Then inspect the migration plan:
+
+```bash
+hops xr migrate \
+  --kind RegistryCache \
+  --name production \
+  --namespace default \
+  --source-context kind-gitkb-aws-bootstrap \
+  --target-context arn:aws:eks:us-east-2:065328823520:cluster/production
+```
+
+The command matches recursively composed managed resources by their composition
+path, API group, and kind. It fails if the graphs differ, a source external name
+is missing, the target allows creation or mutation, or a target already has a
+different external name. Apply the verified identity patches with `--apply`.
+This command stages adoption only; source orphaning and target promotion remain
+separate, explicit cutover steps.
 
 ## Logging
 
