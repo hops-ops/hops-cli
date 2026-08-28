@@ -1,6 +1,7 @@
 mod adopt;
 mod helpers;
 mod manage;
+mod migrate;
 mod observe;
 mod orphan;
 
@@ -17,5 +18,6 @@ pub fn run(args: &XrArgs) -> Result<(), Box<dyn Error>> {
         XrCommand::Manage(manage_args) => manage::run(manage_args),
         XrCommand::Adopt(adopt_args) => adopt::run(adopt_args),
         XrCommand::Orphan(orphan_args) => orphan::run(orphan_args),
+        XrCommand::Migrate(migrate_args) => migrate::run(migrate_args),
     }
 }

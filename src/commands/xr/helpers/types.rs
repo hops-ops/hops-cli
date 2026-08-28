@@ -20,6 +20,8 @@ pub enum XrCommand {
     Adopt(AdoptArgs),
     /// Render managed-resource patches that remove Delete from management policies
     Orphan(OrphanArgs),
+    /// Stage an XR for migration between Crossplane control planes
+    Migrate(MigrateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -118,6 +120,37 @@ pub struct OrphanArgs {
     pub output: Option<String>,
 
     /// Apply the generated patches to the cluster
+    #[arg(long)]
+    pub apply: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct MigrateArgs {
+    /// XR kind, plural, or project slug (for example: RegistryCache)
+    #[arg(long)]
+    pub kind: String,
+
+    /// Kubernetes object name in both control planes
+    #[arg(long)]
+    pub name: String,
+
+    /// Namespace of the XR and its namespaced composed resources
+    #[arg(long, default_value = "default")]
+    pub namespace: String,
+
+    /// Kubectl context for the control plane that currently owns the resources
+    #[arg(long)]
+    pub source_context: String,
+
+    /// Kubectl context for the observe-only destination control plane
+    #[arg(long)]
+    pub target_context: String,
+
+    /// Write the migration plan to a file instead of stdout
+    #[arg(long)]
+    pub output: Option<String>,
+
+    /// Apply missing external-name annotations to the target control plane
     #[arg(long)]
     pub apply: bool,
 }
