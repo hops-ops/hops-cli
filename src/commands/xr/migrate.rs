@@ -23,8 +23,8 @@ pub(crate) fn run(args: &MigrateArgs) -> Result<(), Box<dyn Error>> {
     let mut source = KubectlClient::new(&args.source_context);
     let mut target = KubectlClient::new(&args.target_context);
 
-    let source_root = source.resolve_root(&args.kind, &args.name, &args.namespace)?;
-    let target_root = target.resolve_root(&args.kind, &args.name, &args.namespace)?;
+    let source_root = source.resolve_root(&args.kind, &args.name, &args.source_namespace)?;
+    let target_root = target.resolve_root(&args.kind, &args.name, &args.target_namespace)?;
     if source_root.api_version != target_root.api_version || source_root.kind != target_root.kind {
         return Err(format!(
             "source XR {} does not match target XR {}",
@@ -36,7 +36,12 @@ pub(crate) fn run(args: &MigrateArgs) -> Result<(), Box<dyn Error>> {
     let source_graph = collect_graph(&mut source, &source_root)?;
     let target_graph = collect_graph(&mut target, &target_root)?;
     let plan = build_plan(&source_graph, &target_graph)?;
-    let rendered = plan.render(&args.source_context, &args.target_context);
+    let rendered = plan.render(
+        &args.source_context,
+        &args.source_namespace,
+        &args.target_context,
+        &args.target_namespace,
+    );
 
     if let Some(output) = &args.output {
         fs::write(output, &rendered)?;
@@ -194,9 +199,15 @@ impl MigrationPlan {
         self.entries.len() - self.patch_count()
     }
 
-    fn render(&self, source_context: &str, target_context: &str) -> String {
+    fn render(
+        &self,
+        source_context: &str,
+        source_namespace: &str,
+        target_context: &str,
+        target_namespace: &str,
+    ) -> String {
         let mut rendered = format!(
-            "XR migration plan\nsource context: {source_context}\ntarget context: {target_context}\nmanaged resources: {}\npatches required: {}\nalready matching: {}\n",
+            "XR migration plan\nsource context: {source_context}\nsource namespace: {source_namespace}\ntarget context: {target_context}\ntarget namespace: {target_namespace}\nmanaged resources: {}\npatches required: {}\nalready matching: {}\n",
             self.entries.len(),
             self.patch_count(),
             self.matching_count()
@@ -937,6 +948,10 @@ mod tests {
             "RegistryCache",
             "--name",
             "production",
+            "--source-namespace",
+            "default",
+            "--target-namespace",
+            "production",
             "--source-context",
             "kind-bootstrap",
             "--target-context",
@@ -945,7 +960,8 @@ mod tests {
         ])
         .expect("parse");
 
-        assert_eq!(cli.migrate.namespace, "default");
+        assert_eq!(cli.migrate.source_namespace, "default");
+        assert_eq!(cli.migrate.target_namespace, "production");
         assert_eq!(cli.migrate.source_context, "kind-bootstrap");
         assert_eq!(cli.migrate.target_context, "production");
         assert!(cli.migrate.apply);
