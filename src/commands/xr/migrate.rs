@@ -98,14 +98,16 @@ pub(crate) fn run(args: &MigrateArgs) -> Result<(), Box<dyn Error>> {
             }
         }
         log::info!(
-            "applied and verified {} external-name patch(es) in target context {}; source context was not modified",
+            "applied and verified {} external-name patch(es) in target context {}; {} source resource(s) remain deferred; source context was not modified",
             applied_count,
-            args.target_context
+            args.target_context,
+            plan.deferred_count()
         );
     } else {
         log::info!(
-            "dry run only; rerun with --apply to patch {} target resource(s)",
-            plan.patch_count()
+            "dry run only; rerun with --apply to patch {} target resource(s); {} source resource(s) remain deferred",
+            plan.patch_count(),
+            plan.deferred_count()
         );
     }
 
@@ -185,6 +187,7 @@ struct MigrationEntry {
 #[derive(Clone, Debug, Default)]
 struct MigrationPlan {
     entries: Vec<MigrationEntry>,
+    deferred: Vec<MigrationKey>,
 }
 
 impl MigrationPlan {
@@ -199,6 +202,10 @@ impl MigrationPlan {
         self.entries.len() - self.patch_count()
     }
 
+    fn deferred_count(&self) -> usize {
+        self.deferred.len()
+    }
+
     fn render(
         &self,
         source_context: &str,
@@ -207,10 +214,12 @@ impl MigrationPlan {
         target_namespace: &str,
     ) -> String {
         let mut rendered = format!(
-            "XR migration plan\nsource context: {source_context}\nsource namespace: {source_namespace}\ntarget context: {target_context}\ntarget namespace: {target_namespace}\nmanaged resources: {}\npatches required: {}\nalready matching: {}\n",
+            "XR migration plan\nsource context: {source_context}\nsource namespace: {source_namespace}\ntarget context: {target_context}\ntarget namespace: {target_namespace}\nmanaged resources: {}\ncurrently rendered: {}\npatches required: {}\nalready matching: {}\ndeferred: {}\n",
+            self.entries.len() + self.deferred_count(),
             self.entries.len(),
             self.patch_count(),
-            self.matching_count()
+            self.matching_count(),
+            self.deferred_count()
         );
 
         for entry in &self.entries {
@@ -221,6 +230,10 @@ impl MigrationPlan {
                 "{action}\t{}\t{}\t{external_name}\n",
                 entry.key, entry.target
             ));
+        }
+
+        for key in &self.deferred {
+            rendered.push_str(&format!("DEFER\t{key}\n"));
         }
 
         rendered
@@ -334,28 +347,27 @@ fn build_plan(
 
     let source_keys = source_managed.keys().copied().collect::<BTreeSet<_>>();
     let target_keys = target_managed.keys().copied().collect::<BTreeSet<_>>();
-    let missing = source_keys
+    let deferred = source_keys
         .difference(&target_keys)
-        .map(ToString::to_string)
+        .map(|key| (*key).clone())
         .collect::<Vec<_>>();
     let extra = target_keys
         .difference(&source_keys)
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    if !missing.is_empty() || !extra.is_empty() {
+    if !extra.is_empty() {
         return Err(format!(
-            "source and target managed-resource graphs differ; missing in target: [{}]; extra in target: [{}]",
-            missing.join(", "),
+            "target managed-resource graph is not a subset of the source; extra in target: [{}]",
             extra.join(", ")
         )
         .into());
     }
 
-    let mut entries = Vec::with_capacity(source_managed.len());
-    for (key, source_item) in source_managed {
-        let target_item = target_managed
+    let mut entries = Vec::with_capacity(target_managed.len());
+    for (key, target_item) in target_managed {
+        let source_item = source_managed
             .get(key)
-            .expect("graph key sets were checked above");
+            .expect("target graph subset was checked above");
         let source_external_name = source_item
             .resource
             .external_name
@@ -396,7 +408,7 @@ fn build_plan(
         });
     }
 
-    Ok(MigrationPlan { entries })
+    Ok(MigrationPlan { entries, deferred })
 }
 
 fn is_observe_only(policies: &[String]) -> bool {
@@ -932,6 +944,70 @@ mod tests {
         let plan = build_plan(&source, &target).expect("plan");
         assert_eq!(plan.patch_count(), 1);
         assert_eq!(plan.entries[0].external_name, "bucket-id");
+    }
+
+    #[test]
+    fn build_plan_defers_source_resources_missing_from_target() {
+        let mut source = graph_with_external_name(Some("bucket-id"), &["*"]);
+        let target = graph_with_external_name(None, &["Observe", "LateInitialize"]);
+        let later_ref = reference("s3.aws.m.upbound.io/v1beta1", "Bucket", "later");
+        let later_key = MigrationKey {
+            path: "later".to_string(),
+            group: "s3.aws.m.upbound.io".to_string(),
+            kind: "Bucket".to_string(),
+        };
+        source.resources.insert(
+            later_key.clone(),
+            GraphResource {
+                resource: resource(
+                    later_ref,
+                    Some("later"),
+                    Some("later-id"),
+                    &["*"],
+                    Vec::new(),
+                    true,
+                    false,
+                ),
+            },
+        );
+
+        let plan = build_plan(&source, &target).expect("progressive plan");
+        assert_eq!(plan.patch_count(), 1);
+        assert_eq!(plan.deferred, vec![later_key]);
+        assert!(plan
+            .render("source", "default", "target", "target")
+            .contains("DEFER\tlater [s3.aws.m.upbound.io Bucket]"));
+    }
+
+    #[test]
+    fn build_plan_rejects_target_resources_missing_from_source() {
+        let source = graph_with_external_name(Some("bucket-id"), &["*"]);
+        let mut target = graph_with_external_name(None, &["Observe"]);
+        let extra_ref = reference("s3.aws.m.upbound.io/v1beta1", "Bucket", "extra");
+        let extra_key = MigrationKey {
+            path: "extra".to_string(),
+            group: "s3.aws.m.upbound.io".to_string(),
+            kind: "Bucket".to_string(),
+        };
+        target.resources.insert(
+            extra_key,
+            GraphResource {
+                resource: resource(
+                    extra_ref,
+                    Some("extra"),
+                    None,
+                    &["Observe"],
+                    Vec::new(),
+                    true,
+                    false,
+                ),
+            },
+        );
+
+        let error = build_plan(&source, &target).expect_err("target-only resource must fail");
+        assert!(error
+            .to_string()
+            .contains("target managed-resource graph is not a subset"));
     }
 
     #[test]
