@@ -742,6 +742,7 @@ Notes:
   - Recursively compares the source and target XR composition graphs
   - Requires the target XR and its composed resources to be observe-only
   - Copies existing `crossplane.io/external-name` identities to matching target managed resources
+  - Supports status-gated graphs by reporting source resources not rendered in the target as deferred
   - Plans without changing either cluster by default; `--apply` patches only the target
   - Never orphans, deletes, or changes management policies on the source XR
 
@@ -789,11 +790,15 @@ hops xr migrate \
 ```
 
 The command matches recursively composed managed resources by their composition
-path, API group, and kind. It fails if the graphs differ, a source external name
-is missing, the target allows creation or mutation, or a target already has a
-different external name. Apply the verified identity patches with `--apply`.
-This command stages adoption only; source orphaning and target promotion remain
-separate, explicit cutover steps.
+path, API group, and kind. A status-gated target may initially be a strict
+subset of the source; source-only resources are reported as `DEFER` until an
+earlier identity patch lets the target render them. Apply the verified identity
+patches with `--apply`, wait for the graph to expand, and repeat until
+`deferred: 0`. The command still fails if the target has a resource absent from
+the source, a source external name is missing, the target allows creation or
+mutation, or a target already has a different external name. This command
+stages adoption only; source orphaning and target promotion remain separate,
+explicit cutover steps.
 
 ## Logging
 
