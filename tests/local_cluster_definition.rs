@@ -28,7 +28,8 @@ spec:
     name: project-dev
   root: .
   deploys:
-    - path: apps/gateway
+    - path: apps/gateway/.gitops/local
+      type: helm
 "#;
 
 const FAKE_TOOL: &str = r#"#!/bin/sh

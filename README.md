@@ -17,6 +17,7 @@ For local development, it can also:
 - Install the Kubernetes and Helm Crossplane providers
 - Deploy an in-cluster OCI registry (`crossplane-system/registry`)
 - Build and publish Crossplane configuration packages from an XRD project
+- Run a Kubernetes-shaped GitOps workbench for a project and its worktrees
 
 ## Installation
 
@@ -81,12 +82,39 @@ hops validate --help
 hops xr --help
 ```
 
-## Local workbench definition
+## Local GitOps workbench
 
-Keep the Kubernetes-shaped local workbench definitions together under
-`.gitops/local/`. The Cluster owns the local control plane and shared
-`.gitops/local/cluster/` manifests. The reusable Environment names the deploys
-that make up the current checkout's environment.
+The local workbench has two Kubernetes-shaped resources:
+
+- **Cluster** describes one durable local control plane and its shared
+  Crossplane resources. There is normally one Cluster per project/meta root.
+- **Environment** describes the applications that should run for one checkout
+  or worktree. Environment definitions are independent of the Cluster, so a
+  worktree can be added or removed without editing `cluster.yaml`.
+
+Keep the canonical files together under `.gitops/local/`:
+
+```text
+project/
+  .gitops/local/cluster.yaml
+  .gitops/local/environment.yaml
+  .gitops/local/cluster/
+    registry/        # local package registry
+    providers/       # Provider, ProviderConfig, and runtime config
+    configurations/  # Crossplane Configuration packages
+    functions/       # Crossplane Function packages
+    platform/        # namespaces and other platform resources
+    shared/          # resources shared by all Environments
+    rbac/            # cluster-level access for local packages
+  apps/api/.gitops/local/       # editable local workload chart
+  apps/api/.gitops/deploy/      # cloud workload chart
+  apps/api/.gitops/promote/     # cloud promotion chart (not local input)
+  apps/ui/.gitops/test-users/   # optional explicit local deploy
+```
+
+### Cluster definition
+
+`cluster.yaml` must contain exactly one `hops.local/v1alpha1` `Cluster`:
 
 ```yaml
 apiVersion: hops.local/v1alpha1
@@ -96,10 +124,24 @@ metadata:
 spec:
   clusterProvider: kind
   dockerProvider: dory
+  # Relative to .gitops/local/cluster.yaml. ../.. is the project root.
   mountRoot: ../..
   manifests:
     path: .gitops/local/cluster
+  controlPlane:
+    crossplane:
+      chart: crossplane-stable/crossplane
+      version: "2.4.0"
 ```
+
+`mountRoot` is the smallest project/meta directory that contains the
+worktrees. For kind, that exact host path is mounted into the node. An existing
+kind Cluster with a different exact mount path fails with explicit
+recreate/reset guidance; Hops never silently deletes it.
+
+### Environment definition
+
+An Environment is reusable from a checkout:
 
 ```yaml
 apiVersion: hops.local/v1alpha1
@@ -109,52 +151,182 @@ metadata:
 spec:
   clusterRef:
     name: project-dev
+  # Resolved inside Cluster.spec.mountRoot.
   root: .
   values:
     local: true
     preview: false
   deploys:
-    - path: apps/gateway
+    # Every path is a complete, explicit renderer input.
+    - path: apps/api/.gitops/local
+      type: helm
+    - path: apps/ui/.gitops/local
+      type: helm
+    # A second deploy can use another chart from the same application.
+    - path: apps/ui/.gitops/test-users
+      type: helm
+    # Raw Kubernetes YAML; recurse only when requested.
+    - path: platform/manifests
+      type: k8s
+      recursive: true
+    # A directory containing kustomization.yaml.
+    - path: platform/overlays/local
+      type: kustomize
 ```
 
-From that project root:
+Environment values are merged with deploy-specific values for Helm deploys. The
+local controller injects the immutable runtime values `local: true`, the
+Environment name/namespace, and the resolved source path/type. Raw Kubernetes
+and Kustomize directories are already rendered inputs; they do not consume Helm
+values or get silently Helm-templated, but they do receive the common namespace,
+labels, and ownership pipeline. The namespace defaults to the Environment
+runtime name; `--name` and `--namespace` can override those values for an
+explicitly run Environment.
+
+`type` is required and must be `helm`, `k8s`, or `kustomize`:
+
+- `helm` requires `Chart.yaml` and renders with Helm values.
+- `k8s` applies YAML files directly; `recursive` defaults to `false`.
+- `kustomize` runs the directory's `kustomization.yaml`.
+
+Each local workload chart is deliberately separate from its cloud chart:
+
+- `.gitops/local` is the editable, source-mounted development workload.
+- `.gitops/deploy` is the cloud deployment workload.
+- `.gitops/promote` is rendered by cloud promotion tooling and is not selected
+  by local reconciliation unless explicitly named as a deploy path.
+- `.gitops/test-users` (or another explicit renderer directory) is an optional
+  independent deploy, useful for local identities and fixtures.
+
+### Start the Cluster controller
+
+From the project/meta root:
 
 ```bash
-hops local gitops cluster ./.gitops/local/cluster.yaml
-hops local gitops environment ./.gitops/local/environment.yaml --name main
+# Defaults to .gitops/local/cluster.yaml.
+hops local gitops cluster
+
+# One reconcile for CI/scripts; do not enter the watcher.
+hops local gitops cluster ./.gitops/local/cluster.yaml --once
 ```
 
-From another checkout of the same project:
+`gitops cluster` is the canonical GitOps entry point. It:
+
+1. Validates the Cluster, providers, paths, and manifest identities before
+   touching the backend.
+2. Starts or resumes the declared kind, Colima, or Dory backend.
+3. Waits for the API and nodes, ensures local registry trust, and installs the
+   pinned Crossplane Helm seed. This Helm seed is the one intentional
+   prerequisite outside the file-owned tree because it creates the APIs needed
+   by the remaining manifests.
+4. Applies `.gitops/local/cluster/` and records a last-known-good inventory of
+   exact object identities and content revisions.
+5. Discovers every `.gitops/local/environment.yaml` below `mountRoot`, renders
+   each Environment's explicit deploy paths with their declared renderer, and
+   applies them to their namespaces.
+6. Keeps one foreground watcher for the Cluster tree, discovered Environments,
+   and their explicitly selected renderer directories.
+
+The controller lock is stored under
+`~/.hops/local/clusters/<cluster>/controller.lock`. A second process cannot
+become a competing watcher. A malformed, conflicting, or stale lock is
+rejected rather than implicitly adopted; stop or explicitly hand off the
+existing owner first.
+
+### Add a worktree
+
+Put the worktree under the configured `mountRoot`, ensure it contains its
+`.gitops/local/environment.yaml`, and give it a distinct Environment name (or
+use an explicit `--name` invocation). The running Cluster controller discovers
+the file and reconciles it into a separate namespace:
 
 ```bash
-hops local gitops environment ./.gitops/local/environment.yaml --name feature-auth
+git worktree add .worktrees/feature-auth feature/auth
+
+# Usually the single Cluster watcher is enough.
+hops local gitops cluster
 ```
 
-`gitops cluster` validates the Cluster, starts or resumes it, bootstraps the
-local control plane, and watches the declared shared manifests.
-`environment` validates the Environment against that Cluster, turns each
-deploy's `.gitops/local` chart (or explicit `deploys[].chart`) into a local
-Application, applies it to the runtime namespace, and watches
-`.gitops/local/environment.yaml` plus those chart roots. Each application's
-`.gitops/local` chart owns its editable local workload; `.gitops/deploy` is a
-separate cloud workload chart selected by promotion outside local mode.
-The runtime name, namespace, checkout path, and Cluster binding are local state;
-they are not committed to the Cluster definition.
+For a targeted one-shot or compatibility workflow, reconcile an Environment
+directly. This does not start a second watcher when the Cluster controller
+already owns the backend:
 
-Use the same commands for teardown:
+```bash
+hops local gitops environment ./.gitops/local/environment.yaml --name feature-auth --once
+```
+
+The Environment command also accepts the legacy directory of pre-rendered
+Application YAMLs while projects migrate to the reusable Environment format.
+
+### What is watched and what happens on deletion
+
+The watcher uses a short debounce and reacts to:
+
+- Cluster YAML under `.gitops/local/cluster/`
+- Environment definitions under `mountRoot`
+- referenced explicit deploy directories (Helm, raw Kubernetes, or Kustomize)
+- `.gitops/test-users` or other explicitly selected renderer directories
+- `.gitops/promote` paths when a promotion chart is explicitly selected
+
+Ordinary application source changes are handled by the development process in
+the pod through the mounted source tree; they do not require a Helm reconcile.
+
+Every successful Cluster pass atomically updates its inventory. A removed
+Cluster manifest is pruned only by its recorded API version, kind, namespace,
+and name. A removed Environment definition is pruned only from its durable
+ownership snapshot and then unregistered. Removing a chart while the
+Environment still exists is a reconcile error, not permission to delete the
+whole Environment. Invalid changes retain the previous last-known-good state.
+
+Environment cleanup is explicit and exact:
 
 ```bash
 hops local gitops environment --name feature-auth --down
-hops local gitops cluster ./.gitops/local/cluster.yaml --down
+hops local gitops cluster --down
 ```
 
-Deleting a watched Environment definition also purges and unregisters its
-runtime Environment.
+Environment `--down` deletes only its recorded namespaced objects and removes
+its local registration. Cluster `--down` stops the backend and source-delivery
+runtimes while preserving the inventory/snapshots for a later restart.
 
-An existing kind Cluster with a different exact `mountRoot` fails with an
-explicit reset/recreate instruction and is never silently deleted. A legacy
-directory of pre-rendered Application YAMLs is still accepted by `environment`
-during migration.
+### Desired state versus local state
+
+Committed YAML is the desired state. Hops keeps only runtime coordination data
+under `~/.hops/local/`, including:
+
+```text
+clusters/<cluster>/controller.lock
+clusters/<cluster>/cluster-inventory.json
+clusters/<cluster>/environments/<environment>.json
+```
+
+These files contain ownership and identity metadata, not rendered secret
+values, worktree inventories, restart counters, or source-generation values.
+
+### GitOps and standalone local setup are separate modes
+
+`hops local start` remains valid for the non-GitOps use case: prepare a local
+control plane imperatively, then use plain `hops local aws`, `hops config
+install`, or `hops provider install` to bootstrap an AWS/cloud environment.
+That mode is intentionally separate from `hops local gitops cluster`; do not
+run both owners against the same backend. When the GitOps controller owns a
+Cluster, imperative package/provider installers reject the conflicting owner.
+
+Provider credential commands have a deliberate secret boundary. For example:
+
+```bash
+hops local aws --profile my-profile --gitops ./.gitops/local/cluster
+```
+
+This writes the non-secret AWS Provider, runtime config, and ProviderConfig
+files, while applying only the live credential Secret. The Cluster watcher
+then owns the non-secret resources. GitHub and Zitadel currently have partial
+`--gitops` writers; Cloudflare and Listmonk remain imperative. Local
+`secretSync` is parsed as configuration but is not an active sync mechanism
+yet.
+
+The controller does not create or infer secrets, namespaces, or shared-resource
+ownership from names alone.
 
 ## Command Areas
 
@@ -263,7 +435,11 @@ Examples:
 - `secrets/github/repo-a/.env` with `NPM_TOKEN=...` -> GitHub secret `NPM_TOKEN` in `repo-a`
 - `secrets/github/_shared/ORG_TOKEN` -> synced to every configured shared target repo
 
-## Create a Local Control Plane
+## Create a Local Control Plane (standalone mode)
+
+The following is the separate non-GitOps workflow. Use it when the local
+control plane is being used imperatively to bootstrap an AWS/cloud environment,
+or when no `gitops cluster` controller owns the backend.
 
 ```bash
 # 1) Install/select the cluster and Docker providers.

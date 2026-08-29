@@ -5,8 +5,11 @@
 //! diagnostic state and conflict protection, not a second desired-state
 //! document.  Secrets and rendered Helm values never enter this state.
 
-use super::definition::LoadedEnvironment;
-use super::reconcile::{HelmRunner, KubectlApplier, ReconcileOptions, ReconcileResult};
+use super::definition::{DeployType, LoadedEnvironment};
+use super::reconcile::{
+    ensure_environment_namespace, HelmRunner, KubectlApplier, KustomizeRunner, ReconcileOptions,
+    ReconcileResult,
+};
 use crate::commands::local::workbench::registry::{remove_workspace, WorkspaceRecord};
 use crate::commands::local::{kubectl_command, local_state_dir};
 use serde::{Deserialize, Serialize};
@@ -258,8 +261,14 @@ pub struct OwnedObject {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentDeploySnapshot {
+    /// Kept under the historical JSON keys for backwards-compatible cleanup
+    /// of snapshots written before explicit renderer directories.
     pub application_root: String,
     pub chart_path: String,
+    #[serde(default)]
+    pub deploy_type: DeployType,
+    #[serde(default)]
+    pub recursive: bool,
     pub app_name: String,
     pub objects: Vec<OwnedObject>,
 }
@@ -302,8 +311,10 @@ pub fn save_environment_snapshot(
         .zip(results)
         .map(|(deploy, result)| {
             Ok(EnvironmentDeploySnapshot {
-                application_root: deploy.application_root.to_string_lossy().into_owned(),
-                chart_path: deploy.chart_path.to_string_lossy().into_owned(),
+                application_root: deploy.source_root.to_string_lossy().into_owned(),
+                chart_path: deploy.source_path.to_string_lossy().into_owned(),
+                deploy_type: deploy.deploy_type,
+                recursive: deploy.recursive,
                 app_name: result.app_name.clone(),
                 objects: owned_objects_from_yaml(&result.rendered_yaml)?,
             })
@@ -333,16 +344,17 @@ pub fn save_environment_snapshot(
     Ok(path)
 }
 
-/// Render and reconcile every deploy in a validated Environment directly from
-/// its resolved chart pair. This is the controller-owned path: no generated
-/// Application YAML is written and protected identity values are injected
-/// after user values are merged.
-pub fn reconcile_environment<H: HelmRunner, K: KubectlApplier>(
+/// Render and reconcile every explicit deploy directory in a validated
+/// Environment. No generated Application YAML is written; protected identity
+/// values are injected after user values are merged.
+pub fn reconcile_environment<H: HelmRunner, K: KubectlApplier, R: KustomizeRunner>(
     loaded: &LoadedEnvironment,
     opts: &ReconcileOptions,
     helm: &H,
+    kustomize: &R,
     kubectl: &K,
 ) -> Result<Vec<ReconcileResult>, Box<dyn Error>> {
+    ensure_environment_namespace(opts, kubectl)?;
     let mut results = Vec::new();
     let mut errors = Vec::new();
     for deploy in &loaded.environment.deploys {
@@ -359,17 +371,21 @@ pub fn reconcile_environment<H: HelmRunner, K: KubectlApplier>(
         values.insert(
             Value::String("source".into()),
             string_mapping(&[
-                ("localPath", &deploy.application_root.to_string_lossy()),
-                ("chartPath", &deploy.chart_path.to_string_lossy()),
+                ("localPath", &deploy.source_root.to_string_lossy()),
+                ("path", &deploy.source_path.to_string_lossy()),
+                ("type", deploy.deploy_type.as_str()),
             ]),
         );
         let app_name = local_application_name(deploy);
-        match super::reconcile::reconcile_deploy_chart(
-            &deploy.chart_path,
+        match super::reconcile::reconcile_deploy(
+            &deploy.source_path,
+            deploy.deploy_type,
+            deploy.recursive,
             &app_name,
             Value::Mapping(values),
             opts,
             helm,
+            kustomize,
             kubectl,
         ) {
             Ok(result) => results.push(result),
@@ -413,41 +429,7 @@ fn string_mapping(values: &[(&str, &str)]) -> Value {
 }
 
 fn local_application_name(deploy: &super::definition::DeployDefinition) -> String {
-    let application = deploy
-        .application_root
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("application");
-    let default_chart = deploy
-        .application_root
-        .join(super::definition::DEFAULT_DEPLOY_CHART_PATH);
-    let raw = if deploy.chart_path == default_chart {
-        application.to_string()
-    } else {
-        let chart = deploy
-            .chart_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("chart");
-        format!("{application}-{chart}")
-    };
-    let name = raw
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '-' {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    if name.is_empty() {
-        "application".to_string()
-    } else {
-        name
-    }
+    super::definition::local_deploy_name(deploy)
 }
 
 pub fn load_environment_snapshot(

@@ -17,15 +17,15 @@ use super::workbench::controller::{
     reconcile_environment, release_controller_for_down, save_environment_snapshot,
 };
 use super::workbench::definition::{
-    load_environment_definition, prepare_cluster, prepare_cluster_for_stop, ClusterOverrides,
-    DeployDefinition, DEFAULT_DEPLOY_CHART_PATH,
+    load_environment_definition, local_deploy_name, prepare_cluster, prepare_cluster_for_stop,
+    ClusterOverrides, DeployDefinition,
 };
 use super::workbench::delivery::{
     attach_sync_delivery, discover_sync_targets, save_delivery_runtime, stop_delivery_runtime,
     DeliveryStrategy, NodePathProber, SystemNodeProber,
 };
 use super::workbench::reconcile::{
-    reconcile_applications, ReconcileOptions, SystemHelm, SystemKubectl,
+    reconcile_applications, ReconcileOptions, SystemHelm, SystemKubectl, SystemKustomize,
 };
 use super::workbench::registry::{
     activate_workspace_cluster, load_workspace, save_workspace, WorkspaceRecord,
@@ -55,7 +55,7 @@ pub struct GitopsArgs {
 pub enum GitopsCommands {
     /// Shared control-plane gitops (packages, PSQLStack, AuthStack → local CP)
     Cluster(ClusterArgs),
-    /// Reconcile an Environment's Applications (charts → namespace = --name)
+    /// Reconcile an Environment's explicit deploy directories → namespace = --name
     #[command(alias = "worktree")]
     Environment(EnvironmentArgs),
 }
@@ -110,7 +110,7 @@ pub struct EnvironmentArgs {
     #[arg(long, default_value_t = false)]
     pub once: bool,
 
-    /// Watch env + chart paths and re-reconcile (default). Use `--once` to disable.
+    /// Watch env + deploy paths and re-reconcile (default). Use `--once` to disable.
     #[arg(long, default_value_t = false)]
     pub watch: bool,
 
@@ -345,7 +345,7 @@ fn reconcile_cluster_environments(
             delivery_mode: Some(delivery_strategy.as_str().into()),
             dry_run,
         };
-        match reconcile_environment(loaded, &opts, &SystemHelm, &SystemKubectl) {
+        match reconcile_environment(loaded, &opts, &SystemHelm, &SystemKustomize, &SystemKubectl) {
             Ok(results) => {
                 if !dry_run {
                     if let Err(error) = save_environment_snapshot(
@@ -366,6 +366,8 @@ fn reconcile_cluster_environments(
                         &loaded.environment.root,
                         &definition.cluster.name,
                         &kube_context,
+                        &loaded.environment.namespace,
+                        delivery_strategy,
                     ) {
                         errors.push(format!(
                             "{}: save registration: {error}",
@@ -545,11 +547,11 @@ fn run_environment_definition(
     let workspace_name = loaded.environment.name.clone();
     let namespace = loaded.environment.namespace.clone();
     let worktree_root = loaded.environment.root.clone();
-    let mut chart_watch_roots = BTreeSet::new();
+    let mut deploy_watch_roots = BTreeSet::new();
     for deploy in &loaded.environment.deploys {
-        chart_watch_roots.insert(deploy.chart_path.clone());
+        deploy_watch_roots.insert(deploy.source_path.clone());
     }
-    let chart_watch_roots: Vec<_> = chart_watch_roots.into_iter().collect();
+    let deploy_watch_roots: Vec<_> = deploy_watch_roots.into_iter().collect();
     let kube_context = super::kube_context_from_env().ok_or_else(|| {
         format!(
             "declared Cluster {:?} has no available kube context; start it with `hops local gitops cluster {}` first",
@@ -582,7 +584,13 @@ fn run_environment_definition(
     };
 
     let reconcile = || -> Result<(), Box<dyn Error>> {
-        let results = reconcile_environment(&loaded, &opts, &SystemHelm, &SystemKubectl)?;
+        let results = reconcile_environment(
+            &loaded,
+            &opts,
+            &SystemHelm,
+            &SystemKustomize,
+            &SystemKubectl,
+        )?;
         if !args.dry_run {
             save_environment_snapshot(&cluster.cluster.name, &kube_context, &loaded, &results)?;
             persist_environment_registration(
@@ -591,6 +599,8 @@ fn run_environment_definition(
                 &worktree_root,
                 &cluster.cluster.name,
                 &kube_context,
+                &namespace,
+                delivery_strategy,
             )?;
         }
         Ok(())
@@ -612,7 +622,7 @@ fn run_environment_definition(
     run_environment_watch(
         &source,
         &worktree_root,
-        &chart_watch_roots,
+        &deploy_watch_roots,
         &workspace_name,
         args.debounce,
         reconcile,
@@ -640,28 +650,7 @@ fn discover_cluster_definition(environment_file: &Path) -> Option<PathBuf> {
 }
 
 fn local_application_name(deploy: &DeployDefinition) -> String {
-    let application = deploy
-        .application_root
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("application");
-    let default_chart = deploy.application_root.join(DEFAULT_DEPLOY_CHART_PATH);
-    let raw = if deploy.chart_path == default_chart {
-        application.to_string()
-    } else {
-        let chart = deploy
-            .chart_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("chart");
-        format!("{application}-{chart}")
-    };
-    let name = sanitize_name(&raw);
-    if name.is_empty() {
-        "application".to_string()
-    } else {
-        name
-    }
+    local_deploy_name(deploy)
 }
 
 #[cfg(test)]
@@ -690,34 +679,31 @@ fn string_mapping(values: &[(&str, &str)]) -> Value {
     Value::Mapping(mapping)
 }
 
-fn sanitize_name(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '-' {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
-}
-
 fn persist_environment_registration(
     workspace_name: &str,
     source: &Path,
     worktree_root: &Path,
     cluster_name: &str,
     kube_context: &str,
+    namespace: &str,
+    delivery_strategy: DeliveryStrategy,
 ) -> Result<(), Box<dyn Error>> {
     let state_dir = local_state_dir()?;
-    let Some(mut record) = load_workspace(&state_dir, workspace_name)? else {
-        return Err(format!("workspace {workspace_name:?} was not registered").into());
-    };
+    let mut record =
+        load_workspace(&state_dir, workspace_name)?.unwrap_or_else(|| WorkspaceRecord {
+            name: workspace_name.to_string(),
+            namespace: namespace.to_string(),
+            env_path: source.to_string_lossy().into_owned(),
+            project_root: Some(worktree_root.to_string_lossy().into_owned()),
+            delivery_mode: Some(delivery_strategy.as_str().to_string()),
+            updated_at: None,
+            cluster_name: Some(cluster_name.to_string()),
+            kube_context: Some(kube_context.to_string()),
+        });
     record.env_path = source.to_string_lossy().into_owned();
     record.project_root = Some(worktree_root.to_string_lossy().into_owned());
+    record.namespace = namespace.to_string();
+    record.delivery_mode = Some(delivery_strategy.as_str().to_string());
     record.cluster_name = Some(cluster_name.to_string());
     record.kube_context = Some(kube_context.to_string());
     save_workspace(&state_dir, &record)?;
@@ -872,16 +858,16 @@ fn run_application_worktree(
 
     let do_once = || -> Result<(), Box<dyn Error>> {
         log::info!(
-            "environment gitops: Applications from {} → namespace {}",
+            "environment gitops: deploys from {} → namespace {}",
             env_path.display(),
             opts.namespace
         );
         let results = reconcile_applications(&env_path, &opts, &SystemHelm, &SystemKubectl)?;
         for r in &results {
             log::info!(
-                "  {} (chart {}) {}",
+                "  {} (source {}) {}",
                 r.app_name,
-                r.chart_path.display(),
+                r.source_path.display(),
                 if r.applied { "applied" } else { "rendered" }
             );
         }
@@ -1080,7 +1066,7 @@ where
         }
     }
     log::info!(
-        "Environment gitops watch active (debounce {}s). Environment YAML + charts only. Ctrl+C to stop.",
+        "Environment gitops watch active (debounce {}s). Environment YAML + deploy directories only. Ctrl+C to stop.",
         debounce_secs
     );
 
@@ -1135,7 +1121,7 @@ where
         watcher.watch(project_root, RecursiveMode::Recursive)?;
     }
     log::info!(
-        "Watching Cluster tree {} and project Environment/local chart paths (debounce {}s). Ctrl+C to stop.",
+        "Watching Cluster tree {} and project Environment/deploy paths (debounce {}s). Ctrl+C to stop.",
         cluster.display(),
         debounce_secs
     );
@@ -1268,7 +1254,8 @@ spec:
     feature:
       enabled: false
   deploys:
-    - path: apps/gateway
+    - path: apps/gateway/.gitops/local
+      type: helm
       values:
         feature:
           enabled: true
@@ -1309,7 +1296,7 @@ spec:
             Value::String("feature-auth-ns".into())
         );
         assert_eq!(local_application_name(deploy), "gateway");
-        assert_eq!(deploy.chart_path, root.join("apps/gateway/.gitops/local"));
+        assert_eq!(deploy.source_path, root.join("apps/gateway/.gitops/local"));
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -81,8 +81,20 @@ hops local gitops environment ./.gitops/local/environment.yaml --name dogfood
 ```
 
 Editable charts live under `api/.gitops/local` and `ui/.gitops/local`;
-`.gitops/deploy` is reserved for independent cloud charts. You can render the
-local charts without Hops:
+`.gitops/deploy` is reserved for independent cloud charts. The Environment
+definition names each renderer directory explicitly:
+
+```yaml
+deploys:
+  - path: api/.gitops/local
+    type: helm
+  - path: ui/.gitops/local
+    type: helm
+  - path: ui/.gitops/test-users
+    type: helm
+```
+
+You can render the local charts without Hops:
 
 ```bash
 helm template api ./api/.gitops/local
@@ -134,9 +146,9 @@ not a host `make run` you invent.
 ## Layout
 
 ```text
-gitops/
+.gitops/local/
   cluster/          # shared CP (one per machine) — hops local gitops cluster
-  .gitops/local/environment.yaml # reusable Environment definition
+  environment.yaml  # reusable Environment definition
 ```
 
 - **cluster** — not per-worktree; packages + platform XRs on the local CP
