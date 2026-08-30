@@ -8,12 +8,12 @@
 //! <project>/                        # checkout root
 //!   .gitops/local/cluster/          # CP: PSQLStack, AuthStack, packages…
 //!   .gitops/local/environment.yaml  # reusable checkout Environment
-//!   clients/foo/.gitops/local/      # editable local application charts
+//!   clients/foo/.gitops/local/      # editable local workload charts
 //!   platform/api/.gitops/local/
 //! ```
 //!
-//! Env Applications only isolate **app** namespaces. Cluster YAML is applied
-//! once to the CP and reconciled by Crossplane.
+//! Environments isolate workload namespaces. Cluster YAML is applied once to
+//! the CP and reconciled by Crossplane.
 //!
 //! Watched like env gitops: change a file → `kubectl apply` → CP.
 
@@ -444,8 +444,7 @@ pub fn should_apply_manifest(path: &Path) -> bool {
 }
 
 /// Reconcile a validated Cluster tree and maintain an exact last-known-good
-/// inventory. This is the controller-facing API; the legacy wrapper above
-/// remains a one-shot compatibility adapter without persistence.
+/// inventory for the local controller.
 pub fn reconcile_cluster_dir_with_inventory(
     cluster_path: &Path,
     inventory_path: &Path,

@@ -152,7 +152,7 @@ not a host `make run` you invent.
 ```
 
 - **cluster** — not per-worktree; packages + platform XRs on the local CP
-- **environment** — promoted local applications into namespace `= --name`
+- **environment** — promoted local workloads into namespace `= --name`
 
 ## Developing configs & providers on this CP
 
@@ -160,7 +160,7 @@ Iterate from **source** while keeping the cluster gitops tree coherent:
 
 ```bash
 # Stack XRDs / compositions
-hops config install --path xrs/stacks/k8s/auth --gitops ./gitops/cluster --local
+hops config install --path xrs/stacks/k8s/auth --gitops ./.gitops/local/cluster --local
 
 # Provider implementation (SemVer-safe vMAJOR.999.N + ImageConfig in gitops)
 hops provider install --path /path/to/provider-helm --gitops ./gitops/cluster

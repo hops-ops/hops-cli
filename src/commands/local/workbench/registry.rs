@@ -14,7 +14,7 @@ pub struct WorkspaceRecord {
     pub name: String,
     /// Kubernetes namespace — same as the slugified workspace name (`--name`).
     pub namespace: String,
-    /// Absolute path to the env Application directory.
+    /// Absolute path to the Environment definition.
     pub env_path: String,
     /// Absolute project root (parent of env path when known).
     #[serde(default)]

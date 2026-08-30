@@ -247,16 +247,13 @@ git worktree add .worktrees/feature-auth feature/auth
 hops local gitops cluster
 ```
 
-For a targeted one-shot or compatibility workflow, reconcile an Environment
+For a targeted one-shot workflow, reconcile an Environment
 directly. This does not start a second watcher when the Cluster controller
 already owns the backend:
 
 ```bash
 hops local gitops environment ./.gitops/local/environment.yaml --name feature-auth --once
 ```
-
-The Environment command also accepts the legacy directory of pre-rendered
-Application YAMLs while projects migrate to the reusable Environment format.
 
 ### What is watched and what happens on deletion
 

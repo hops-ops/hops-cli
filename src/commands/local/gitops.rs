@@ -2,13 +2,12 @@
 //!
 //! ```text
 //! hops local gitops cluster [cluster.yaml] # lifecycle + shared CP manifests
-//! hops local gitops environment <PATH> # Environment apps → namespace = --name
+//! hops local gitops environment <PATH> # Environment deploys → namespace = --name
 //! ```
 //!
 //! Both **watch by default**; pass `--once` for a single reconcile (CI/scripts).
 
 use super::local_state_dir;
-use super::workbench::application::{load_applications, resolve_delivery_host_path};
 use super::workbench::cluster_gitops::{
     reconcile_cluster_dir_with_inventory, should_reconcile_cluster_change,
 };
@@ -18,25 +17,18 @@ use super::workbench::controller::{
 };
 use super::workbench::definition::{
     load_environment_definition, local_deploy_name, prepare_cluster, prepare_cluster_for_stop,
-    ClusterOverrides, DeployDefinition,
+    ClusterOverrides,
 };
 use super::workbench::delivery::{
-    attach_sync_delivery, discover_sync_targets, save_delivery_runtime, stop_delivery_runtime,
-    DeliveryStrategy, NodePathProber, SystemNodeProber,
+    stop_delivery_runtime, DeliveryStrategy, NodePathProber, SystemNodeProber,
 };
-use super::workbench::reconcile::{
-    reconcile_applications, ReconcileOptions, SystemHelm, SystemKubectl, SystemKustomize,
-};
-use super::workbench::registry::{
-    activate_workspace_cluster, load_workspace, save_workspace, WorkspaceRecord,
-};
-use super::workbench::watch::{
-    is_chart_or_env_path, should_ignore_watch_path, watch_roots_for_applications, WatchPathClass,
-};
-use super::workbench::{namespace_for_name, slugify_name};
+use super::workbench::reconcile::{ReconcileOptions, SystemHelm, SystemKubectl, SystemKustomize};
+use super::workbench::registry::{load_workspace, save_workspace, WorkspaceRecord};
+use super::workbench::slugify_name;
+use super::workbench::watch::should_ignore_watch_path;
 use clap::{Args, Subcommand};
 use notify::{RecursiveMode, Watcher};
-use serde::Deserialize;
+#[cfg(test)]
 use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -56,7 +48,6 @@ pub enum GitopsCommands {
     /// Shared control-plane gitops (packages, PSQLStack, AuthStack → local CP)
     Cluster(ClusterArgs),
     /// Reconcile an Environment's explicit deploy directories → namespace = --name
-    #[command(alias = "worktree")]
     Environment(EnvironmentArgs),
 }
 
@@ -89,7 +80,7 @@ pub struct ClusterArgs {
 
 #[derive(Args, Debug)]
 pub struct EnvironmentArgs {
-    /// Reusable Environment YAML, or a legacy Application directory.
+    /// Reusable Environment YAML.
     /// Optional with --down, which resolves the registered Environment by name.
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
@@ -309,7 +300,7 @@ fn reconcile_cluster_environments(
         let mut hosts = BTreeMap::new();
         for deploy in &loaded.environment.deploys {
             hosts.insert(
-                local_application_name(deploy),
+                local_deploy_name(deploy),
                 definition.cluster.mount_root.clone(),
             );
         }
@@ -510,10 +501,7 @@ fn run_environment(
         .path
         .as_deref()
         .ok_or("Environment PATH is required unless --down is used with a registered --name")?;
-    if path.is_file() && yaml_kind(path)?.as_deref() == Some("Environment") {
-        return run_environment_definition(args, path, overrides);
-    }
-    run_application_worktree(args, path, None)
+    run_environment_definition(args, path, overrides)
 }
 
 fn run_environment_definition(
@@ -556,7 +544,7 @@ fn run_environment_definition(
     let mut app_delivery_host_paths = BTreeMap::new();
     for deploy in &deploys {
         app_delivery_host_paths.insert(
-            local_application_name(deploy),
+            local_deploy_name(deploy),
             cluster.cluster.mount_root.clone(),
         );
     }
@@ -622,28 +610,12 @@ fn run_environment_definition(
     )
 }
 
-fn yaml_kind(path: &Path) -> Result<Option<String>, Box<dyn Error>> {
-    let text = fs::read_to_string(path)?;
-    let Some(document) = serde_yaml::Deserializer::from_str(&text).next() else {
-        return Ok(None);
-    };
-    let value = Value::deserialize(document)?;
-    Ok(value
-        .get("kind")
-        .and_then(Value::as_str)
-        .map(str::to_string))
-}
-
 fn discover_cluster_definition(environment_file: &Path) -> Option<PathBuf> {
     environment_file
         .parent()?
         .ancestors()
         .map(|directory| directory.join("cluster.yaml"))
         .find(|candidate| candidate.is_file())
-}
-
-fn local_application_name(deploy: &DeployDefinition) -> String {
-    local_deploy_name(deploy)
 }
 
 #[cfg(test)]
@@ -787,196 +759,12 @@ fn is_environment_watch_path(path: &Path, source: &Path, chart_roots: &[PathBuf]
     path == source || chart_roots.iter().any(|root| path.starts_with(root))
 }
 
-fn run_application_worktree(
-    args: &EnvironmentArgs,
-    path: &Path,
-    declared_cluster: Option<(&str, &str)>,
-) -> Result<(), Box<dyn Error>> {
-    let env_path = path
-        .canonicalize()
-        .map_err(|e| format!("env path {}: {e}", path.display()))?;
-
-    let workspace_name = args
-        .name
-        .clone()
-        .or_else(|| args.namespace.clone())
-        .unwrap_or_else(|| {
-            env_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(slugify_name)
-                .unwrap_or_else(|| "local".into())
-        });
-
-    let namespace = args
-        .namespace
-        .clone()
-        .unwrap_or_else(|| namespace_for_name(&workspace_name));
-
-    // Sticky workspace→cluster: use bound kube context when registered.
-    let existing_workspace = local_state_dir()
-        .ok()
-        .and_then(|state_dir| load_workspace(&state_dir, &workspace_name).ok().flatten());
-    if let Some((cluster, context)) = declared_cluster {
-        std::env::set_var(super::HOPS_KUBE_CONTEXT_ENV, context);
-        super::backend::kind::set_active_cluster_name(cluster);
-        log::info!("environment gitops: declared cluster `{cluster}` (context {context})");
-    } else if let Some(rec) = existing_workspace.as_ref() {
-        if let Some((cluster, ctx)) = activate_workspace_cluster(rec) {
-            log::info!("environment gitops: bound cluster `{cluster}` (context {ctx})");
-        }
-    }
-
-    let mut app_delivery_host_paths = BTreeMap::new();
-    for (app_file, app) in load_applications(&env_path)? {
-        let host = resolve_delivery_host_path(&app_file, &app)?;
-        app_delivery_host_paths.insert(app.metadata.name, host);
-    }
-    let (delivery_strategy, delivery_detail) =
-        resolve_worktree_delivery(&app_delivery_host_paths, &SystemNodeProber)?;
-    log::info!(
-        "environment gitops: source delivery {} ({})",
-        delivery_strategy.as_str(),
-        delivery_detail
-    );
-
-    let opts = ReconcileOptions {
-        namespace: namespace.clone(),
-        workspace_name: workspace_name.clone(),
-        runtime_values: BTreeMap::new(),
-        app_delivery_host_paths,
-        delivery_mode: Some(delivery_strategy.as_str().into()),
-        dry_run: args.dry_run,
-    };
-
-    let do_once = || -> Result<(), Box<dyn Error>> {
-        log::info!(
-            "environment gitops: deploys from {} → namespace {}",
-            env_path.display(),
-            opts.namespace
-        );
-        let results = reconcile_applications(&env_path, &opts, &SystemHelm, &SystemKubectl)?;
-        for r in &results {
-            log::info!(
-                "  {} (source {}) {}",
-                r.app_name,
-                r.source_path.display(),
-                if r.applied { "applied" } else { "rendered" }
-            );
-        }
-
-        if !opts.dry_run {
-            let state_dir = local_state_dir()?;
-            // A previous run may have fallen back to a detached tar/mutagen
-            // sync runtime. Retire it even when the current probe selects
-            // hostPath, otherwise that stale writer keeps replacing files in
-            // the mounted tree and repeatedly restarts dev servers.
-            stop_delivery_runtime(&state_dir, &workspace_name);
-
-            if delivery_strategy != DeliveryStrategy::Sync {
-                return Ok(());
-            }
-
-            let targets = wait_for_sync_targets(
-                &opts.namespace,
-                &workspace_name,
-                "/workspace",
-                &opts.app_delivery_host_paths,
-                90,
-            );
-            let attached =
-                attach_sync_delivery(&targets, &workspace_name, !args.once && !args.dry_run)?;
-            save_delivery_runtime(
-                &state_dir,
-                &workspace_name,
-                &attached.mutagen_sessions,
-                &attached.sync_pids,
-            )?;
-            for message in attached.messages {
-                log::info!("delivery: {message}");
-            }
-        }
-        Ok(())
-    };
-
-    do_once()?;
-    if !args.dry_run {
-        register_worktree(
-            &env_path,
-            &workspace_name,
-            &namespace,
-            delivery_strategy,
-            existing_workspace.as_ref(),
-            declared_cluster,
-        )?;
-    }
-    if args.once || args.dry_run {
-        return Ok(());
-    }
-
-    run_worktree_watch(&env_path, args.debounce, do_once)
-}
-
-fn register_worktree(
-    env_path: &Path,
-    workspace_name: &str,
-    namespace: &str,
-    delivery_strategy: DeliveryStrategy,
-    existing: Option<&WorkspaceRecord>,
-    declared_cluster: Option<(&str, &str)>,
-) -> Result<(), Box<dyn Error>> {
-    let cluster_name = declared_cluster
-        .map(|(cluster, _)| cluster.to_string())
-        .or_else(|| {
-            existing
-                .and_then(|record| record.cluster_name.clone())
-                .filter(|name| !name.is_empty())
-        })
-        .unwrap_or_else(super::backend::kind::active_cluster_name);
-    let kube_context = declared_cluster
-        .map(|(_, context)| context.to_string())
-        .or_else(|| {
-            existing
-                .and_then(|record| record.kube_context.clone())
-                .filter(|context| !context.is_empty())
-        })
-        .or_else(super::kube_context_from_env)
-        .or_else(|| Some(format!("kind-{cluster_name}")));
-    let project_root = discover_project_root(env_path)
-        .map(|path| path.to_string_lossy().into_owned())
-        .or_else(|| existing.and_then(|record| record.project_root.clone()));
-
-    let record = WorkspaceRecord {
-        name: workspace_name.to_string(),
-        namespace: namespace.to_string(),
-        env_path: env_path.to_string_lossy().into_owned(),
-        project_root,
-        delivery_mode: Some(delivery_strategy.as_str().to_string()),
-        updated_at: None,
-        cluster_name: Some(cluster_name),
-        kube_context,
-    };
-    let path = save_workspace(&local_state_dir()?, &record)?;
-    log::info!(
-        "environment gitops: registered Environment `{workspace_name}` at {}",
-        path.display()
-    );
-    Ok(())
-}
-
-fn discover_project_root(env_path: &Path) -> Option<PathBuf> {
-    env_path
-        .ancestors()
-        .find(|candidate| candidate.join(".git").exists())
-        .map(Path::to_path_buf)
-}
-
 fn resolve_worktree_delivery(
     app_paths: &BTreeMap<String, PathBuf>,
     prober: &dyn NodePathProber,
 ) -> Result<(DeliveryStrategy, String), Box<dyn Error>> {
     if app_paths.is_empty() {
-        return Err("environment gitops found no Application source paths".into());
+        return Err("environment gitops found no deploy source paths".into());
     }
 
     let mut all_visible = true;
@@ -993,86 +781,6 @@ fn resolve_worktree_delivery(
         DeliveryStrategy::Sync
     };
     Ok((strategy, details.join("; ")))
-}
-
-fn wait_for_sync_targets(
-    namespace: &str,
-    workspace: &str,
-    mount_path: &str,
-    app_hosts: &BTreeMap<String, PathBuf>,
-    timeout_secs: u64,
-) -> Vec<super::workbench::delivery::SyncPodTarget> {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        match discover_sync_targets(namespace, workspace, mount_path, app_hosts) {
-            Ok(targets) if !targets.is_empty() => return targets,
-            Ok(_) => {}
-            Err(error) => log::debug!("sync target discovery: {error}"),
-        }
-        if Instant::now() >= deadline {
-            return discover_sync_targets(namespace, workspace, mount_path, app_hosts)
-                .unwrap_or_default();
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
-fn run_worktree_watch<F>(
-    env_path: &Path,
-    debounce_secs: u64,
-    mut rebuild: F,
-) -> Result<(), Box<dyn Error>>
-where
-    F: FnMut() -> Result<(), Box<dyn Error>>,
-{
-    let roots = watch_roots_for_applications(env_path)?;
-    let env_canon = env_path
-        .canonicalize()
-        .unwrap_or_else(|_| env_path.to_path_buf());
-    let chart_paths: Vec<PathBuf> = roots.iter().filter(|p| *p != &env_canon).cloned().collect();
-
-    let debounce = Duration::from_secs(debounce_secs);
-    let (tx, rx) = mpsc::channel();
-
-    let env_c = env_canon.clone();
-    let charts = chart_paths.clone();
-    let mut watcher =
-        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-            Ok(event) => {
-                for p in &event.paths {
-                    if should_ignore_watch_path(p) {
-                        continue;
-                    }
-                    if is_chart_or_env_path(p, &env_c, &charts) == WatchPathClass::ChartOrEnv {
-                        let _ = tx.send(());
-                        break;
-                    }
-                }
-            }
-            Err(e) => log::debug!("watch error: {e:?}"),
-        })?;
-
-    for root in &roots {
-        if root.exists() {
-            watcher.watch(root, RecursiveMode::Recursive)?;
-            log::info!("Watching {}", root.display());
-        }
-    }
-    log::info!(
-        "Environment gitops watch active (debounce {}s). Environment YAML + deploy directories only. Ctrl+C to stop.",
-        debounce_secs
-    );
-
-    loop {
-        rx.recv().map_err(|_| "watcher channel closed")?;
-        wait_for_quiet(&rx, debounce)?;
-        log::info!("──────────────────────────────────────────────");
-        log::info!("Environment gitops change, reconciling...");
-        match rebuild() {
-            Ok(()) => log::info!("Reconcile succeeded."),
-            Err(e) => log::error!("Reconcile failed: {e}"),
-        }
-    }
 }
 
 // ── shared watch helpers ─────────────────────────────────────────────────────
@@ -1175,37 +883,6 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn discovers_project_root_from_git_ancestor() {
-        let root = std::env::temp_dir().join(format!(
-            "hops-gitops-root-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let env_path = root.join("gitops/envs/local");
-        fs::create_dir_all(&env_path).unwrap();
-        fs::write(root.join(".git"), "gitdir: /tmp/example\n").unwrap();
-
-        assert_eq!(discover_project_root(&env_path), Some(root.clone()));
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn project_root_is_unknown_without_git_ancestor() {
-        let root = std::env::temp_dir().join(format!(
-            "hops-gitops-no-root-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let env_path = root.join("gitops/envs/local");
-        fs::create_dir_all(&env_path).unwrap();
-
-        assert_eq!(discover_project_root(&env_path), None);
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn renders_reusable_environment_for_runtime_identity() {
         let root = std::env::temp_dir().join(format!(
             "hops-gitops-environment-{}-{}",
@@ -1288,7 +965,7 @@ spec:
             values["environment"]["namespace"],
             Value::String("feature-auth-ns".into())
         );
-        assert_eq!(local_application_name(deploy), "gateway");
+        assert_eq!(local_deploy_name(deploy), "gateway");
         assert_eq!(deploy.source_path, root.join("apps/gateway/.gitops/local"));
 
         fs::remove_dir_all(root).unwrap();

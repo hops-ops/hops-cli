@@ -3,7 +3,6 @@
 //! The GitOps cluster command consumes the validated definition to select the
 //! backend, mount the project root, and start or resume the named cluster.
 
-use super::application::service_root_from_chart_path;
 use crate::commands::local::backend::{self, Backend, ClusterProvider, DockerProvider};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -17,12 +16,10 @@ use std::path::{Component, Path, PathBuf};
 
 pub const API_VERSION: &str = "hops.local/v1alpha1";
 pub const DEFAULT_DEFINITION_FILE: &str = ".gitops/local/cluster.yaml";
-pub const LEGACY_DEFINITION_FILE: &str = "cluster.yaml";
 pub const DEFAULT_ENVIRONMENT_FILE: &str = ".gitops/local/environment.yaml";
 pub const DEFAULT_CROSSPLANE_CHART: &str = "crossplane-stable/crossplane";
 pub const DEFAULT_CROSSPLANE_VERSION: &str = "2.4.0";
 pub const CLUSTER_MANIFESTS_PATH: &str = ".gitops/local/cluster";
-pub const LEGACY_CLUSTER_MANIFESTS_PATH: &str = ".gitops/cluster";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClusterOverrides<'a> {
@@ -129,7 +126,7 @@ pub struct DeployDefinition {
     pub values: Mapping,
 }
 
-/// Stable local Application identity derived from the explicit source path.
+/// Stable local deploy identity derived from the explicit source path.
 /// Including the renderer directory keeps sibling deploys such as
 /// `ui/.gitops/local` and `ui/.gitops/test-users` independent.
 pub fn local_deploy_name(deploy: &DeployDefinition) -> String {
@@ -187,6 +184,28 @@ pub fn local_deploy_name(deploy: &DeployDefinition) -> String {
         "deploy".to_string()
     } else {
         name
+    }
+}
+
+/// Given `…/<service>/.gitops/<deploy>`, return `…/<service>`.
+/// If `.gitops` is not in the path, return the deploy path itself.
+pub fn service_root_from_deploy_path(deploy_path: &Path) -> PathBuf {
+    let components: Vec<_> = deploy_path.components().collect();
+    if let Some(index) = components
+        .iter()
+        .position(|component| component.as_os_str() == std::ffi::OsStr::new(".gitops"))
+    {
+        let mut root = PathBuf::new();
+        for component in &components[..index] {
+            root.push(component.as_os_str());
+        }
+        if root.as_os_str().is_empty() {
+            deploy_path.to_path_buf()
+        } else {
+            root
+        }
+    } else {
+        deploy_path.to_path_buf()
     }
 }
 
@@ -379,20 +398,7 @@ pub fn definition_path(file: Option<&Path>, cwd: &Path) -> PathBuf {
     match file {
         Some(path) if path.is_absolute() => path.to_path_buf(),
         Some(path) => cwd.join(path),
-        None => {
-            let preferred = cwd.join(DEFAULT_DEFINITION_FILE);
-            let legacy = cwd.join(LEGACY_DEFINITION_FILE);
-            if preferred.is_file() || !legacy.is_file() {
-                preferred
-            } else {
-                log::warn!(
-                    "using legacy Cluster definition {}; move it to {}",
-                    legacy.display(),
-                    preferred.display()
-                );
-                legacy
-            }
-        }
+        None => cwd.join(DEFAULT_DEFINITION_FILE),
     }
 }
 
@@ -484,19 +490,12 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
     )?;
     ensure_within(&mount_root, &definition_root, "Cluster definition")?;
     let manifests_relative = &raw_cluster.spec.manifests.path;
-    if !manifests_relative.ends_with(CLUSTER_MANIFESTS_PATH)
-        && manifests_relative != Path::new(LEGACY_CLUSTER_MANIFESTS_PATH)
-    {
+    if !manifests_relative.ends_with(CLUSTER_MANIFESTS_PATH) {
         return Err(format!(
-            "Cluster.spec.manifests.path must end with {CLUSTER_MANIFESTS_PATH:?} (or equal legacy {LEGACY_CLUSTER_MANIFESTS_PATH:?}); got {:?}",
+            "Cluster.spec.manifests.path must end with {CLUSTER_MANIFESTS_PATH:?}; got {:?}",
             raw_cluster.spec.manifests.path.display().to_string()
         )
         .into());
-    }
-    if manifests_relative == Path::new(LEGACY_CLUSTER_MANIFESTS_PATH) {
-        log::warn!(
-            "using legacy Cluster manifest path {LEGACY_CLUSTER_MANIFESTS_PATH}; move it to {CLUSTER_MANIFESTS_PATH}"
-        );
     }
     let manifests_base = if source.ends_with(DEFAULT_DEFINITION_FILE) {
         &mount_root
@@ -687,7 +686,7 @@ pub fn load_environment_definition(
             )
             .into());
         }
-        let source_root = service_root_from_chart_path(&source_path);
+        let source_root = service_root_from_deploy_path(&source_path);
         let deploy_definition = DeployDefinition {
             source_path,
             source_root,
@@ -1125,16 +1124,11 @@ spec:
     }
 
     #[test]
-    fn default_definition_prefers_local_layout_then_legacy_root() {
+    fn default_definition_uses_local_layout() {
         let fixture = Fixture::new();
         let preferred = fixture.write(valid_yaml());
-        let legacy = fixture.root.join(LEGACY_DEFINITION_FILE);
-        fs::write(&legacy, valid_yaml()).unwrap();
 
         assert_eq!(definition_path(None, &fixture.root), preferred);
-
-        fs::remove_file(&preferred).unwrap();
-        assert_eq!(definition_path(None, &fixture.root), legacy);
     }
 
     #[test]
@@ -1336,25 +1330,6 @@ spec:
         let loaded = load_definition(&fixture.write(&yaml)).unwrap();
 
         assert_eq!(loaded.cluster.manifests_path, fixture.root.join(nested));
-    }
-
-    #[test]
-    fn accepts_legacy_root_definition_and_manifest_layout() {
-        let fixture = Fixture::new();
-        fs::create_dir_all(fixture.root.join(LEGACY_CLUSTER_MANIFESTS_PATH)).unwrap();
-        let legacy = valid_yaml()
-            .replacen("mountRoot: ../..", "mountRoot: .", 1)
-            .replacen(CLUSTER_MANIFESTS_PATH, LEGACY_CLUSTER_MANIFESTS_PATH, 1);
-        let source = fixture.root.join(LEGACY_DEFINITION_FILE);
-        fs::write(&source, legacy).unwrap();
-
-        let loaded = load_definition(&source).unwrap();
-
-        assert_eq!(loaded.cluster.mount_root, fixture.root);
-        assert_eq!(
-            loaded.cluster.manifests_path,
-            fixture.root.join(LEGACY_CLUSTER_MANIFESTS_PATH)
-        );
     }
 
     #[test]

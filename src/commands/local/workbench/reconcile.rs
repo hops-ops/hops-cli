@@ -1,7 +1,6 @@
 //! Environment deploy reconcile: render explicit Helm/Kubernetes/Kustomize
 //! sources, inject ownership metadata, and apply.
 
-use super::application::{load_applications, resolve_source_path, Application};
 use super::definition::DeployType;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -238,7 +237,7 @@ impl KubectlApplier for SystemKubectl {
             // apply. It must not infer ownership from broad label queries.
             return Ok(());
         };
-        // A worktree Application may render shared resources in another
+        // A worktree deploy may render shared resources in another
         // namespace, but its prune inventory is owned by this workspace. Never
         // let one workspace delete another namespace's shared identity objects.
         let previous = object_refs_in_namespace(previous, inventory_namespace);
@@ -269,7 +268,7 @@ impl KubectlApplier for SystemKubectl {
             return Err(format!("kubectl prune exited with {status}").into());
         }
         log::info!(
-            "Pruned {} stale object(s) for Application {}",
+            "Pruned {} stale object(s) for deploy {}",
             stale.len(),
             app_name
         );
@@ -425,7 +424,7 @@ fn is_soft_apply_error(msg: &str) -> bool {
         || lower.contains("the server doesn't have a resource type")
 }
 
-/// Merge chart-level application values with runtime inject.
+/// Merge chart-level deploy values with runtime inject.
 /// Precedence: base (app helm values) ← runtime_values (runtime wins on key clash).
 pub fn merge_helm_values(app_values: Option<&Value>, runtime: &BTreeMap<String, Value>) -> Value {
     let mut out = serde_yaml::Mapping::new();
@@ -579,45 +578,6 @@ fn build_runtime_values(opts: &ReconcileOptions, app_name: &str) -> BTreeMap<Str
     runtime
 }
 
-/// Reconcile all Applications under `env_path`.
-pub fn reconcile_applications<H: HelmRunner, K: KubectlApplier>(
-    env_path: &Path,
-    opts: &ReconcileOptions,
-    helm: &H,
-    kubectl: &K,
-) -> Result<Vec<ReconcileResult>, Box<dyn Error>> {
-    let apps = load_applications(env_path)?;
-    if apps.is_empty() {
-        return Err(format!(
-            "no Application YAML files found under {}",
-            env_path.display()
-        )
-        .into());
-    }
-
-    ensure_environment_namespace(opts, kubectl)?;
-
-    let mut results = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-
-    for (app_file, app) in apps {
-        match reconcile_one(&app_file, &app, opts, helm, kubectl) {
-            Ok(r) => results.push(r),
-            Err(e) => errors.push(format!("{}: {e}", app.metadata.name)),
-        }
-    }
-
-    if !errors.is_empty() {
-        return Err(format!(
-            "reconcile failed for {} app(s):\n  - {}",
-            errors.len(),
-            errors.join("\n  - ")
-        )
-        .into());
-    }
-    Ok(results)
-}
-
 /// Ensure the Environment namespace exists before any renderer output is
 /// applied. Helm charts often rely on the release namespace, while raw YAML
 /// and Kustomize output may not include a Namespace object themselves.
@@ -655,20 +615,20 @@ pub fn reconcile_deploy<H: HelmRunner, K: KubectlApplier, R: KustomizeRunner>(
         }
         DeployType::K8s => {
             let rendered = render_k8s_directory(source_path, recursive)?;
-            reconcile_rendered(source_path, app_name, &rendered, true, true, opts, kubectl)
+            reconcile_rendered(source_path, app_name, &rendered, true, opts, kubectl)
         }
         DeployType::Kustomize => {
             if recursive {
                 return Err("Environment deploys[].recursive is only valid for type k8s".into());
             }
             let rendered = kustomize.build(source_path)?;
-            reconcile_rendered(source_path, app_name, &rendered, true, true, opts, kubectl)
+            reconcile_rendered(source_path, app_name, &rendered, true, opts, kubectl)
         }
     }
 }
 
-/// Reconcile one contained Helm chart directly, without materializing a
-/// generated Application YAML file.
+/// Reconcile one contained Helm chart directly, without materializing an
+/// intermediate manifest file.
 pub fn reconcile_deploy_chart<H: HelmRunner, K: KubectlApplier>(
     chart_path: &Path,
     app_name: &str,
@@ -699,7 +659,7 @@ pub fn reconcile_deploy_chart<H: HelmRunner, K: KubectlApplier>(
     let values_yaml = values_to_yaml(&merged)?;
     let release = sanitize_release_name(app_name);
     let rendered = helm.template(&release, &chart_path, &opts.namespace, &values_yaml)?;
-    reconcile_rendered(&chart_path, app_name, &rendered, true, true, opts, kubectl)
+    reconcile_rendered(&chart_path, app_name, &rendered, true, opts, kubectl)
 }
 
 /// Render a directory of raw Kubernetes YAML files. The source directory is
@@ -793,14 +753,13 @@ fn reconcile_rendered<K: KubectlApplier>(
     app_name: &str,
     rendered: &str,
     prune: bool,
-    reject_cluster_scoped: bool,
     opts: &ReconcileOptions,
     kubectl: &K,
 ) -> Result<ReconcileResult, Box<dyn Error>> {
     let source_path = source_path
         .canonicalize()
         .map_err(|error| format!("deploy path {}: {error}", source_path.display()))?;
-    validate_rendered_manifests_with_options(rendered, reject_cluster_scoped)?;
+    validate_rendered_manifests(rendered)?;
     let labels = inject_labels(&opts.workspace_name, app_name);
     let labeled = render_labels_into_manifests(rendered, &labels)?;
     let labeled = ensure_namespace_on_docs(&labeled, &opts.namespace)?;
@@ -827,45 +786,7 @@ fn reconcile_rendered<K: KubectlApplier>(
     })
 }
 
-fn reconcile_one<H: HelmRunner, K: KubectlApplier>(
-    app_file: &Path,
-    app: &Application,
-    opts: &ReconcileOptions,
-    helm: &H,
-    kubectl: &K,
-) -> Result<ReconcileResult, Box<dyn Error>> {
-    let chart_path = resolve_source_path(app_file, &app.spec.source.path)?;
-    if !chart_path.exists() {
-        return Err(format!("chart path does not exist: {}", chart_path.display()).into());
-    }
-    if !chart_has_chart_yaml(&chart_path) {
-        return Err(format!(
-            "not a Helm chart (missing Chart.yaml): {}",
-            chart_path.display()
-        )
-        .into());
-    }
-
-    let runtime = build_runtime_values(opts, &app.metadata.name);
-    let merged = merge_helm_values(app.spec.source.helm.values.as_ref(), &runtime);
-    let values_yaml = values_to_yaml(&merged)?;
-    let release = sanitize_release_name(&app.metadata.name);
-    let rendered = helm.template(&release, &chart_path, &opts.namespace, &values_yaml)?;
-    reconcile_rendered(
-        &chart_path,
-        &app.metadata.name,
-        &rendered,
-        app.spec.sync_policy.prune,
-        false,
-        opts,
-        kubectl,
-    )
-}
-
-fn validate_rendered_manifests_with_options(
-    yaml: &str,
-    reject_cluster_scoped: bool,
-) -> Result<(), Box<dyn Error>> {
+fn validate_rendered_manifests(yaml: &str) -> Result<(), Box<dyn Error>> {
     let mut count = 0;
     for value in parse_yaml_docs(yaml)? {
         count += 1;
@@ -882,7 +803,7 @@ fn validate_rendered_manifests_with_options(
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .ok_or("renderer output document is missing kind")?;
-        if reject_cluster_scoped && is_cluster_scoped_kind(kind) {
+        if is_cluster_scoped_kind(kind) {
             let name = root
                 .get(Value::String("metadata".into()))
                 .and_then(Value::as_mapping)
@@ -1268,90 +1189,7 @@ metadata:
     }
 
     #[test]
-    fn reconcile_applications_labels_and_namespace_override() {
-        let dir = std::env::temp_dir().join(format!(
-            "lwb-rec-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let chart = dir.join("chart");
-        std::fs::create_dir_all(chart.join("templates")).unwrap();
-        std::fs::write(
-            chart.join("Chart.yaml"),
-            "apiVersion: v2\nname: t\nversion: 0.1.0\n",
-        )
-        .unwrap();
-        std::fs::write(chart.join("values.yaml"), "local: false\n").unwrap();
-        std::fs::write(
-            chart.join("templates/svc.yaml"),
-            "apiVersion: v1\nkind: Service\nmetadata:\n  name: t\n",
-        )
-        .unwrap();
-
-        let env = dir.join("env");
-        std::fs::create_dir_all(&env).unwrap();
-        let app_yaml = r#"
-apiVersion: hops.local/v1alpha1
-kind: Application
-metadata:
-  name: demo-app
-spec:
-  source:
-    path: ../chart
-    helm:
-      values:
-        local: true
-  destination:
-    namespace: should-be-overridden
-  syncPolicy:
-    prune: true
-"#;
-        std::fs::write(env.join("app.yaml"), app_yaml).unwrap();
-
-        let helm = MockHelm {
-            body: "apiVersion: v1\nkind: Service\nmetadata:\n  name: t\n".into(),
-        };
-        let kubectl = MockKubectl {
-            applied: Mutex::new(Vec::new()),
-            namespaces: Mutex::new(Vec::new()),
-            pruned: Mutex::new(Vec::new()),
-            inventories: Mutex::new(Vec::new()),
-        };
-        let opts = ReconcileOptions {
-            namespace: "alice".into(),
-            workspace_name: "alice".into(),
-            runtime_values: BTreeMap::new(),
-            app_delivery_host_paths: BTreeMap::new(),
-            delivery_mode: None,
-            dry_run: false,
-        };
-        let results = reconcile_applications(&env, &opts, &helm, &kubectl).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].namespace, "alice");
-        assert!(results[0].applied);
-        let applied = kubectl.applied.lock().unwrap();
-        assert_eq!(applied.len(), 1);
-        assert!(applied[0].contains("hops-local-gitops"));
-        assert!(applied[0].contains("hops.ops.com.ai/local-env: alice"));
-        assert!(applied[0].contains("namespace: alice"));
-        assert_eq!(
-            kubectl.namespaces.lock().unwrap().as_slice(),
-            &["alice".to_string()]
-        );
-        assert_eq!(
-            kubectl.pruned.lock().unwrap().as_slice(),
-            &["demo-app".to_string()]
-        );
-        assert_eq!(
-            kubectl.inventories.lock().unwrap().as_slice(),
-            &["demo-app".to_string()]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reconcile_deploy_chart_does_not_materialize_application_file() {
+    fn reconcile_deploy_chart_does_not_materialize_generated_file() {
         let dir = std::env::temp_dir().join(format!(
             "lwb-direct-{}-{}",
             std::process::id(),
@@ -1397,7 +1235,7 @@ spec:
         assert_eq!(result.app_name, "direct-app");
         assert_eq!(result.source_path, chart.canonicalize().unwrap());
         assert!(!result.applied);
-        assert!(!dir.join(".hops-direct-application.yaml").exists());
+        assert!(!dir.join(".hops-direct-generated.yaml").exists());
         assert!(kubectl.applied.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1600,9 +1438,8 @@ metadata:
 
     #[test]
     fn environment_rejects_cluster_scoped_objects_before_apply() {
-        let error = validate_rendered_manifests_with_options(
+        let error = validate_rendered_manifests(
             "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: forbidden\n",
-            true,
         )
         .unwrap_err()
         .to_string();
@@ -1610,15 +1447,6 @@ metadata:
             error.contains("cluster-scoped Namespace forbidden"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn legacy_application_validation_allows_cluster_scoped_objects() {
-        assert!(validate_rendered_manifests_with_options(
-            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: legacy\n",
-            false,
-        )
-        .is_ok());
     }
 
     #[test]

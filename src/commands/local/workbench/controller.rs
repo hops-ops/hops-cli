@@ -261,10 +261,9 @@ pub struct OwnedObject {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentDeploySnapshot {
-    /// Kept under the historical JSON keys for backwards-compatible cleanup
-    /// of snapshots written before explicit renderer directories.
-    pub application_root: String,
-    pub chart_path: String,
+    /// Source root containing the deploy directory.
+    pub source_root: String,
+    pub source_path: String,
     #[serde(default)]
     pub deploy_type: DeployType,
     #[serde(default)]
@@ -311,8 +310,8 @@ pub fn save_environment_snapshot(
         .zip(results)
         .map(|(deploy, result)| {
             Ok(EnvironmentDeploySnapshot {
-                application_root: deploy.source_root.to_string_lossy().into_owned(),
-                chart_path: deploy.source_path.to_string_lossy().into_owned(),
+                source_root: deploy.source_root.to_string_lossy().into_owned(),
+                source_path: deploy.source_path.to_string_lossy().into_owned(),
                 deploy_type: deploy.deploy_type,
                 recursive: deploy.recursive,
                 app_name: result.app_name.clone(),
@@ -345,8 +344,8 @@ pub fn save_environment_snapshot(
 }
 
 /// Render and reconcile every explicit deploy directory in a validated
-/// Environment. No generated Application YAML is written; protected identity
-/// values are injected after user values are merged.
+/// Environment. Protected identity values are injected after user values are
+/// merged.
 pub fn reconcile_environment<H: HelmRunner, K: KubectlApplier, R: KustomizeRunner>(
     loaded: &LoadedEnvironment,
     opts: &ReconcileOptions,
@@ -376,7 +375,7 @@ pub fn reconcile_environment<H: HelmRunner, K: KubectlApplier, R: KustomizeRunne
                 ("type", deploy.deploy_type.as_str()),
             ]),
         );
-        let app_name = local_application_name(deploy);
+        let app_name = local_deploy_name(deploy);
         match super::reconcile::reconcile_deploy(
             &deploy.source_path,
             deploy.deploy_type,
@@ -428,7 +427,7 @@ fn string_mapping(values: &[(&str, &str)]) -> Value {
     Value::Mapping(mapping)
 }
 
-fn local_application_name(deploy: &super::definition::DeployDefinition) -> String {
+fn local_deploy_name(deploy: &super::definition::DeployDefinition) -> String {
     super::definition::local_deploy_name(deploy)
 }
 
