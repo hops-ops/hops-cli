@@ -167,55 +167,48 @@ pub fn run_cluster(
         .join(slugify_name(&definition.cluster.name))
         .join("cluster-inventory.json");
 
+    let context = super::kube_context_from_env()
+        .unwrap_or_else(|| format!("kind-{}", definition.cluster.name));
     if args.dry_run {
         log::info!(
             "Dry-run uses the declared Cluster '{}' without changing its lifecycle",
             definition.cluster.name
         );
-    } else {
-        let context = super::kube_context_from_env()
-            .unwrap_or_else(|| format!("kind-{}", definition.cluster.name));
-        let controller = acquire_controller(
-            &definition.cluster.name,
-            &definition.source,
-            &context,
-            false,
-        )?;
-        if controller.reused {
-            log::info!(
-                "Cluster '{}' is already reconciled by controller pid {}; reusing that owner",
-                definition.cluster.name,
-                controller.lease.pid
-            );
-            return Ok(());
-        }
-        super::start::run_gitops_seed(
-            backend,
-            &super::start::StartArgs {
-                size: super::backend::SizeArgs::default(),
-                yes: false,
-                bootstrap: false,
-            },
-            &definition.cluster.control_plane.crossplane.chart,
-            &definition.cluster.control_plane.crossplane.version,
-            &definition.cluster.control_plane.crossplane.values,
-        )?;
-
-        // Keep the lease alive through the foreground watcher. The guard is
-        // intentionally scoped to this command so Ctrl-C releases only this
-        // controller's lock; the Kubernetes inventory remains last-known-good.
-        let _controller = controller;
-        return run_cluster_reconcile_loop(
-            args,
-            definition,
-            cluster,
-            inventory,
-            false,
-            _controller,
-        );
+        let controller =
+            acquire_controller(&definition.cluster.name, &definition.source, &context, true)?;
+        return run_cluster_reconcile_loop(args, definition, cluster, inventory, true, controller);
     }
 
-    unreachable!("non-dry-run Cluster path returns after seed")
+    let controller = acquire_controller(
+        &definition.cluster.name,
+        &definition.source,
+        &context,
+        false,
+    )?;
+    if controller.reused {
+        log::info!(
+            "Cluster '{}' is already reconciled by controller pid {}; reusing that owner",
+            definition.cluster.name,
+            controller.lease.pid
+        );
+        return Ok(());
+    }
+    super::start::run_gitops_seed(
+        backend,
+        &super::start::StartArgs {
+            size: super::backend::SizeArgs::default(),
+            yes: false,
+            bootstrap: false,
+        },
+        &definition.cluster.control_plane.crossplane.chart,
+        &definition.cluster.control_plane.crossplane.version,
+        &definition.cluster.control_plane.crossplane.values,
+    )?;
+
+    // Keep the lease alive through the foreground watcher. The guard is
+    // intentionally scoped to this command so Ctrl-C releases only this
+    // controller's lock; the Kubernetes inventory remains last-known-good.
+    run_cluster_reconcile_loop(args, definition, cluster, inventory, false, controller)
 }
 
 fn stop_cluster_environment_runtime(cluster_name: &str) -> Result<(), Box<dyn Error>> {

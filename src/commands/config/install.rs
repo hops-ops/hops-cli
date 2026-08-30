@@ -198,6 +198,7 @@ pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
                 let path_owned = path.to_string();
                 let skip = args.skip_dependency_resolution;
                 run_watch(path, args.debounce, move || {
+                    reject_imperative_owner(&backend::kind::active_cluster_name())?;
                     run_local_path(&path_owned, skip)
                 })?;
             }

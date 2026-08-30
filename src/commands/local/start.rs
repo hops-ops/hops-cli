@@ -1,9 +1,9 @@
 use super::backend::{self, SizeArgs};
+use super::workbench::reconcile::TemporaryValuesFile;
 use super::{kubectl_apply_stdin, run_cmd, run_cmd_output, wait_for_kubernetes};
 use clap::Args;
 use serde_yaml::Mapping;
 use std::error::Error;
-use std::fs;
 use std::thread;
 use std::time::Duration;
 
@@ -138,13 +138,9 @@ pub fn seed_crossplane(chart: &str, version: &str, values: &Mapping) -> Result<(
     let values_file = if values.is_empty() {
         None
     } else {
-        let path = std::env::temp_dir().join(format!(
-            "hops-crossplane-values-{}-{}.yaml",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        fs::write(&path, serde_yaml::to_string(values)?)?;
-        Some(path)
+        Some(TemporaryValuesFile::create(&serde_yaml::to_string(
+            values,
+        )?)?)
     };
     let mut args = vec![
         "upgrade".to_string(),
@@ -160,14 +156,10 @@ pub fn seed_crossplane(chart: &str, version: &str, values: &Mapping) -> Result<(
         "5m".to_string(),
     ];
     if let Some(path) = values_file.as_ref() {
-        args.extend(["-f".to_string(), path.to_string_lossy().into_owned()]);
+        args.extend(["-f".to_string(), path.path().to_string_lossy().into_owned()]);
     }
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let result = run_cmd("helm", &refs);
-    if let Some(path) = values_file {
-        let _ = fs::remove_file(path);
-    }
-    result?;
+    run_cmd("helm", &refs)?;
     wait_for_deployment_with_diagnostics("crossplane-system", "crossplane")?;
     // The deployment can be Available before discovery serves Crossplane
     // package/composition APIs.  Do not hand the Cluster tree to kubectl until

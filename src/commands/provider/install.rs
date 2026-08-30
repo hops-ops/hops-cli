@@ -119,6 +119,7 @@ pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
                 let skip = args.skip_dependency_resolution;
                 let prefix_owned = prefix;
                 run_watch(path, args.debounce, move || {
+                    reject_imperative_owner(&backend::kind::active_cluster_name())?;
                     run_local_path(&path_owned, skip, prefix_owned.as_deref())
                 })?;
             }

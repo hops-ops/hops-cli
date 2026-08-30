@@ -94,12 +94,12 @@ pub trait KubectlApplier {
     ) -> Result<(), Box<dyn Error>>;
 }
 
-struct TemporaryValuesFile {
+pub(crate) struct TemporaryValuesFile {
     path: PathBuf,
 }
 
 impl TemporaryValuesFile {
-    fn create(contents: &str) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn create(contents: &str) -> Result<Self, Box<dyn Error>> {
         let path =
             std::env::temp_dir().join(format!("hops-lwb-values-{}.yaml", uuid::Uuid::new_v4()));
         let temporary = Self { path };
@@ -113,6 +113,10 @@ impl TemporaryValuesFile {
         let mut file = options.open(&temporary.path)?;
         file.write_all(contents.as_bytes())?;
         Ok(temporary)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -142,7 +146,7 @@ impl HelmRunner for SystemHelm {
                 "--namespace",
                 namespace,
                 "--values",
-                &values_file.path.to_string_lossy(),
+                &values_file.path().to_string_lossy(),
             ])
             .output()?;
         if !output.status.success() {
@@ -651,14 +655,14 @@ pub fn reconcile_deploy<H: HelmRunner, K: KubectlApplier, R: KustomizeRunner>(
         }
         DeployType::K8s => {
             let rendered = render_k8s_directory(source_path, recursive)?;
-            reconcile_rendered(source_path, app_name, &rendered, true, opts, kubectl)
+            reconcile_rendered(source_path, app_name, &rendered, true, true, opts, kubectl)
         }
         DeployType::Kustomize => {
             if recursive {
                 return Err("Environment deploys[].recursive is only valid for type k8s".into());
             }
             let rendered = kustomize.build(source_path)?;
-            reconcile_rendered(source_path, app_name, &rendered, true, opts, kubectl)
+            reconcile_rendered(source_path, app_name, &rendered, true, true, opts, kubectl)
         }
     }
 }
@@ -695,7 +699,7 @@ pub fn reconcile_deploy_chart<H: HelmRunner, K: KubectlApplier>(
     let values_yaml = values_to_yaml(&merged)?;
     let release = sanitize_release_name(app_name);
     let rendered = helm.template(&release, &chart_path, &opts.namespace, &values_yaml)?;
-    reconcile_rendered(&chart_path, app_name, &rendered, true, opts, kubectl)
+    reconcile_rendered(&chart_path, app_name, &rendered, true, true, opts, kubectl)
 }
 
 /// Render a directory of raw Kubernetes YAML files. The source directory is
@@ -789,13 +793,14 @@ fn reconcile_rendered<K: KubectlApplier>(
     app_name: &str,
     rendered: &str,
     prune: bool,
+    reject_cluster_scoped: bool,
     opts: &ReconcileOptions,
     kubectl: &K,
 ) -> Result<ReconcileResult, Box<dyn Error>> {
     let source_path = source_path
         .canonicalize()
         .map_err(|error| format!("deploy path {}: {error}", source_path.display()))?;
-    validate_rendered_manifests(rendered)?;
+    validate_rendered_manifests_with_options(rendered, reject_cluster_scoped)?;
     let labels = inject_labels(&opts.workspace_name, app_name);
     let labeled = render_labels_into_manifests(rendered, &labels)?;
     let labeled = ensure_namespace_on_docs(&labeled, &opts.namespace)?;
@@ -851,12 +856,16 @@ fn reconcile_one<H: HelmRunner, K: KubectlApplier>(
         &app.metadata.name,
         &rendered,
         app.spec.sync_policy.prune,
+        false,
         opts,
         kubectl,
     )
 }
 
-fn validate_rendered_manifests(yaml: &str) -> Result<(), Box<dyn Error>> {
+fn validate_rendered_manifests_with_options(
+    yaml: &str,
+    reject_cluster_scoped: bool,
+) -> Result<(), Box<dyn Error>> {
     let mut count = 0;
     for value in parse_yaml_docs(yaml)? {
         count += 1;
@@ -873,7 +882,7 @@ fn validate_rendered_manifests(yaml: &str) -> Result<(), Box<dyn Error>> {
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .ok_or("renderer output document is missing kind")?;
-        if is_cluster_scoped_kind(kind) {
+        if reject_cluster_scoped && is_cluster_scoped_kind(kind) {
             let name = root
                 .get(Value::String("metadata".into()))
                 .and_then(Value::as_mapping)
@@ -1591,8 +1600,9 @@ metadata:
 
     #[test]
     fn environment_rejects_cluster_scoped_objects_before_apply() {
-        let error = validate_rendered_manifests(
+        let error = validate_rendered_manifests_with_options(
             "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: forbidden\n",
+            true,
         )
         .unwrap_err()
         .to_string();
@@ -1600,6 +1610,15 @@ metadata:
             error.contains("cluster-scoped Namespace forbidden"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn legacy_application_validation_allows_cluster_scoped_objects() {
+        assert!(validate_rendered_manifests_with_options(
+            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: legacy\n",
+            false,
+        )
+        .is_ok());
     }
 
     #[test]

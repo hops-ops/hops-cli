@@ -653,11 +653,11 @@ mod tests {
     }
 
     #[test]
-    fn owned_objects_reject_cluster_scope() {
-        let error = owned_objects_from_yaml(
+    fn owned_objects_record_empty_namespace_for_cluster_scope() {
+        let objects = owned_objects_from_yaml(
             "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: forbidden\n",
         )
         .unwrap();
-        assert!(error[0].namespace.is_empty());
+        assert!(objects[0].namespace.is_empty());
     }
 }

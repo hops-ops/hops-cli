@@ -346,6 +346,14 @@ fn collect_manifests_rec(
     for ent in fs::read_dir(dir)? {
         let ent = ent?;
         let path = ent.path();
+        // Skip common non-manifest trees before inspecting symlinks or
+        // canonicalizing their contents. A skipped directory may itself be a
+        // symlink (for example, a checked-out node_modules tree) and must not
+        // make an otherwise valid Cluster tree fail closed.
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if matches!(name, ".git" | "node_modules" | "target" | "_output") {
+            continue;
+        }
         let file_type = ent.file_type()?;
         if file_type.is_symlink() {
             return Err(format!("Cluster tree must not contain symlink {}", path.display()).into());
@@ -360,11 +368,6 @@ fn collect_manifests_rec(
             return Err(format!("Cluster source escapes root: {}", path.display()).into());
         }
         if path.is_dir() {
-            // Skip common non-manifest trees
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if matches!(name, ".git" | "node_modules" | "target" | "_output") {
-                continue;
-            }
             collect_manifests_rec(&path, root, out)?;
             continue;
         }
@@ -507,13 +510,24 @@ pub fn reconcile_cluster_dir_with_inventory(
 }
 
 fn delete_exact(identity: &ClusterObjectIdentity) -> Result<(), Box<dyn Error>> {
-    let kind = identity.kind.to_ascii_lowercase();
-    let mut args = vec!["delete", kind.as_str(), identity.name.as_str()];
+    let resource = qualified_resource_name(identity);
+    let mut args = vec!["delete", resource.as_str(), identity.name.as_str()];
     if !identity.namespace.is_empty() {
         args.extend(["-n", identity.namespace.as_str()]);
     }
     args.push("--ignore-not-found=true");
     run_kubectl(&args)
+}
+
+fn qualified_resource_name(identity: &ClusterObjectIdentity) -> String {
+    let kind = identity.kind.to_ascii_lowercase();
+    if let Some((group, _version)) = identity.api_version.split_once('/') {
+        let group = group.trim();
+        if !group.is_empty() {
+            return format!("{kind}.{group}");
+        }
+    }
+    kind
 }
 
 fn apply_one(path: &Path, dry_run: bool) -> Result<(), Box<dyn Error>> {
@@ -731,6 +745,28 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn qualified_resource_name_includes_api_group() {
+        let grouped = ClusterObjectIdentity {
+            api_version: "pkg.crossplane.io/v1".into(),
+            kind: "Provider".into(),
+            namespace: String::new(),
+            name: "aws".into(),
+        };
+        assert_eq!(
+            qualified_resource_name(&grouped),
+            "provider.pkg.crossplane.io"
+        );
+
+        let core = ClusterObjectIdentity {
+            api_version: "v1".into(),
+            kind: "Namespace".into(),
+            namespace: String::new(),
+            name: "default".into(),
+        };
+        assert_eq!(qualified_resource_name(&core), "namespace");
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlinked_cluster_sources_fail_closed() {
@@ -752,6 +788,33 @@ mod tests {
         symlink(&outside, dir.join("shared")).unwrap();
         let error = resolve_cluster_tree(&dir).unwrap_err().to_string();
         assert!(error.contains("symlink"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skipped_symlinked_directories_are_ignored() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "hops-cg-skipped-symlink-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let outside =
+            std::env::temp_dir().join(format!("hops-cg-skipped-outside-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("ignored.yaml"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ignored\n",
+        )
+        .unwrap();
+        symlink(&outside, dir.join("node_modules")).unwrap();
+
+        let manifests = collect_cluster_manifests(&dir).unwrap();
+        assert!(manifests.is_empty());
+
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&outside);
     }
