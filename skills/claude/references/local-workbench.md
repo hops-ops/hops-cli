@@ -163,7 +163,7 @@ Iterate from **source** while keeping the cluster gitops tree coherent:
 hops config install --path xrs/stacks/k8s/auth --gitops ./.gitops/local/cluster --local
 
 # Provider implementation (SemVer-safe vMAJOR.999.N + ImageConfig in gitops)
-hops provider install --path /path/to/provider-helm --gitops ./gitops/cluster
+hops provider install --path /path/to/provider-helm --gitops ./.gitops/local/cluster
 ```
 
 Source installs write **`imageconfigs/`** rewrites; published installs do not.
