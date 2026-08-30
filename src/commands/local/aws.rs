@@ -1,4 +1,5 @@
 use super::gitops_write::{log_written, write_gitops_files, GitopsFile};
+use super::workbench::controller::reject_imperative_owner;
 use super::{kubectl_apply_stdin, run_cmd, run_cmd_output};
 use clap::Args;
 use serde::Deserialize;
@@ -51,13 +52,14 @@ pub struct AwsArgs {
     #[arg(long, default_value = DEFAULT_PROVIDER_PACKAGE)]
     pub provider_package: String,
 
-    /// Refresh credentials and AWS runtime region; skips Provider and ProviderConfig apply
+    /// Refresh credentials and AWS runtime region in the live, non-GitOps mode
     #[arg(long)]
     pub refresh: bool,
 
     /// Write non-secret Provider / DeploymentRuntimeConfig / ProviderConfig YAML
     /// under this directory (e.g. `./.gitops/local/cluster`). Credential Secrets are
-    /// **not** written — still applied live only.
+    /// **not** written — applied live only. In GitOps mode this is the only
+    /// Kubernetes object this command applies.
     #[arg(long)]
     pub gitops: Option<PathBuf>,
 }
@@ -73,12 +75,73 @@ struct AwsExportCredentials {
 }
 
 pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
+    if args.gitops.is_none() {
+        reject_imperative_owner(&super::backend::kind::active_cluster_name())?;
+    }
     let profile = resolve_profile(args.profile.as_deref())?;
     let region = resolve_region(args.region.as_deref())?;
 
     log::info!("Exporting AWS credentials from profile '{}'...", profile);
     let creds = export_credentials(&profile)?;
     let credentials_ini = build_credentials_ini(&creds, &region);
+
+    let runtime_yaml = build_runtime_config_yaml(&args.runtime_config_name, &region);
+    let provider_yaml = build_provider_yaml(
+        &args.provider_name,
+        &args.provider_package,
+        &args.runtime_config_name,
+    );
+    let provider_config_yaml = build_provider_config_yaml(
+        &args.namespace,
+        &args.provider_config_name,
+        &args.secret_name,
+    );
+
+    // GitOps owns every non-secret Kubernetes object above the bare control
+    // plane. Keep credentials live-only, but materialize the Provider,
+    // ProviderConfig, and runtime declarations for the Cluster controller.
+    // Returning here is important: applying these objects imperatively would
+    // create a second state owner and makes `--gitops` unsafe to re-run.
+    if let Some(gitops) = &args.gitops {
+        let written = write_gitops_files(
+            gitops,
+            &[
+                GitopsFile {
+                    rel_path: "providers/aws-runtime.yaml".into(),
+                    yaml: runtime_yaml.clone(),
+                },
+                GitopsFile {
+                    rel_path: "providers/aws.yaml".into(),
+                    yaml: provider_yaml.clone(),
+                },
+                GitopsFile {
+                    rel_path: "providers/aws-provider-config.yaml".into(),
+                    yaml: provider_config_yaml.clone(),
+                },
+            ],
+        )?;
+        log_written(&written);
+        log::info!(
+            "Applying credential secret '{}/{}'; non-secret AWS manifests are file-owned under {}",
+            args.namespace,
+            args.secret_name,
+            gitops.display()
+        );
+        apply_gitops_secret(
+            &args.namespace,
+            &args.secret_name,
+            &credentials_ini,
+            kubectl_apply_stdin,
+        )?;
+        log::info!(
+            "AWS credentials secret refreshed from profile '{}' for region '{}' ({}/{})",
+            profile,
+            region,
+            args.namespace,
+            args.secret_name
+        );
+        return Ok(());
+    }
 
     if args.refresh {
         log::info!(
@@ -109,43 +172,6 @@ pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
             args.secret_name
         );
         return Ok(());
-    }
-
-    let runtime_yaml = build_runtime_config_yaml(&args.runtime_config_name, &region);
-    let provider_yaml = build_provider_yaml(
-        &args.provider_name,
-        &args.provider_package,
-        &args.runtime_config_name,
-    );
-    let provider_config_yaml = build_provider_config_yaml(
-        &args.namespace,
-        &args.provider_config_name,
-        &args.secret_name,
-    );
-
-    if let Some(gitops) = &args.gitops {
-        let written = write_gitops_files(
-            gitops,
-            &[
-                GitopsFile {
-                    rel_path: "runtime/aws.yaml".into(),
-                    yaml: runtime_yaml.clone(),
-                },
-                GitopsFile {
-                    rel_path: "providers/aws.yaml".into(),
-                    yaml: provider_yaml.clone(),
-                },
-                GitopsFile {
-                    rel_path: "providerconfigs/aws.yaml".into(),
-                    yaml: provider_config_yaml.clone(),
-                },
-            ],
-        )?;
-        log_written(&written);
-        log::info!(
-            "AWS non-secret manifests written under {} (Secret still applied live only)",
-            gitops.display()
-        );
     }
 
     log::info!(
@@ -189,6 +215,20 @@ pub fn run(args: &AwsArgs) -> Result<(), Box<dyn Error>> {
         args.provider_config_name
     );
     Ok(())
+}
+
+/// Apply only the live credential prerequisite for a GitOps AWS setup. The
+/// callback keeps the ownership boundary testable without invoking kubectl.
+fn apply_gitops_secret<F>(
+    namespace: &str,
+    secret_name: &str,
+    credentials_ini: &str,
+    mut apply: F,
+) -> Result<(), Box<dyn Error>>
+where
+    F: FnMut(&str) -> Result<(), Box<dyn Error>>,
+{
+    apply(&build_secret_yaml(namespace, secret_name, credentials_ini))
 }
 
 fn resolve_profile(cli_profile: Option<&str>) -> Result<String, Box<dyn Error>> {
@@ -525,5 +565,25 @@ mod tests {
         assert!(yaml.contains("package: xpkg.example/provider:v1"));
         assert!(yaml.contains("runtimeConfigRef:"));
         assert!(yaml.contains("name: aws"));
+    }
+
+    #[test]
+    fn gitops_applies_only_the_credential_secret() {
+        let mut applied = Vec::new();
+        apply_gitops_secret(
+            "default",
+            "aws-creds",
+            "[default]\nregion = us-east-2\n",
+            |yaml| {
+                applied.push(yaml.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(applied.len(), 1);
+        assert!(applied[0].contains("kind: Secret"));
+        assert!(!applied[0].contains("kind: Provider\n"));
+        assert!(!applied[0].contains("kind: ProviderConfig\n"));
+        assert!(!applied[0].contains("kind: DeploymentRuntimeConfig\n"));
     }
 }

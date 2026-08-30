@@ -1,11 +1,12 @@
-//! Application reconcile: helm template + label inject + apply.
+//! Environment deploy reconcile: render explicit Helm/Kubernetes/Kustomize
+//! sources, inject ownership metadata, and apply.
 
-use super::application::{load_applications, resolve_source_path, Application};
+use super::definition::DeployType;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -37,7 +38,7 @@ pub struct ReconcileOptions {
 #[derive(Debug, Clone)]
 pub struct ReconcileResult {
     pub app_name: String,
-    pub chart_path: PathBuf,
+    pub source_path: PathBuf,
     pub namespace: String,
     pub rendered_yaml: String,
     pub applied: bool,
@@ -64,6 +65,11 @@ pub trait HelmRunner {
     ) -> Result<String, Box<dyn Error>>;
 }
 
+/// Abstraction over `kubectl kustomize` for tests.
+pub trait KustomizeRunner {
+    fn build(&self, source_path: &Path) -> Result<String, Box<dyn Error>>;
+}
+
 /// Abstraction over kubectl apply for tests.
 pub trait KubectlApplier {
     fn ensure_namespace(
@@ -87,12 +93,12 @@ pub trait KubectlApplier {
     ) -> Result<(), Box<dyn Error>>;
 }
 
-struct TemporaryValuesFile {
+pub(crate) struct TemporaryValuesFile {
     path: PathBuf,
 }
 
 impl TemporaryValuesFile {
-    fn create(contents: &str) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn create(contents: &str) -> Result<Self, Box<dyn Error>> {
         let path =
             std::env::temp_dir().join(format!("hops-lwb-values-{}.yaml", uuid::Uuid::new_v4()));
         let temporary = Self { path };
@@ -106,6 +112,10 @@ impl TemporaryValuesFile {
         let mut file = options.open(&temporary.path)?;
         file.write_all(contents.as_bytes())?;
         Ok(temporary)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -135,7 +145,7 @@ impl HelmRunner for SystemHelm {
                 "--namespace",
                 namespace,
                 "--values",
-                &values_file.path.to_string_lossy(),
+                &values_file.path().to_string_lossy(),
             ])
             .output()?;
         if !output.status.success() {
@@ -144,6 +154,27 @@ impl HelmRunner for SystemHelm {
                 "helm template failed for {}: {}",
                 chart_path.display(),
                 stderr
+            )
+            .into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+}
+
+/// Real `kubectl kustomize` runner.
+pub struct SystemKustomize;
+
+impl KustomizeRunner for SystemKustomize {
+    fn build(&self, source_path: &Path) -> Result<String, Box<dyn Error>> {
+        let source = source_path.to_string_lossy();
+        let output =
+            crate::commands::local::kubectl_command(&["kustomize", source.as_ref()]).output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "kubectl kustomize failed for {}: {}",
+                source_path.display(),
+                stderr.trim()
             )
             .into());
         }
@@ -206,7 +237,7 @@ impl KubectlApplier for SystemKubectl {
             // apply. It must not infer ownership from broad label queries.
             return Ok(());
         };
-        // A worktree Application may render shared resources in another
+        // A worktree deploy may render shared resources in another
         // namespace, but its prune inventory is owned by this workspace. Never
         // let one workspace delete another namespace's shared identity objects.
         let previous = object_refs_in_namespace(previous, inventory_namespace);
@@ -237,7 +268,7 @@ impl KubectlApplier for SystemKubectl {
             return Err(format!("kubectl prune exited with {status}").into());
         }
         log::info!(
-            "Pruned {} stale object(s) for Application {}",
+            "Pruned {} stale object(s) for deploy {}",
             stale.len(),
             app_name
         );
@@ -393,7 +424,7 @@ fn is_soft_apply_error(msg: &str) -> bool {
         || lower.contains("the server doesn't have a resource type")
 }
 
-/// Merge chart-level application values with runtime inject.
+/// Merge chart-level deploy values with runtime inject.
 /// Precedence: base (app helm values) ← runtime_values (runtime wins on key clash).
 pub fn merge_helm_values(app_values: Option<&Value>, runtime: &BTreeMap<String, Value>) -> Value {
     let mut out = serde_yaml::Mapping::new();
@@ -547,67 +578,74 @@ fn build_runtime_values(opts: &ReconcileOptions, app_name: &str) -> BTreeMap<Str
     runtime
 }
 
-/// Reconcile all Applications under `env_path`.
-pub fn reconcile_applications<H: HelmRunner, K: KubectlApplier>(
-    env_path: &Path,
+/// Ensure the Environment namespace exists before any renderer output is
+/// applied. Helm charts often rely on the release namespace, while raw YAML
+/// and Kustomize output may not include a Namespace object themselves.
+pub fn ensure_environment_namespace<K: KubectlApplier>(
     opts: &ReconcileOptions,
-    helm: &H,
     kubectl: &K,
-) -> Result<Vec<ReconcileResult>, Box<dyn Error>> {
-    let apps = load_applications(env_path)?;
-    if apps.is_empty() {
-        return Err(format!(
-            "no Application YAML files found under {}",
-            env_path.display()
-        )
-        .into());
+) -> Result<(), Box<dyn Error>> {
+    if opts.dry_run {
+        return Ok(());
     }
-
-    let ns_labels = {
-        let mut m = BTreeMap::new();
-        m.insert(
-            "app.kubernetes.io/managed-by".to_string(),
-            MANAGED_BY_VALUE.to_string(),
-        );
-        m.insert(WORKSPACE_ENV_LABEL.to_string(), opts.workspace_name.clone());
-        m
-    };
-
-    if !opts.dry_run {
-        kubectl.ensure_namespace(&opts.namespace, &ns_labels)?;
-    }
-
-    let mut results = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-
-    for (app_file, app) in apps {
-        match reconcile_one(&app_file, &app, opts, helm, kubectl) {
-            Ok(r) => results.push(r),
-            Err(e) => errors.push(format!("{}: {e}", app.metadata.name)),
-        }
-    }
-
-    if !errors.is_empty() {
-        return Err(format!(
-            "reconcile failed for {} app(s):\n  - {}",
-            errors.len(),
-            errors.join("\n  - ")
-        )
-        .into());
-    }
-    Ok(results)
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        MANAGED_BY_VALUE.to_string(),
+    );
+    labels.insert(WORKSPACE_ENV_LABEL.to_string(), opts.workspace_name.clone());
+    kubectl.ensure_namespace(&opts.namespace, &labels)
 }
 
-fn reconcile_one<H: HelmRunner, K: KubectlApplier>(
-    app_file: &Path,
-    app: &Application,
+/// Reconcile one explicit Environment deploy directory.
+pub fn reconcile_deploy<H: HelmRunner, K: KubectlApplier, R: KustomizeRunner>(
+    source_path: &Path,
+    deploy_type: DeployType,
+    recursive: bool,
+    app_name: &str,
+    values: Value,
+    opts: &ReconcileOptions,
+    helm: &H,
+    kustomize: &R,
+    kubectl: &K,
+) -> Result<ReconcileResult, Box<dyn Error>> {
+    match deploy_type {
+        DeployType::Helm => {
+            reconcile_deploy_chart(source_path, app_name, values, opts, helm, kubectl)
+        }
+        DeployType::K8s => {
+            let rendered = render_k8s_directory(source_path, recursive)?;
+            reconcile_rendered(source_path, app_name, &rendered, true, opts, kubectl)
+        }
+        DeployType::Kustomize => {
+            if recursive {
+                return Err("Environment deploys[].recursive is only valid for type k8s".into());
+            }
+            let rendered = kustomize.build(source_path)?;
+            reconcile_rendered(source_path, app_name, &rendered, true, opts, kubectl)
+        }
+    }
+}
+
+/// Reconcile one contained Helm chart directly, without materializing an
+/// intermediate manifest file.
+pub fn reconcile_deploy_chart<H: HelmRunner, K: KubectlApplier>(
+    chart_path: &Path,
+    app_name: &str,
+    values: Value,
     opts: &ReconcileOptions,
     helm: &H,
     kubectl: &K,
 ) -> Result<ReconcileResult, Box<dyn Error>> {
-    let chart_path = resolve_source_path(app_file, &app.spec.source.path)?;
-    if !chart_path.exists() {
-        return Err(format!("chart path does not exist: {}", chart_path.display()).into());
+    let chart_path = chart_path
+        .canonicalize()
+        .map_err(|error| format!("chart path {}: {error}", chart_path.display()))?;
+    if !chart_path.is_dir() {
+        return Err(format!(
+            "Helm deploy path is not a directory: {}",
+            chart_path.display()
+        )
+        .into());
     }
     if !chart_has_chart_yaml(&chart_path) {
         return Err(format!(
@@ -616,41 +654,172 @@ fn reconcile_one<H: HelmRunner, K: KubectlApplier>(
         )
         .into());
     }
-
-    let runtime = build_runtime_values(opts, &app.metadata.name);
-    let merged = merge_helm_values(app.spec.source.helm.values.as_ref(), &runtime);
+    let runtime = build_runtime_values(opts, app_name);
+    let merged = merge_helm_values(Some(&values), &runtime);
     let values_yaml = values_to_yaml(&merged)?;
-    let release = sanitize_release_name(&app.metadata.name);
+    let release = sanitize_release_name(app_name);
     let rendered = helm.template(&release, &chart_path, &opts.namespace, &values_yaml)?;
-    let labels = inject_labels(&opts.workspace_name, &app.metadata.name);
-    let labeled = render_labels_into_manifests(&rendered, &labels)?;
+    reconcile_rendered(&chart_path, app_name, &rendered, true, opts, kubectl)
+}
+
+/// Render a directory of raw Kubernetes YAML files. The source directory is
+/// deliberately explicit; recursion is opt-in so adding a nested example or
+/// backup directory cannot silently change a running Environment.
+fn render_k8s_directory(source_path: &Path, recursive: bool) -> Result<String, Box<dyn Error>> {
+    let root = source_path
+        .canonicalize()
+        .map_err(|error| format!("k8s path {}: {error}", source_path.display()))?;
+    if !root.is_dir() {
+        return Err(format!("k8s deploy path is not a directory: {}", root.display()).into());
+    }
+    let mut files = Vec::new();
+    collect_k8s_files(&root, &root, recursive, &mut files)?;
+    files.sort();
+    if files.is_empty() {
+        return Err(format!(
+            "k8s deploy directory contains no YAML manifests: {}",
+            root.display()
+        )
+        .into());
+    }
+    let mut documents = Vec::with_capacity(files.len());
+    for file in files {
+        let text = fs::read_to_string(&file)
+            .map_err(|error| format!("read k8s manifest {}: {error}", file.display()))?;
+        if !text.trim().is_empty() {
+            documents.push(text);
+        }
+    }
+    if documents.is_empty() {
+        return Err(format!(
+            "k8s deploy directory contains only empty YAML files: {}",
+            root.display()
+        )
+        .into());
+    }
+    Ok(documents.join("\n---\n"))
+}
+
+fn collect_k8s_files(
+    directory: &Path,
+    root: &Path,
+    recursive: bool,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "k8s deploy directory must not contain symlink {}",
+                path.display()
+            )
+            .into());
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| format!("unable to resolve k8s source {}: {error}", path.display()))?;
+        if !canonical.starts_with(root) {
+            return Err(format!("k8s source escapes deploy root: {}", path.display()).into());
+        }
+        if file_type.is_dir() {
+            if recursive {
+                collect_k8s_files(&canonical, root, recursive, files)?;
+            }
+            continue;
+        }
+        if is_k8s_yaml_file(&path) {
+            files.push(canonical);
+        }
+    }
+    Ok(())
+}
+
+fn is_k8s_yaml_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    (name.ends_with(".yaml") || name.ends_with(".yml"))
+        && name != "kustomization.yaml"
+        && name != "kustomization.yml"
+}
+
+fn reconcile_rendered<K: KubectlApplier>(
+    source_path: &Path,
+    app_name: &str,
+    rendered: &str,
+    prune: bool,
+    opts: &ReconcileOptions,
+    kubectl: &K,
+) -> Result<ReconcileResult, Box<dyn Error>> {
+    let source_path = source_path
+        .canonicalize()
+        .map_err(|error| format!("deploy path {}: {error}", source_path.display()))?;
+    validate_rendered_manifests(rendered)?;
+    let labels = inject_labels(&opts.workspace_name, app_name);
+    let labeled = render_labels_into_manifests(rendered, &labels)?;
     let labeled = ensure_namespace_on_docs(&labeled, &opts.namespace)?;
 
     let applied = if opts.dry_run {
         false
     } else {
-        if app.spec.sync_policy.prune {
-            kubectl.prune(&app.metadata.name, &opts.namespace, &labeled)?;
+        if prune {
+            kubectl.prune(app_name, &opts.namespace, &labeled)?;
         }
         kubectl.apply(&labeled)?;
-        if app.spec.sync_policy.prune {
-            kubectl.record_inventory(
-                &app.metadata.name,
-                &opts.workspace_name,
-                &opts.namespace,
-                &labeled,
-            )?;
+        if prune {
+            kubectl.record_inventory(app_name, &opts.workspace_name, &opts.namespace, &labeled)?;
         }
         true
     };
 
     Ok(ReconcileResult {
-        app_name: app.metadata.name.clone(),
-        chart_path,
+        app_name: app_name.to_string(),
+        source_path,
         namespace: opts.namespace.clone(),
         rendered_yaml: labeled,
         applied,
     })
+}
+
+fn validate_rendered_manifests(yaml: &str) -> Result<(), Box<dyn Error>> {
+    let mut count = 0;
+    for value in parse_yaml_docs(yaml)? {
+        count += 1;
+        let Some(root) = value.as_mapping() else {
+            return Err("renderer output document must be a mapping".into());
+        };
+        let api_version = root
+            .get(Value::String("apiVersion".into()))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("renderer output document is missing apiVersion")?;
+        let kind = root
+            .get(Value::String("kind".into()))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("renderer output document is missing kind")?;
+        if is_cluster_scoped_kind(kind) {
+            let name = root
+                .get(Value::String("metadata".into()))
+                .and_then(Value::as_mapping)
+                .and_then(|metadata| metadata.get(Value::String("name".into())))
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            return Err(format!(
+                "Environment renderer output cluster-scoped {kind} {name} ({api_version}); declare it in the Cluster tree"
+            )
+            .into());
+        }
+    }
+    if count == 0 {
+        return Err("renderer output contains no Kubernetes manifests".into());
+    }
+    Ok(())
 }
 
 fn sanitize_release_name(name: &str) -> String {
@@ -968,6 +1137,16 @@ metadata:
         }
     }
 
+    struct MockKustomize {
+        body: String,
+    }
+
+    impl KustomizeRunner for MockKustomize {
+        fn build(&self, _source_path: &Path) -> Result<String, Box<dyn Error>> {
+            Ok(self.body.clone())
+        }
+    }
+
     struct MockKubectl {
         applied: Mutex<Vec<String>>,
         namespaces: Mutex<Vec<String>>,
@@ -1010,49 +1189,23 @@ metadata:
     }
 
     #[test]
-    fn reconcile_applications_labels_and_namespace_override() {
+    fn reconcile_deploy_chart_does_not_materialize_generated_file() {
         let dir = std::env::temp_dir().join(format!(
-            "lwb-rec-{}-{}",
+            "lwb-direct-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("chart/templates")).unwrap();
         let chart = dir.join("chart");
-        std::fs::create_dir_all(chart.join("templates")).unwrap();
         std::fs::write(
             chart.join("Chart.yaml"),
-            "apiVersion: v2\nname: t\nversion: 0.1.0\n",
+            "apiVersion: v2\nname: direct\nversion: 0.1.0\n",
         )
         .unwrap();
-        std::fs::write(chart.join("values.yaml"), "local: false\n").unwrap();
-        std::fs::write(
-            chart.join("templates/svc.yaml"),
-            "apiVersion: v1\nkind: Service\nmetadata:\n  name: t\n",
-        )
-        .unwrap();
-
-        let env = dir.join("env");
-        std::fs::create_dir_all(&env).unwrap();
-        let app_yaml = r#"
-apiVersion: hops.local/v1alpha1
-kind: Application
-metadata:
-  name: demo-app
-spec:
-  source:
-    path: ../chart
-    helm:
-      values:
-        local: true
-  destination:
-    namespace: should-be-overridden
-  syncPolicy:
-    prune: true
-"#;
-        std::fs::write(env.join("app.yaml"), app_yaml).unwrap();
+        std::fs::write(chart.join("templates/svc.yaml"), "kind: Service\n").unwrap();
 
         let helm = MockHelm {
-            body: "apiVersion: v1\nkind: Service\nmetadata:\n  name: t\n".into(),
+            body: "apiVersion: v1\nkind: Service\nmetadata:\n  name: direct\n".into(),
         };
         let kubectl = MockKubectl {
             applied: Mutex::new(Vec::new()),
@@ -1061,34 +1214,138 @@ spec:
             inventories: Mutex::new(Vec::new()),
         };
         let opts = ReconcileOptions {
-            namespace: "alice".into(),
-            workspace_name: "alice".into(),
+            namespace: "local".into(),
+            workspace_name: "local".into(),
+            runtime_values: BTreeMap::new(),
+            app_delivery_host_paths: BTreeMap::new(),
+            delivery_mode: None,
+            dry_run: true,
+        };
+
+        let result = reconcile_deploy_chart(
+            &chart,
+            "direct-app",
+            serde_yaml::from_str("local: true\npreview: false\n").unwrap(),
+            &opts,
+            &helm,
+            &kubectl,
+        )
+        .unwrap();
+
+        assert_eq!(result.app_name, "direct-app");
+        assert_eq!(result.source_path, chart.canonicalize().unwrap());
+        assert!(!result.applied);
+        assert!(!dir.join(".hops-direct-generated.yaml").exists());
+        assert!(kubectl.applied.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_k8s_directory_is_explicitly_recursive() {
+        let dir = std::env::temp_dir().join(format!(
+            "lwb-k8s-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(
+            dir.join("service.yaml"),
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: direct\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("nested/config.yaml"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: nested\n",
+        )
+        .unwrap();
+
+        let direct = render_k8s_directory(&dir, false).unwrap();
+        assert!(direct.contains("name: direct"));
+        assert!(!direct.contains("name: nested"));
+
+        let recursive = render_k8s_directory(&dir, true).unwrap();
+        assert!(recursive.contains("name: direct"));
+        assert!(recursive.contains("name: nested"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn k8s_and_kustomize_deploys_share_manifest_ownership_pipeline() {
+        let dir = std::env::temp_dir().join(format!(
+            "lwb-renderers-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("raw")).unwrap();
+        std::fs::create_dir_all(dir.join("overlay")).unwrap();
+        std::fs::write(
+            dir.join("raw/service.yaml"),
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: raw\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("overlay/kustomization.yaml"), "resources: []\n").unwrap();
+
+        let helm = MockHelm {
+            body: String::new(),
+        };
+        let kustomize = MockKustomize {
+            body: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: rendered\n".into(),
+        };
+        let kubectl = MockKubectl {
+            applied: Mutex::new(Vec::new()),
+            namespaces: Mutex::new(Vec::new()),
+            pruned: Mutex::new(Vec::new()),
+            inventories: Mutex::new(Vec::new()),
+        };
+        let opts = ReconcileOptions {
+            namespace: "local".into(),
+            workspace_name: "local".into(),
             runtime_values: BTreeMap::new(),
             app_delivery_host_paths: BTreeMap::new(),
             delivery_mode: None,
             dry_run: false,
         };
-        let results = reconcile_applications(&env, &opts, &helm, &kubectl).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].namespace, "alice");
-        assert!(results[0].applied);
-        let applied = kubectl.applied.lock().unwrap();
-        assert_eq!(applied.len(), 1);
-        assert!(applied[0].contains("hops-local-gitops"));
-        assert!(applied[0].contains("hops.ops.com.ai/local-env: alice"));
-        assert!(applied[0].contains("namespace: alice"));
-        assert_eq!(
-            kubectl.namespaces.lock().unwrap().as_slice(),
-            &["alice".to_string()]
-        );
+
+        let raw = reconcile_deploy(
+            &dir.join("raw"),
+            DeployType::K8s,
+            false,
+            "raw",
+            Value::Mapping(serde_yaml::Mapping::new()),
+            &opts,
+            &helm,
+            &kustomize,
+            &kubectl,
+        )
+        .unwrap();
+        assert_eq!(raw.source_path, dir.join("raw").canonicalize().unwrap());
+
+        let rendered = reconcile_deploy(
+            &dir.join("overlay"),
+            DeployType::Kustomize,
+            false,
+            "overlay",
+            Value::Mapping(serde_yaml::Mapping::new()),
+            &opts,
+            &helm,
+            &kustomize,
+            &kubectl,
+        )
+        .unwrap();
+        assert!(rendered.rendered_yaml.contains("name: rendered"));
         assert_eq!(
             kubectl.pruned.lock().unwrap().as_slice(),
-            &["demo-app".to_string()]
+            &["raw".to_string(), "overlay".to_string()]
         );
         assert_eq!(
             kubectl.inventories.lock().unwrap().as_slice(),
-            &["demo-app".to_string()]
+            &["raw".to_string(), "overlay".to_string()]
         );
+        let applied = kubectl.applied.lock().unwrap();
+        assert_eq!(applied.len(), 2);
+        assert!(applied
+            .iter()
+            .all(|yaml| yaml.contains("hops-local-gitops")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1176,6 +1433,19 @@ metadata:
         assert!(
             !cr_doc.lines().any(|l| l.trim() == "namespace: alice"),
             "ClusterRole must not get worktree ns"
+        );
+    }
+
+    #[test]
+    fn environment_rejects_cluster_scoped_objects_before_apply() {
+        let error = validate_rendered_manifests(
+            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: forbidden\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("cluster-scoped Namespace forbidden"),
+            "{error}"
         );
     }
 

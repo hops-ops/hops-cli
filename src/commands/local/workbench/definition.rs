@@ -5,7 +5,7 @@
 
 use crate::commands::local::backend::{self, Backend, ClusterProvider, DockerProvider};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -16,11 +16,10 @@ use std::path::{Component, Path, PathBuf};
 
 pub const API_VERSION: &str = "hops.local/v1alpha1";
 pub const DEFAULT_DEFINITION_FILE: &str = ".gitops/local/cluster.yaml";
-pub const LEGACY_DEFINITION_FILE: &str = "cluster.yaml";
 pub const DEFAULT_ENVIRONMENT_FILE: &str = ".gitops/local/environment.yaml";
+pub const DEFAULT_CROSSPLANE_CHART: &str = "crossplane-stable/crossplane";
+pub const DEFAULT_CROSSPLANE_VERSION: &str = "2.4.0";
 pub const CLUSTER_MANIFESTS_PATH: &str = ".gitops/local/cluster";
-pub const LEGACY_CLUSTER_MANIFESTS_PATH: &str = ".gitops/cluster";
-pub const DEFAULT_DEPLOY_CHART_PATH: &str = ".gitops/local";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClusterOverrides<'a> {
@@ -51,7 +50,20 @@ pub struct ClusterDefinition {
     pub docker_provider: DockerProvider,
     pub mount_root: PathBuf,
     pub manifests_path: PathBuf,
+    pub control_plane: ControlPlaneDefinition,
     pub secret_sync: Option<SecretSyncDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlPlaneDefinition {
+    pub crossplane: CrossplaneSeedDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrossplaneSeedDefinition {
+    pub chart: String,
+    pub version: String,
+    pub values: Mapping,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,11 +83,130 @@ pub struct EnvironmentDefinition {
     pub deploys: Vec<DeployDefinition>,
 }
 
+/// Renderer for one explicit Environment deploy directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeployType {
+    Helm,
+    K8s,
+    Kustomize,
+}
+
+impl Default for DeployType {
+    fn default() -> Self {
+        Self::Helm
+    }
+}
+
+impl DeployType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Helm => "helm",
+            Self::K8s => "k8s",
+            Self::Kustomize => "kustomize",
+        }
+    }
+}
+
+impl std::fmt::Display for DeployType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeployDefinition {
-    pub application_root: PathBuf,
-    pub chart_path: PathBuf,
+    /// Explicit directory consumed by the selected renderer.
+    pub source_path: PathBuf,
+    /// Owning service/project root used for source metadata and delivery.
+    pub source_root: PathBuf,
+    pub deploy_type: DeployType,
+    /// Raw k8s manifests recurse into child directories when true.
+    pub recursive: bool,
     pub values: Mapping,
+}
+
+/// Stable local deploy identity derived from the explicit source path.
+/// Including the renderer directory keeps sibling deploys such as
+/// `ui/.gitops/local` and `ui/.gitops/test-users` independent.
+pub fn local_deploy_name(deploy: &DeployDefinition) -> String {
+    let source = deploy
+        .source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("deploy");
+    let source_parent = deploy
+        .source_path
+        .parent()
+        .and_then(|path| path.file_name());
+    let is_default_local = source == "local"
+        && source_parent
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value == ".gitops");
+    let raw = if is_default_local {
+        let application = deploy
+            .source_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("application");
+        application.to_string()
+    } else if deploy.source_root == deploy.source_path {
+        let parent = source_parent
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("deploy");
+        format!("{parent}-{source}")
+    } else {
+        let application = deploy
+            .source_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("application");
+        format!("{application}-{source}")
+    };
+    let name = raw
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(63)
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if name.is_empty() {
+        "deploy".to_string()
+    } else {
+        name
+    }
+}
+
+/// Given `…/<service>/.gitops/<deploy>`, return `…/<service>`.
+/// If `.gitops` is not in the path, return the deploy path itself.
+pub fn service_root_from_deploy_path(deploy_path: &Path) -> PathBuf {
+    let components: Vec<_> = deploy_path.components().collect();
+    if let Some(index) = components
+        .iter()
+        .position(|component| component.as_os_str() == std::ffi::OsStr::new(".gitops"))
+    {
+        let mut root = PathBuf::new();
+        for component in &components[..index] {
+            root.push(component.as_os_str());
+        }
+        if root.as_os_str().is_empty() {
+            deploy_path.to_path_buf()
+        } else {
+            root
+        }
+    } else {
+        deploy_path.to_path_buf()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,7 +248,24 @@ struct ClusterSpec {
     mount_root: PathBuf,
     manifests: ManifestsSpec,
     #[serde(default)]
+    control_plane: Option<ControlPlaneSpec>,
+    #[serde(default)]
     secret_sync: Option<SecretSyncSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ControlPlaneSpec {
+    crossplane: CrossplaneSeedSpec,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CrossplaneSeedSpec {
+    chart: String,
+    version: String,
+    #[serde(default)]
+    values: Mapping,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,8 +302,10 @@ struct ClusterReference {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeploySpec {
     path: PathBuf,
+    #[serde(rename = "type")]
+    deploy_type: DeployType,
     #[serde(default)]
-    chart: Option<PathBuf>,
+    recursive: bool,
     #[serde(default)]
     values: Mapping,
 }
@@ -248,20 +398,7 @@ pub fn definition_path(file: Option<&Path>, cwd: &Path) -> PathBuf {
     match file {
         Some(path) if path.is_absolute() => path.to_path_buf(),
         Some(path) => cwd.join(path),
-        None => {
-            let preferred = cwd.join(DEFAULT_DEFINITION_FILE);
-            let legacy = cwd.join(LEGACY_DEFINITION_FILE);
-            if preferred.is_file() || !legacy.is_file() {
-                preferred
-            } else {
-                log::warn!(
-                    "using legacy Cluster definition {}; move it to {}",
-                    legacy.display(),
-                    preferred.display()
-                );
-                legacy
-            }
-        }
+        None => cwd.join(DEFAULT_DEFINITION_FILE),
     }
 }
 
@@ -353,19 +490,12 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
     )?;
     ensure_within(&mount_root, &definition_root, "Cluster definition")?;
     let manifests_relative = &raw_cluster.spec.manifests.path;
-    if !manifests_relative.ends_with(CLUSTER_MANIFESTS_PATH)
-        && manifests_relative != Path::new(LEGACY_CLUSTER_MANIFESTS_PATH)
-    {
+    if !manifests_relative.ends_with(CLUSTER_MANIFESTS_PATH) {
         return Err(format!(
-            "Cluster.spec.manifests.path must end with {CLUSTER_MANIFESTS_PATH:?} (or equal legacy {LEGACY_CLUSTER_MANIFESTS_PATH:?}); got {:?}",
+            "Cluster.spec.manifests.path must end with {CLUSTER_MANIFESTS_PATH:?}; got {:?}",
             raw_cluster.spec.manifests.path.display().to_string()
         )
         .into());
-    }
-    if manifests_relative == Path::new(LEGACY_CLUSTER_MANIFESTS_PATH) {
-        log::warn!(
-            "using legacy Cluster manifest path {LEGACY_CLUSTER_MANIFESTS_PATH}; move it to {CLUSTER_MANIFESTS_PATH}"
-        );
     }
     let manifests_base = if source.ends_with(DEFAULT_DEFINITION_FILE) {
         &mount_root
@@ -393,6 +523,23 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
             .map(|path| SecretSyncDefinition { path })
         })
         .transpose()?;
+    let control_plane = raw_cluster
+        .spec
+        .control_plane
+        .map(|control_plane| ControlPlaneDefinition {
+            crossplane: CrossplaneSeedDefinition {
+                chart: control_plane.crossplane.chart,
+                version: control_plane.crossplane.version,
+                values: control_plane.crossplane.values,
+            },
+        })
+        .unwrap_or_else(|| ControlPlaneDefinition {
+            crossplane: CrossplaneSeedDefinition {
+                chart: DEFAULT_CROSSPLANE_CHART.to_string(),
+                version: DEFAULT_CROSSPLANE_VERSION.to_string(),
+                values: Mapping::new(),
+            },
+        });
 
     Ok(LoadedDefinition {
         source,
@@ -402,6 +549,7 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
             docker_provider: raw_cluster.spec.docker_provider,
             mount_root,
             manifests_path,
+            control_plane,
             secret_sync,
         },
     })
@@ -515,39 +663,45 @@ pub fn load_environment_definition(
     )?;
 
     let mut seen_deploys = BTreeSet::new();
+    let mut seen_names = BTreeSet::new();
     let mut deploys = Vec::with_capacity(raw.spec.deploys.len());
     for deploy in raw.spec.deploys {
-        let application_root = resolve_bounded_path(
+        let source_path = resolve_bounded_path(
             &cluster.cluster.mount_root,
             &root,
             &deploy.path,
             &format!("Environment {name:?} deploys[].path"),
             true,
         )?;
-        let chart_relative = deploy
-            .chart
-            .as_deref()
-            .unwrap_or_else(|| Path::new(DEFAULT_DEPLOY_CHART_PATH));
-        let chart_path = resolve_bounded_path(
-            &cluster.cluster.mount_root,
-            &application_root,
-            chart_relative,
-            &format!("Environment {name:?} deploys[].chart"),
-            true,
-        )?;
-        if !seen_deploys.insert((application_root.clone(), chart_path.clone())) {
+        if deploy.recursive && deploy.deploy_type != DeployType::K8s {
             return Err(format!(
-                "Environment {name:?} contains duplicate deploy for application root {} and chart {}",
-                application_root.display(),
-                chart_path.display()
+                "Environment {name:?} deploys[].recursive is only valid for type k8s"
             )
             .into());
         }
-        deploys.push(DeployDefinition {
-            application_root,
-            chart_path,
+        if !seen_deploys.insert(source_path.clone()) {
+            return Err(format!(
+                "Environment {name:?} contains duplicate deploy path {}",
+                source_path.display()
+            )
+            .into());
+        }
+        let source_root = service_root_from_deploy_path(&source_path);
+        let deploy_definition = DeployDefinition {
+            source_path,
+            source_root,
+            deploy_type: deploy.deploy_type,
+            recursive: deploy.recursive,
             values: deploy.values,
-        });
+        };
+        let app_name = local_deploy_name(&deploy_definition);
+        if !seen_names.insert(app_name.clone()) {
+            return Err(format!(
+                "Environment {name:?} contains deploys with duplicate application name {app_name:?}; use distinct source directories"
+            )
+            .into());
+        }
+        deploys.push(deploy_definition);
     }
 
     Ok(LoadedEnvironment {
@@ -877,10 +1031,12 @@ spec:
   values:
     local: true
   deploys:
-    - path: apps/gateway
+    - path: apps/gateway/.gitops/local
+      type: helm
       values:
         preview: false
-    - path: services/api
+    - path: services/api/.gitops/local
+      type: helm
 "#
     }
 
@@ -891,6 +1047,14 @@ spec:
         assert_eq!(loaded.cluster.name, "project-dev");
         assert_eq!(loaded.cluster.cluster_provider, ClusterProvider::Kind);
         assert_eq!(loaded.cluster.docker_provider, DockerProvider::Dory);
+        assert_eq!(
+            loaded.cluster.control_plane.crossplane.chart,
+            DEFAULT_CROSSPLANE_CHART
+        );
+        assert_eq!(
+            loaded.cluster.control_plane.crossplane.version,
+            DEFAULT_CROSSPLANE_VERSION
+        );
 
         let environment = load_environment_definition(
             &fixture.write_environment(valid_environment_yaml()),
@@ -903,22 +1067,68 @@ spec:
         assert_eq!(environment.environment.namespace, "feature-auth");
         assert_eq!(environment.environment.root, fixture.root);
         assert_eq!(
-            environment.environment.deploys[0].chart_path,
+            environment.environment.deploys[0].source_path,
             fixture.root.join("apps/gateway/.gitops/local")
+        );
+        assert_eq!(
+            environment.environment.deploys[0].source_root,
+            fixture.root.join("apps/gateway")
+        );
+        assert_eq!(
+            environment.environment.deploys[0].deploy_type,
+            DeployType::Helm
         );
     }
 
     #[test]
-    fn default_definition_prefers_local_layout_then_legacy_root() {
+    fn parses_pinned_crossplane_seed_values() {
+        let fixture = Fixture::new();
+        let source = fixture.write(
+            r#"apiVersion: hops.local/v1alpha1
+kind: Cluster
+metadata:
+  name: project-dev
+spec:
+  clusterProvider: kind
+  dockerProvider: dory
+  mountRoot: ../..
+  manifests:
+    path: .gitops/local/cluster
+  controlPlane:
+    crossplane:
+      chart: crossplane-stable/crossplane
+      version: "2.4.0"
+      values:
+        resourcesCrossplane:
+          limits:
+            cpu: null
+            memory: null
+"#,
+        );
+        let loaded = load_definition(&source).unwrap();
+        assert_eq!(loaded.cluster.control_plane.crossplane.version, "2.4.0");
+        assert_eq!(
+            loaded
+                .cluster
+                .control_plane
+                .crossplane
+                .values
+                .get(Value::String("resourcesCrossplane".into()))
+                .and_then(Value::as_mapping)
+                .and_then(|values| values.get(Value::String("limits".into())))
+                .and_then(Value::as_mapping)
+                .and_then(|values| values.get(Value::String("cpu".into())))
+                .and_then(Value::as_str),
+            None
+        );
+    }
+
+    #[test]
+    fn default_definition_uses_local_layout() {
         let fixture = Fixture::new();
         let preferred = fixture.write(valid_yaml());
-        let legacy = fixture.root.join(LEGACY_DEFINITION_FILE);
-        fs::write(&legacy, valid_yaml()).unwrap();
 
         assert_eq!(definition_path(None, &fixture.root), preferred);
-
-        fs::remove_file(&preferred).unwrap();
-        assert_eq!(definition_path(None, &fixture.root), legacy);
     }
 
     #[test]
@@ -1003,8 +1213,10 @@ spec:
     fn rejects_duplicate_deploy_identity() {
         let fixture = Fixture::new();
         let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
-        let duplicate = valid_environment_yaml()
-            .replace("    - path: services/api", "    - path: apps/gateway");
+        let duplicate = valid_environment_yaml().replace(
+            "    - path: services/api/.gitops/local\n      type: helm",
+            "    - path: apps/gateway/.gitops/local\n      type: helm",
+        );
         assert!(load_environment_definition(
             &fixture.write_environment(&duplicate),
             &loaded,
@@ -1017,12 +1229,12 @@ spec:
     }
 
     #[test]
-    fn allows_distinct_charts_for_the_same_application_root() {
+    fn allows_distinct_explicit_deploy_directories() {
         let fixture = Fixture::new();
         let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
         let multiple = valid_environment_yaml().replace(
-            "    - path: services/api",
-            "    - path: apps/gateway\n      chart: .gitops/test-users",
+            "    - path: services/api/.gitops/local\n      type: helm",
+            "    - path: apps/gateway/.gitops/test-users\n      type: helm",
         );
         let environment =
             load_environment_definition(&fixture.write_environment(&multiple), &loaded, None, None)
@@ -1030,9 +1242,49 @@ spec:
 
         assert_eq!(environment.environment.deploys.len(), 2);
         assert_eq!(
-            environment.environment.deploys[1].chart_path,
+            environment.environment.deploys[1].source_path,
             fixture.root.join("apps/gateway/.gitops/test-users")
         );
+        assert_eq!(
+            local_deploy_name(&environment.environment.deploys[0]),
+            "gateway"
+        );
+        assert_eq!(
+            local_deploy_name(&environment.environment.deploys[1]),
+            "gateway-test-users"
+        );
+    }
+
+    #[test]
+    fn requires_renderer_type_and_limits_recursive_to_raw_k8s() {
+        let fixture = Fixture::new();
+        let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
+
+        let missing_type = valid_environment_yaml().replace(
+            "    - path: apps/gateway/.gitops/local\n      type: helm\n",
+            "    - path: apps/gateway/.gitops/local\n",
+        );
+        let error = load_environment_definition(
+            &fixture.write_environment(&missing_type),
+            &loaded,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing field `type`"));
+
+        let recursive_helm = valid_environment_yaml().replace(
+            "    - path: apps/gateway/.gitops/local\n      type: helm",
+            "    - path: apps/gateway/.gitops/local\n      type: helm\n      recursive: true",
+        );
+        let error = load_environment_definition(
+            &fixture.write_environment(&recursive_helm),
+            &loaded,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("only valid for type k8s"));
     }
 
     #[test]
@@ -1078,25 +1330,6 @@ spec:
         let loaded = load_definition(&fixture.write(&yaml)).unwrap();
 
         assert_eq!(loaded.cluster.manifests_path, fixture.root.join(nested));
-    }
-
-    #[test]
-    fn accepts_legacy_root_definition_and_manifest_layout() {
-        let fixture = Fixture::new();
-        fs::create_dir_all(fixture.root.join(LEGACY_CLUSTER_MANIFESTS_PATH)).unwrap();
-        let legacy = valid_yaml()
-            .replacen("mountRoot: ../..", "mountRoot: .", 1)
-            .replacen(CLUSTER_MANIFESTS_PATH, LEGACY_CLUSTER_MANIFESTS_PATH, 1);
-        let source = fixture.root.join(LEGACY_DEFINITION_FILE);
-        fs::write(&source, legacy).unwrap();
-
-        let loaded = load_definition(&source).unwrap();
-
-        assert_eq!(loaded.cluster.mount_root, fixture.root);
-        assert_eq!(
-            loaded.cluster.manifests_path,
-            fixture.root.join(LEGACY_CLUSTER_MANIFESTS_PATH)
-        );
     }
 
     #[test]

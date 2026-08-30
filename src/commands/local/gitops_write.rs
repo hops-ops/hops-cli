@@ -103,13 +103,13 @@ mod tests {
                 yaml: "apiVersion: pkg.crossplane.io/v1\nkind: Provider\n".into(),
             },
             GitopsFile {
-                rel_path: "providerconfigs/aws.yaml".into(),
+                rel_path: "providers/aws-provider-config.yaml".into(),
                 yaml: "apiVersion: aws.m.upbound.io/v1beta1\nkind: ProviderConfig\n".into(),
             },
         ];
         let written = write_gitops_files(&dir, &files).unwrap();
         assert!(dir.join("providers/aws.yaml").exists());
-        assert!(dir.join("providerconfigs/aws.yaml").exists());
+        assert!(dir.join("providers/aws-provider-config.yaml").exists());
         assert!(dir.join("SECRETS.md").exists());
         assert!(written.len() >= 2);
         let _ = fs::remove_dir_all(&dir);

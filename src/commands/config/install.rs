@@ -7,6 +7,7 @@ use crate::commands::local::package_install::{
     resolve_repo_install_target, rewrite_registry, rewrite_registry_with_tag, short_hash,
     split_ref, strip_registry, unique_suffix, RepoInstallTarget, RepoSpec,
 };
+use crate::commands::local::workbench::controller::reject_imperative_owner;
 use crate::commands::local::{kubectl_apply_stdin, kubectl_command, run_cmd, run_cmd_output};
 use clap::Args;
 use flate2::read::GzDecoder;
@@ -175,6 +176,7 @@ pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
         args.cluster_name.as_deref(),
         args.context.as_deref(),
     )?;
+    reject_imperative_owner(&backend::kind::active_cluster_name())?;
 
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => {
@@ -196,6 +198,7 @@ pub fn run(args: &ConfigArgs) -> Result<(), Box<dyn Error>> {
                 let path_owned = path.to_string();
                 let skip = args.skip_dependency_resolution;
                 run_watch(path, args.debounce, move || {
+                    reject_imperative_owner(&backend::kind::active_cluster_name())?;
                     run_local_path(&path_owned, skip)
                 })?;
             }
