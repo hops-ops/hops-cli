@@ -3,7 +3,7 @@ name: Version and Tag
 on:
   push:
     branches:
-      - main
+      - __DEFAULT_BRANCH__
 
 permissions:
   contents: write
@@ -11,7 +11,7 @@ permissions:
 jobs:
   version-and-tag:
     name: Version and Tag
-    uses: unbounded-tech/workflow-vnext-tag/.github/workflows/workflow.yaml@v1.22.3
+    uses: unbounded-tech/workflow-vnext-tag/.github/workflows/workflow.yaml@03c9e11b6c0a2b43c95ef210b6efbb83ac2755b2 # v1.22.3
     secrets:
       DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
     with:

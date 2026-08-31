@@ -4,7 +4,7 @@
 
 ## Overview
 
-This tool supports three related workflows:
+This tool supports four related workflows:
 
 - Importing existing application repositories into the Hops GitOps delivery contract
 - Local cluster setup on colima or kind
@@ -100,6 +100,17 @@ The command adds three independent Helm charts:
 - `.gitops/promote` for rendering the Argo CD `Application` committed to an
   environment repository
 
+The workload charts contain a Kubernetes `Deployment` and `Service` by
+default. For a Knative Serving application, select a Knative Service in both
+charts instead:
+
+```bash
+hops import --knative-service
+```
+
+The Knative local chart defaults to `minScale: 1`; the deploy chart defaults
+to `minScale: 0`. Both remain configurable in their generated values files.
+
 It also adds workflows that calculate and push vNext tags, publish the
 application image, promote `v*.*.*` releases to staging, and promote pull
 requests labeled `preview` to the preview environment. Existing `./Dockerfile`
@@ -109,12 +120,14 @@ environment is never updated before its image has been published.
 
 By default, `origin` supplies the GitHub `OWNER/REPO`, and the environment
 repositories are `OWNER/OWNER-staging-env` and `OWNER/OWNER-preview-envs`.
-Override those choices when needed:
+The importer reads the default branch from `origin/HEAD`, falling back to the
+checked-out branch. Override those choices when needed:
 
 ```bash
 hops import ./service \
   --staging-repository example/platform-staging-env \
   --preview-repository example/platform-preview-envs \
+  --branch trunk \
   --project example-nonprod
 ```
 

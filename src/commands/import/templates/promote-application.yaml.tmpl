@@ -7,7 +7,11 @@
 {{- $values = mergeOverwrite $values $provided }}
 {{- end }}
 {{- if .Values.preview }}
-{{- $image := default (dict) (get $values "image") }}
+{{- $providedImage := get $values "image" }}
+{{- if and $providedImage (not (kindIs "map" $providedImage)) }}
+{{- fail "application.values.image must contain a YAML mapping" }}
+{{- end }}
+{{- $image := default (dict) $providedImage }}
 {{- $_ := set $image "tag" .Values.application.image.tag }}
 {{- $_ := set $values "image" $image }}
 {{- end }}

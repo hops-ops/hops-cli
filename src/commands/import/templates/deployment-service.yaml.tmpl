@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __APP_NAME__
+  labels:
+    app.kubernetes.io/name: __APP_NAME__
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: __APP_NAME__
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: __APP_NAME__
+    spec:
+      containers:
+        - name: __APP_NAME__
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          {{- with .Values.env }}
+          env:
+            {{- range $name, $value := . }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: __APP_NAME__
+  labels:
+    app.kubernetes.io/name: __APP_NAME__
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app.kubernetes.io/name: __APP_NAME__
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP

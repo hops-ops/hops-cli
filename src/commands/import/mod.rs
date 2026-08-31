@@ -19,6 +19,7 @@ const PLACEHOLDERS: &[&str] = &[
     "__STAGING_REPOSITORY__",
     "__PREVIEW_REPOSITORY__",
     "__PROJECT__",
+    "__DEFAULT_BRANCH__",
     "__DOCKERFILES_JSON__",
 ];
 
@@ -51,6 +52,14 @@ pub struct ImportArgs {
     /// Container and Service target port.
     #[arg(long, default_value_t = 3000)]
     pub port: u16,
+
+    /// Generate a Knative Service instead of a Deployment and Kubernetes Service.
+    #[arg(long)]
+    pub knative_service: bool,
+
+    /// Repository default branch. Detects origin/HEAD, then the checked-out branch.
+    #[arg(long)]
+    pub branch: Option<String>,
 
     /// Dockerfile path relative to the repository. Auto-detects ./Dockerfile.
     #[arg(long)]
@@ -119,12 +128,19 @@ enum BuildStrategy {
     Railpack,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkloadKind {
+    Deployment,
+    KnativeService,
+}
+
 #[derive(Debug)]
 struct ImportPlan {
     root: PathBuf,
     repository: GithubRepository,
     app_name: String,
     build_strategy: BuildStrategy,
+    workload_kind: WorkloadKind,
     files: Vec<GeneratedFile>,
 }
 
@@ -162,6 +178,13 @@ pub fn run(args: &ImportArgs) -> Result<(), Box<dyn Error>> {
         match &plan.build_strategy {
             BuildStrategy::Dockerfile(path) => format!("Dockerfile: {path}"),
             BuildStrategy::Railpack => "Railpack fallback".to_string(),
+        },
+    );
+    log::info!(
+        "Workload: {}",
+        match plan.workload_kind {
+            WorkloadKind::Deployment => "Deployment + Service",
+            WorkloadKind::KnativeService => "Knative Service",
         }
     );
 
@@ -169,6 +192,11 @@ pub fn run(args: &ImportArgs) -> Result<(), Box<dyn Error>> {
         configure_deploy_key(&plan)?;
     } else {
         log::info!("Skipped vNext deploy-key setup (--skip-deploy-key)");
+        log::info!(
+            "Next: vnext generate-deploy-key --owner {} --name {} --key-name DEPLOY_KEY",
+            plan.repository.owner,
+            plan.repository.name
+        );
     }
 
     log::info!("Next: review the generated files and commit them to the application repository");
@@ -196,6 +224,15 @@ fn build_plan(args: &ImportArgs) -> Result<ImportPlan, ImportError> {
     };
     let app_name = kubernetes_name(args.name.as_deref().unwrap_or(&repository.name))?;
     let build_strategy = resolve_build_strategy(&root, args.dockerfile.as_deref())?;
+    let workload_kind = if args.knative_service {
+        WorkloadKind::KnativeService
+    } else {
+        WorkloadKind::Deployment
+    };
+    let default_branch = match &args.branch {
+        Some(branch) => validate_branch(branch)?,
+        None => detect_default_branch(&root)?,
+    };
     let image_repository = format!(
         "ghcr.io/{}/{}",
         repository.owner.to_ascii_lowercase(),
@@ -211,13 +248,14 @@ fn build_plan(args: &ImportArgs) -> Result<ImportPlan, ImportError> {
         ("__STAGING_REPOSITORY__", staging.slug()),
         ("__PREVIEW_REPOSITORY__", preview.slug()),
         ("__PROJECT__", args.project.clone()),
+        ("__DEFAULT_BRANCH__", default_branch),
         (
             "__DOCKERFILES_JSON__",
             dockerfiles_json(&build_strategy).map_err(|error| ImportError(error.to_string()))?,
         ),
     ];
 
-    let files = generated_files(&build_strategy)
+    let files = generated_files(&build_strategy, workload_kind)
         .into_iter()
         .map(|(path, template)| {
             Ok(GeneratedFile {
@@ -232,26 +270,34 @@ fn build_plan(args: &ImportArgs) -> Result<ImportPlan, ImportError> {
         repository,
         app_name,
         build_strategy,
+        workload_kind,
         files,
     })
 }
 
-fn generated_files(strategy: &BuildStrategy) -> Vec<(&'static str, &'static str)> {
+fn generated_files(
+    strategy: &BuildStrategy,
+    workload_kind: WorkloadKind,
+) -> Vec<(&'static str, &'static str)> {
+    let (local_values, deploy_values, workload) = match workload_kind {
+        WorkloadKind::Deployment => (
+            templates::LOCAL_DEPLOYMENT_VALUES,
+            templates::DEPLOY_DEPLOYMENT_VALUES,
+            templates::DEPLOYMENT_SERVICE,
+        ),
+        WorkloadKind::KnativeService => (
+            templates::LOCAL_KNATIVE_VALUES,
+            templates::DEPLOY_KNATIVE_VALUES,
+            templates::KNATIVE_SERVICE,
+        ),
+    };
     vec![
         (".gitops/local/Chart.yaml", templates::LOCAL_CHART),
-        (".gitops/local/values.yaml", templates::LOCAL_VALUES),
-        (
-            ".gitops/local/templates/deployment.yaml",
-            templates::DEPLOYMENT,
-        ),
-        (".gitops/local/templates/service.yaml", templates::SERVICE),
+        (".gitops/local/values.yaml", local_values),
+        (".gitops/local/templates/workload.yaml", workload),
         (".gitops/deploy/Chart.yaml", templates::DEPLOY_CHART),
-        (".gitops/deploy/values.yaml", templates::DEPLOY_VALUES),
-        (
-            ".gitops/deploy/templates/deployment.yaml",
-            templates::DEPLOYMENT,
-        ),
-        (".gitops/deploy/templates/service.yaml", templates::SERVICE),
+        (".gitops/deploy/values.yaml", deploy_values),
+        (".gitops/deploy/templates/workload.yaml", workload),
         (".gitops/promote/Chart.yaml", templates::PROMOTE_CHART),
         (".gitops/promote/values.yaml", templates::PROMOTE_VALUES),
         (
@@ -327,6 +373,44 @@ fn repository_from_origin(root: &Path) -> Result<GithubRepository, ImportError> 
             "origin is not a supported GitHub URL: {remote}; pass --repository OWNER/REPO"
         ))
     })
+}
+
+fn detect_default_branch(root: &Path) -> Result<String, ImportError> {
+    let remote_head = command_output(Command::new("git").arg("-C").arg(root).args([
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ]))
+    .map_err(|error| ImportError(format!("failed to inspect origin/HEAD: {error}")))?;
+    if remote_head.status.success() {
+        let branch = String::from_utf8_lossy(&remote_head.stdout)
+            .trim()
+            .strip_prefix("origin/")
+            .unwrap_or_default()
+            .to_string();
+        if !branch.is_empty() {
+            return validate_branch(&branch);
+        }
+    }
+
+    let current = command_output(Command::new("git").arg("-C").arg(root).args([
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+    ]))
+    .map_err(|error| ImportError(format!("failed to inspect the current branch: {error}")))?;
+    if current.status.success() {
+        let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+        if !branch.is_empty() {
+            return validate_branch(&branch);
+        }
+    }
+
+    Err(ImportError(
+        "unable to detect the default branch; pass --branch explicitly".to_string(),
+    ))
 }
 
 fn parse_github_remote(remote: &str) -> Option<GithubRepository> {
@@ -444,21 +528,58 @@ fn validate_project(project: &str) -> Result<(), ImportError> {
     Ok(())
 }
 
-fn render(template: &str, replacements: &[(&str, String)]) -> Result<String, ImportError> {
-    let mut rendered = template.to_string();
-    for (placeholder, value) in replacements {
-        rendered = rendered.replace(placeholder, value);
+fn validate_branch(branch: &str) -> Result<String, ImportError> {
+    let valid = !branch.is_empty()
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.contains("..")
+        && branch.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
+        });
+    if !valid {
+        return Err(ImportError(
+            "--branch must use letters, numbers, '.', '_', '-', or '/'".to_string(),
+        ));
     }
-    let unresolved = PLACEHOLDERS
+    Ok(branch.to_string())
+}
+
+fn render(template: &str, replacements: &[(&str, String)]) -> Result<String, ImportError> {
+    let missing = PLACEHOLDERS
         .iter()
-        .filter(|placeholder| rendered.contains(**placeholder))
+        .filter(|placeholder| {
+            template.contains(**placeholder)
+                && !replacements
+                    .iter()
+                    .any(|(candidate, _)| candidate == *placeholder)
+        })
         .copied()
         .collect::<Vec<_>>();
-    if !unresolved.is_empty() {
+    if !missing.is_empty() {
         return Err(ImportError(format!(
-            "internal template has unresolved placeholders: {}",
-            unresolved.join(", ")
+            "internal template has missing replacements: {}",
+            missing.join(", ")
         )));
+    }
+
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+    while !remaining.is_empty() {
+        let next = replacements
+            .iter()
+            .filter_map(|(placeholder, value)| {
+                remaining
+                    .find(placeholder)
+                    .map(|offset| (offset, *placeholder, value))
+            })
+            .min_by_key(|(offset, _, _)| *offset);
+        let Some((offset, placeholder, value)) = next else {
+            rendered.push_str(remaining);
+            break;
+        };
+        rendered.push_str(&remaining[..offset]);
+        rendered.push_str(value);
+        remaining = &remaining[offset + placeholder.len()..];
     }
     Ok(rendered)
 }
@@ -577,6 +698,8 @@ mod tests {
             preview_repository: None,
             project: "default".to_string(),
             port: 3000,
+            knative_service: false,
+            branch: Some("main".to_string()),
             dockerfile: None,
             force: false,
             skip_deploy_key: true,
@@ -650,7 +773,7 @@ mod tests {
         let repo = TestRepo::new(Some("git@github.com:gitkb/service.git"));
         let plan = build_plan(&args(&repo.path)).unwrap();
 
-        assert_eq!(plan.files.len(), 15);
+        assert_eq!(plan.files.len(), 13);
         for file in &plan.files {
             for placeholder in PLACEHOLDERS {
                 assert!(
@@ -686,6 +809,120 @@ mod tests {
             .unwrap();
         assert!(release.contents.contains("gitkb/gitkb-staging-env"));
         assert!(release.contents.contains("needs: publish-image"));
+    }
+
+    #[test]
+    fn generated_external_actions_are_pinned_to_commit_shas() {
+        let repo = TestRepo::new(Some("git@github.com:gitkb/service.git"));
+        let plan = build_plan(&args(&repo.path)).unwrap();
+
+        for file in plan
+            .files
+            .iter()
+            .filter(|file| file.path.starts_with(".github/workflows/"))
+        {
+            for line in file.contents.lines() {
+                let Some(reference) = line.trim().strip_prefix("uses: ") else {
+                    continue;
+                };
+                if reference.starts_with("./") {
+                    continue;
+                }
+                let commit = reference
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.rsplit_once('@'))
+                    .map(|(_, commit)| commit)
+                    .unwrap_or_default();
+                assert!(
+                    commit.len() == 40
+                        && commit
+                            .chars()
+                            .all(|character| character.is_ascii_hexdigit()),
+                    "{} contains an unpinned external action: {reference}",
+                    file.path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn detects_default_branch_from_origin_head() {
+        let repo = TestRepo::new(Some("git@github.com:gitkb/service.git"));
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo.path)
+            .args([
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let mut import_args = args(&repo.path);
+        import_args.branch = None;
+
+        let plan = build_plan(&import_args).unwrap();
+        let version = plan
+            .files
+            .iter()
+            .find(|file| file.path.ends_with("on-push-main-version-and-tag.yaml"))
+            .unwrap();
+        let preview = plan
+            .files
+            .iter()
+            .find(|file| file.path.ends_with("on-pr-preview.yaml"))
+            .unwrap();
+
+        assert!(version.contents.contains("      - trunk"));
+        assert!(preview.contents.contains("      - trunk"));
+    }
+
+    #[test]
+    fn knative_mode_replaces_deployment_and_kubernetes_service() {
+        let repo = TestRepo::new(Some("git@github.com:gitkb/service.git"));
+        let mut import_args = args(&repo.path);
+        import_args.knative_service = true;
+
+        let plan = build_plan(&import_args).unwrap();
+
+        assert_eq!(plan.workload_kind, WorkloadKind::KnativeService);
+        let workloads = plan
+            .files
+            .iter()
+            .filter(|file| file.path.ends_with("templates/workload.yaml"))
+            .collect::<Vec<_>>();
+        assert_eq!(workloads.len(), 2);
+        for workload in workloads {
+            assert!(workload.contents.contains("serving.knative.dev/v1"));
+            assert!(!workload.contents.contains("apps/v1"));
+            assert!(!workload.contents.contains("kind: Deployment"));
+        }
+        let local_values = plan
+            .files
+            .iter()
+            .find(|file| file.path == ".gitops/local/values.yaml")
+            .unwrap();
+        assert!(local_values.contents.contains("minScale: 1"));
+        assert!(!local_values.contents.contains("replicaCount"));
+    }
+
+    #[test]
+    fn replacement_values_are_not_interpreted_as_placeholders() {
+        let rendered = render(
+            "repository: __SOURCE_REPOSITORY__\nproject: __PROJECT__\n",
+            &[
+                ("__SOURCE_REPOSITORY__", "owner/__PROJECT__".to_string()),
+                ("__PROJECT__", "default".to_string()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            "repository: owner/__PROJECT__\nproject: default\n"
+        );
     }
 
     #[test]

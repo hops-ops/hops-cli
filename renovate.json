@@ -2,8 +2,17 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended",
-    ":dependencyDashboard"
+    ":dependencyDashboard",
+    "helpers:pinGitHubActionDigests"
   ],
+  "github-actions": {
+    "managerFilePatterns": [
+      "/(^|/)(workflow-templates|\\.(?:github|gitea|forgejo)/(?:workflows|actions))/.+\\.ya?ml$/",
+      "/(^|/)action\\.ya?ml$/",
+      "/^src/commands/import/templates/.*workflow\\.yaml\\.tmpl$/",
+      "/^src/commands/import/templates/publish-image-.*\\.yaml\\.tmpl$/"
+    ]
+  },
   "labels": ["dependencies"],
   "packageRules": [
     {
@@ -11,6 +20,15 @@
       "matchUpdateTypes": ["patch"],
       "automerge": true,
       "matchManagers": ["custom.regex"]
+    },
+    {
+      "description": "Keep the Railpack CLI and BuildKit frontend aligned",
+      "groupName": "hops-import-railpack",
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": [
+        "railwayapp/railpack",
+        "ghcr.io/railwayapp/railpack-frontend"
+      ]
     },
     {
       "description": "Group local-start bootstrap Crossplane pins",
@@ -58,18 +76,6 @@
     },
     {
       "customType": "regex",
-      "description": "GitHub Actions embedded in hops import templates",
-      "managerFilePatterns": [
-        "src/commands/import/templates/.*\\.yaml\\.tmpl$"
-      ],
-      "matchStrings": [
-        "uses:\\s*(?<depName>[^/\\s]+/[^/\\s@]+)(?:/[^\\s@]+)?@(?<currentValue>v?[0-9][^\\s]+)"
-      ],
-      "datasourceTemplate": "github-tags",
-      "packageNameTemplate": "{{depName}}"
-    },
-    {
-      "customType": "regex",
       "description": "Railpack release embedded in hops import fallback",
       "managerFilePatterns": [
         "src/commands/import/templates/publish-image-railpack.yaml.tmpl"
@@ -80,6 +86,18 @@
       "datasourceTemplate": "github-releases",
       "packageNameTemplate": "railwayapp/railpack",
       "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Railpack BuildKit frontend image embedded in hops import fallback",
+      "managerFilePatterns": [
+        "src/commands/import/templates/publish-image-railpack.yaml.tmpl"
+      ],
+      "matchStrings": [
+        "ghcr\\.io/railwayapp/railpack-frontend:v(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker",
+      "packageNameTemplate": "ghcr.io/railwayapp/railpack-frontend"
     }
   ]
 }
