@@ -1,10 +1,6 @@
-pub const LOCAL_CHART: &str = include_str!("templates/local-chart.yaml.tmpl");
 pub const DEPLOY_CHART: &str = include_str!("templates/deploy-chart.yaml.tmpl");
-pub const LOCAL_DEPLOYMENT_VALUES: &str =
-    include_str!("templates/local-deployment-values.yaml.tmpl");
 pub const DEPLOY_DEPLOYMENT_VALUES: &str =
     include_str!("templates/deploy-deployment-values.yaml.tmpl");
-pub const LOCAL_KNATIVE_VALUES: &str = include_str!("templates/local-knative-values.yaml.tmpl");
 pub const DEPLOY_KNATIVE_VALUES: &str = include_str!("templates/deploy-knative-values.yaml.tmpl");
 pub const DEPLOYMENT_SERVICE: &str = include_str!("templates/deployment-service.yaml.tmpl");
 pub const KNATIVE_SERVICE: &str = include_str!("templates/knative-service.yaml.tmpl");

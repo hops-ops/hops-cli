@@ -93,23 +93,22 @@ delivery files without changing its source code:
 hops import
 ```
 
-The command adds three independent Helm charts:
+The command adds two independent Helm charts:
 
-- `.gitops/local` for the local Hops GitOps workbench
 - `.gitops/deploy` for the application workload deployed by Argo CD
 - `.gitops/promote` for rendering the Argo CD `Application` committed to an
   environment repository
 
-The workload charts contain a Kubernetes `Deployment` and `Service` by
-default. For a Knative Serving application, select a Knative Service in both
-charts instead:
+The deploy chart contains a Kubernetes `Deployment` and `Service` by default.
+For a Knative Serving application, select a Knative Service instead:
 
 ```bash
 hops import --knative-service
 ```
 
-The Knative local chart defaults to `minScale: 1`; the deploy chart defaults
-to `minScale: 0`. Both remain configurable in their generated values files.
+The Knative deploy chart defaults to `minScale: 0`, configurable in its
+generated values file. Import intentionally leaves `.gitops/local` alone until
+the application's local development runtime has been selected explicitly.
 
 It also adds workflows that calculate and push vNext tags, publish the
 application image, promote `v*.*.*` releases to staging, and promote pull

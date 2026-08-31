@@ -279,22 +279,16 @@ fn generated_files(
     strategy: &BuildStrategy,
     workload_kind: WorkloadKind,
 ) -> Vec<(&'static str, &'static str)> {
-    let (local_values, deploy_values, workload) = match workload_kind {
+    let (deploy_values, workload) = match workload_kind {
         WorkloadKind::Deployment => (
-            templates::LOCAL_DEPLOYMENT_VALUES,
             templates::DEPLOY_DEPLOYMENT_VALUES,
             templates::DEPLOYMENT_SERVICE,
         ),
-        WorkloadKind::KnativeService => (
-            templates::LOCAL_KNATIVE_VALUES,
-            templates::DEPLOY_KNATIVE_VALUES,
-            templates::KNATIVE_SERVICE,
-        ),
+        WorkloadKind::KnativeService => {
+            (templates::DEPLOY_KNATIVE_VALUES, templates::KNATIVE_SERVICE)
+        }
     };
     vec![
-        (".gitops/local/Chart.yaml", templates::LOCAL_CHART),
-        (".gitops/local/values.yaml", local_values),
-        (".gitops/local/templates/workload.yaml", workload),
         (".gitops/deploy/Chart.yaml", templates::DEPLOY_CHART),
         (".gitops/deploy/values.yaml", deploy_values),
         (".gitops/deploy/templates/workload.yaml", workload),
@@ -773,7 +767,13 @@ mod tests {
         let repo = TestRepo::new(Some("git@github.com:gitkb/service.git"));
         let plan = build_plan(&args(&repo.path)).unwrap();
 
-        assert_eq!(plan.files.len(), 13);
+        assert_eq!(plan.files.len(), 10);
+        assert!(
+            plan.files
+                .iter()
+                .all(|file| !file.path.starts_with(".gitops/local/")),
+            "import must not assume a local development runtime"
+        );
         for file in &plan.files {
             for placeholder in PLACEHOLDERS {
                 assert!(
@@ -893,19 +893,19 @@ mod tests {
             .iter()
             .filter(|file| file.path.ends_with("templates/workload.yaml"))
             .collect::<Vec<_>>();
-        assert_eq!(workloads.len(), 2);
+        assert_eq!(workloads.len(), 1);
         for workload in workloads {
             assert!(workload.contents.contains("serving.knative.dev/v1"));
             assert!(!workload.contents.contains("apps/v1"));
             assert!(!workload.contents.contains("kind: Deployment"));
         }
-        let local_values = plan
+        let deploy_values = plan
             .files
             .iter()
-            .find(|file| file.path == ".gitops/local/values.yaml")
+            .find(|file| file.path == ".gitops/deploy/values.yaml")
             .unwrap();
-        assert!(local_values.contents.contains("minScale: 1"));
-        assert!(!local_values.contents.contains("replicaCount"));
+        assert!(deploy_values.contents.contains("minScale: 0"));
+        assert!(!deploy_values.contents.contains("replicaCount"));
     }
 
     #[test]
@@ -931,7 +931,7 @@ mod tests {
         let plan = build_plan(&args(&repo.path)).unwrap();
         write_plan(&plan).unwrap();
         fs::write(
-            repo.path.join(".gitops/local/values.yaml"),
+            repo.path.join(".gitops/deploy/values.yaml"),
             "owned by user\n",
         )
         .unwrap();
@@ -939,9 +939,9 @@ mod tests {
         let collisions = existing_generated_paths(&plan);
 
         assert_eq!(collisions.len(), plan.files.len());
-        assert!(collisions.contains(&".gitops/local/values.yaml".to_string()));
+        assert!(collisions.contains(&".gitops/deploy/values.yaml".to_string()));
         assert_eq!(
-            fs::read_to_string(repo.path.join(".gitops/local/values.yaml")).unwrap(),
+            fs::read_to_string(repo.path.join(".gitops/deploy/values.yaml")).unwrap(),
             "owned by user\n"
         );
     }
