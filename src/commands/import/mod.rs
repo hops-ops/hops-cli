@@ -928,6 +928,7 @@ mod tests {
         assert!(preview.contents.contains("preview: true"));
         assert!(preview.contents.contains("gitkb/gitkb-preview-envs"));
         assert!(preview.contents.contains("auth_mode: app"));
+        assert!(preview.contents.contains("contents: write"));
 
         let release = plan
             .files
