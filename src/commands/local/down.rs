@@ -1,6 +1,7 @@
 //! `hops local down` — stop workspace host access, delivery, and optionally purge namespace.
 
 use super::workbench::delivery::stop_delivery_runtime;
+use super::workbench::ingress::stop_ingress_access;
 use super::workbench::net::stop_host_access;
 use super::workbench::registry::{
     activate_workspace_cluster, list_workspaces, load_workspace, namespace_for_name,
@@ -57,6 +58,10 @@ pub fn run(args: &DownArgs) -> Result<(), Box<dyn Error>> {
     }
 
     log::info!("Bringing down workspace `{name}` (namespace {namespace})");
+
+    if let Err(e) = stop_ingress_access(&state_dir, &name) {
+        log::warn!("ingress access stop: {e}");
+    }
 
     // Stop recorded host-access processes (recorded PIDs + pkill safety net).
     if let Err(e) = stop_host_access(&state_dir, &name) {

@@ -205,6 +205,16 @@ pub fn run_cluster(
 fn stop_cluster_environment_runtime(cluster_name: &str) -> Result<(), Box<dyn Error>> {
     let state_dir = local_state_dir()?;
     for snapshot in list_environment_snapshots(cluster_name)? {
+        if let Err(error) =
+            super::workbench::ingress::stop_ingress_access(&state_dir, &snapshot.name)
+        {
+            log::warn!(
+                "Cluster {} Environment {} ingress-access cleanup: {}",
+                cluster_name,
+                snapshot.name,
+                error
+            );
+        }
         if let Err(error) = super::workbench::net::stop_host_access(&state_dir, &snapshot.name) {
             log::warn!(
                 "Cluster {} Environment {} host-access cleanup: {}",
