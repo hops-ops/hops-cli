@@ -93,6 +93,16 @@ delivery files without changing its source code:
 hops import
 ```
 
+Preview the exact generated state before changing an existing repository:
+
+```bash
+hops import --dry-run
+```
+
+Dry-run classifies importer-owned paths as `CREATE`, `UPDATE`, or `UNCHANGED`
+and prints the complete proposed content for creates and updates. It does not
+write files, require `gh` or `vnext`, or configure a deploy key.
+
 The command adds two independent Helm charts:
 
 - `.gitops/deploy` for the application workload deployed by Argo CD

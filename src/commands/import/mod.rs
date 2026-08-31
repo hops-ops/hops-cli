@@ -6,7 +6,9 @@ mod templates;
 use clap::Args;
 use std::error::Error;
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -68,6 +70,10 @@ pub struct ImportArgs {
     /// Replace files owned by the importer when they already exist.
     #[arg(long)]
     pub force: bool,
+
+    /// Preview generated files without writing or configuring repository secrets.
+    #[arg(long)]
+    pub dry_run: bool,
 
     /// Do not configure the vNext DEPLOY_KEY repository secret and deploy key.
     #[arg(long)]
@@ -150,8 +156,44 @@ struct GeneratedFile {
     contents: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileChange {
+    Create,
+    Update,
+    Unchanged,
+}
+
+impl FileChange {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Create => "CREATE",
+            Self::Update => "UPDATE",
+            Self::Unchanged => "UNCHANGED",
+        }
+    }
+}
+
 pub fn run(args: &ImportArgs) -> Result<(), Box<dyn Error>> {
     let plan = build_plan(args)?;
+
+    if args.dry_run {
+        let (preview, counts) = format_dry_run(&plan)?;
+        io::stdout().write_all(preview.as_bytes())?;
+        log::info!(
+            "Dry run for {}: {} create, {} update, {} unchanged; no files or repository settings changed",
+            plan.repository.slug(),
+            counts.created,
+            counts.updated,
+            counts.unchanged
+        );
+        if !args.skip_deploy_key {
+            log::info!(
+                "Would configure the vNext DEPLOY_KEY for {} after writing files",
+                plan.repository.slug()
+            );
+        }
+        return Ok(());
+    }
 
     if !args.skip_deploy_key {
         require_command("vnext", "install vnext before configuring the deploy key")?;
@@ -586,6 +628,76 @@ fn existing_generated_paths(plan: &ImportPlan) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ChangeCounts {
+    created: usize,
+    updated: usize,
+    unchanged: usize,
+}
+
+fn planned_file_changes(
+    plan: &ImportPlan,
+) -> Result<Vec<(&GeneratedFile, FileChange)>, ImportError> {
+    plan.files
+        .iter()
+        .map(|file| {
+            let destination = plan.root.join(file.path);
+            if !destination.exists() {
+                return Ok((file, FileChange::Create));
+            }
+            let existing = fs::read(&destination).map_err(|error| {
+                ImportError(format!(
+                    "failed to read existing {}: {error}",
+                    destination.display()
+                ))
+            })?;
+            let change = if existing == file.contents.as_bytes() {
+                FileChange::Unchanged
+            } else {
+                FileChange::Update
+            };
+            Ok((file, change))
+        })
+        .collect()
+}
+
+fn format_dry_run(plan: &ImportPlan) -> Result<(String, ChangeCounts), ImportError> {
+    let changes = planned_file_changes(plan)?;
+    let mut preview = String::new();
+    let mut counts = ChangeCounts::default();
+
+    for (file, change) in changes {
+        match change {
+            FileChange::Create => counts.created += 1,
+            FileChange::Update => counts.updated += 1,
+            FileChange::Unchanged => {
+                counts.unchanged += 1;
+                continue;
+            }
+        }
+
+        writeln!(&mut preview, "# === {} {} ===", change.label(), file.path)
+            .expect("writing to a String cannot fail");
+        preview.push_str(&file.contents);
+        if !file.contents.ends_with('\n') {
+            preview.push('\n');
+        }
+        preview.push('\n');
+    }
+
+    if preview.is_empty() {
+        preview.push_str("# No generated file changes.\n");
+    }
+    writeln!(
+        &mut preview,
+        "# Summary: {} create, {} update, {} unchanged",
+        counts.created, counts.updated, counts.unchanged
+    )
+    .expect("writing to a String cannot fail");
+
+    Ok((preview, counts))
+}
+
 fn write_plan(plan: &ImportPlan) -> Result<(), ImportError> {
     for file in &plan.files {
         let destination = plan.root.join(file.path);
@@ -696,6 +808,7 @@ mod tests {
             branch: Some("main".to_string()),
             dockerfile: None,
             force: false,
+            dry_run: false,
             skip_deploy_key: true,
         }
     }
@@ -944,6 +1057,36 @@ mod tests {
             fs::read_to_string(repo.path.join(".gitops/deploy/values.yaml")).unwrap(),
             "owned by user\n"
         );
+    }
+
+    #[test]
+    fn dry_run_classifies_files_and_does_not_write() {
+        let repo = TestRepo::new(Some("git@github.com:gitkb/service.git"));
+        let plan = build_plan(&args(&repo.path)).unwrap();
+        let unchanged = &plan.files[0];
+        let updated = &plan.files[1];
+        fs::create_dir_all(repo.path.join(".gitops/deploy")).unwrap();
+        fs::write(repo.path.join(unchanged.path), &unchanged.contents).unwrap();
+        fs::write(repo.path.join(updated.path), "user-owned content\n").unwrap();
+
+        let (preview, counts) = format_dry_run(&plan).unwrap();
+
+        assert_eq!(
+            counts,
+            ChangeCounts {
+                created: plan.files.len() - 2,
+                updated: 1,
+                unchanged: 1,
+            }
+        );
+        assert!(preview.contains("# === UPDATE .gitops/deploy/values.yaml ==="));
+        assert!(preview.contains("# === CREATE .gitops/deploy/templates/workload.yaml ==="));
+        assert!(!preview.contains("# === UNCHANGED"));
+        assert_eq!(
+            fs::read_to_string(repo.path.join(updated.path)).unwrap(),
+            "user-owned content\n"
+        );
+        assert!(!repo.path.join(".github").exists());
     }
 
     #[test]
