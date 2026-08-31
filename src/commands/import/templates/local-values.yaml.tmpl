@@ -1,0 +1,14 @@
+replicaCount: 1
+
+image:
+  repository: __IMAGE_REPOSITORY__
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: __PORT__
+
+env: {}
+resources: {}

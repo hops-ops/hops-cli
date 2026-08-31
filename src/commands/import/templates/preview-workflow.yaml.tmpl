@@ -1,0 +1,48 @@
+name: Preview
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - labeled
+      - opened
+      - reopened
+      - synchronize
+
+permissions:
+  contents: read
+  issues: write
+  packages: write
+  pull-requests: write
+
+jobs:
+  publish-image:
+    name: Publish Preview Image
+    if: contains(github.event.pull_request.labels.*.name, 'preview')
+    uses: ./.github/workflows/publish-image.yaml
+    secrets: inherit
+
+  promote-preview:
+    name: Promote Preview
+    if: contains(github.event.pull_request.labels.*.name, 'preview')
+    needs: publish-image
+    uses: unbounded-tech/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@v1.6.0
+    secrets:
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_KEY: ${{ secrets.GH_APP_KEY }}
+    with:
+      auth_mode: app
+      promotion_chart_path: .gitops/promote
+      destination_path: .gitops/deploy/helm/templates
+      environment_repository: __PREVIEW_REPOSITORY__
+      environment_name: preview
+      project: __PROJECT__
+      name: __APP_NAME__
+      preview: true
+      promotion_pr: false
+      values: |
+        image:
+          repository: __IMAGE_REPOSITORY__
+      comment: |
+        Preview promoted for `__APP_NAME__` at `pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}`.

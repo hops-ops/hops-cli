@@ -6,6 +6,7 @@
 
 This tool supports three related workflows:
 
+- Importing existing application repositories into the Hops GitOps delivery contract
 - Local cluster setup on colima or kind
 - Configuration package install/uninstall against the connected cluster
 - XR observe/manage/adopt/orphan and cross-control-plane migration workflows
@@ -75,12 +76,58 @@ cargo build --features vendored
 
 ```bash
 hops --help
+hops import --help
 hops local --help
 hops config --help
 hops secrets --help
 hops validate --help
 hops xr --help
 ```
+
+## Import an existing application
+
+Run `hops import` from an existing GitHub repository to add the application
+delivery files without changing its source code:
+
+```bash
+hops import
+```
+
+The command adds three independent Helm charts:
+
+- `.gitops/local` for the local Hops GitOps workbench
+- `.gitops/deploy` for the application workload deployed by Argo CD
+- `.gitops/promote` for rendering the Argo CD `Application` committed to an
+  environment repository
+
+It also adds workflows that calculate and push vNext tags, publish the
+application image, promote `v*.*.*` releases to staging, and promote pull
+requests labeled `preview` to the preview environment. Existing `./Dockerfile`
+repositories use `workflows-containers`; repositories without one use the
+pinned Railpack fallback. Image tags and promotion are ordered so an
+environment is never updated before its image has been published.
+
+By default, `origin` supplies the GitHub `OWNER/REPO`, and the environment
+repositories are `OWNER/OWNER-staging-env` and `OWNER/OWNER-preview-envs`.
+Override those choices when needed:
+
+```bash
+hops import ./service \
+  --staging-repository example/platform-staging-env \
+  --preview-repository example/platform-preview-envs \
+  --project example-nonprod
+```
+
+The importer uses `vnext generate-deploy-key` to create the repository's
+`DEPLOY_KEY` secret and corresponding write-enabled deploy key. This requires
+authenticated `gh` and `vnext` CLIs. Use `--skip-deploy-key` for offline
+scaffolding or tests, then run the printed vNext command later. Existing
+importer-owned files cause the command to stop before writing anything; use
+`--force` to replace only those known paths.
+
+Promotions authenticate with a GitHub App. The application repository must
+receive the Actions secrets `GH_APP_ID` and `GH_APP_KEY`, and that App must be
+installed with write access to the selected staging and preview repositories.
 
 ## Local GitOps workbench
 

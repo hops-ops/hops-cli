@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod auth;
 pub mod config;
+pub mod import;
 pub mod local;
 pub mod provider;
 pub mod secrets;

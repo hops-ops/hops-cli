@@ -1,0 +1,29 @@
+name: Version and Tag
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  version-and-tag:
+    name: Version and Tag
+    uses: unbounded-tech/workflow-vnext-tag/.github/workflows/workflow.yaml@v1.22.3
+    secrets:
+      DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+    with:
+      useDeployKey: true
+      yqPatches: |
+        patches:
+          - filePath: .gitops/deploy/values.yaml
+            selector: .image.tag
+            valuePrefix: v
+          - filePath: .gitops/deploy/Chart.yaml
+            selector: .version
+            valuePrefix: ""
+          - filePath: .gitops/deploy/Chart.yaml
+            selector: .appVersion
+            valuePrefix: v

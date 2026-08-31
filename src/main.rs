@@ -12,6 +12,8 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Add Hops GitOps charts and delivery workflows to an existing repository
+    Import(commands::import::ImportArgs),
     /// Manage the local control plane environment
     Local(commands::local::LocalArgs),
     /// Bootstrap durable AuthStack secrets in AWS Secrets Manager
@@ -40,6 +42,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     log::debug!("Command line args: {:?}", args);
 
     match &args.command {
+        Some(Commands::Import(import_args)) => {
+            commands::import::run(import_args)?;
+        }
         Some(Commands::Local(local_args)) => {
             commands::local::run(local_args)?;
         }

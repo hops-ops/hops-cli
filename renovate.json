@@ -55,6 +55,31 @@
       "datasourceTemplate": "github-releases",
       "packageNameTemplate": "crossplane/crossplane",
       "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "GitHub Actions embedded in hops import templates",
+      "managerFilePatterns": [
+        "src/commands/import/templates/.*\\.yaml\\.tmpl$"
+      ],
+      "matchStrings": [
+        "uses:\\s*(?<depName>[^/\\s]+/[^/\\s@]+)(?:/[^\\s@]+)?@(?<currentValue>v?[0-9][^\\s]+)"
+      ],
+      "datasourceTemplate": "github-tags",
+      "packageNameTemplate": "{{depName}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Railpack release embedded in hops import fallback",
+      "managerFilePatterns": [
+        "src/commands/import/templates/publish-image-railpack.yaml.tmpl"
+      ],
+      "matchStrings": [
+        "RAILPACK_VERSION:\\s*\"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)\""
+      ],
+      "datasourceTemplate": "github-releases",
+      "packageNameTemplate": "railwayapp/railpack",
+      "extractVersionTemplate": "^v(?<version>.*)$"
     }
   ]
 }
