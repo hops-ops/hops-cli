@@ -75,6 +75,10 @@ pub struct ImportArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Generate only the files needed for pull-request preview environments.
+    #[arg(long)]
+    pub preview_only: bool,
+
     /// Do not configure the vNext DEPLOY_KEY repository secret and deploy key.
     #[arg(long)]
     pub skip_deploy_key: bool,
@@ -175,6 +179,7 @@ impl FileChange {
 
 pub fn run(args: &ImportArgs) -> Result<(), Box<dyn Error>> {
     let plan = build_plan(args)?;
+    let configure_vnext = !args.preview_only && !args.skip_deploy_key;
 
     if args.dry_run {
         let (preview, counts) = format_dry_run(&plan)?;
@@ -186,7 +191,7 @@ pub fn run(args: &ImportArgs) -> Result<(), Box<dyn Error>> {
             counts.updated,
             counts.unchanged
         );
-        if !args.skip_deploy_key {
+        if configure_vnext {
             log::info!(
                 "Would configure the vNext DEPLOY_KEY for {} after writing files",
                 plan.repository.slug()
@@ -195,7 +200,7 @@ pub fn run(args: &ImportArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    if !args.skip_deploy_key {
+    if configure_vnext {
         require_command("vnext", "install vnext before configuring the deploy key")?;
         require_command(
             "gh",
@@ -230,8 +235,10 @@ pub fn run(args: &ImportArgs) -> Result<(), Box<dyn Error>> {
         }
     );
 
-    if !args.skip_deploy_key {
+    if configure_vnext {
         configure_deploy_key(&plan)?;
+    } else if args.preview_only {
+        log::info!("Skipped vNext deploy-key setup because --preview-only omits versioning");
     } else {
         log::info!("Skipped vNext deploy-key setup (--skip-deploy-key)");
         log::info!(
@@ -297,7 +304,7 @@ fn build_plan(args: &ImportArgs) -> Result<ImportPlan, ImportError> {
         ),
     ];
 
-    let files = generated_files(&build_strategy, workload_kind)
+    let files = generated_files(&build_strategy, workload_kind, args.preview_only)
         .into_iter()
         .map(|(path, template)| {
             Ok(GeneratedFile {
@@ -320,6 +327,7 @@ fn build_plan(args: &ImportArgs) -> Result<ImportPlan, ImportError> {
 fn generated_files(
     strategy: &BuildStrategy,
     workload_kind: WorkloadKind,
+    preview_only: bool,
 ) -> Vec<(&'static str, &'static str)> {
     let (deploy_values, workload) = match workload_kind {
         WorkloadKind::Deployment => (
@@ -330,7 +338,7 @@ fn generated_files(
             (templates::DEPLOY_KNATIVE_VALUES, templates::KNATIVE_SERVICE)
         }
     };
-    vec![
+    let mut files = vec![
         (".gitops/deploy/Chart.yaml", templates::DEPLOY_CHART),
         (".gitops/deploy/values.yaml", deploy_values),
         (".gitops/deploy/templates/workload.yaml", workload),
@@ -340,26 +348,31 @@ fn generated_files(
             ".gitops/promote/templates/application.yaml",
             templates::PROMOTE_APPLICATION,
         ),
-        (
+    ];
+    if !preview_only {
+        files.push((
             ".github/workflows/on-push-main-version-and-tag.yaml",
             templates::VERSION_WORKFLOW,
-        ),
-        (
-            ".github/workflows/publish-image.yaml",
-            match strategy {
-                BuildStrategy::Dockerfile(_) => templates::DOCKER_PUBLISH_WORKFLOW,
-                BuildStrategy::Railpack => templates::RAILPACK_PUBLISH_WORKFLOW,
-            },
-        ),
-        (
+        ));
+    }
+    files.push((
+        ".github/workflows/publish-image.yaml",
+        match strategy {
+            BuildStrategy::Dockerfile(_) => templates::DOCKER_PUBLISH_WORKFLOW,
+            BuildStrategy::Railpack => templates::RAILPACK_PUBLISH_WORKFLOW,
+        },
+    ));
+    if !preview_only {
+        files.push((
             ".github/workflows/on-v-tag.yaml",
             templates::RELEASE_WORKFLOW,
-        ),
-        (
-            ".github/workflows/on-pr-preview.yaml",
-            templates::PREVIEW_WORKFLOW,
-        ),
-    ]
+        ));
+    }
+    files.push((
+        ".github/workflows/on-pr-preview.yaml",
+        templates::PREVIEW_WORKFLOW,
+    ));
+    files
 }
 
 fn git_root(path: &Path) -> Result<PathBuf, ImportError> {
@@ -809,6 +822,7 @@ mod tests {
             dockerfile: None,
             force: false,
             dry_run: false,
+            preview_only: false,
             skip_deploy_key: true,
         }
     }
@@ -922,6 +936,26 @@ mod tests {
             .unwrap();
         assert!(release.contents.contains("gitkb/gitkb-staging-env"));
         assert!(release.contents.contains("needs: publish-image"));
+    }
+
+    #[test]
+    fn preview_only_omits_versioning_and_staging_promotion() {
+        let repo = TestRepo::new(Some("git@github.com:gitkb/service.git"));
+        let mut import_args = args(&repo.path);
+        import_args.preview_only = true;
+
+        let plan = build_plan(&import_args).unwrap();
+        let paths = plan.files.iter().map(|file| file.path).collect::<Vec<_>>();
+
+        assert_eq!(paths.len(), 8);
+        assert!(paths.contains(&".github/workflows/publish-image.yaml"));
+        assert!(paths.contains(&".github/workflows/on-pr-preview.yaml"));
+        assert!(!paths.contains(&".github/workflows/on-push-main-version-and-tag.yaml"));
+        assert!(!paths.contains(&".github/workflows/on-v-tag.yaml"));
+        assert!(plan.files.iter().all(|file| {
+            !file.contents.contains("gitkb/gitkb-staging-env")
+                && !file.contents.contains("DEPLOY_KEY")
+        }));
     }
 
     #[test]

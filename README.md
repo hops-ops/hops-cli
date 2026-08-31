@@ -127,6 +127,18 @@ repositories use `workflows-containers`; repositories without one use the
 pinned Railpack fallback. Image tags and promotion are ordered so an
 environment is never updated before its image has been published.
 
+To pilot an application through pull-request previews before enabling releases,
+generate only the deploy and promotion charts, image publisher, and preview
+workflow:
+
+```bash
+hops import --preview-only
+```
+
+Preview-only imports do not add main-branch versioning or staging promotion and
+do not require a vNext deploy key. They still require the GitHub App credentials
+described below to write the preview environment repository.
+
 By default, `origin` supplies the GitHub `OWNER/REPO`, and the environment
 repositories are `OWNER/OWNER-staging-env` and `OWNER/OWNER-preview-envs`.
 The importer reads the default branch from `origin/HEAD`, falling back to the
