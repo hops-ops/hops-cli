@@ -9,6 +9,8 @@ on:
       - opened
       - reopened
       - synchronize
+      - unlabeled
+      - closed
 
 permissions:
   contents: write
@@ -19,14 +21,20 @@ permissions:
 jobs:
   publish-image:
     name: Publish Preview Image
-    if: contains(github.event.pull_request.labels.*.name, 'preview')
+    if: >-
+      github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'preview')
     uses: ./.github/workflows/publish-image.yaml
 
   promote-preview:
     name: Promote Preview
-    if: contains(github.event.pull_request.labels.*.name, 'preview')
+    if: >-
+      github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'preview')
     needs: publish-image
-    uses: unbounded-tech/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@61979f24bebf3b76454501860397f37eef4d8ae5 # v1.6.0
+    uses: hops-ops/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@6f50d1ded5ab0336cd97008886c7147a3da5c585 # v2.0.0
     secrets:
       GH_APP_ID: ${{ secrets.GH_APP_ID }}
       GH_APP_KEY: ${{ secrets.GH_APP_KEY }}
@@ -39,9 +47,26 @@ jobs:
       project: __PROJECT__
       name: __APP_NAME__
       preview: true
-      promotion_pr: false
+      promotion_mode: pull-request-merge
       values: |
         image:
           repository: __IMAGE_REPOSITORY__
       comment: |
         Preview promoted for `__APP_NAME__` at `pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}`.
+
+  remove-preview:
+    name: Remove Preview
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action == 'closed' ||
+      (github.event.action == 'unlabeled' && github.event.label.name == 'preview'))
+    uses: hops-ops/workflows-gitops/.github/workflows/preview-cleanup.yaml@6f50d1ded5ab0336cd97008886c7147a3da5c585 # v2.0.0
+    secrets:
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_KEY: ${{ secrets.GH_APP_KEY }}
+    with:
+      auth_mode: app
+      environment_repository: __PREVIEW_REPOSITORY__
+      destination_path: .gitops/deploy/helm/templates
+      name: __APP_NAME__
+      promotion_mode: pull-request-merge

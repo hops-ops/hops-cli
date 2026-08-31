@@ -929,7 +929,10 @@ mod tests {
         assert!(preview.contents.contains("gitkb/gitkb-preview-envs"));
         assert!(preview.contents.contains("auth_mode: app"));
         assert!(preview.contents.contains("contents: write"));
-        assert!(preview.contents.contains("promotion_pr: false"));
+        assert!(preview.contents.contains("promotion_mode: pull-request-merge"));
+        assert!(preview.contents.contains("hops-ops/workflows-gitops"));
+        assert!(preview.contents.contains("preview-cleanup.yaml"));
+        assert!(preview.contents.contains("github.event.action == 'closed'"));
 
         let release = plan
             .files
@@ -938,6 +941,8 @@ mod tests {
             .unwrap();
         assert!(release.contents.contains("gitkb/gitkb-staging-env"));
         assert!(release.contents.contains("needs: publish-image"));
+        assert!(release.contents.contains("promotion_mode: direct"));
+        assert!(release.contents.contains("hops-ops/workflows-gitops"));
     }
 
     #[test]
