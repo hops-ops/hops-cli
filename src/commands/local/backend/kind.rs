@@ -38,6 +38,10 @@ const KIND_CLUSTER_NAME_ENV: &str = "HOPS_KIND_CLUSTER_NAME";
 const KIND_REGISTRY_HOST_PORT_ENV: &str = "HOPS_KIND_REGISTRY_HOST_PORT";
 const REGISTRY_HOST_PORT_START: u16 = 30500;
 const REGISTRY_HOST_PORT_END: u16 = 30599;
+const KIND_INGRESS_HOST_PORT_ENV: &str = "HOPS_KIND_INGRESS_HOST_PORT";
+pub const INGRESS_NODE_PORT: u16 = 30080;
+const INGRESS_HOST_PORT_START: u16 = 30600;
+const INGRESS_HOST_PORT_END: u16 = 30699;
 const INOTIFY_SYSCTL_PATH: &str = "/etc/sysctl.d/99-hops-local-inotify.conf";
 const INOTIFY_MAX_USER_INSTANCES: u32 = 8192;
 const INOTIFY_MAX_USER_WATCHES: u32 = 1_048_576;
@@ -263,6 +267,57 @@ fn resolve_registry_host_port() -> Result<u16, Box<dyn Error>> {
     })
 }
 
+/// Host port published for the shared local Gateway API ingress NodePort.
+///
+/// The node-side port is stable so cluster GitOps can configure an ingress
+/// Gateway declaratively. The host-side port is allocated per cluster so
+/// multiple stopped or running clusters do not collide.
+pub fn ingress_host_port() -> Result<u16, Box<dyn Error>> {
+    if let Some(port) =
+        published_host_port(&node_container_name(), &format!("{INGRESS_NODE_PORT}/tcp"))
+    {
+        return Ok(port);
+    }
+
+    Err(format!(
+        "kind cluster '{}' does not publish the Hops ingress NodePort {INGRESS_NODE_PORT}; recreate it with `hops local gitops cluster <cluster.yaml> --down` followed by `hops local gitops cluster <cluster.yaml>`",
+        active_cluster_name()
+    )
+    .into())
+}
+
+fn resolve_new_ingress_host_port() -> Result<u16, Box<dyn Error>> {
+    let env_override = match std::env::var(KIND_INGRESS_HOST_PORT_ENV) {
+        Ok(raw) if raw.trim().is_empty() => None,
+        Ok(raw) => Some(raw.trim().parse::<u16>().map_err(|_| {
+            format!(
+                "{KIND_INGRESS_HOST_PORT_ENV} must be a valid TCP port, got {:?}",
+                raw.trim()
+            )
+        })?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let unavailable = unavailable_host_ports(INGRESS_HOST_PORT_START, INGRESS_HOST_PORT_END)?;
+    if let Some(port) = env_override {
+        if unavailable.contains(&port) {
+            return Err(format!(
+                "{KIND_INGRESS_HOST_PORT_ENV}={port} is already reserved; choose another port"
+            )
+            .into());
+        }
+        return Ok(port);
+    }
+    (INGRESS_HOST_PORT_START..=INGRESS_HOST_PORT_END)
+        .find(|port| !unavailable.contains(port))
+        .ok_or_else(|| {
+            format!(
+                "no free kind ingress host port in {INGRESS_HOST_PORT_START}-{INGRESS_HOST_PORT_END}; free a port or set {KIND_INGRESS_HOST_PORT_ENV}"
+            )
+            .into()
+        })
+}
+
 /// Read a container's configured host binding. HostConfig works for both
 /// running and stopped containers, so stopped named clusters still reserve
 /// their ports and can be restarted later.
@@ -277,11 +332,15 @@ fn published_host_port(container: &str, container_port: &str) -> Option<u16> {
 }
 
 fn unavailable_registry_host_ports() -> Result<BTreeSet<u16>, Box<dyn Error>> {
+    unavailable_host_ports(REGISTRY_HOST_PORT_START, REGISTRY_HOST_PORT_END)
+}
+
+fn unavailable_host_ports(start: u16, end: u16) -> Result<BTreeSet<u16>, Box<dyn Error>> {
     let mut unavailable = docker_reserved_host_ports()?;
 
     // Docker reservations do not include native host processes. Probe the
     // bounded allocation range as well; the listener is dropped immediately.
-    for port in REGISTRY_HOST_PORT_START..=REGISTRY_HOST_PORT_END {
+    for port in start..=end {
         if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err() {
             unavailable.insert(port);
         }
@@ -441,7 +500,11 @@ fn mount_inventory_has_same_path(raw: &str, expected: &Path) -> Result<bool, Box
 ///
 /// When `extra_mount_host` is a directory, mount it at the same absolute path
 /// inside the node (kind `extraMounts`) so pod hostPath of that path works.
-pub fn build_kind_config(extra_mount_host: Option<&Path>, registry_host_port: u16) -> String {
+pub fn build_kind_config(
+    extra_mount_host: Option<&Path>,
+    registry_host_port: u16,
+    ingress_host_port: u16,
+) -> String {
     let mut cfg = format!(
         r#"kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -450,6 +513,9 @@ nodes:
   extraPortMappings:
   - containerPort: 30500
     hostPort: {registry_host_port}
+    listenAddress: "127.0.0.1"
+  - containerPort: {INGRESS_NODE_PORT}
+    hostPort: {ingress_host_port}
     listenAddress: "127.0.0.1"
 "#
     );
@@ -802,13 +868,15 @@ fn preflight() -> Result<(), Box<dyn Error>> {
 fn create_cluster() -> Result<(), Box<dyn Error>> {
     let mount = default_extra_mount_root();
     let reg_port = resolve_registry_host_port()?;
-    let config = build_kind_config(mount.as_deref(), reg_port);
+    let ingress_port = resolve_new_ingress_host_port()?;
+    let config = build_kind_config(mount.as_deref(), reg_port, ingress_port);
     if reg_port != 30500 {
         log::info!(
             "kind registry hostPort={reg_port} ({REGISTRY_HOST_PORT_START} is already reserved or \
              {KIND_REGISTRY_HOST_PORT_ENV} was set)"
         );
     }
+    log::info!("kind ingress hostPort={ingress_port} -> nodePort={INGRESS_NODE_PORT}");
     let name = active_cluster_name();
     // A missing kind node with an owned volume is residue from an interrupted
     // create or external container cleanup. Starting a fresh kind node on old
@@ -1119,10 +1187,12 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn kind_config_pins_registry_nodeport_to_localhost() {
-        let cfg = build_kind_config(None, 30500);
+    fn kind_config_pins_registry_and_ingress_nodeports_to_localhost() {
+        let cfg = build_kind_config(None, 30500, 30600);
         assert!(cfg.contains("containerPort: 30500"));
         assert!(cfg.contains("hostPort: 30500"));
+        assert!(cfg.contains("containerPort: 30080"));
+        assert!(cfg.contains("hostPort: 30600"));
         assert!(cfg.contains("listenAddress: \"127.0.0.1\""));
         assert!(cfg.contains("role: control-plane"));
         assert!(!cfg.contains("extraMounts:"));
@@ -1130,9 +1200,10 @@ mod tests {
 
     #[test]
     fn kind_config_can_shift_registry_host_port() {
-        let cfg = build_kind_config(None, 30501);
+        let cfg = build_kind_config(None, 30501, 30642);
         assert!(cfg.contains("hostPort: 30501"));
         assert!(cfg.contains("containerPort: 30500"));
+        assert!(cfg.contains("hostPort: 30642"));
     }
 
     #[test]
@@ -1189,7 +1260,7 @@ mod tests {
 
     #[test]
     fn kind_config_includes_extra_mounts_for_host_path() {
-        let cfg = build_kind_config(Some(Path::new("/Users/test")), 30500);
+        let cfg = build_kind_config(Some(Path::new("/Users/test")), 30500, 30600);
         assert!(cfg.contains("extraMounts:"));
         assert!(cfg.contains("hostPath: \"/Users/test\""));
         assert!(cfg.contains("containerPath: \"/Users/test\""));
@@ -1269,7 +1340,7 @@ fs.inotify.max_user_watches = 1048576\n"
     fn resolve_docker_host_respects_env() {
         // Only assert pure formatting when env is set — avoid flaking on machine state.
         // build_kind_config + extra mounts are the contract under test here.
-        let cfg = build_kind_config(Some(Path::new("/home/ci")), 30500);
+        let cfg = build_kind_config(Some(Path::new("/home/ci")), 30500, 30600);
         assert!(cfg.contains("/home/ci"));
     }
 

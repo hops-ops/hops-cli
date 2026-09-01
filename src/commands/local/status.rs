@@ -2,6 +2,9 @@
 //!
 //! Self-heals a dead DNS supervisor / port-forwards by default so status is usable truth.
 
+use super::workbench::ingress::{
+    ensure_ingress_access, format_ingress_status, load_ingress_access_runtime, plan_from_runtime,
+};
 use super::workbench::net::{
     discover_workspace_endpoints, ensure_host_access, format_status_card_with_listen,
     host_access_status_line, load_host_access_runtime, plan_host_access, url_listen_status,
@@ -119,6 +122,34 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
             println!("note:     no services listed yet — is the workspace up?");
         } else {
             println!("access processes: not recorded");
+        }
+
+        if args.no_heal {
+            if let Some(runtime) = load_ingress_access_runtime(&state_dir, &ws.name)? {
+                let plan = plan_from_runtime(&runtime);
+                if super::workbench::ingress::ingress_access_needs_heal(&runtime) {
+                    all_ok = false;
+                }
+                println!("{}", format_ingress_status(&plan, &runtime));
+            }
+        } else {
+            match ensure_ingress_access(&ws.namespace, &state_dir, &ws.name) {
+                Ok((plan, runtime, restarted)) => {
+                    if restarted && !plan.urls.is_empty() {
+                        println!("note:     ingress access restarted (self-heal)");
+                    }
+                    if super::workbench::ingress::ingress_access_needs_heal(&runtime)
+                        && !plan.urls.is_empty()
+                    {
+                        all_ok = false;
+                    }
+                    println!("{}", format_ingress_status(&plan, &runtime));
+                }
+                Err(error) => {
+                    all_ok = false;
+                    println!("ingress:  unavailable ({error})");
+                }
+            }
         }
 
         // URL listen summary for --check (cluster FQDN endpoints)

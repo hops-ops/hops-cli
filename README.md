@@ -268,6 +268,63 @@ The watcher uses a short debounce and reacts to:
 Ordinary application source changes are handled by the development process in
 the pod through the mounted source tree; they do not require a Helm reconcile.
 
+### Browser ingress with Gateway API
+
+Services keep their Kubernetes DNS URLs for direct access. An Environment can
+also expose browser-facing HTTPS names by applying ordinary Gateway API
+`HTTPRoute` resources. Hops discovers their `spec.hostnames` and Gateway parent
+references; no extra Environment fields or Hops-specific ingress objects are
+required.
+
+With `clusterProvider: kind` and `dockerProvider: dory`, Hops reserves nodePort
+`30080` when it creates the cluster. Configure the shared Istio Gateway to use
+that port declaratively. Istio supports a GatewayClass defaults ConfigMap, so a
+local cluster can include this next to its other cluster manifests:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-istio-gateway-defaults
+  namespace: istio-system
+  labels:
+    gateway.istio.io/defaults-for-class: istio
+data:
+  service: |
+    spec:
+      type: NodePort
+      ports:
+        - name: http
+          port: 80
+          nodePort: 30080
+```
+
+Then reconcile browser access and print every URL:
+
+```bash
+hops local status --name feature-auth
+```
+
+`local status` finds the controller-created Service by its standard
+`gateway.networking.k8s.io/gateway-name` label, verifies the reserved NodePort,
+and reconciles every route hostname through Dory's custom-domain API. Multiple
+hostnames and worktree Environments share the cluster Gateway. Duplicate
+hostnames across Environments fail instead of silently stealing a route.
+
+The normal result has no visible port:
+
+```text
+https://gitkb.feature-auth.localhost
+https://console.gitkb.feature-auth.localhost
+```
+
+Dory owns trusted local TLS and standard ports 80/443; Istio owns routing inside
+Kubernetes. Cert-stack is therefore unnecessary for this host-only edge. There
+is no app-specific host file entry, local proxy process, or visible port.
+
+Environment and Cluster `--down` remove only the Dory custom domains recorded
+for the affected Environment. They do not remove another worktree's routes.
+
 Every successful Cluster pass atomically updates its inventory. A removed
 Cluster manifest is pruned only by its recorded API version, kind, namespace,
 and name. A removed Environment definition is pruned only from its durable

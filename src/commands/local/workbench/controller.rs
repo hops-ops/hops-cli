@@ -506,6 +506,9 @@ pub fn down_environment(
         return Err("Environment ownership snapshot has no namespace; refusing cleanup".into());
     }
     if let Ok(state_dir) = local_state_dir() {
+        if let Err(error) = super::ingress::stop_ingress_access(&state_dir, environment_name) {
+            log::warn!("Environment ingress-access cleanup: {error}");
+        }
         if let Err(error) = super::net::stop_host_access(&state_dir, environment_name) {
             log::warn!("Environment host-access cleanup: {error}");
         }
