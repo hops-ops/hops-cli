@@ -943,6 +943,8 @@ mod tests {
         assert!(preview.contents.contains("pull_request_target:"));
         assert!(preview.contents.contains("wait-for-image:"));
         assert!(preview.contents.contains("docker manifest inspect"));
+        assert!(preview.contents.contains("|| 'state'"));
+        assert!(preview.contents.contains("cancel-in-progress: true"));
         assert!(preview.contents.contains("github.event.action == 'opened'"));
         assert!(preview
             .contents

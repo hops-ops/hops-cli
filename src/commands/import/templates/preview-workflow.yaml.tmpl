@@ -15,11 +15,12 @@ on:
       - closed
 
 concurrency:
-  group: __APP_NAME__-preview-${{ github.event.pull_request.number }}
-  # Irrelevant label changes must not cancel an active promotion.
-  cancel-in-progress: >-
-    ${{ (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-    github.event.label.name == 'preview' }}
+  # Route irrelevant label changes away from the serialized preview-state group.
+  group: >-
+    __APP_NAME__-preview-${{ github.event.pull_request.number }}-${{
+    ((github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+    github.event.label.name != 'preview' && github.event.label.name) || 'state' }}
+  cancel-in-progress: true
 
 jobs:
   wait-for-image:
