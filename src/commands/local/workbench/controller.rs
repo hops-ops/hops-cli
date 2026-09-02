@@ -346,6 +346,35 @@ pub fn save_environment_snapshot(
 /// Render and reconcile every explicit deploy directory in a validated
 /// Environment. Protected identity values are injected after user values are
 /// merged.
+fn environment_helm_values(
+    loaded: &LoadedEnvironment,
+    deploy: &super::definition::DeployDefinition,
+) -> serde_yaml::Mapping {
+    let mut values = loaded.environment.values.clone();
+    merge_mapping(&mut values, &deploy.values);
+    values.insert(Value::String("local".into()), Value::Bool(true));
+    values.insert(
+        Value::String("localDomain".into()),
+        Value::String(loaded.environment.local_domain.clone()),
+    );
+    values.insert(
+        Value::String("environment".into()),
+        string_mapping(&[
+            ("name", &loaded.environment.name),
+            ("namespace", &loaded.environment.namespace),
+        ]),
+    );
+    values.insert(
+        Value::String("source".into()),
+        string_mapping(&[
+            ("localPath", &deploy.source_root.to_string_lossy()),
+            ("path", &deploy.source_path.to_string_lossy()),
+            ("type", deploy.deploy_type.as_str()),
+        ]),
+    );
+    values
+}
+
 pub fn reconcile_environment<H: HelmRunner, K: KubectlApplier, R: KustomizeRunner>(
     loaded: &LoadedEnvironment,
     opts: &ReconcileOptions,
@@ -357,24 +386,7 @@ pub fn reconcile_environment<H: HelmRunner, K: KubectlApplier, R: KustomizeRunne
     let mut results = Vec::new();
     let mut errors = Vec::new();
     for deploy in &loaded.environment.deploys {
-        let mut values = loaded.environment.values.clone();
-        merge_mapping(&mut values, &deploy.values);
-        values.insert(Value::String("local".into()), Value::Bool(true));
-        values.insert(
-            Value::String("environment".into()),
-            string_mapping(&[
-                ("name", &loaded.environment.name),
-                ("namespace", &loaded.environment.namespace),
-            ]),
-        );
-        values.insert(
-            Value::String("source".into()),
-            string_mapping(&[
-                ("localPath", &deploy.source_root.to_string_lossy()),
-                ("path", &deploy.source_path.to_string_lossy()),
-                ("type", deploy.deploy_type.as_str()),
-            ]),
-        );
+        let values = environment_helm_values(loaded, deploy);
         let app_name = local_deploy_name(deploy);
         match super::reconcile::reconcile_deploy(
             &deploy.source_path,
@@ -630,6 +642,51 @@ pub fn validate_environment_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_helm_values_include_local_domain_and_override_user_values() {
+        let environment_values =
+            serde_yaml::from_str("local: false\nlocalDomain: public.example.com\npreview: false\n")
+                .unwrap();
+        let deploy_values =
+            serde_yaml::from_str("localDomain: other.localhost\npreview: true\n").unwrap();
+        let deploy = super::super::definition::DeployDefinition {
+            source_path: PathBuf::from("/project/apps/gateway/.gitops/local"),
+            source_root: PathBuf::from("/project/apps/gateway"),
+            deploy_type: DeployType::Helm,
+            recursive: false,
+            values: deploy_values,
+        };
+        let loaded = LoadedEnvironment {
+            source: PathBuf::from("/project/.gitops/local/environment.yaml"),
+            environment: super::super::definition::EnvironmentDefinition {
+                name: "feature-auth".into(),
+                namespace: "feature-auth-ns".into(),
+                cluster_ref: "project-dev".into(),
+                local_domain: "gitkb.localhost".into(),
+                root: PathBuf::from("/project"),
+                values: environment_values,
+                deploys: vec![deploy.clone()],
+            },
+        };
+
+        let values = environment_helm_values(&loaded, &deploy);
+
+        assert_eq!(values["local"], Value::Bool(true));
+        assert_eq!(
+            values["localDomain"],
+            Value::String("gitkb.localhost".into())
+        );
+        assert_eq!(values["preview"], Value::Bool(true));
+        assert_eq!(
+            values["environment"]["name"],
+            Value::String("feature-auth".into())
+        );
+        assert_eq!(
+            values["environment"]["namespace"],
+            Value::String("feature-auth-ns".into())
+        );
+    }
 
     #[test]
     fn lease_round_trip_and_reuse_metadata() {

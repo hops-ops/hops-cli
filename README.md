@@ -228,6 +228,8 @@ spec:
   dockerProvider: dory
   # Relative to .gitops/local/cluster.yaml. ../.. is the project root.
   mountRoot: ../..
+  # Optional; defaults to localhost. A leading dot is accepted and normalized.
+  localDomain: gitkb.localhost
   manifests:
     path: .gitops/local/cluster
   controlPlane:
@@ -240,6 +242,12 @@ spec:
 worktrees. For kind, that exact host path is mounted into the node. An existing
 kind Cluster with a different exact mount path fails with explicit
 recreate/reset guidance; Hops never silently deletes it.
+
+`localDomain` is the trusted local hostname suffix injected into every local
+Helm deploy. It must be `localhost` or a subdomain ending in `.localhost`.
+Omitting it preserves the default `<service>.<environment>.localhost` shape;
+for example, `gitkb.localhost` lets a chart render
+`<service>.<environment>.gitkb.localhost`.
 
 ### Environment definition
 
@@ -278,12 +286,12 @@ spec:
 
 Environment values are merged with deploy-specific values for Helm deploys. The
 local controller injects the immutable runtime values `local: true`, the
-Environment name/namespace, and the resolved source path/type. Raw Kubernetes
-and Kustomize directories are already rendered inputs; they do not consume Helm
-values or get silently Helm-templated, but they do receive the common namespace,
-labels, and ownership pipeline. The namespace defaults to the Environment
-runtime name; `--name` and `--namespace` can override those values for an
-explicitly run Environment.
+Cluster `localDomain`, the Environment name/namespace, and the resolved source
+path/type. Raw Kubernetes and Kustomize directories are already rendered
+inputs; they do not consume Helm values or get silently Helm-templated, but they
+do receive the common namespace, labels, and ownership pipeline. The namespace
+defaults to the Environment runtime name; `--name` and `--namespace` can
+override those values for an explicitly run Environment.
 
 `type` is required and must be `helm`, `k8s`, or `kustomize`:
 
@@ -378,6 +386,15 @@ also expose browser-facing HTTPS names by applying ordinary Gateway API
 references; no extra Environment fields or Hops-specific ingress objects are
 required.
 
+Local Helm charts can compose route names from the protected values injected by
+Hops:
+
+```yaml
+spec:
+  hostnames:
+    - {{ printf "gitkb.%s.%s" .Values.environment.name .Values.localDomain | quote }}
+```
+
 With `clusterProvider: kind` and `dockerProvider: dory`, Hops reserves nodePort
 `30080` when it creates the cluster. Configure the shared Istio Gateway to use
 that port declaratively. Istio supports a GatewayClass defaults ConfigMap, so a
@@ -416,8 +433,8 @@ hostnames across Environments fail instead of silently stealing a route.
 The normal result has no visible port:
 
 ```text
-https://gitkb.feature-auth.localhost
-https://console.gitkb.feature-auth.localhost
+https://gitkb.feature-auth.gitkb.localhost
+https://console.gitkb.feature-auth.gitkb.localhost
 ```
 
 Dory owns trusted local TLS and standard ports 80/443; Istio owns routing inside
