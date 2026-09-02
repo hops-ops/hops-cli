@@ -82,7 +82,20 @@ hops config --help
 hops secrets --help
 hops validate --help
 hops xr --help
+hops ai --help
 ```
+
+Install the bundled Hops skills into the current repository for either
+supported agent client:
+
+```bash
+hops ai codex
+hops ai claude
+```
+
+Both commands install the general `hops` skill and the focused `hops-import`
+skill. Existing files are preserved; pass `--force` only when replacing a
+locally customized installed copy is intentional.
 
 ## Import an existing application
 

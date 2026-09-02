@@ -1,7 +1,8 @@
 use clap::Args;
 use std::error::Error;
-use std::fs;
 use std::path::Path;
+
+use super::{install_files, print_summary};
 
 // Codex uses the same Agent Skills open standard as Claude Code, but reads
 // from .agents/skills/ instead of .claude/skills/.
@@ -15,6 +16,11 @@ const REF_STACKS_AND_XRS: &str =
     include_str!("../../../skills/claude/references/stacks-and-xrs.md");
 const REF_DEBUGGING: &str = include_str!("../../../skills/claude/references/debugging.md");
 const REF_VARS: &str = include_str!("../../../skills/claude/references/vars.md");
+const REF_LOCAL_SOURCE_PACKAGES: &str =
+    include_str!("../../../skills/claude/references/local-source-packages.md");
+const REF_LOCAL_WORKBENCH: &str =
+    include_str!("../../../skills/claude/references/local-workbench.md");
+const IMPORT_SKILL_MD: &str = include_str!("../../../skills/hops-import/SKILL.md");
 
 #[derive(Args, Debug)]
 pub struct CodexArgs {
@@ -24,7 +30,7 @@ pub struct CodexArgs {
 }
 
 pub fn run(args: &CodexArgs) -> Result<(), Box<dyn Error>> {
-    let files: Vec<(&str, &str)> = vec![
+    let files = [
         (".agents/skills/hops/SKILL.md", SKILL_MD),
         (
             ".agents/skills/hops/references/config-install.md",
@@ -45,37 +51,30 @@ pub fn run(args: &CodexArgs) -> Result<(), Box<dyn Error>> {
         ),
         (".agents/skills/hops/references/debugging.md", REF_DEBUGGING),
         (".agents/skills/hops/references/vars.md", REF_VARS),
+        (
+            ".agents/skills/hops/references/local-source-packages.md",
+            REF_LOCAL_SOURCE_PACKAGES,
+        ),
+        (
+            ".agents/skills/hops/references/local-workbench.md",
+            REF_LOCAL_WORKBENCH,
+        ),
+        (".agents/skills/hops-import/SKILL.md", IMPORT_SKILL_MD),
     ];
 
-    let mut wrote = 0usize;
-    let mut skipped = 0usize;
-
-    for (path, content) in &files {
-        let p = Path::new(path);
-        if p.exists() && !args.force {
-            log::info!("Skipping {} (exists, use --force to overwrite)", path);
-            skipped += 1;
-            continue;
-        }
-        if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(p, content)?;
-        log::info!("Wrote {}", path);
-        wrote += 1;
-    }
-
-    if wrote > 0 {
-        println!(
-            "Installed hops skill for Codex CLI ({} files written, {} skipped)",
-            wrote, skipped
-        );
-    } else {
-        println!(
-            "All files already exist ({} skipped). Use --force to overwrite.",
-            skipped
-        );
-    }
+    let summary = install_files(Path::new("."), &files, args.force)?;
+    print_summary("Codex CLI", &summary);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundles_the_focused_import_skill() {
+        assert!(IMPORT_SKILL_MD.contains("name: hops-import"));
+        assert!(IMPORT_SKILL_MD.contains("`--dry-run`"));
+    }
 }
