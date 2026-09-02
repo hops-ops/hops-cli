@@ -152,6 +152,14 @@ Preview-only imports do not add main-branch versioning or staging promotion and
 do not require a vNext deploy key. They still require the GitHub App credentials
 described below to write the preview environment repository.
 
+Preview handling is split across two workflows. An unprivileged `pull_request`
+workflow publishes the exact same-repository PR head using only read access to
+the repository and write access to packages. A separate `pull_request_target`
+workflow loaded from the protected base branch waits for that immutable image,
+then exposes GitHub App credentials only to promotion or cleanup. The privileged
+workflow must therefore be present on the repository's default branch before a
+preview can be promoted.
+
 By default, `origin` supplies the GitHub `OWNER/REPO`, and the environment
 repositories are `OWNER/OWNER-staging-env` and `OWNER/OWNER-preview-envs`.
 The importer reads the default branch from `origin/HEAD`, falling back to the

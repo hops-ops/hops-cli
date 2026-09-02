@@ -12,4 +12,5 @@ pub const DOCKER_PUBLISH_WORKFLOW: &str = include_str!("templates/publish-image-
 pub const RAILPACK_PUBLISH_WORKFLOW: &str =
     include_str!("templates/publish-image-railpack.yaml.tmpl");
 pub const RELEASE_WORKFLOW: &str = include_str!("templates/release-workflow.yaml.tmpl");
+pub const PREVIEW_IMAGE_WORKFLOW: &str = include_str!("templates/preview-image-workflow.yaml.tmpl");
 pub const PREVIEW_WORKFLOW: &str = include_str!("templates/preview-workflow.yaml.tmpl");

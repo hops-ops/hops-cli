@@ -1,7 +1,9 @@
-name: Preview
+name: Preview Promotion
 
 on:
-  pull_request:
+  # pull_request_target loads this privileged workflow from the protected base
+  # branch. Never check out or execute pull-request code in this workflow.
+  pull_request_target:
     branches:
       - __DEFAULT_BRANCH__
     types:
@@ -12,29 +14,58 @@ on:
       - unlabeled
       - closed
 
-permissions:
-  contents: write
-  issues: write
-  packages: write
-  pull-requests: write
+concurrency:
+  group: __APP_NAME__-preview-${{ github.event.pull_request.number }}
+  # Irrelevant label changes must not cancel an active promotion.
+  cancel-in-progress: >-
+    ${{ (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+    github.event.label.name == 'preview' }}
 
 jobs:
-  publish-image:
-    name: Publish Preview Image
+  wait-for-image:
+    name: Wait for Preview Image
     if: >-
-      github.event.action != 'closed' &&
+      (github.event.action == 'opened' ||
+      github.event.action == 'reopened' ||
+      github.event.action == 'synchronize' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'preview')) &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       contains(github.event.pull_request.labels.*.name, 'preview')
-    uses: ./.github/workflows/publish-image.yaml
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Wait for immutable PR image
+        shell: bash
+        env:
+          IMAGE: __IMAGE_REPOSITORY__:pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+        run: |
+          for attempt in {1..60}; do
+            if docker manifest inspect "${IMAGE}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            echo "Waiting for ${IMAGE} (attempt ${attempt}/60)"
+            sleep 10
+          done
+          echo "Timed out waiting for ${IMAGE}" >&2
+          exit 1
 
   promote-preview:
     name: Promote Preview
-    if: >-
-      github.event.action != 'closed' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      contains(github.event.pull_request.labels.*.name, 'preview')
-    needs: publish-image
-    uses: hops-ops/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@6f50d1ded5ab0336cd97008886c7147a3da5c585 # v2.0.0
+    needs: wait-for-image
+    uses: hops-ops/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@3a758761c76834953fa1207487dd4f0a947e193f # protected preview support
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
     secrets:
       GH_APP_ID: ${{ secrets.GH_APP_ID }}
       GH_APP_KEY: ${{ secrets.GH_APP_KEY }}
@@ -52,7 +83,8 @@ jobs:
         image:
           repository: __IMAGE_REPOSITORY__
       comment: |
-        Preview promoted for `__APP_NAME__` at `pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}`.
+        Preview promoted for `__APP_NAME__`:
+        [Open preview](https://__APP_NAME__.__APP_NAME__-pr-${{ github.event.pull_request.number }}.p0.gitkb.com)
 
   remove-preview:
     name: Remove Preview
@@ -61,6 +93,10 @@ jobs:
       (github.event.action == 'closed' ||
       (github.event.action == 'unlabeled' && github.event.label.name == 'preview'))
     uses: hops-ops/workflows-gitops/.github/workflows/preview-cleanup.yaml@6f50d1ded5ab0336cd97008886c7147a3da5c585 # v2.0.0
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
     secrets:
       GH_APP_ID: ${{ secrets.GH_APP_ID }}
       GH_APP_KEY: ${{ secrets.GH_APP_KEY }}

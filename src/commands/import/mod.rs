@@ -297,7 +297,7 @@ fn build_plan(args: &ImportArgs) -> Result<ImportPlan, ImportError> {
         ("__STAGING_REPOSITORY__", staging.slug()),
         ("__PREVIEW_REPOSITORY__", preview.slug()),
         ("__PROJECT__", args.project.clone()),
-        ("__DEFAULT_BRANCH__", default_branch),
+        ("__DEFAULT_BRANCH__", yaml_quoted(&default_branch)),
         (
             "__DOCKERFILES_JSON__",
             dockerfiles_json(&build_strategy).map_err(|error| ImportError(error.to_string()))?,
@@ -368,6 +368,10 @@ fn generated_files(
             templates::RELEASE_WORKFLOW,
         ));
     }
+    files.push((
+        ".github/workflows/on-pr-preview-image.yaml",
+        templates::PREVIEW_IMAGE_WORKFLOW,
+    ));
     files.push((
         ".github/workflows/on-pr-preview.yaml",
         templates::PREVIEW_WORKFLOW,
@@ -578,19 +582,20 @@ fn validate_project(project: &str) -> Result<(), ImportError> {
 }
 
 fn validate_branch(branch: &str) -> Result<String, ImportError> {
-    let valid = !branch.is_empty()
-        && !branch.starts_with('/')
-        && !branch.ends_with('/')
-        && !branch.contains("..")
-        && branch.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
-        });
-    if !valid {
+    let output = Command::new("git")
+        .args(["check-ref-format", "--branch", branch])
+        .output()
+        .map_err(|error| ImportError(format!("failed to validate --branch with git: {error}")))?;
+    if !output.status.success() {
         return Err(ImportError(
-            "--branch must use letters, numbers, '.', '_', '-', or '/'".to_string(),
+            "--branch must be a valid Git branch name".to_string(),
         ));
     }
     Ok(branch.to_string())
+}
+
+fn yaml_quoted(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
 fn render(template: &str, replacements: &[(&str, String)]) -> Result<String, ImportError> {
@@ -894,7 +899,7 @@ mod tests {
         let repo = TestRepo::new(Some("git@github.com:gitkb/service.git"));
         let plan = build_plan(&args(&repo.path)).unwrap();
 
-        assert_eq!(plan.files.len(), 10);
+        assert_eq!(plan.files.len(), 11);
         assert!(
             plan.files
                 .iter()
@@ -920,16 +925,37 @@ mod tests {
             }
         }
 
+        let preview_image = plan
+            .files
+            .iter()
+            .find(|file| file.path.ends_with("on-pr-preview-image.yaml"))
+            .unwrap();
+        assert!(preview_image.contents.contains("pull_request:"));
+        assert!(preview_image.contents.contains("packages: write"));
+        assert!(!preview_image.contents.contains("GH_APP_ID"));
+
         let preview = plan
             .files
             .iter()
             .find(|file| file.path.ends_with("on-pr-preview.yaml"))
             .unwrap();
         assert!(preview.contents.contains("preview: true"));
+        assert!(preview.contents.contains("pull_request_target:"));
+        assert!(preview.contents.contains("wait-for-image:"));
+        assert!(preview.contents.contains("docker manifest inspect"));
+        assert!(preview.contents.contains("github.event.action == 'opened'"));
+        assert!(preview
+            .contents
+            .contains("github.event.action == 'unlabeled'"));
         assert!(preview.contents.contains("gitkb/gitkb-preview-envs"));
         assert!(preview.contents.contains("auth_mode: app"));
         assert!(preview.contents.contains("contents: write"));
-        assert!(preview.contents.contains("promotion_mode: pull-request-merge"));
+        assert!(preview
+            .contents
+            .contains("promotion_chart_path: .gitops/promote"));
+        assert!(preview
+            .contents
+            .contains("promotion_mode: pull-request-merge"));
         assert!(preview.contents.contains("hops-ops/workflows-gitops"));
         assert!(preview.contents.contains("preview-cleanup.yaml"));
         assert!(preview.contents.contains("github.event.action == 'closed'"));
@@ -954,8 +980,9 @@ mod tests {
         let plan = build_plan(&import_args).unwrap();
         let paths = plan.files.iter().map(|file| file.path).collect::<Vec<_>>();
 
-        assert_eq!(paths.len(), 8);
+        assert_eq!(paths.len(), 9);
         assert!(paths.contains(&".github/workflows/publish-image.yaml"));
+        assert!(paths.contains(&".github/workflows/on-pr-preview-image.yaml"));
         assert!(paths.contains(&".github/workflows/on-pr-preview.yaml"));
         assert!(!paths.contains(&".github/workflows/on-push-main-version-and-tag.yaml"));
         assert!(!paths.contains(&".github/workflows/on-v-tag.yaml"));
@@ -1028,9 +1055,51 @@ mod tests {
             .iter()
             .find(|file| file.path.ends_with("on-pr-preview.yaml"))
             .unwrap();
+        let preview_image = plan
+            .files
+            .iter()
+            .find(|file| file.path.ends_with("on-pr-preview-image.yaml"))
+            .unwrap();
 
-        assert!(version.contents.contains("      - trunk"));
-        assert!(preview.contents.contains("      - trunk"));
+        assert!(version.contents.contains("      - \"trunk\""));
+        assert!(preview.contents.contains("      - \"trunk\""));
+        assert!(preview_image.contents.contains("      - \"trunk\""));
+    }
+
+    #[test]
+    fn validates_git_branch_names_and_quotes_yaml_scalars() {
+        for branch in ["main.", "feature//api", ".hidden/api", "release.lock"] {
+            assert!(validate_branch(branch).is_err(), "accepted {branch}");
+        }
+        for branch in ["main", "feature/api", "true", "123", "pat's-branch"] {
+            assert_eq!(validate_branch(branch).unwrap(), branch);
+        }
+
+        let repo = TestRepo::new(Some("git@github.com:gitkb/service.git"));
+        for (branch, quoted) in [
+            ("true", "\"true\""),
+            ("123", "\"123\""),
+            ("pat's-branch", "\"pat's-branch\""),
+        ] {
+            let mut import_args = args(&repo.path);
+            import_args.branch = Some(branch.to_string());
+            let plan = build_plan(&import_args).unwrap();
+            let branch_sites = plan.files.iter().filter(|file| {
+                file.path.ends_with("on-push-main-version-and-tag.yaml")
+                    || file.path.ends_with("on-pr-preview-image.yaml")
+                    || file.path.ends_with("on-pr-preview.yaml")
+                    || file.path == ".gitops/promote/values.yaml"
+            });
+            for file in branch_sites {
+                assert!(
+                    file.contents.contains(quoted),
+                    "{} did not quote {branch}",
+                    file.path
+                );
+                serde_yaml::from_str::<serde_yaml::Value>(&file.contents)
+                    .unwrap_or_else(|error| panic!("{} is invalid YAML: {error}", file.path));
+            }
+        }
     }
 
     #[test]

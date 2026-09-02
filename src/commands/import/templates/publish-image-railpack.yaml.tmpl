@@ -37,8 +37,8 @@ jobs:
           else
             tag="${GITHUB_REF_NAME}"
           fi
-          if [ -z "${tag}" ]; then
-            echo "Unable to derive an image tag for ${GITHUB_EVENT_NAME}" >&2
+          if [[ ! "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid OCI image tag for ${GITHUB_EVENT_NAME}: ${tag}" >&2
             exit 1
           fi
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
