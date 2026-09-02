@@ -62,7 +62,7 @@ jobs:
   promote-preview:
     name: Promote Preview
     needs: wait-for-image
-    uses: hops-ops/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@3a758761c76834953fa1207487dd4f0a947e193f # protected preview support
+    uses: hops-ops/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@75693d14a07f495d56a13b26ea34774f958a10d1 # protected preview support
     permissions:
       contents: write
       issues: write
