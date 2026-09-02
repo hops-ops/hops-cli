@@ -386,13 +386,14 @@ also expose browser-facing HTTPS names by applying ordinary Gateway API
 references; no extra Environment fields or Hops-specific ingress objects are
 required.
 
-Local Helm charts can compose route names from the protected values injected by
-Hops:
+Local Helm charts compose route names from the protected values injected by
+Hops. The application owns any service prefix, including choosing no prefix for
+its canonical gateway:
 
 ```yaml
 spec:
   hostnames:
-    - {{ printf "gitkb.%s.%s" .Values.environment.name .Values.localDomain | quote }}
+    - {{ printf "%s.%s" .Values.environment.name .Values.localDomain | quote }}
 ```
 
 With `clusterProvider: kind` and `dockerProvider: dory`, Hops reserves nodePort
@@ -433,8 +434,8 @@ hostnames across Environments fail instead of silently stealing a route.
 The normal result has no visible port:
 
 ```text
-https://gitkb.feature-auth.gitkb.localhost
-https://console.gitkb.feature-auth.gitkb.localhost
+https://feature-auth.gitkb.localhost
+https://console.feature-auth.gitkb.localhost
 ```
 
 Dory owns trusted local TLS and standard ports 80/443; Istio owns routing inside
