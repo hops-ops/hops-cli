@@ -1,0 +1,30 @@
+name: Preview Image
+
+on:
+  pull_request:
+    branches:
+      - __DEFAULT_BRANCH__
+    types:
+      - labeled
+      - opened
+      - reopened
+      - synchronize
+
+concurrency:
+  group: __APP_NAME__-preview-image-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  publish-image:
+    name: Publish Preview Image
+    if: >-
+      (github.event.action == 'opened' ||
+      github.event.action == 'reopened' ||
+      github.event.action == 'synchronize' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'preview')) &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'preview')
+    uses: ./.github/workflows/publish-image.yaml
+    permissions:
+      contents: read
+      packages: write

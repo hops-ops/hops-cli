@@ -1,0 +1,14 @@
+application:
+  name: __APP_NAME__
+  repository: https://github.com/__SOURCE_REPOSITORY__.git
+  targetRevision: __DEFAULT_BRANCH__
+  path: .gitops/deploy
+  values: ""
+  destination:
+    namespace: default
+    server: https://kubernetes.default.svc
+  image:
+    tag: latest
+
+project: __PROJECT__
+preview: false

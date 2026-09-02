@@ -1,0 +1,33 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: __APP_NAME__
+  labels:
+    app.kubernetes.io/name: __APP_NAME__
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: __APP_NAME__
+      annotations:
+        autoscaling.knative.dev/min-scale: {{ .Values.autoscaling.minScale | quote }}
+        {{- with .Values.autoscaling.maxScale }}
+        autoscaling.knative.dev/max-scale: {{ . | quote }}
+        {{- end }}
+    spec:
+      containers:
+        - name: __APP_NAME__
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+          {{- with .Values.env }}
+          env:
+            {{- range $name, $value := . }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

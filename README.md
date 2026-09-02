@@ -4,8 +4,9 @@
 
 ## Overview
 
-This tool supports three related workflows:
+This tool supports four related workflows:
 
+- Importing existing application repositories into the Hops GitOps delivery contract
 - Local cluster setup on colima or kind
 - Configuration package install/uninstall against the connected cluster
 - XR observe/manage/adopt/orphan and cross-control-plane migration workflows
@@ -75,12 +76,113 @@ cargo build --features vendored
 
 ```bash
 hops --help
+hops import --help
 hops local --help
 hops config --help
 hops secrets --help
 hops validate --help
 hops xr --help
+hops ai --help
 ```
+
+Install the bundled Hops skills into the current repository for either
+supported agent client:
+
+```bash
+hops ai codex
+hops ai claude
+```
+
+Both commands install the general `hops` skill and the focused `hops-import`
+skill. Existing files are preserved; pass `--force` only when replacing a
+locally customized installed copy is intentional.
+
+## Import an existing application
+
+Run `hops import` from an existing GitHub repository to add the application
+delivery files without changing its source code:
+
+```bash
+hops import
+```
+
+Preview the exact generated state before changing an existing repository:
+
+```bash
+hops import --dry-run
+```
+
+Dry-run classifies importer-owned paths as `CREATE`, `UPDATE`, or `UNCHANGED`
+and prints the complete proposed content for creates and updates. It does not
+write files, require `gh` or `vnext`, or configure a deploy key.
+
+The command adds two independent Helm charts:
+
+- `.gitops/deploy` for the application workload deployed by Argo CD
+- `.gitops/promote` for rendering the Argo CD `Application` committed to an
+  environment repository
+
+The deploy chart contains a Kubernetes `Deployment` and `Service` by default.
+For a Knative Serving application, select a Knative Service instead:
+
+```bash
+hops import --knative-service
+```
+
+The Knative deploy chart defaults to `minScale: 0`, configurable in its
+generated values file. Import intentionally leaves `.gitops/local` alone until
+the application's local development runtime has been selected explicitly.
+
+It also adds workflows that calculate and push vNext tags, publish the
+application image, promote `v*.*.*` releases to staging, and promote pull
+requests labeled `preview` to the preview environment. Existing `./Dockerfile`
+repositories use `workflows-containers`; repositories without one use the
+pinned Railpack fallback. Image tags and promotion are ordered so an
+environment is never updated before its image has been published.
+
+To pilot an application through pull-request previews before enabling releases,
+generate only the deploy and promotion charts, image publisher, and preview
+workflow:
+
+```bash
+hops import --preview-only
+```
+
+Preview-only imports do not add main-branch versioning or staging promotion and
+do not require a vNext deploy key. They still require the GitHub App credentials
+described below to write the preview environment repository.
+
+Preview handling is split across two workflows. An unprivileged `pull_request`
+workflow publishes the exact same-repository PR head using only read access to
+the repository and write access to packages. A separate `pull_request_target`
+workflow loaded from the protected base branch waits for that immutable image,
+then exposes GitHub App credentials only to promotion or cleanup. The privileged
+workflow must therefore be present on the repository's default branch before a
+preview can be promoted.
+
+By default, `origin` supplies the GitHub `OWNER/REPO`, and the environment
+repositories are `OWNER/OWNER-staging-env` and `OWNER/OWNER-preview-envs`.
+The importer reads the default branch from `origin/HEAD`, falling back to the
+checked-out branch. Override those choices when needed:
+
+```bash
+hops import ./service \
+  --staging-repository example/platform-staging-env \
+  --preview-repository example/platform-preview-envs \
+  --branch trunk \
+  --project example-nonprod
+```
+
+The importer uses `vnext generate-deploy-key` to create the repository's
+`DEPLOY_KEY` secret and corresponding write-enabled deploy key. This requires
+authenticated `gh` and `vnext` CLIs. Use `--skip-deploy-key` for offline
+scaffolding or tests, then run the printed vNext command later. Existing
+importer-owned files cause the command to stop before writing anything; use
+`--force` to replace only those known paths.
+
+Promotions authenticate with a GitHub App. The application repository must
+receive the Actions secrets `GH_APP_ID` and `GH_APP_KEY`, and that App must be
+installed with write access to the selected staging and preview repositories.
 
 ## Local GitOps workbench
 

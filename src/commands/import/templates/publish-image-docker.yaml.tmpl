@@ -1,0 +1,16 @@
+name: Publish Image
+
+on:
+  workflow_call:
+
+jobs:
+  publish:
+    uses: unbounded-tech/workflows-containers/.github/workflows/publish.yaml@f8ba7899b6727e108e2b9243bb05bff394cf5cea # v1.8.0
+    permissions:
+      contents: read
+      packages: write
+    with:
+      dockerfiles: >-
+        __DOCKERFILES_JSON__
+    secrets:
+      docker_password: ${{ secrets.GITHUB_TOKEN }}

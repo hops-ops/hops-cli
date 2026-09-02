@@ -1,0 +1,46 @@
+name: Release and Promote Staging
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  issues: write
+  packages: write
+  pull-requests: write
+
+jobs:
+  publish-image:
+    name: Publish Image
+    uses: ./.github/workflows/publish-image.yaml
+
+  github-release:
+    name: GitHub Release
+    needs: publish-image
+    uses: unbounded-tech/workflow-simple-release/.github/workflows/workflow.yaml@d577e3b6df67795ece619270377bb551703cf2fe # v2.1.3
+    with:
+      tag: ${{ github.ref_name }}
+      name: ${{ github.ref_name }}
+
+  promote-staging:
+    name: Promote Staging
+    needs: publish-image
+    uses: hops-ops/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@6f50d1ded5ab0336cd97008886c7147a3da5c585 # v2.0.0
+    secrets:
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_KEY: ${{ secrets.GH_APP_KEY }}
+    with:
+      auth_mode: app
+      promotion_chart_path: .gitops/promote
+      destination_path: .gitops/deploy/helm/templates
+      environment_repository: __STAGING_REPOSITORY__
+      environment_name: staging
+      project: __PROJECT__
+      name: __APP_NAME__
+      promotion_mode: direct
+      values: |
+        image:
+          repository: __IMAGE_REPOSITORY__
+          tag: ${{ github.ref_name }}

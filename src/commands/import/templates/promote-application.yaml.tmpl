@@ -1,0 +1,43 @@
+{{- $values := dict }}
+{{- if .Values.application.values }}
+{{- $provided := fromYaml .Values.application.values }}
+{{- if not (kindIs "map" $provided) }}
+{{- fail "application.values must contain a YAML mapping" }}
+{{- end }}
+{{- $values = mergeOverwrite $values $provided }}
+{{- end }}
+{{- if .Values.preview }}
+{{- $providedImage := get $values "image" }}
+{{- if and $providedImage (not (kindIs "map" $providedImage)) }}
+{{- fail "application.values.image must contain a YAML mapping" }}
+{{- end }}
+{{- $image := default (dict) $providedImage }}
+{{- $_ := set $image "tag" .Values.application.image.tag }}
+{{- $_ := set $values "image" $image }}
+{{- end }}
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Values.project }}-{{ .Values.application.name }}
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.project }}
+  source:
+    repoURL: {{ .Values.application.repository }}
+    targetRevision: {{ .Values.application.targetRevision }}
+    path: {{ .Values.application.path }}
+    helm:
+      version: v3
+      values: |
+        {{- toYaml $values | nindent 8 }}
+  destination:
+    namespace: {{ .Values.application.destination.namespace }}
+    server: {{ .Values.application.destination.server }}
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
