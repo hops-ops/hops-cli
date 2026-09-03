@@ -19,6 +19,7 @@ pub const DEFAULT_DEFINITION_FILE: &str = ".gitops/local/cluster.yaml";
 pub const DEFAULT_ENVIRONMENT_FILE: &str = ".gitops/local/environment.yaml";
 pub const DEFAULT_CROSSPLANE_CHART: &str = "crossplane-stable/crossplane";
 pub const DEFAULT_CROSSPLANE_VERSION: &str = "2.4.0";
+pub const DEFAULT_LOCAL_DOMAIN: &str = "localhost";
 pub const CLUSTER_MANIFESTS_PATH: &str = ".gitops/local/cluster";
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -50,6 +51,7 @@ pub struct ClusterDefinition {
     pub docker_provider: DockerProvider,
     pub mount_root: PathBuf,
     pub manifests_path: PathBuf,
+    pub local_domain: String,
     pub control_plane: ControlPlaneDefinition,
     pub secret_sync: Option<SecretSyncDefinition>,
 }
@@ -78,6 +80,7 @@ pub struct EnvironmentDefinition {
     pub name: String,
     pub namespace: String,
     pub cluster_ref: String,
+    pub local_domain: String,
     pub root: PathBuf,
     pub values: Mapping,
     pub deploys: Vec<DeployDefinition>,
@@ -247,6 +250,8 @@ struct ClusterSpec {
     docker_provider: DockerProvider,
     mount_root: PathBuf,
     manifests: ManifestsSpec,
+    #[serde(default)]
+    local_domain: Option<String>,
     #[serde(default)]
     control_plane: Option<ControlPlaneSpec>,
     #[serde(default)]
@@ -523,6 +528,7 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
             .map(|path| SecretSyncDefinition { path })
         })
         .transpose()?;
+    let local_domain = normalize_local_domain(raw_cluster.spec.local_domain.as_deref())?;
     let control_plane = raw_cluster
         .spec
         .control_plane
@@ -549,6 +555,7 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
             docker_provider: raw_cluster.spec.docker_provider,
             mount_root,
             manifests_path,
+            local_domain,
             control_plane,
             secret_sync,
         },
@@ -710,6 +717,7 @@ pub fn load_environment_definition(
             name,
             namespace,
             cluster_ref: raw.spec.cluster_ref.name,
+            local_domain: cluster.cluster.local_domain.clone(),
             root,
             values: raw.spec.values,
             deploys,
@@ -854,6 +862,26 @@ fn validate_dns_label(field: &str, value: &str) -> Result<(), Box<dyn Error>> {
                 .into(),
         )
     }
+}
+
+fn normalize_local_domain(value: Option<&str>) -> Result<String, Box<dyn Error>> {
+    let raw = value.unwrap_or(DEFAULT_LOCAL_DOMAIN);
+    if raw != raw.trim() {
+        return Err("Cluster.spec.localDomain must not contain surrounding whitespace".into());
+    }
+    let normalized = raw.strip_prefix('.').unwrap_or(raw);
+    if normalized.len() > 253
+        || (normalized != DEFAULT_LOCAL_DOMAIN && !normalized.ends_with(".localhost"))
+    {
+        return Err(format!(
+            "Cluster.spec.localDomain must be localhost or a subdomain ending in .localhost, got {raw:?}"
+        )
+        .into());
+    }
+    for label in normalized.split('.') {
+        validate_dns_label("Cluster.spec.localDomain label", label)?;
+    }
+    Ok(normalized.to_string())
 }
 
 fn resolve_bounded_path(
@@ -1047,6 +1075,7 @@ spec:
         assert_eq!(loaded.cluster.name, "project-dev");
         assert_eq!(loaded.cluster.cluster_provider, ClusterProvider::Kind);
         assert_eq!(loaded.cluster.docker_provider, DockerProvider::Dory);
+        assert_eq!(loaded.cluster.local_domain, DEFAULT_LOCAL_DOMAIN);
         assert_eq!(
             loaded.cluster.control_plane.crossplane.chart,
             DEFAULT_CROSSPLANE_CHART
@@ -1065,6 +1094,7 @@ spec:
         .unwrap();
         assert_eq!(environment.environment.name, "feature-auth");
         assert_eq!(environment.environment.namespace, "feature-auth");
+        assert_eq!(environment.environment.local_domain, DEFAULT_LOCAL_DOMAIN);
         assert_eq!(environment.environment.root, fixture.root);
         assert_eq!(
             environment.environment.deploys[0].source_path,
@@ -1078,6 +1108,51 @@ spec:
             environment.environment.deploys[0].deploy_type,
             DeployType::Helm
         );
+    }
+
+    #[test]
+    fn normalizes_and_validates_local_domain() {
+        let fixture = Fixture::new();
+        for configured in ["gitkb.localhost", ".gitkb.localhost"] {
+            let yaml = valid_yaml().replacen(
+                "  manifests:",
+                &format!("  localDomain: \"{configured}\"\n  manifests:"),
+                1,
+            );
+            let loaded = load_definition(&fixture.write(&yaml)).unwrap();
+            assert_eq!(loaded.cluster.local_domain, "gitkb.localhost");
+            let environment = load_environment_definition(
+                &fixture.write_environment(valid_environment_yaml()),
+                &loaded,
+                Some("feature-auth"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(environment.environment.local_domain, "gitkb.localhost");
+        }
+
+        for invalid in [
+            "example.com",
+            "GitKB.localhost",
+            "https://gitkb.localhost",
+            "gitkb.localhost:443",
+            "gitkb.localhost/path",
+            "*.gitkb.localhost",
+            "gitkb..localhost",
+            "gitkb.localhost.",
+            " gitkb.localhost",
+        ] {
+            let yaml = valid_yaml().replacen(
+                "  manifests:",
+                &format!("  localDomain: \"{invalid}\"\n  manifests:"),
+                1,
+            );
+            let error = load_definition(&fixture.write(&yaml)).unwrap_err();
+            assert!(
+                error.to_string().contains("Cluster.spec.localDomain"),
+                "{invalid:?}: {error}"
+            );
+        }
     }
 
     #[test]

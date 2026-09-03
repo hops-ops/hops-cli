@@ -87,6 +87,18 @@ case "$tool" in
     ;;
   helm)
     if test "$1" = "template"; then
+      values_file=
+      while test "$#" -gt 0; do
+        if test "$1" = "--values"; then
+          shift
+          values_file=$1
+          break
+        fi
+        shift
+      done
+      if test -n "$values_file"; then
+        sed 's/^/helm-values /' "$values_file" >> "$HOPS_TEST_COMMAND_LOG"
+      fi
       cat <<'YAML'
 apiVersion: v1
 kind: ConfigMap
@@ -326,6 +338,63 @@ fn rejects_unknown_fields_and_escaping_paths_before_mutation() {
     let output = fixture.run();
     assert!(!output.status.success());
     assert!(output_text(&output).contains("must be relative"));
+    fixture.assert_no_mutation();
+}
+
+#[test]
+fn injects_normalized_local_domain_for_runtime_environment() {
+    let fixture = Fixture::new();
+    let definition = VALID_DEFINITION.replacen(
+        "  manifests:",
+        "  localDomain: .gitkb.localhost\n  manifests:",
+        1,
+    );
+    fixture.write_definition(&definition);
+    fs::write(
+        fixture.root.join(".gitops/local/environment.yaml"),
+        ENVIRONMENT_DEFINITION,
+    )
+    .unwrap();
+    fs::write(&fixture.cluster_exists, "existing").unwrap();
+
+    let output = fixture
+        .base_command()
+        .args([
+            "local",
+            "gitops",
+            "environment",
+            ".gitops/local/environment.yaml",
+            "--name",
+            "feature-auth",
+            "--once",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_text(&output));
+    let log = fixture.log();
+    assert!(
+        log.contains("helm-values localDomain: gitkb.localhost"),
+        "{log}"
+    );
+    assert!(log.contains("helm-values   name: feature-auth"), "{log}");
+}
+
+#[test]
+fn rejects_non_local_domain_before_mutation() {
+    let fixture = Fixture::new();
+    let definition = VALID_DEFINITION.replacen(
+        "  manifests:",
+        "  localDomain: example.com\n  manifests:",
+        1,
+    );
+    fixture.write_definition(&definition);
+
+    let output = fixture.run();
+
+    assert!(!output.status.success());
+    assert!(output_text(&output).contains("Cluster.spec.localDomain"));
     fixture.assert_no_mutation();
 }
 
