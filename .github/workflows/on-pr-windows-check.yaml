@@ -1,0 +1,35 @@
+name: Windows release check
+
+# The release feature set is intentionally opt-in because compiling vendored
+# OpenSSL for all three Windows targets takes roughly 8-10 minutes per target.
+# Add the `test-windows` label to run it. While the label remains, pushes rerun
+# the check against the new PR head.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled]
+
+jobs:
+  windows-check:
+    if: contains(github.event.pull_request.labels.*.name, 'test-windows')
+    name: Windows check (${{ matrix.target }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - i686-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Check release feature set
+        run: cargo check --features vendored --target ${{ matrix.target }}
