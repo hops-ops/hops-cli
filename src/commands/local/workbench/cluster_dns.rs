@@ -519,7 +519,7 @@ fn apply_privileged_dns_config_with_prompt(
         format!(
             "cluster DNS needs admin privileges to write /etc/hosts (and lo0 aliases on macOS).\n\
              {e}\n\
-             Re-run `hops local status` and approve the **single** prompt,\n\
+             Re-run `hops local dns --name <environment>` and approve the **single** prompt,\n\
              or grant passwordless sudo for hops on this machine."
         )
         .into()

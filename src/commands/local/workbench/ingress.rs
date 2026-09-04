@@ -312,6 +312,22 @@ pub fn plan_from_runtime(runtime: &IngressAccessRuntime) -> IngressAccessPlan {
     }
 }
 
+pub fn plan_from_routes(
+    namespace: &str,
+    routes: &[IngressRoute],
+) -> Result<IngressAccessPlan, Box<dyn Error>> {
+    let routes = route_map(routes)?;
+    let urls = routes
+        .keys()
+        .map(|hostname| (hostname.clone(), format!("https://{hostname}")))
+        .collect();
+    Ok(IngressAccessPlan {
+        namespace: namespace.to_string(),
+        routes,
+        urls,
+    })
+}
+
 fn ensure_alias_ownership(
     state_dir: &Path,
     workspace: &str,
@@ -399,6 +415,17 @@ pub fn ingress_access_needs_heal(runtime: &IngressAccessRuntime) -> bool {
         .aliases
         .iter()
         .any(|(hostname, port)| domains.get(hostname) != Some(port))
+}
+
+pub fn ingress_access_matches_plan(
+    plan: &IngressAccessPlan,
+    runtime: &IngressAccessRuntime,
+) -> bool {
+    runtime.namespace == plan.namespace
+        && runtime.adapter == DORY_ADAPTER
+        && runtime.routes == plan.routes
+        && runtime.aliases.keys().eq(plan.urls.keys())
+        && !ingress_access_needs_heal(runtime)
 }
 
 fn route_map(routes: &[IngressRoute]) -> Result<BTreeMap<String, GatewayKey>, Box<dyn Error>> {
@@ -533,7 +560,7 @@ pub fn format_ingress_status(plan: &IngressAccessPlan, runtime: &IngressAccessRu
     if plan.urls.is_empty() {
         return "ingress:  (no HTTPRoute hostnames)".into();
     }
-    let up = !ingress_access_needs_heal(runtime);
+    let up = ingress_access_matches_plan(plan, runtime);
     let mut lines = vec![format!(
         "ingress:  Gateway API via Dory [{}]",
         if up { "up" } else { "down" }
@@ -582,6 +609,46 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn plans_https_urls_from_declared_routes_without_mutation() {
+        let routes = vec![IngressRoute {
+            hostname: "app.feature.localhost".into(),
+            gateway: GatewayKey {
+                namespace: "ingress".into(),
+                name: "local".into(),
+            },
+        }];
+        let plan = plan_from_routes("feature", &routes).unwrap();
+        assert_eq!(
+            plan.urls.get("app.feature.localhost").map(String::as_str),
+            Some("https://app.feature.localhost")
+        );
+        assert_eq!(plan.namespace, "feature");
+    }
+
+    #[test]
+    fn runtime_must_match_the_current_route_plan() {
+        let gateway = GatewayKey {
+            namespace: "ingress".into(),
+            name: "local".into(),
+        };
+        let plan = IngressAccessPlan {
+            namespace: "feature".into(),
+            routes: BTreeMap::from([("app.feature.localhost".into(), gateway.clone())]),
+            urls: BTreeMap::from([(
+                "app.feature.localhost".into(),
+                "https://app.feature.localhost".into(),
+            )]),
+        };
+        let stale = IngressAccessRuntime {
+            namespace: "feature".into(),
+            adapter: DORY_ADAPTER.into(),
+            aliases: BTreeMap::from([("old.feature.localhost".into(), 443)]),
+            routes: BTreeMap::from([("old.feature.localhost".into(), gateway)]),
+        };
+        assert!(!ingress_access_matches_plan(&plan, &stale));
     }
 
     #[test]

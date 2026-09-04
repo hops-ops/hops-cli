@@ -1,11 +1,11 @@
-//! Host access — one path.
+//! Optional direct Kubernetes Service access from the host.
 //!
 //! Services this workspace cares about:
 //! - Services in the workspace namespace
 //! - In-cluster `*.svc.cluster.local` endpoints referenced by those pods
 //!   (e.g. OIDC issuer in `auth`)
 //!
-//! For each:
+//! `hops local dns` explicitly enables this compatibility/debug path. For each:
 //! 1. allocate loopback IPs in `127.53.0.0/16`
 //! 2. write `/etc/hosts` + lo0 aliases (one admin elevation)
 //! 3. run a supervisor that keeps `kubectl port-forward` alive
@@ -931,7 +931,18 @@ pub fn host_access_needs_heal(rt: &HostAccessRuntime) -> bool {
     if !rt.pids.iter().any(|p| pid_is_alive(*p)) {
         return true;
     }
-    for (endpoint_key, port) in &rt.service_ports {
+    let fallback_ports;
+    let service_ports = if rt.service_ports.is_empty() {
+        fallback_ports = rt
+            .ip_map
+            .keys()
+            .map(|service_key| (service_key.clone(), 80))
+            .collect::<BTreeMap<_, _>>();
+        &fallback_ports
+    } else {
+        &rt.service_ports
+    };
+    for (endpoint_key, port) in service_ports {
         let service_key = service_key_from_endpoint_key(endpoint_key);
         let Some(ip) = rt.ip_map.get(service_key) else {
             return true;
@@ -990,7 +1001,7 @@ pub fn ensure_host_access(
     Ok((plan, rt, true))
 }
 
-fn plan_from_runtime(rt: &HostAccessRuntime) -> HostAccessPlan {
+pub fn plan_from_runtime(rt: &HostAccessRuntime) -> HostAccessPlan {
     let mut urls = BTreeMap::new();
     for (endpoint_key, port) in &rt.service_ports {
         let service_key = service_key_from_endpoint_key(endpoint_key);
@@ -1059,7 +1070,18 @@ fn services_from_runtime(rt: &HostAccessRuntime) -> Vec<ServiceEndpoint> {
 
 pub fn url_listen_status(plan: &HostAccessPlan) -> BTreeMap<String, bool> {
     let mut out = BTreeMap::new();
-    for (endpoint_key, port) in &plan.service_ports {
+    let fallback_ports;
+    let service_ports = if plan.service_ports.is_empty() {
+        fallback_ports = plan
+            .ip_map
+            .keys()
+            .map(|service_key| (service_key.clone(), 80))
+            .collect::<BTreeMap<_, _>>();
+        &fallback_ports
+    } else {
+        &plan.service_ports
+    };
+    for (endpoint_key, port) in service_ports {
         let service_key = service_key_from_endpoint_key(endpoint_key);
         let listening = plan
             .ip_map
@@ -1328,6 +1350,23 @@ mod tests {
             ..runtime
         };
         assert!(host_access_runtime_matches_services(&current, &services));
+    }
+
+    #[test]
+    fn legacy_runtime_checks_its_displayed_port_80_endpoint() {
+        let runtime = HostAccessRuntime {
+            namespace: "sample-app".into(),
+            pids: vec![std::process::id()],
+            ip_map: BTreeMap::from([("sample-app/api".into(), "not-an-ip".into())]),
+            ..Default::default()
+        };
+        let plan = plan_from_runtime(&runtime);
+        assert_eq!(
+            plan.urls.get("sample-app/api").map(String::as_str),
+            Some("http://api.sample-app.svc.cluster.local:80")
+        );
+        assert_eq!(url_listen_status(&plan).get("sample-app/api"), Some(&false));
+        assert!(host_access_needs_heal(&runtime));
     }
 
     #[test]

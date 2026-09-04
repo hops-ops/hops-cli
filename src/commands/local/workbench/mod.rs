@@ -1,5 +1,6 @@
 //! Local workbench library: Environment reconcile, workspace registry, GitOps
-//! watch path filtering, source delivery selection, and host access URLs.
+//! watch path filtering, source delivery selection, browser ingress, and
+//! optional direct Service access.
 //!
 //! Pure logic is unit-tested without a cluster; kubectl/helm live behind thin
 //! adapters used by the CLI entrypoints.

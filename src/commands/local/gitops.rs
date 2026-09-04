@@ -7,6 +7,7 @@
 //!
 //! Both **watch by default**; pass `--once` for a single reconcile (CI/scripts).
 
+use super::backend::{ClusterProvider, DockerProvider};
 use super::local_state_dir;
 use super::workbench::cluster_gitops::{
     reconcile_cluster_dir_with_inventory, should_reconcile_cluster_change,
@@ -23,6 +24,7 @@ use super::workbench::definition::{
 use super::workbench::delivery::{
     stop_delivery_runtime, DeliveryStrategy, NodePathProber, SystemNodeProber,
 };
+use super::workbench::ingress::ensure_ingress_access;
 use super::workbench::reconcile::{ReconcileOptions, SystemHelm, SystemKubectl, SystemKustomize};
 use super::workbench::registry::{load_workspace, save_workspace, WorkspaceRecord};
 use super::workbench::slugify_name;
@@ -385,6 +387,19 @@ fn reconcile_cluster_environments(
                             "{}: save registration: {error}",
                             loaded.source.display()
                         ));
+                        continue;
+                    }
+                    if let Err(error) = reconcile_browser_ingress(
+                        definition.cluster.cluster_provider,
+                        definition.cluster.docker_provider,
+                        false,
+                        &loaded.environment.namespace,
+                        &loaded.environment.name,
+                    ) {
+                        errors.push(format!(
+                            "{}: browser ingress: {error}",
+                            loaded.source.display()
+                        ));
                     }
                 }
             }
@@ -608,6 +623,13 @@ fn run_environment_definition(
                 &namespace,
                 delivery_strategy,
             )?;
+            reconcile_browser_ingress(
+                cluster.cluster.cluster_provider,
+                cluster.cluster.docker_provider,
+                false,
+                &namespace,
+                &workspace_name,
+            )?;
         }
         Ok(())
     };
@@ -697,6 +719,36 @@ fn persist_environment_registration(
     record.cluster_name = Some(cluster_name.to_string());
     record.kube_context = Some(kube_context.to_string());
     save_workspace(&state_dir, &record)?;
+    Ok(())
+}
+
+fn should_reconcile_browser_ingress(
+    cluster_provider: ClusterProvider,
+    docker_provider: DockerProvider,
+    dry_run: bool,
+) -> bool {
+    cluster_provider == ClusterProvider::Kind && docker_provider == DockerProvider::Dory && !dry_run
+}
+
+fn reconcile_browser_ingress(
+    cluster_provider: ClusterProvider,
+    docker_provider: DockerProvider,
+    dry_run: bool,
+    namespace: &str,
+    workspace_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    if !should_reconcile_browser_ingress(cluster_provider, docker_provider, dry_run) {
+        return Ok(());
+    }
+    let state_dir = local_state_dir()?;
+    let (plan, _runtime, changed) = ensure_ingress_access(namespace, &state_dir, workspace_name)?;
+    if changed && !plan.urls.is_empty() {
+        log::info!(
+            "Environment {} browser ingress reconciled: {}",
+            workspace_name,
+            plan.urls.values().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -1059,5 +1111,34 @@ spec:
             &root
         ));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_ingress_reconciles_only_for_dory_and_never_during_dry_run() {
+        assert!(should_reconcile_browser_ingress(
+            ClusterProvider::Kind,
+            DockerProvider::Dory,
+            false
+        ));
+        assert!(!should_reconcile_browser_ingress(
+            ClusterProvider::Kind,
+            DockerProvider::Dory,
+            true
+        ));
+        assert!(!should_reconcile_browser_ingress(
+            ClusterProvider::Kind,
+            DockerProvider::Docker,
+            false
+        ));
+        assert!(!should_reconcile_browser_ingress(
+            ClusterProvider::Colima,
+            DockerProvider::Colima,
+            false
+        ));
+        assert!(!should_reconcile_browser_ingress(
+            ClusterProvider::Dory,
+            DockerProvider::Dory,
+            false
+        ));
     }
 }
