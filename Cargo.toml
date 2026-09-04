@@ -25,6 +25,7 @@ tokio = { version = "1.45.1", features = ["rt-multi-thread"] }
 uuid = { version = "1.17.0", features = ["v4"] }
 notify = "8.2.0"
 libc = "0.2"
+ureq = { version = "2.12", features = ["json"] }
 
 [features]
 vendored = ["openssl-sys/vendored"]

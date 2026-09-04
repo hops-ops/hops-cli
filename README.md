@@ -257,11 +257,12 @@ An Environment is reusable from a checkout:
 apiVersion: hops.local/v1alpha1
 kind: Environment
 metadata:
+  # Template identity. The runtime name defaults from the checkout/worktree.
   name: local
 spec:
   clusterRef:
     name: project-dev
-  # Resolved inside Cluster.spec.mountRoot.
+  # Resolved from the checkout containing this Environment file.
   root: .
   values:
     local: true
@@ -289,9 +290,12 @@ local controller injects the immutable runtime values `local: true`, the
 Cluster `localDomain`, the Environment name/namespace, and the resolved source
 path/type. Raw Kubernetes and Kustomize directories are already rendered
 inputs; they do not consume Helm values or get silently Helm-templated, but they
-do receive the common namespace, labels, and ownership pipeline. The namespace
-defaults to the Environment runtime name; `--name` and `--namespace` can
-override those values for an explicitly run Environment.
+do receive the common namespace, labels, and ownership pipeline. The runtime
+name defaults to the basename of the checkout/worktree containing
+`.gitops/local/environment.yaml`, and the namespace defaults to that runtime
+name. This makes the committed Environment a reusable template: copied
+worktrees do not need YAML edits. `--name` and `--namespace` remain explicit
+overrides.
 
 `type` is required and must be `helm`, `k8s`, or `kustomize`:
 
@@ -339,16 +343,20 @@ hops local gitops cluster ./.gitops/local/cluster.yaml --once
 
 The controller lock is stored under
 `~/.hops/local/clusters/<cluster>/controller.lock`. A second process cannot
-become a competing watcher. A malformed, conflicting, or stale lock is
-rejected rather than implicitly adopted; stop or explicitly hand off the
-existing owner first.
+become a competing watcher. Conflicts for an existing backend are rejected
+rather than implicitly adopted. If the backend itself was deleted, Hops
+discards obsolete inventory and stale ownership before recreating it; a still
+running controller process must be stopped first. If the backend is still
+running but an exact matching lock records a dead process, Hops serializes the
+handoff and recovers that lock automatically. Live owners, malformed locks,
+and locks for a different definition or context still fail closed.
 
 ### Add a worktree
 
 Put the worktree under the configured `mountRoot`, ensure it contains its
-`.gitops/local/environment.yaml`, and give it a distinct Environment name (or
-use an explicit `--name` invocation). The running Cluster controller discovers
-the file and reconciles it into a separate namespace:
+`.gitops/local/environment.yaml`, and give the worktree directory the desired
+runtime name. The running Cluster controller discovers the file and reconciles
+it into a namespace of the same name:
 
 ```bash
 git worktree add .worktrees/feature-auth feature/auth
@@ -357,12 +365,17 @@ git worktree add .worktrees/feature-auth feature/auth
 hops local gitops cluster
 ```
 
+If a newly created meta-repo worktree has not populated its nested repositories
+yet, the controller reports that Environment as pending instead of blocking the
+Cluster or pruning its previous ownership. Creation of the missing local deploy
+directories triggers reconciliation automatically.
+
 For a targeted one-shot workflow, reconcile an Environment
 directly. This does not start a second watcher when the Cluster controller
 already owns the backend:
 
 ```bash
-hops local gitops environment ./.gitops/local/environment.yaml --name feature-auth --once
+hops local gitops environment ./.gitops/local/environment.yaml --once
 ```
 
 ### What is watched and what happens on deletion
@@ -511,7 +524,7 @@ ownership from names alone.
 - `config`
   - Build, install, reload, and uninstall Crossplane configuration packages against the connected cluster.
 - `secrets`
-  - Initialize secrets config, encrypt and decrypt local secrets, and sync repo-managed secrets to AWS Secrets Manager or GitHub repository secrets.
+  - Initialize secrets config, encrypt and decrypt local secrets, and sync repo-managed secrets to AWS Secrets Manager, GitHub repository secrets, or Vault KV.
 - `validate`
   - Generate configuration manifests from Upbound-format XRD projects for validation workflows.
 - `xr`
@@ -521,7 +534,7 @@ Microservice scaffolding previously available as `hops service` now lives in the
 
 ## Secrets
 
-`hops secrets init` sets up local secrets directories, `.sops.yaml`, and `.hops.yaml` so plaintext secrets can be encrypted locally and synced to AWS Secrets Manager or GitHub repository secrets.
+`hops secrets init` sets up local secrets directories, `.sops.yaml`, and `.hops.yaml` so plaintext secrets can be encrypted locally and synced to AWS Secrets Manager, GitHub repository secrets, or Vault KV.
 
 Typical layout:
 
@@ -554,6 +567,17 @@ secrets:
       repos:
         - repo-a
         - repo-b
+  vault:
+    path: vault
+    address: http://127.0.0.1:8200
+    mount: secret
+    version: v2
+    token_env: VAULT_TOKEN
+    kube:
+      enabled: true
+      namespace: vault
+      service: vault
+      local_port: 8200
 ```
 
 Encrypt and decrypt operate from the configured roots:
@@ -608,6 +632,30 @@ Examples:
 - `secrets/github/repo-a/actions.json` with `{"SLACK_WEBHOOK":"..."}` -> GitHub secret `SLACK_WEBHOOK` in `repo-a`
 - `secrets/github/repo-a/.env` with `NPM_TOKEN=...` -> GitHub secret `NPM_TOKEN` in `repo-a`
 - `secrets/github/_shared/ORG_TOKEN` -> synced to every configured shared target repo
+
+Vault sync reads only untracked, gitignored files below
+`<plaintext_dir>/<vault.path>`:
+
+```bash
+export VAULT_TOKEN=root # local development only
+hops secrets sync vault --no-port-forward --yes
+```
+
+Vault rules:
+
+- A `.json` object becomes one KV path; nested JSON values are stored as JSON strings.
+- Plain files in a directory roll up to one KV path keyed by filename.
+- A `.env` file rolls up to its directory's KV path as key/value properties.
+- Paths are relative to the configured Vault root; `path_prefix` optionally prepends a remote prefix.
+- KV v1 and v2 are supported. Unchanged maps are skipped and unspecified remote paths are never pruned.
+- The writer token is read only from `VAULT_TOKEN` (or `token_env`) and values are sent in the HTTP request body, never command arguments or logs.
+- Every input is validated before Vault is contacted. Symlinks, traversal, tracked files, non-ignored files, collisions, invalid paths, binary input, and oversized batches fail closed.
+- When an unreachable address is loopback and `kube.enabled` is true, Hops opens a quiet `kubectl port-forward`. Remote addresses never fall back implicitly; pass `--port-forward` to request that override explicitly, or `--no-port-forward` to require the configured address.
+
+Examples:
+
+- `secrets/vault/harmony/stripe/.env` -> KV `harmony/stripe`
+- `secrets/vault/harmony/oidc.json` -> KV `harmony/oidc`
 
 ## Create a Local Control Plane (standalone mode)
 

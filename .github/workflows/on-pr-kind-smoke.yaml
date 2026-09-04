@@ -2,12 +2,18 @@ name: kind backend smoke
 
 # End-to-end check of `hops local` on the kind backend (ubuntu runners).
 # Registry round-trip + path-based config install (same fixture as dory smoke).
+# Trigger with the `test-kind` PR label or a manual workflow dispatch.
 
 on:
   pull_request:
+    types: [opened, reopened, synchronize, labeled]
+  workflow_dispatch:
 
 jobs:
   kind-smoke:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'test-kind')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

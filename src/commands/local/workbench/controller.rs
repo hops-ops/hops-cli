@@ -10,15 +10,18 @@ use super::reconcile::{
     ensure_environment_namespace, HelmRunner, KubectlApplier, KustomizeRunner, ReconcileOptions,
     ReconcileResult,
 };
-use crate::commands::local::workbench::registry::{remove_workspace, WorkspaceRecord};
+use crate::commands::local::workbench::registry::{
+    list_workspaces, remove_workspace, WorkspaceRecord,
+};
 use crate::commands::local::{kubectl_command, local_state_dir};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::error::Error;
-use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONTROLLER_SCHEMA_VERSION: u32 = 1;
@@ -41,6 +44,22 @@ pub struct ControllerHandle {
     lock_path: PathBuf,
     pub lease: ControllerLease,
     pub reused: bool,
+}
+
+struct ControllerRecoveryLock {
+    #[cfg(unix)]
+    file: File,
+}
+
+impl Drop for ControllerRecoveryLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: `file` remains open for the lifetime of this guard and
+            // `LOCK_UN` only releases this process's advisory lock.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
 }
 
 impl ControllerHandle {
@@ -76,6 +95,73 @@ pub fn controller_state_dir(cluster_name: &str) -> Result<PathBuf, Box<dyn Error
 
 pub fn controller_lock_path(cluster_name: &str) -> Result<PathBuf, Box<dyn Error>> {
     Ok(controller_state_dir(cluster_name)?.join("controller.lock"))
+}
+
+/// Forget machine-local ownership only when the selected backend no longer
+/// exists. A live controller remains a real conflict even when its backend was
+/// removed out-of-band; the user must stop that process before a new owner can
+/// safely start.
+pub fn reset_absent_cluster_state(cluster_name: &str) -> Result<bool, Box<dyn Error>> {
+    let state_dir = local_state_dir()?;
+    let cluster_dir = state_dir
+        .join("clusters")
+        .join(super::slugify_name(cluster_name));
+    reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name)
+}
+
+fn reset_absent_cluster_state_at(
+    state_dir: &Path,
+    cluster_dir: &Path,
+    cluster_name: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let lock_path = cluster_dir.join("controller.lock");
+    #[cfg(unix)]
+    let _state_guard = acquire_controller_recovery_lock(&lock_path)?;
+
+    if !cluster_dir.exists() {
+        return Ok(false);
+    }
+
+    let initial_lease = read_controller_lease_if_present(&lock_path)?;
+    if let Some(lease) = &initial_lease {
+        if controller_pid_is_live(lease.pid) {
+            return Err(format!(
+                "Cluster {:?} backend is absent, but GitOps controller pid {} is still live; stop that process before restarting from clean state",
+                cluster_name, lease.pid
+            )
+            .into());
+        }
+    }
+
+    for record in list_workspaces(state_dir)? {
+        if record.cluster_name.as_deref() == Some(cluster_name) {
+            remove_workspace(state_dir, &record.name)?;
+        }
+    }
+
+    let final_lease = read_controller_lease_if_present(&lock_path)?;
+    if final_lease != initial_lease {
+        return Err(format!(
+            "GitOps controller ownership changed while resetting absent Cluster {:?}; refusing to remove {}",
+            cluster_name,
+            cluster_dir.display()
+        )
+        .into());
+    }
+    if let Some(lease) = &final_lease {
+        if controller_pid_is_live(lease.pid) {
+            return Err(format!(
+                "Cluster {:?} acquired live GitOps controller pid {} while absent state was being reset; refusing to remove {}",
+                cluster_name,
+                lease.pid,
+                cluster_dir.display()
+            )
+            .into());
+        }
+    }
+
+    fs::remove_dir_all(cluster_dir)?;
+    Ok(true)
 }
 
 /// Guard imperative package/provider installers from becoming a second owner
@@ -125,58 +211,191 @@ pub fn acquire_controller(
             reused: true,
         });
     }
+    #[cfg(unix)]
+    let _state_guard = acquire_controller_recovery_lock(&path)?;
     if let Some(parent) = path.parent() {
+        // The absent-backend reset may have removed this directory while this
+        // process waited for the stable, sibling recovery lock.
         fs::create_dir_all(parent)?;
     }
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(_) => {
-            fs::write(&path, serde_json::to_vec_pretty(&lease)?)?;
-            Ok(ControllerHandle {
-                lock_path: path,
-                lease,
-                reused: false,
-            })
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            let current_text = fs::read_to_string(&path).map_err(|read_error| {
-                format!(
-                    "GitOps controller lock {} exists but cannot be read: {read_error}",
-                    path.display()
-                )
-            })?;
-            let current: ControllerLease =
-                serde_json::from_str(&current_text).map_err(|parse| {
-                    format!(
-                        "GitOps controller lock {} is malformed; refusing adoption: {parse}",
-                        path.display()
-                    )
-                })?;
-            if current.cluster_name == lease.cluster_name
-                && current.definition_path == lease.definition_path
-                && current.kube_context == lease.kube_context
-                && current.mode == CONTROLLER_MODE
-            {
-                if current.pid != std::process::id() && !controller_pid_is_live(current.pid) {
-                    return Err(format!(
-                        "GitOps controller lock {} belongs to stale pid {}; refusing implicit adoption. Stop the declared Cluster or complete an explicit ownership handoff before retrying",
-                        path.display(), current.pid
-                    )
-                    .into());
-                }
+    loop {
+        match create_controller_lock(&path, &lease) {
+            Ok(true) => {
                 return Ok(ControllerHandle {
                     lock_path: path,
-                    lease: current,
-                    reused: true,
+                    lease,
+                    reused: false,
                 });
             }
-            Err(format!(
+            Ok(false) => {
+                let Some(current) = read_controller_lease_if_present(&path)? else {
+                    continue;
+                };
+                if controller_lease_matches(&current, &lease) {
+                    if current.pid == std::process::id() || controller_pid_is_live(current.pid) {
+                        return Ok(ControllerHandle {
+                            lock_path: path,
+                            lease: current,
+                            reused: true,
+                        });
+                    }
+
+                    let Some(recovered) = read_controller_lease_if_present(&path)? else {
+                        continue;
+                    };
+                    if !controller_lease_matches(&recovered, &lease) {
+                        continue;
+                    }
+                    if recovered.pid == std::process::id() || controller_pid_is_live(recovered.pid)
+                    {
+                        return Ok(ControllerHandle {
+                            lock_path: path,
+                            lease: recovered,
+                            reused: true,
+                        });
+                    }
+
+                    fs::remove_file(&path)?;
+                    log::info!(
+                        "Recovered GitOps controller lock {} from dead pid {}",
+                        path.display(),
+                        recovered.pid
+                    );
+                    // Keep the recovery lock held while establishing the new
+                    // owner. An older Hops process may not honor the advisory
+                    // lock, so create_new remains the final ownership arbiter.
+                    match create_controller_lock(&path, &lease) {
+                        Ok(true) => {
+                            return Ok(ControllerHandle {
+                                lock_path: path,
+                                lease,
+                                reused: false,
+                            });
+                        }
+                        Ok(false) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                return Err(format!(
                 "Cluster {:?} is already owned by a different GitOps controller (pid {}, definition {}); stop or explicitly hand off that controller before retrying",
                 cluster_name, current.pid, current.definition_path
             )
-            .into())
+            .into());
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => Err(error.into()),
     }
+}
+
+fn create_controller_lock(path: &Path, lease: &ControllerLease) -> Result<bool, Box<dyn Error>> {
+    let encoded = serde_json::to_vec_pretty(lease)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("controller lock path has no UTF-8 filename")?;
+    let pending_path = path.with_file_name(format!(
+        ".{file_name}.pending-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending_path)?;
+    if let Err(error) = file.write_all(&encoded).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&pending_path);
+        return Err(error.into());
+    }
+    let published = match fs::hard_link(&pending_path, path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = fs::remove_file(&pending_path) {
+        log::warn!(
+            "Could not remove pending controller lock {}: {}",
+            pending_path.display(),
+            error
+        );
+    }
+    published
+}
+
+fn controller_lease_matches(current: &ControllerLease, expected: &ControllerLease) -> bool {
+    current.schema_version == expected.schema_version
+        && current.cluster_name == expected.cluster_name
+        && current.definition_path == expected.definition_path
+        && current.kube_context == expected.kube_context
+        && current.mode == expected.mode
+}
+
+fn read_controller_lease_if_present(
+    path: &Path,
+) -> Result<Option<ControllerLease>, Box<dyn Error>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        format!(
+            "GitOps controller lock {} is malformed; refusing ownership mutation: {error}",
+            path.display()
+        )
+        .into()
+    })
+}
+
+fn controller_recovery_lock_path(controller_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let cluster_dir = controller_path
+        .parent()
+        .ok_or("controller lock path has no cluster directory")?;
+    let clusters_dir = cluster_dir
+        .parent()
+        .ok_or("controller lock path has no clusters directory")?;
+    let cluster_slug = cluster_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("controller cluster directory has no UTF-8 name")?;
+    Ok(clusters_dir.join(format!(".{cluster_slug}.controller.lock.recovery")))
+}
+
+#[cfg(unix)]
+fn acquire_controller_recovery_lock(
+    controller_path: &Path,
+) -> Result<ControllerRecoveryLock, Box<dyn Error>> {
+    let recovery_path = controller_recovery_lock_path(controller_path)?;
+    if let Some(parent) = recovery_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&recovery_path)?;
+    // SAFETY: `file` is a valid open descriptor and stays owned by the guard.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(format!(
+            "failed to serialize recovery through {}: {}",
+            recovery_path.display(),
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    Ok(ControllerRecoveryLock { file })
+}
+
+#[cfg(not(unix))]
+fn acquire_controller_recovery_lock(
+    controller_path: &Path,
+) -> Result<ControllerRecoveryLock, Box<dyn Error>> {
+    Err(format!(
+        "automatic dead-controller recovery is not supported on this platform for {}",
+        controller_path.display()
+    )
+    .into())
 }
 
 /// Return whether a controller process is still live. A failure to inspect a
@@ -188,11 +407,15 @@ fn controller_pid_is_live(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        return Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(true);
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        // SAFETY: signal 0 does not deliver a signal; it only checks whether
+        // the process exists and whether this user may inspect it.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
     #[cfg(not(unix))]
     {
@@ -709,6 +932,278 @@ mod tests {
         assert!(!lock.exists());
         let _ = fs::remove_dir_all(lock.parent().unwrap());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrepresentable_controller_pid_fails_closed() {
+        assert!(controller_pid_is_live(u32::MAX));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_matching_controller_lock_is_recovered() {
+        let root = std::env::temp_dir().join(format!(
+            "hops-controller-recovery-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let definition = root.join("project/.gitops/local/cluster.yaml");
+        fs::create_dir_all(definition.parent().unwrap()).unwrap();
+        let cluster_name = format!("recovery-{}", uuid::Uuid::new_v4().simple());
+        let lock = controller_lock_path(&cluster_name).unwrap();
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        let stale = ControllerLease {
+            schema_version: CONTROLLER_SCHEMA_VERSION,
+            mode: CONTROLLER_MODE.into(),
+            cluster_name: cluster_name.clone(),
+            definition_path: definition.to_string_lossy().into_owned(),
+            kube_context: "kind-recovery".into(),
+            pid: i32::MAX as u32,
+            started_at: 0,
+        };
+        fs::write(&lock, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+
+        let handle =
+            acquire_controller(&cluster_name, &definition, "kind-recovery", false).unwrap();
+        assert!(handle.is_owner());
+        assert_eq!(handle.lease.pid, std::process::id());
+        let stored: ControllerLease = serde_json::from_slice(&fs::read(&lock).unwrap()).unwrap();
+        assert_eq!(stored, handle.lease);
+
+        drop(handle);
+        assert!(!lock.exists());
+        let _ = fs::remove_dir_all(lock.parent().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_dead_lock_recovery_establishes_one_owner() {
+        use std::sync::{Arc, Barrier};
+
+        for _ in 0..16 {
+            let root = std::env::temp_dir().join(format!(
+                "hops-controller-race-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let definition = root.join("project/.gitops/local/cluster.yaml");
+            fs::create_dir_all(definition.parent().unwrap()).unwrap();
+            let cluster_name = format!("race-{}", uuid::Uuid::new_v4().simple());
+            let lock = controller_lock_path(&cluster_name).unwrap();
+            fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            let stale = ControllerLease {
+                schema_version: CONTROLLER_SCHEMA_VERSION,
+                mode: CONTROLLER_MODE.into(),
+                cluster_name: cluster_name.clone(),
+                definition_path: definition.to_string_lossy().into_owned(),
+                kube_context: "kind-race".into(),
+                pid: i32::MAX as u32,
+                started_at: 0,
+            };
+            fs::write(&lock, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+
+            let contenders = 8;
+            let barrier = Arc::new(Barrier::new(contenders));
+            let mut threads = Vec::new();
+            for _ in 0..contenders {
+                let barrier = Arc::clone(&barrier);
+                let cluster_name = cluster_name.clone();
+                let definition = definition.clone();
+                threads.push(std::thread::spawn(move || {
+                    let result = acquire_controller(&cluster_name, &definition, "kind-race", false)
+                        .map_err(|error| error.to_string());
+                    let is_owner = result
+                        .as_ref()
+                        .map(ControllerHandle::is_owner)
+                        .unwrap_or(false);
+                    barrier.wait();
+                    result.map(|_| is_owner)
+                }));
+            }
+            let owner_count = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap().unwrap())
+                .filter(|is_owner| *is_owner)
+                .count();
+            assert_eq!(owner_count, 1);
+            assert!(!lock.exists());
+
+            let _ = fs::remove_dir_all(lock.parent().unwrap());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_mismatched_controller_lock_still_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "hops-controller-mismatch-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let definition = root.join("project/.gitops/local/cluster.yaml");
+        fs::create_dir_all(definition.parent().unwrap()).unwrap();
+        let cluster_name = format!("mismatch-{}", uuid::Uuid::new_v4().simple());
+        let lock = controller_lock_path(&cluster_name).unwrap();
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        let stale = ControllerLease {
+            schema_version: CONTROLLER_SCHEMA_VERSION,
+            mode: CONTROLLER_MODE.into(),
+            cluster_name: cluster_name.clone(),
+            definition_path: "/another/worktree/.gitops/local/cluster.yaml".into(),
+            kube_context: "kind-mismatch".into(),
+            pid: i32::MAX as u32,
+            started_at: 0,
+        };
+        fs::write(&lock, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+
+        let error =
+            acquire_controller(&cluster_name, &definition, "kind-mismatch", false).unwrap_err();
+        assert!(error.to_string().contains("different GitOps controller"));
+        assert!(lock.exists());
+
+        let _ = fs::remove_dir_all(lock.parent().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn absent_cluster_reset_clears_stale_state_but_rejects_a_live_owner() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hops-absent-cluster-reset-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let cluster_name = "project-dev";
+        let cluster_dir = state_dir.join("clusters/project-dev");
+        fs::create_dir_all(cluster_dir.join("environments")).unwrap();
+        fs::write(cluster_dir.join("cluster-inventory.json"), "{}").unwrap();
+        let lease = ControllerLease {
+            schema_version: CONTROLLER_SCHEMA_VERSION,
+            mode: CONTROLLER_MODE.into(),
+            cluster_name: cluster_name.into(),
+            definition_path: "/old/worktree/.gitops/local/cluster.yaml".into(),
+            kube_context: "kind-project-dev".into(),
+            pid: std::process::id(),
+            started_at: 0,
+        };
+        fs::write(
+            cluster_dir.join("controller.lock"),
+            serde_json::to_vec(&lease).unwrap(),
+        )
+        .unwrap();
+
+        let error =
+            reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name).unwrap_err();
+        assert!(error.to_string().contains("still live"));
+        assert!(cluster_dir.exists());
+
+        fs::remove_file(cluster_dir.join("controller.lock")).unwrap();
+        assert!(reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name).unwrap());
+        assert!(!cluster_dir.exists());
+        assert!(!reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name).unwrap());
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn absent_cluster_reset_fails_closed_on_a_malformed_lock() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hops-malformed-absent-cluster-reset-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let cluster_name = "project-dev";
+        let cluster_dir = state_dir.join("clusters/project-dev");
+        fs::create_dir_all(&cluster_dir).unwrap();
+        fs::write(cluster_dir.join("controller.lock"), "not json").unwrap();
+
+        let error =
+            reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name).unwrap_err();
+
+        assert!(error.to_string().contains("malformed"));
+        assert!(cluster_dir.exists());
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn absent_cluster_reset_preserves_state_when_workspace_cleanup_fails() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hops-failed-workspace-cleanup-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let cluster_name = "project-dev";
+        let cluster_dir = state_dir.join("clusters/project-dev");
+        fs::create_dir_all(&cluster_dir).unwrap();
+        fs::write(cluster_dir.join("cluster-inventory.json"), "{}").unwrap();
+        fs::write(state_dir.join("envs"), "not a directory").unwrap();
+
+        assert!(reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name).is_err());
+        assert!(cluster_dir.exists());
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_cluster_reset_cannot_delete_a_concurrent_new_owner() {
+        use std::sync::{mpsc, Arc, Barrier};
+
+        for _ in 0..8 {
+            let root = std::env::temp_dir().join(format!(
+                "hops-reset-acquire-race-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let definition = root.join("project/.gitops/local/cluster.yaml");
+            fs::create_dir_all(definition.parent().unwrap()).unwrap();
+            let cluster_name = format!("reset-race-{}", uuid::Uuid::new_v4().simple());
+            let lock = controller_lock_path(&cluster_name).unwrap();
+            fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            fs::write(lock.parent().unwrap().join("cluster-inventory.json"), "{}").unwrap();
+
+            let barrier = Arc::new(Barrier::new(2));
+            let reset_barrier = Arc::clone(&barrier);
+            let reset_cluster_name = cluster_name.clone();
+            let reset_thread = std::thread::spawn(move || {
+                reset_barrier.wait();
+                reset_absent_cluster_state(&reset_cluster_name).map_err(|error| error.to_string())
+            });
+
+            let acquire_barrier = Arc::clone(&barrier);
+            let acquire_cluster_name = cluster_name.clone();
+            let acquire_definition = definition.clone();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let acquire_thread = std::thread::spawn(move || {
+                acquire_barrier.wait();
+                let handle = acquire_controller(
+                    &acquire_cluster_name,
+                    &acquire_definition,
+                    "kind-reset-race",
+                    false,
+                )
+                .map_err(|error| error.to_string())?;
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(handle);
+                Ok::<_, String>(())
+            });
+
+            ready_rx.recv().unwrap();
+            let reset_result = reset_thread.join().unwrap();
+            assert!(lock.exists(), "reset removed a concurrently acquired lock");
+            if let Err(error) = reset_result {
+                assert!(error.contains("still live") || error.contains("acquired live"));
+            }
+
+            release_tx.send(()).unwrap();
+            acquire_thread.join().unwrap().unwrap();
+            let recovery_lock = controller_recovery_lock_path(&lock).unwrap();
+            let _ = fs::remove_dir_all(lock.parent().unwrap());
+            let _ = fs::remove_file(recovery_lock);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

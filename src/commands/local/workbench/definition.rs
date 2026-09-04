@@ -4,6 +4,7 @@
 //! backend, mount the project root, and start or resume the named cluster.
 
 use crate::commands::local::backend::{self, Backend, ClusterProvider, DockerProvider};
+use crate::commands::local::workbench::registry::default_name_from_cwd;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
@@ -13,6 +14,26 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+
+#[derive(Debug)]
+struct MissingDefinitionDirectory {
+    message: String,
+}
+
+impl std::fmt::Display for MissingDefinitionDirectory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for MissingDefinitionDirectory {}
+
+/// A discovered checkout can temporarily lack nested repositories or deploy
+/// directories while it is being created. Controllers defer that checkout;
+/// explicit Environment commands still report the underlying error.
+pub fn is_missing_definition_directory(error: &(dyn Error + 'static)) -> bool {
+    error.downcast_ref::<MissingDefinitionDirectory>().is_some()
+}
 
 pub const API_VERSION: &str = "hops.local/v1alpha1";
 pub const DEFAULT_DEFINITION_FILE: &str = ".gitops/local/cluster.yaml";
@@ -636,11 +657,22 @@ pub fn load_environment_definition(
     let raw = environments.remove(0);
     debug_assert_eq!(raw.api_version, API_VERSION);
     debug_assert_eq!(raw.kind, "Environment");
+    validate_dns_label("Environment.metadata.name", &raw.metadata.name)?;
+    let checkout_root = if source.ends_with(DEFAULT_ENVIRONMENT_FILE) {
+        source.ancestors().nth(3).ok_or_else(|| {
+            format!(
+                "Environment definition has no containing checkout: {}",
+                source.display()
+            )
+        })?
+    } else {
+        definition_root.as_path()
+    };
     let name = name_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(&raw.metadata.name)
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| default_name_from_cwd(checkout_root));
     validate_dns_label("Environment runtime name", &name)?;
     if raw.spec.cluster_ref.name != cluster.cluster.name {
         return Err(format!(
@@ -656,14 +688,9 @@ pub fn load_environment_definition(
         .or(raw.spec.namespace)
         .unwrap_or_else(|| name.clone());
     validate_dns_label("Environment namespace", &namespace)?;
-    let root_base = if source.ends_with(DEFAULT_ENVIRONMENT_FILE) {
-        &cluster.cluster.mount_root
-    } else {
-        &definition_root
-    };
     let root = resolve_bounded_path(
         &cluster.cluster.mount_root,
-        root_base,
+        checkout_root,
         &raw.spec.root,
         &format!("Environment {name:?} spec.root"),
         true,
@@ -950,8 +977,29 @@ fn resolve_bounded_path(
     }
     ensure_within(&boundary, &current, field)?;
 
-    if require_directory && !current.is_dir() {
-        return Err(format!("{field} directory does not exist: {}", current.display()).into());
+    if require_directory {
+        match fs::metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{field} must be a directory, but an existing non-directory occupies {}",
+                    current.display()
+                )
+                .into())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(Box::new(MissingDefinitionDirectory {
+                    message: format!("{field} directory does not exist: {}", current.display()),
+                }))
+            }
+            Err(error) => {
+                return Err(format!(
+                    "unable to inspect {field} directory {}: {error}",
+                    current.display()
+                )
+                .into())
+            }
+        }
     }
     Ok(current)
 }
@@ -1108,6 +1156,74 @@ spec:
             environment.environment.deploys[0].deploy_type,
             DeployType::Helm
         );
+    }
+
+    #[test]
+    fn reusable_environment_derives_identity_and_sources_from_each_worktree() {
+        let fixture = Fixture::new();
+        let loaded_cluster = load_definition(&fixture.write(valid_yaml())).unwrap();
+
+        for index in 0..25 {
+            let name = format!("feature-{index:02}");
+            let worktree = fixture.root.join(".worktrees").join(&name);
+            fs::create_dir_all(worktree.join(".gitops/local")).unwrap();
+            fs::create_dir_all(worktree.join("apps/gateway/.gitops/local")).unwrap();
+            fs::create_dir_all(worktree.join("services/api/.gitops/local")).unwrap();
+            let source = worktree.join(DEFAULT_ENVIRONMENT_FILE);
+            fs::write(&source, valid_environment_yaml()).unwrap();
+
+            let loaded = load_environment_definition(&source, &loaded_cluster, None, None).unwrap();
+
+            assert_eq!(loaded.environment.name, name);
+            assert_eq!(loaded.environment.namespace, name);
+            assert_eq!(loaded.environment.root, worktree);
+            assert_eq!(
+                loaded.environment.deploys[0].source_path,
+                worktree.join("apps/gateway/.gitops/local")
+            );
+            assert_eq!(
+                loaded.environment.deploys[1].source_path,
+                worktree.join("services/api/.gitops/local")
+            );
+        }
+    }
+
+    #[test]
+    fn missing_worktree_sources_are_classified_as_pending() {
+        let fixture = Fixture::new();
+        let loaded_cluster = load_definition(&fixture.write(valid_yaml())).unwrap();
+        let worktree = fixture.root.join(".worktrees/incomplete-feature");
+        fs::create_dir_all(worktree.join(".gitops/local")).unwrap();
+        let source = worktree.join(DEFAULT_ENVIRONMENT_FILE);
+        fs::write(&source, valid_environment_yaml()).unwrap();
+
+        let error = load_environment_definition(&source, &loaded_cluster, None, None).unwrap_err();
+
+        assert!(is_missing_definition_directory(error.as_ref()));
+        assert!(error
+            .to_string()
+            .contains("incomplete-feature/apps/gateway/.gitops/local"));
+    }
+
+    #[test]
+    fn existing_file_at_worktree_source_is_a_validation_error() {
+        let fixture = Fixture::new();
+        let loaded_cluster = load_definition(&fixture.write(valid_yaml())).unwrap();
+        let worktree = fixture.root.join(".worktrees/invalid-feature");
+        fs::create_dir_all(worktree.join(".gitops/local")).unwrap();
+        fs::create_dir_all(worktree.join("apps/gateway/.gitops")).unwrap();
+        fs::write(
+            worktree.join("apps/gateway/.gitops/local"),
+            "not a directory",
+        )
+        .unwrap();
+        let source = worktree.join(DEFAULT_ENVIRONMENT_FILE);
+        fs::write(&source, valid_environment_yaml()).unwrap();
+
+        let error = load_environment_definition(&source, &loaded_cluster, None, None).unwrap_err();
+
+        assert!(!is_missing_definition_directory(error.as_ref()));
+        assert!(error.to_string().contains("must be a directory"));
     }
 
     #[test]

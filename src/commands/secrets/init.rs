@@ -1,6 +1,7 @@
 use super::{
-    configured_aws_settings, configured_github_settings, configured_secret_paths, load_config,
-    require_command, save_config, sort_value, CONFIG_FILE, SOPS_FILE,
+    configured_aws_settings, configured_github_settings, configured_secret_paths,
+    configured_vault_prompt_settings, load_config, require_command, save_config, sort_value,
+    CONFIG_FILE, SOPS_FILE,
 };
 use crate::commands::local::{kubectl_apply_stdin, run_cmd_output};
 use clap::Args;
@@ -286,6 +287,7 @@ fn configure_target_paths() -> Result<(), Box<dyn Error>> {
     let mut config = load_config()?;
     let aws = configured_aws_settings()?;
     let github = configured_github_settings()?;
+    let vault = configured_vault_prompt_settings()?;
 
     let aws_path: String = Input::new()
         .with_prompt("Subdirectory for AWS secrets")
@@ -313,6 +315,18 @@ fn configure_target_paths() -> Result<(), Box<dyn Error>> {
         .allow_empty(true)
         .default(github.shared_repos.join(","))
         .interact_text()?;
+    let vault_path: String = Input::new()
+        .with_prompt("Subdirectory for Vault secrets")
+        .default(vault.path)
+        .interact_text()?;
+    let vault_address: String = Input::new()
+        .with_prompt("Vault address")
+        .default(vault.address)
+        .interact_text()?;
+    let vault_mount: String = Input::new()
+        .with_prompt("Vault KV mount")
+        .default(vault.mount)
+        .interact_text()?;
 
     config.secrets.aws.path = Some(aws_path.trim().to_string());
     config.secrets.aws.region = Some(aws_region.trim().to_string());
@@ -320,6 +334,9 @@ fn configure_target_paths() -> Result<(), Box<dyn Error>> {
     config.secrets.github.shared_secrets.path = Some(github_shared_path.trim().to_string());
     config.secrets.github.owner = non_empty(github_owner.trim());
     config.secrets.github.shared_secrets.repos = parse_csv(github_repos.trim());
+    config.secrets.vault.path = Some(vault_path.trim().to_string());
+    config.secrets.vault.address = non_empty(vault_address.trim());
+    config.secrets.vault.mount = non_empty(vault_mount.trim());
     save_config(&config)?;
     log::info!("Saved secrets target settings to {}", CONFIG_FILE);
     Ok(())

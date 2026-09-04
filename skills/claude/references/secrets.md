@@ -3,7 +3,7 @@
 ## Overview
 
 `hops secrets` manages repo-level secrets using SOPS for encryption and syncs
-to AWS Secrets Manager or GitHub repository secrets.
+to AWS Secrets Manager, GitHub repository secrets, or HashiCorp Vault KV.
 
 ## Setup
 
@@ -20,9 +20,11 @@ secrets/              # Plaintext (gitignored)
   aws/
   github/
     _shared/
+  vault/
 secrets-encrypted/    # SOPS-encrypted (committed)
   aws/
   github/
+  vault/
 ```
 
 ### Configuration (`.hops.yaml`)
@@ -44,6 +46,17 @@ secrets:
       repos:
         - repo-a
         - repo-b
+  vault:
+    path: vault
+    address: http://127.0.0.1:8200
+    mount: secret
+    version: v2
+    token_env: VAULT_TOKEN
+    kube:
+      enabled: true
+      namespace: vault
+      service: vault
+      local_port: 8200
 ```
 
 ## Encrypt / Decrypt
@@ -94,3 +107,21 @@ hops secrets sync github
 - `.env` files → one secret per `KEY=value` entry
 - Shared secrets fan out to all repos in `shared_secrets.repos`
 - Repo-specific values override shared values
+
+## Sync to HashiCorp Vault KV
+
+```bash
+export VAULT_TOKEN=root # local development only
+hops secrets sync vault --no-port-forward --yes
+```
+
+| Source | Vault KV path |
+|--------|---------------|
+| `secrets/vault/harmony/stripe/.env` | `harmony/stripe` |
+| `secrets/vault/harmony/oidc.json` | `harmony/oidc` |
+
+- Vault inputs must be untracked and gitignored beneath the configured root.
+- `.json` objects map to one path; plain files and `.env` entries roll up by directory.
+- KV v1/v2 and an optional remote `path_prefix` are supported.
+- Values travel in the HTTP body and are never placed in argv, logs, or Hops state.
+- Hops compares before writing, does not prune unspecified paths, and can open a quiet kubectl port-forward to local Vault.
