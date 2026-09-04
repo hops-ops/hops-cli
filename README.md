@@ -257,11 +257,12 @@ An Environment is reusable from a checkout:
 apiVersion: hops.local/v1alpha1
 kind: Environment
 metadata:
+  # Template identity. The runtime name defaults from the checkout/worktree.
   name: local
 spec:
   clusterRef:
     name: project-dev
-  # Resolved inside Cluster.spec.mountRoot.
+  # Resolved from the checkout containing this Environment file.
   root: .
   values:
     local: true
@@ -289,9 +290,12 @@ local controller injects the immutable runtime values `local: true`, the
 Cluster `localDomain`, the Environment name/namespace, and the resolved source
 path/type. Raw Kubernetes and Kustomize directories are already rendered
 inputs; they do not consume Helm values or get silently Helm-templated, but they
-do receive the common namespace, labels, and ownership pipeline. The namespace
-defaults to the Environment runtime name; `--name` and `--namespace` can
-override those values for an explicitly run Environment.
+do receive the common namespace, labels, and ownership pipeline. The runtime
+name defaults to the basename of the checkout/worktree containing
+`.gitops/local/environment.yaml`, and the namespace defaults to that runtime
+name. This makes the committed Environment a reusable template: copied
+worktrees do not need YAML edits. `--name` and `--namespace` remain explicit
+overrides.
 
 `type` is required and must be `helm`, `k8s`, or `kustomize`:
 
@@ -339,16 +343,17 @@ hops local gitops cluster ./.gitops/local/cluster.yaml --once
 
 The controller lock is stored under
 `~/.hops/local/clusters/<cluster>/controller.lock`. A second process cannot
-become a competing watcher. A malformed, conflicting, or stale lock is
-rejected rather than implicitly adopted; stop or explicitly hand off the
-existing owner first.
+become a competing watcher. Conflicts for an existing backend are rejected
+rather than implicitly adopted. If the backend itself was deleted, Hops
+discards obsolete inventory and stale ownership before recreating it; a still
+running controller process must be stopped first.
 
 ### Add a worktree
 
 Put the worktree under the configured `mountRoot`, ensure it contains its
-`.gitops/local/environment.yaml`, and give it a distinct Environment name (or
-use an explicit `--name` invocation). The running Cluster controller discovers
-the file and reconciles it into a separate namespace:
+`.gitops/local/environment.yaml`, and give the worktree directory the desired
+runtime name. The running Cluster controller discovers the file and reconciles
+it into a namespace of the same name:
 
 ```bash
 git worktree add .worktrees/feature-auth feature/auth
@@ -357,12 +362,17 @@ git worktree add .worktrees/feature-auth feature/auth
 hops local gitops cluster
 ```
 
+If a newly created meta-repo worktree has not populated its nested repositories
+yet, the controller reports that Environment as pending instead of blocking the
+Cluster or pruning its previous ownership. Creation of the missing local deploy
+directories triggers reconciliation automatically.
+
 For a targeted one-shot workflow, reconcile an Environment
 directly. This does not start a second watcher when the Cluster controller
 already owns the backend:
 
 ```bash
-hops local gitops environment ./.gitops/local/environment.yaml --name feature-auth --once
+hops local gitops environment ./.gitops/local/environment.yaml --once
 ```
 
 ### What is watched and what happens on deletion

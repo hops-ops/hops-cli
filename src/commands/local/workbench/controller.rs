@@ -10,7 +10,9 @@ use super::reconcile::{
     ensure_environment_namespace, HelmRunner, KubectlApplier, KustomizeRunner, ReconcileOptions,
     ReconcileResult,
 };
-use crate::commands::local::workbench::registry::{remove_workspace, WorkspaceRecord};
+use crate::commands::local::workbench::registry::{
+    list_workspaces, remove_workspace, WorkspaceRecord,
+};
 use crate::commands::local::{kubectl_command, local_state_dir};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -76,6 +78,48 @@ pub fn controller_state_dir(cluster_name: &str) -> Result<PathBuf, Box<dyn Error
 
 pub fn controller_lock_path(cluster_name: &str) -> Result<PathBuf, Box<dyn Error>> {
     Ok(controller_state_dir(cluster_name)?.join("controller.lock"))
+}
+
+/// Forget machine-local ownership only when the selected backend no longer
+/// exists. A live controller remains a real conflict even when its backend was
+/// removed out-of-band; the user must stop that process before a new owner can
+/// safely start.
+pub fn reset_absent_cluster_state(cluster_name: &str) -> Result<bool, Box<dyn Error>> {
+    let state_dir = local_state_dir()?;
+    let cluster_dir = state_dir
+        .join("clusters")
+        .join(super::slugify_name(cluster_name));
+    reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name)
+}
+
+fn reset_absent_cluster_state_at(
+    state_dir: &Path,
+    cluster_dir: &Path,
+    cluster_name: &str,
+) -> Result<bool, Box<dyn Error>> {
+    if !cluster_dir.exists() {
+        return Ok(false);
+    }
+    let lock_path = cluster_dir.join("controller.lock");
+    if lock_path.is_file() {
+        if let Ok(lease) = serde_json::from_slice::<ControllerLease>(&fs::read(&lock_path)?) {
+            if controller_pid_is_live(lease.pid) {
+                return Err(format!(
+                    "Cluster {:?} backend is absent, but GitOps controller pid {} is still live; stop that process before restarting from clean state",
+                    cluster_name, lease.pid
+                )
+                .into());
+            }
+        }
+    }
+
+    fs::remove_dir_all(cluster_dir)?;
+    for record in list_workspaces(state_dir)? {
+        if record.cluster_name.as_deref() == Some(cluster_name) {
+            remove_workspace(state_dir, &record.name)?;
+        }
+    }
+    Ok(true)
 }
 
 /// Guard imperative package/provider installers from becoming a second owner
@@ -709,6 +753,44 @@ mod tests {
         assert!(!lock.exists());
         let _ = fs::remove_dir_all(lock.parent().unwrap());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn absent_cluster_reset_clears_stale_state_but_rejects_a_live_owner() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hops-absent-cluster-reset-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let cluster_name = "project-dev";
+        let cluster_dir = state_dir.join("clusters/project-dev");
+        fs::create_dir_all(cluster_dir.join("environments")).unwrap();
+        fs::write(cluster_dir.join("cluster-inventory.json"), "{}").unwrap();
+        let lease = ControllerLease {
+            schema_version: CONTROLLER_SCHEMA_VERSION,
+            mode: CONTROLLER_MODE.into(),
+            cluster_name: cluster_name.into(),
+            definition_path: "/old/worktree/.gitops/local/cluster.yaml".into(),
+            kube_context: "kind-project-dev".into(),
+            pid: std::process::id(),
+            started_at: 0,
+        };
+        fs::write(
+            cluster_dir.join("controller.lock"),
+            serde_json::to_vec(&lease).unwrap(),
+        )
+        .unwrap();
+
+        let error =
+            reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name).unwrap_err();
+        assert!(error.to_string().contains("still live"));
+        assert!(cluster_dir.exists());
+
+        fs::remove_file(cluster_dir.join("controller.lock")).unwrap();
+        assert!(reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name).unwrap());
+        assert!(!cluster_dir.exists());
+        assert!(!reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name).unwrap());
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]

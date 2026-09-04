@@ -13,11 +13,12 @@ use super::workbench::cluster_gitops::{
 };
 use super::workbench::controller::{
     acquire_controller, controller_lock_path, down_environment, list_environment_snapshots,
-    reconcile_environment, release_controller_for_down, save_environment_snapshot,
+    reconcile_environment, release_controller_for_down, reset_absent_cluster_state,
+    save_environment_snapshot,
 };
 use super::workbench::definition::{
-    load_environment_definition, local_deploy_name, prepare_cluster, prepare_cluster_for_stop,
-    ClusterOverrides,
+    is_missing_definition_directory, load_environment_definition, local_deploy_name,
+    prepare_cluster, prepare_cluster_for_stop, ClusterOverrides,
 };
 use super::workbench::delivery::{
     stop_delivery_runtime, DeliveryStrategy, NodePathProber, SystemNodeProber,
@@ -93,7 +94,7 @@ pub struct EnvironmentArgs {
     #[arg(long, short = 'n')]
     pub namespace: Option<String>,
 
-    /// Runtime Environment name (defaults from Environment metadata / namespace / path).
+    /// Runtime Environment name (defaults from the containing worktree name).
     #[arg(long)]
     pub name: Option<String>,
 
@@ -168,6 +169,16 @@ pub fn run_cluster(
         let controller =
             acquire_controller(&definition.cluster.name, &definition.source, &context, true)?;
         return run_cluster_reconcile_loop(args, definition, cluster, inventory, true, controller);
+    }
+
+    if !backend.cluster_exists() {
+        stop_cluster_environment_runtime(&definition.cluster.name)?;
+        if reset_absent_cluster_state(&definition.cluster.name)? {
+            log::info!(
+                "Cluster '{}' backend is absent; cleared obsolete machine-local ownership and inventory before creating it again",
+                definition.cluster.name
+            );
+        }
     }
 
     let controller = acquire_controller(
@@ -280,9 +291,19 @@ fn reconcile_cluster_environments(
     let mut errors = Vec::new();
     let mut loaded_environments = Vec::new();
     let mut names = BTreeSet::new();
+    let mut has_pending_environment = false;
     for environment_file in environment_files {
         let loaded = match load_environment_definition(&environment_file, definition, None, None) {
             Ok(loaded) => loaded,
+            Err(error) if is_missing_definition_directory(error.as_ref()) => {
+                has_pending_environment = true;
+                log::warn!(
+                    "controller deferred incomplete Environment {}: {}",
+                    environment_file.display(),
+                    error
+                );
+                continue;
+            }
             Err(error) => {
                 errors.push(format!("{}: {error}", environment_file.display()));
                 continue;
@@ -309,10 +330,7 @@ fn reconcile_cluster_environments(
     for loaded in &loaded_environments {
         let mut hosts = BTreeMap::new();
         for deploy in &loaded.environment.deploys {
-            hosts.insert(
-                local_deploy_name(deploy),
-                definition.cluster.mount_root.clone(),
-            );
+            hosts.insert(local_deploy_name(deploy), loaded.environment.root.clone());
         }
         let (delivery_strategy, detail) = match resolve_worktree_delivery(&hosts, &SystemNodeProber)
         {
@@ -373,7 +391,7 @@ fn reconcile_cluster_environments(
             Err(error) => errors.push(format!("{}: {error}", loaded.source.display())),
         }
     }
-    if errors.is_empty() {
+    if errors.is_empty() && !has_pending_environment {
         let active_names = loaded_environments
             .iter()
             .map(|loaded| loaded.environment.name.clone())
@@ -553,10 +571,7 @@ fn run_environment_definition(
     let deploys = loaded.environment.deploys.clone();
     let mut app_delivery_host_paths = BTreeMap::new();
     for deploy in &deploys {
-        app_delivery_host_paths.insert(
-            local_deploy_name(deploy),
-            cluster.cluster.mount_root.clone(),
-        );
+        app_delivery_host_paths.insert(local_deploy_name(deploy), loaded.environment.root.clone());
     }
     let (delivery_strategy, delivery_detail) =
         resolve_worktree_delivery(&app_delivery_host_paths, &SystemNodeProber)?;
