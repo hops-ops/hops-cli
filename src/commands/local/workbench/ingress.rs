@@ -360,7 +360,7 @@ fn ensure_alias_ownership(
             .find(|hostname| hostnames.contains(*hostname))
         {
             return Err(format!(
-                "hostname {hostname:?} is already owned by Environment runtime {}",
+                "hostname {hostname:?} is already owned by ingress runtime {}",
                 path.display()
             )
             .into());
@@ -455,6 +455,31 @@ pub fn ensure_ingress_access(
     workspace: &str,
 ) -> Result<(IngressAccessPlan, IngressAccessRuntime, bool), Box<dyn Error>> {
     let routes = discover_ingress_routes(namespace)?;
+    ensure_ingress_access_for_routes(namespace, state_dir, workspace, routes)
+}
+
+/// Reconcile one Cluster-owned browser ingress runtime from the explicitly
+/// declared shared namespaces. The Kubernetes HTTPRoutes remain authoritative;
+/// this list only bounds which shared namespaces Hops may expose on the host.
+pub fn ensure_cluster_ingress_access(
+    namespaces: &[String],
+    state_dir: &Path,
+    workspace: &str,
+) -> Result<(IngressAccessPlan, IngressAccessRuntime, bool), Box<dyn Error>> {
+    let mut routes = Vec::new();
+    for namespace in namespaces {
+        routes.extend(discover_ingress_routes(namespace)?);
+    }
+    let scope = namespaces.join(",");
+    ensure_ingress_access_for_routes(&scope, state_dir, workspace, routes)
+}
+
+fn ensure_ingress_access_for_routes(
+    namespace: &str,
+    state_dir: &Path,
+    workspace: &str,
+    routes: Vec<IngressRoute>,
+) -> Result<(IngressAccessPlan, IngressAccessRuntime, bool), Box<dyn Error>> {
     let prior = load_ingress_access_runtime(state_dir, workspace)?;
     if routes.is_empty() {
         if prior.is_some() {
@@ -487,7 +512,7 @@ pub fn ensure_ingress_access(
         .collect::<BTreeSet<_>>();
     if gateways.len() != 1 {
         return Err(format!(
-            "local ingress expects one shared cluster Gateway, but Environment {namespace} selects {}",
+            "local ingress expects one shared cluster Gateway, but ingress scope {namespace:?} selects {}",
             gateways.len()
         )
         .into());

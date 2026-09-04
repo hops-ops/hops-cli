@@ -24,7 +24,7 @@ use super::workbench::definition::{
 use super::workbench::delivery::{
     stop_delivery_runtime, DeliveryStrategy, NodePathProber, SystemNodeProber,
 };
-use super::workbench::ingress::ensure_ingress_access;
+use super::workbench::ingress::{ensure_cluster_ingress_access, ensure_ingress_access};
 use super::workbench::reconcile::{ReconcileOptions, SystemHelm, SystemKubectl, SystemKustomize};
 use super::workbench::registry::{load_workspace, save_workspace, WorkspaceRecord};
 use super::workbench::slugify_name;
@@ -217,6 +217,12 @@ pub fn run_cluster(
 
 fn stop_cluster_environment_runtime(cluster_name: &str) -> Result<(), Box<dyn Error>> {
     let state_dir = local_state_dir()?;
+    if let Err(error) = super::workbench::ingress::stop_ingress_access(
+        &state_dir,
+        &cluster_ingress_workspace_name(cluster_name),
+    ) {
+        log::warn!("Cluster {cluster_name} browser ingress cleanup: {error}");
+    }
     for snapshot in list_environment_snapshots(cluster_name)? {
         if let Err(error) =
             super::workbench::ingress::stop_ingress_access(&state_dir, &snapshot.name)
@@ -270,6 +276,7 @@ fn run_cluster_reconcile_loop(
             return Ok(());
         }
         reconcile_cluster_environments_with_retry(&definition, dry_run)?;
+        reconcile_cluster_browser_ingress(&definition, dry_run)?;
         Ok(())
     };
 
@@ -289,6 +296,45 @@ fn run_cluster_reconcile_loop(
         args.debounce,
         do_once,
     )
+}
+
+fn cluster_ingress_workspace_name(cluster_name: &str) -> String {
+    format!("cluster-ingress-{cluster_name}")
+}
+
+fn reconcile_cluster_browser_ingress(
+    definition: &super::workbench::definition::LoadedDefinition,
+    dry_run: bool,
+) -> Result<(), Box<dyn Error>> {
+    if definition.cluster.cluster_provider != ClusterProvider::Kind
+        || definition.cluster.docker_provider != DockerProvider::Dory
+        || dry_run
+    {
+        return Ok(());
+    }
+
+    let state_dir = local_state_dir()?;
+    let workspace = cluster_ingress_workspace_name(&definition.cluster.name);
+    let (plan, _runtime, changed) = ensure_cluster_ingress_access(
+        &definition.cluster.browser_ingress.namespaces,
+        &state_dir,
+        &workspace,
+    )?;
+    if changed {
+        if plan.urls.is_empty() {
+            log::info!(
+                "Cluster {} browser ingress has no declared HTTPRoute hostnames",
+                definition.cluster.name
+            );
+        } else {
+            log::info!(
+                "Cluster {} browser ingress reconciled: {}",
+                definition.cluster.name,
+                plan.urls.values().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn reconcile_cluster_secret_sync(
