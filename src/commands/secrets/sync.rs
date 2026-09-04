@@ -1667,24 +1667,24 @@ mod tests {
     fn vault_inputs_map_env_directory_and_json_file_to_relative_paths() {
         let root = temp_fixture("vault-map");
         let vault_root = root.join("secrets/vault");
-        fs::create_dir_all(vault_root.join("harmony/stripe")).unwrap();
-        fs::create_dir_all(vault_root.join("harmony/auth")).unwrap();
+        fs::create_dir_all(vault_root.join("sample-app/stripe")).unwrap();
+        fs::create_dir_all(vault_root.join("sample-app/auth")).unwrap();
         fs::write(
-            vault_root.join("harmony/stripe/.env"),
+            vault_root.join("sample-app/stripe/.env"),
             "STRIPE_API_KEY=test-key\nSTRIPE_WEBHOOK_SECRET=test-hook\n",
         )
         .unwrap();
         fs::write(
-            vault_root.join("harmony/auth/oidc.json"),
+            vault_root.join("sample-app/auth/oidc.json"),
             "{\"client_id\":\"test-client\"}",
         )
         .unwrap();
 
         let desired = collect_desired_vault_secrets(&vault_root, &vault_root).unwrap();
         assert_eq!(desired.len(), 2);
-        assert_eq!(desired[0].path, "harmony/auth/oidc");
+        assert_eq!(desired[0].path, "sample-app/auth/oidc");
         assert_eq!(desired[0].data["client_id"], json!("test-client"));
-        assert_eq!(desired[1].path, "harmony/stripe");
+        assert_eq!(desired[1].path, "sample-app/stripe");
         assert_eq!(desired[1].data["STRIPE_API_KEY"], json!("test-key"));
         assert_eq!(desired[1].data["STRIPE_WEBHOOK_SECRET"], json!("test-hook"));
 
@@ -1725,7 +1725,7 @@ mod tests {
     #[test]
     fn vault_sync_accepts_only_ignored_untracked_files() {
         let root = temp_fixture("vault-ignore");
-        let secret = root.join("secrets/vault/harmony/stripe/.env");
+        let secret = root.join("secrets/vault/sample-app/stripe/.env");
         fs::create_dir_all(secret.parent().unwrap()).unwrap();
         fs::write(&secret, "TOKEN=test-value\n").unwrap();
         assert!(Command::new("git")
@@ -1742,7 +1742,12 @@ mod tests {
         fs::write(root.join(".gitignore"), "secrets/\n").unwrap();
         ensure_vault_sources_are_ignored_at(&root, std::slice::from_ref(&secret)).unwrap();
         assert!(Command::new("git")
-            .args(["add", "--force", "--", "secrets/vault/harmony/stripe/.env"])
+            .args([
+                "add",
+                "--force",
+                "--",
+                "secrets/vault/sample-app/stripe/.env",
+            ])
             .current_dir(&root)
             .status()
             .unwrap()

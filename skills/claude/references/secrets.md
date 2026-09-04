@@ -117,8 +117,8 @@ hops secrets sync vault --no-port-forward --yes
 
 | Source | Vault KV path |
 |--------|---------------|
-| `secrets/vault/harmony/stripe/.env` | `harmony/stripe` |
-| `secrets/vault/harmony/oidc.json` | `harmony/oidc` |
+| `secrets/vault/sample-app/stripe/.env` | `sample-app/stripe` |
+| `secrets/vault/sample-app/oidc.json` | `sample-app/oidc` |
 
 - Vault inputs must be untracked and gitignored beneath the configured root.
 - `.json` objects map to one path; plain files and `.env` entries roll up by directory.

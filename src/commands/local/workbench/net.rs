@@ -1272,13 +1272,16 @@ mod tests {
                 ]
             }
         });
-        let endpoints = service_endpoints_from_value("harmony-system", &service);
+        let endpoints = service_endpoints_from_value("platform-system", &service);
         assert_eq!(
             endpoints
                 .iter()
                 .map(|endpoint| endpoint.endpoint_key())
                 .collect::<Vec<_>>(),
-            vec!["harmony-system/mailpit:1025", "harmony-system/mailpit:8025"]
+            vec![
+                "platform-system/mailpit:1025",
+                "platform-system/mailpit:8025"
+            ]
         );
     }
 
@@ -1286,26 +1289,26 @@ mod tests {
     fn host_access_runtime_must_match_discovered_service_keys_and_ports() {
         let services = vec![
             ServiceEndpoint {
-                namespace: "harmony".into(),
+                namespace: "sample-app".into(),
                 name: "api".into(),
                 port: 8080,
                 protocol: "TCP".into(),
             },
             ServiceEndpoint {
-                namespace: "harmony-auth".into(),
+                namespace: "sample-auth".into(),
                 name: "zitadel".into(),
                 port: 8080,
                 protocol: "TCP".into(),
             },
         ];
         let runtime = HostAccessRuntime {
-            namespace: "harmony".into(),
+            namespace: "sample-app".into(),
             service_ports: BTreeMap::from([
-                ("harmony/api:8080".into(), 8080),
+                ("sample-app/api:8080".into(), 8080),
                 ("auth/zitadel:8080".into(), 8080),
             ]),
             ip_map: BTreeMap::from([
-                ("harmony/api".into(), "127.53.0.2".into()),
+                ("sample-app/api".into(), "127.53.0.2".into()),
                 ("auth/zitadel".into(), "127.53.0.3".into()),
             ]),
             ..Default::default()
@@ -1315,12 +1318,12 @@ mod tests {
 
         let current = HostAccessRuntime {
             service_ports: BTreeMap::from([
-                ("harmony/api:8080".into(), 8080),
-                ("harmony-auth/zitadel:8080".into(), 8080),
+                ("sample-app/api:8080".into(), 8080),
+                ("sample-auth/zitadel:8080".into(), 8080),
             ]),
             ip_map: BTreeMap::from([
-                ("harmony/api".into(), "127.53.0.2".into()),
-                ("harmony-auth/zitadel".into(), "127.53.0.3".into()),
+                ("sample-app/api".into(), "127.53.0.2".into()),
+                ("sample-auth/zitadel".into(), "127.53.0.3".into()),
             ]),
             ..runtime
         };
@@ -1331,25 +1334,25 @@ mod tests {
     fn runtime_tracks_multiple_ports_on_one_service_ip() {
         let services = vec![
             ServiceEndpoint {
-                namespace: "harmony-system".into(),
+                namespace: "platform-system".into(),
                 name: "mailpit".into(),
                 port: 1025,
                 protocol: "TCP".into(),
             },
             ServiceEndpoint {
-                namespace: "harmony-system".into(),
+                namespace: "platform-system".into(),
                 name: "mailpit".into(),
                 port: 8025,
                 protocol: "TCP".into(),
             },
         ];
         let runtime = HostAccessRuntime {
-            namespace: "harmony".into(),
+            namespace: "sample-app".into(),
             service_ports: BTreeMap::from([
-                ("harmony-system/mailpit:1025".into(), 1025),
-                ("harmony-system/mailpit:8025".into(), 8025),
+                ("platform-system/mailpit:1025".into(), 1025),
+                ("platform-system/mailpit:8025".into(), 8025),
             ]),
-            ip_map: BTreeMap::from([("harmony-system/mailpit".into(), "127.53.0.20".into())]),
+            ip_map: BTreeMap::from([("platform-system/mailpit".into(), "127.53.0.20".into())]),
             ..Default::default()
         };
 
