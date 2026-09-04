@@ -9,3 +9,27 @@ jobs:
     uses: unbounded-tech/workflows-rust/.github/workflows/quality.yaml@v2.3.0
     with:
       cargo_incremental: true
+
+  windows-check:
+    name: Windows check (${{ matrix.target }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - i686-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Check release feature set
+        run: cargo check --features vendored --target ${{ matrix.target }}

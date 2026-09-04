@@ -20,12 +20,23 @@ use crate::commands::local::package_install::{
 };
 use crate::commands::local::{command_exists, run_cmd, run_cmd_output};
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
 const NODE_CONTAINER: &str = "dory-k8s";
 const REGISTRY_NODE_PORT: &str = "30500";
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 fn home() -> Result<PathBuf, Box<dyn Error>> {
     Ok(PathBuf::from(std::env::var("HOME").map_err(|_| {
@@ -247,10 +258,7 @@ fn ensure_side_kubeconfig_hint() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let _ = std::fs::write(&path, yaml);
-            let _ = std::fs::set_permissions(
-                &path,
-                std::os::unix::fs::PermissionsExt::from_mode(0o600),
-            );
+            let _ = set_private_file_permissions(Path::new(&path));
             log::info!("Wrote kubeconfig side file {}", path);
         }
     }
@@ -687,12 +695,10 @@ fn ensure_user_kubeconfig_context(name: &str) -> Result<(), Box<dyn Error>> {
         let backup = kube_dir.join("config.hops-dory-backup");
         let _ = std::fs::copy(&main, &backup);
         std::fs::write(&main, merged)?;
-        let _ =
-            std::fs::set_permissions(&main, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+        let _ = set_private_file_permissions(&main);
     } else {
         std::fs::copy(&tmp, &main)?;
-        let _ =
-            std::fs::set_permissions(&main, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+        let _ = set_private_file_permissions(&main);
     }
     let _ = std::fs::remove_file(&tmp);
 
