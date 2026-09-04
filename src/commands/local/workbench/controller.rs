@@ -956,16 +956,19 @@ mod tests {
             let cluster_name = cluster_name.clone();
             let definition = definition.clone();
             threads.push(std::thread::spawn(move || {
-                let handle =
-                    acquire_controller(&cluster_name, &definition, "kind-race", false).unwrap();
-                let is_owner = handle.is_owner();
+                let result = acquire_controller(&cluster_name, &definition, "kind-race", false)
+                    .map_err(|error| error.to_string());
+                let is_owner = result
+                    .as_ref()
+                    .map(ControllerHandle::is_owner)
+                    .unwrap_or(false);
                 barrier.wait();
-                is_owner
+                result.map(|_| is_owner)
             }));
         }
         let owner_count = threads
             .into_iter()
-            .map(|thread| thread.join().unwrap())
+            .map(|thread| thread.join().unwrap().unwrap())
             .filter(|is_owner| *is_owner)
             .count();
         assert_eq!(owner_count, 1);
