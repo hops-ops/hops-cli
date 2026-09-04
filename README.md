@@ -654,8 +654,8 @@ Vault rules:
 
 Examples:
 
-- `secrets/vault/harmony/stripe/.env` -> KV `harmony/stripe`
-- `secrets/vault/harmony/oidc.json` -> KV `harmony/oidc`
+- `secrets/vault/sample-app/stripe/.env` -> KV `sample-app/stripe`
+- `secrets/vault/sample-app/oidc.json` -> KV `sample-app/oidc`
 
 ## Create a Local Control Plane (standalone mode)
 

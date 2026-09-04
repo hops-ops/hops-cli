@@ -409,11 +409,11 @@ mod tests {
     #[test]
     fn validates_and_normalizes_vault_paths() {
         assert_eq!(
-            validate_vault_path("/harmony/stripe/", "path", false).unwrap(),
-            "harmony/stripe"
+            validate_vault_path("/sample-app/stripe/", "path", false).unwrap(),
+            "sample-app/stripe"
         );
-        assert!(validate_vault_path("harmony/../stripe", "path", false).is_err());
-        assert!(validate_vault_path("harmony//stripe", "path", false).is_err());
+        assert!(validate_vault_path("sample-app/../stripe", "path", false).is_err());
+        assert!(validate_vault_path("sample-app//stripe", "path", false).is_err());
     }
 
     #[test]
