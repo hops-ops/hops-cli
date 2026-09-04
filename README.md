@@ -650,7 +650,7 @@ Vault rules:
 - KV v1 and v2 are supported. Unchanged maps are skipped and unspecified remote paths are never pruned.
 - The writer token is read only from `VAULT_TOKEN` (or `token_env`) and values are sent in the HTTP request body, never command arguments or logs.
 - Every input is validated before Vault is contacted. Symlinks, traversal, tracked files, non-ignored files, collisions, invalid paths, binary input, and oversized batches fail closed.
-- When the address is unreachable and `kube.enabled` is true, Hops opens a quiet `kubectl port-forward`; use `--no-port-forward` to require the configured address.
+- When an unreachable address is loopback and `kube.enabled` is true, Hops opens a quiet `kubectl port-forward`. Remote addresses never fall back implicitly; pass `--port-forward` to request that override explicitly, or `--no-port-forward` to require the configured address.
 
 Examples:
 

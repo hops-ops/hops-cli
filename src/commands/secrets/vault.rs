@@ -3,7 +3,7 @@
 use super::VaultSecretsRuntimeConfig;
 use serde_json::{json, Map, Value as JsonValue};
 use std::error::Error;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,20 +30,7 @@ impl Drop for PortForwardGuard {
 pub(crate) fn validate_settings(
     settings: &VaultSecretsRuntimeConfig,
 ) -> Result<(), Box<dyn Error>> {
-    if !settings.address.starts_with("http://") && !settings.address.starts_with("https://") {
-        return Err("secrets.vault.address must use http:// or https://".into());
-    }
-    let remainder = settings
-        .address
-        .split_once("://")
-        .map(|(_, remainder)| remainder)
-        .unwrap_or_default();
-    if remainder.contains('/') || remainder.contains('?') || remainder.contains('#') {
-        return Err("secrets.vault.address must not contain a path, query, or fragment".into());
-    }
-    if parse_host_port(&settings.address).is_none() {
-        return Err("secrets.vault.address must contain a valid host and port".into());
-    }
+    normalize_vault_address(&settings.address)?;
     validate_vault_path(&settings.mount, "secrets.vault.mount", false)?;
     validate_vault_path(&settings.path_prefix, "secrets.vault.path_prefix", true)?;
     validate_env_name(&settings.token_env)?;
@@ -66,6 +53,24 @@ pub(crate) fn validate_settings(
         }
     }
     Ok(())
+}
+
+pub(crate) fn normalize_vault_address(value: &str) -> Result<String, Box<dyn Error>> {
+    let normalized = value.trim().trim_end_matches('/').to_string();
+    if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
+        return Err("secrets.vault.address must use http:// or https://".into());
+    }
+    let remainder = normalized
+        .split_once("://")
+        .map(|(_, remainder)| remainder)
+        .unwrap_or_default();
+    if remainder.contains('/') || remainder.contains('?') || remainder.contains('#') {
+        return Err("secrets.vault.address must not contain a path, query, or fragment".into());
+    }
+    if parse_host_port(&normalized).is_none() {
+        return Err("secrets.vault.address must contain a valid host and port".into());
+    }
+    Ok(normalized)
 }
 
 pub(crate) fn validate_vault_path(
@@ -134,12 +139,12 @@ pub(crate) fn open_session(
     }
 
     let mut address = effective.address.trim_end_matches('/').to_string();
-    let want_port_forward = port_forward.unwrap_or(effective.kube_enabled);
+    let want_port_forward = should_port_forward(&address, effective.kube_enabled, port_forward);
     let mut port_forward_guard = None;
     if !address_reachable(&address) {
         if !want_port_forward {
             return Err(format!(
-                "Vault at {address} is unreachable; start Vault, correct secrets.vault.address, or enable port-forwarding"
+                "Vault at {address} is unreachable; start Vault, correct secrets.vault.address, or pass --port-forward explicitly"
             )
             .into());
         }
@@ -201,12 +206,30 @@ fn address_reachable(address: &str) -> bool {
     let Some((host, port)) = parse_host_port(address) else {
         return false;
     };
-    let Ok(mut addresses) = (host.as_str(), port).to_socket_addrs() else {
+    let Ok(addresses) = (host.as_str(), port).to_socket_addrs() else {
         return false;
     };
-    addresses.next().is_some_and(|address| {
-        TcpStream::connect_timeout(&address, Duration::from_millis(400)).is_ok()
-    })
+    any_address_reachable(addresses)
+}
+
+fn any_address_reachable(addresses: impl IntoIterator<Item = SocketAddr>) -> bool {
+    addresses
+        .into_iter()
+        .any(|address| TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_ok())
+}
+
+fn should_port_forward(address: &str, kube_enabled: bool, requested: Option<bool>) -> bool {
+    requested.unwrap_or_else(|| kube_enabled && is_loopback_address(address))
+}
+
+fn is_loopback_address(address: &str) -> bool {
+    let Some((host, _)) = parse_host_port(address) else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn parse_host_port(address: &str) -> Option<(String, u16)> {
@@ -381,6 +404,7 @@ pub(crate) fn object_to_vault_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     #[test]
     fn validates_and_normalizes_vault_paths() {
@@ -403,6 +427,36 @@ mod tests {
             Some(("vault.example.com".to_string(), 443))
         );
         assert!(parse_host_port("http://token@vault.example.com").is_none());
+    }
+
+    #[test]
+    fn implicit_port_forwarding_is_limited_to_loopback_addresses() {
+        assert!(should_port_forward("http://127.0.0.1:8200", true, None));
+        assert!(should_port_forward("http://[::1]:8200", true, None));
+        assert!(!should_port_forward(
+            "https://vault.example.com",
+            true,
+            None
+        ));
+        assert!(should_port_forward(
+            "https://vault.example.com",
+            false,
+            Some(true)
+        ));
+        assert!(!should_port_forward(
+            "http://127.0.0.1:8200",
+            true,
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn reachability_checks_every_resolved_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let unreachable: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        assert!(any_address_reachable([unreachable, reachable]));
     }
 
     #[test]

@@ -668,6 +668,14 @@ fn build_desired_vault_secrets(
         let parent = file
             .parent()
             .ok_or("Vault secret file has no parent directory")?;
+        if parent == root {
+            return Err(format!(
+                "loose Vault secret file {} must be placed in a subdirectory below {}; the subdirectory becomes its Vault path",
+                file.display(),
+                root.display()
+            )
+            .into());
+        }
         let path = relative_vault_path(root, parent, None)?;
         let (data, sources) = loose.entry(path).or_default();
         merge_vault_loose_file(file, data)?;
@@ -1694,6 +1702,23 @@ mod tests {
         let error = collect_desired_vault_secrets(&vault_root, &vault_root).unwrap_err();
         assert!(error.to_string().contains("multiple local inputs map"));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn root_level_loose_vault_file_reports_required_layout() {
+        let root = temp_fixture("vault-root-loose-file");
+        let vault_root = root.join("secrets/vault");
+        fs::create_dir_all(&vault_root).unwrap();
+        let loose_file = vault_root.join("TOKEN");
+        fs::write(&loose_file, "test-value").unwrap();
+
+        let error = collect_desired_vault_secrets(&vault_root, &vault_root).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains(&loose_file.display().to_string()));
+        assert!(error.to_string().contains("placed in a subdirectory"));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -977,10 +977,29 @@ fn resolve_bounded_path(
     }
     ensure_within(&boundary, &current, field)?;
 
-    if require_directory && !current.is_dir() {
-        return Err(Box::new(MissingDefinitionDirectory {
-            message: format!("{field} directory does not exist: {}", current.display()),
-        }));
+    if require_directory {
+        match fs::metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{field} must be a directory, but an existing non-directory occupies {}",
+                    current.display()
+                )
+                .into())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(Box::new(MissingDefinitionDirectory {
+                    message: format!("{field} directory does not exist: {}", current.display()),
+                }))
+            }
+            Err(error) => {
+                return Err(format!(
+                    "unable to inspect {field} directory {}: {error}",
+                    current.display()
+                )
+                .into())
+            }
+        }
     }
     Ok(current)
 }
@@ -1184,6 +1203,27 @@ spec:
         assert!(error
             .to_string()
             .contains("incomplete-feature/apps/gateway/.gitops/local"));
+    }
+
+    #[test]
+    fn existing_file_at_worktree_source_is_a_validation_error() {
+        let fixture = Fixture::new();
+        let loaded_cluster = load_definition(&fixture.write(valid_yaml())).unwrap();
+        let worktree = fixture.root.join(".worktrees/invalid-feature");
+        fs::create_dir_all(worktree.join(".gitops/local")).unwrap();
+        fs::create_dir_all(worktree.join("apps/gateway/.gitops")).unwrap();
+        fs::write(
+            worktree.join("apps/gateway/.gitops/local"),
+            "not a directory",
+        )
+        .unwrap();
+        let source = worktree.join(DEFAULT_ENVIRONMENT_FILE);
+        fs::write(&source, valid_environment_yaml()).unwrap();
+
+        let error = load_environment_definition(&source, &loaded_cluster, None, None).unwrap_err();
+
+        assert!(!is_missing_definition_directory(error.as_ref()));
+        assert!(error.to_string().contains("must be a directory"));
     }
 
     #[test]

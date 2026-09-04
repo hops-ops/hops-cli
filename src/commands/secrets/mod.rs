@@ -260,12 +260,76 @@ fn configured_vault_settings() -> Result<VaultSecretsRuntimeConfig, Box<dyn Erro
             .unwrap_or_else(|| DEFAULT_VAULT_KUBE_SERVICE.to_string()),
         kube_local_port: kube.local_port.unwrap_or(DEFAULT_VAULT_KUBE_LOCAL_PORT),
     };
-    settings.address = settings.address.trim().trim_end_matches('/').to_string();
+    settings.address = vault::normalize_vault_address(&settings.address)?;
     settings.mount = vault::validate_vault_path(&settings.mount, "secrets.vault.mount", false)?;
     settings.path_prefix =
         vault::validate_vault_path(&settings.path_prefix, "secrets.vault.path_prefix", true)?;
     vault::validate_settings(&settings)?;
     Ok(settings)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct VaultPromptSettings {
+    path: String,
+    address: String,
+    mount: String,
+}
+
+fn configured_vault_prompt_settings() -> Result<VaultPromptSettings, Box<dyn Error>> {
+    let config = load_config()?;
+    let env_address = std::env::var("VAULT_ADDR").ok();
+    Ok(vault_prompt_settings(
+        &config.secrets.vault,
+        env_address.as_deref(),
+    ))
+}
+
+fn vault_prompt_settings(
+    configured: &VaultSecretsConfig,
+    env_address: Option<&str>,
+) -> VaultPromptSettings {
+    let path = configured
+        .path
+        .as_deref()
+        .and_then(normalize_vault_source_subdir)
+        .unwrap_or_else(|| DEFAULT_VAULT_SECRET_SUBDIR.to_string());
+    let address = configured
+        .address
+        .as_deref()
+        .into_iter()
+        .chain(env_address)
+        .find_map(|value| vault::normalize_vault_address(value).ok())
+        .unwrap_or_else(|| DEFAULT_VAULT_ADDRESS.to_string());
+    let mount = configured
+        .mount
+        .as_deref()
+        .and_then(|value| vault::validate_vault_path(value, "secrets.vault.mount", false).ok())
+        .unwrap_or_else(|| DEFAULT_VAULT_MOUNT.to_string());
+    VaultPromptSettings {
+        path,
+        address,
+        mount,
+    }
+}
+
+fn normalize_vault_source_subdir(value: &str) -> Option<String> {
+    let normalized = value.trim();
+    let path = Path::new(normalized);
+    if normalized.is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::CurDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    Some(normalized.to_string())
 }
 
 pub(crate) fn configured_secret_paths() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
@@ -628,7 +692,10 @@ fn default_secret_paths() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_secret_name, sort_value};
+    use super::{
+        derive_secret_name, sort_value, vault_prompt_settings, VaultSecretsConfig,
+        DEFAULT_VAULT_ADDRESS, DEFAULT_VAULT_MOUNT, DEFAULT_VAULT_SECRET_SUBDIR,
+    };
     use serde_yaml::Value;
     use std::path::Path;
 
@@ -653,5 +720,32 @@ mod tests {
         sort_value(&mut value);
         let rendered = serde_yaml::to_string(&value).expect("yaml");
         assert!(rendered.find("a: 1").unwrap() < rendered.find("b: 2").unwrap());
+    }
+
+    #[test]
+    fn vault_init_defaults_only_invalid_prompt_fields() {
+        let configured = VaultSecretsConfig {
+            path: Some("team-secrets".into()),
+            address: Some("not-a-vault-url".into()),
+            mount: Some("team-kv".into()),
+            ..VaultSecretsConfig::default()
+        };
+
+        let prompts = vault_prompt_settings(&configured, Some("still-not-a-url"));
+
+        assert_eq!(prompts.path, "team-secrets");
+        assert_eq!(prompts.address, DEFAULT_VAULT_ADDRESS);
+        assert_eq!(prompts.mount, "team-kv");
+
+        let invalid = VaultSecretsConfig {
+            path: Some("../outside".into()),
+            address: Some("https://vault.example.com".into()),
+            mount: Some("../invalid".into()),
+            ..VaultSecretsConfig::default()
+        };
+        let prompts = vault_prompt_settings(&invalid, None);
+        assert_eq!(prompts.path, DEFAULT_VAULT_SECRET_SUBDIR);
+        assert_eq!(prompts.address, "https://vault.example.com");
+        assert_eq!(prompts.mount, DEFAULT_VAULT_MOUNT);
     }
 }

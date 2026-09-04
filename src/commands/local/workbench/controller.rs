@@ -114,28 +114,53 @@ fn reset_absent_cluster_state_at(
     cluster_dir: &Path,
     cluster_name: &str,
 ) -> Result<bool, Box<dyn Error>> {
+    let lock_path = cluster_dir.join("controller.lock");
+    #[cfg(unix)]
+    let _state_guard = acquire_controller_recovery_lock(&lock_path)?;
+
     if !cluster_dir.exists() {
         return Ok(false);
     }
-    let lock_path = cluster_dir.join("controller.lock");
-    if lock_path.is_file() {
-        if let Ok(lease) = serde_json::from_slice::<ControllerLease>(&fs::read(&lock_path)?) {
-            if controller_pid_is_live(lease.pid) {
-                return Err(format!(
-                    "Cluster {:?} backend is absent, but GitOps controller pid {} is still live; stop that process before restarting from clean state",
-                    cluster_name, lease.pid
-                )
-                .into());
-            }
+
+    let initial_lease = read_controller_lease_if_present(&lock_path)?;
+    if let Some(lease) = &initial_lease {
+        if controller_pid_is_live(lease.pid) {
+            return Err(format!(
+                "Cluster {:?} backend is absent, but GitOps controller pid {} is still live; stop that process before restarting from clean state",
+                cluster_name, lease.pid
+            )
+            .into());
         }
     }
 
-    fs::remove_dir_all(cluster_dir)?;
     for record in list_workspaces(state_dir)? {
         if record.cluster_name.as_deref() == Some(cluster_name) {
             remove_workspace(state_dir, &record.name)?;
         }
     }
+
+    let final_lease = read_controller_lease_if_present(&lock_path)?;
+    if final_lease != initial_lease {
+        return Err(format!(
+            "GitOps controller ownership changed while resetting absent Cluster {:?}; refusing to remove {}",
+            cluster_name,
+            cluster_dir.display()
+        )
+        .into());
+    }
+    if let Some(lease) = &final_lease {
+        if controller_pid_is_live(lease.pid) {
+            return Err(format!(
+                "Cluster {:?} acquired live GitOps controller pid {} while absent state was being reset; refusing to remove {}",
+                cluster_name,
+                lease.pid,
+                cluster_dir.display()
+            )
+            .into());
+        }
+    }
+
+    fs::remove_dir_all(cluster_dir)?;
     Ok(true)
 }
 
@@ -186,7 +211,11 @@ pub fn acquire_controller(
             reused: true,
         });
     }
+    #[cfg(unix)]
+    let _state_guard = acquire_controller_recovery_lock(&path)?;
     if let Some(parent) = path.parent() {
+        // The absent-backend reset may have removed this directory while this
+        // process waited for the stable, sibling recovery lock.
         fs::create_dir_all(parent)?;
     }
     loop {
@@ -211,7 +240,6 @@ pub fn acquire_controller(
                         });
                     }
 
-                    let _recovery = acquire_controller_recovery_lock(&path)?;
                     let Some(recovered) = read_controller_lease_if_present(&path)? else {
                         continue;
                     };
@@ -311,18 +339,35 @@ fn read_controller_lease_if_present(
     };
     serde_json::from_slice(&bytes).map(Some).map_err(|error| {
         format!(
-            "GitOps controller lock {} is malformed; refusing adoption: {error}",
+            "GitOps controller lock {} is malformed; refusing ownership mutation: {error}",
             path.display()
         )
         .into()
     })
 }
 
+fn controller_recovery_lock_path(controller_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let cluster_dir = controller_path
+        .parent()
+        .ok_or("controller lock path has no cluster directory")?;
+    let clusters_dir = cluster_dir
+        .parent()
+        .ok_or("controller lock path has no clusters directory")?;
+    let cluster_slug = cluster_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("controller cluster directory has no UTF-8 name")?;
+    Ok(clusters_dir.join(format!(".{cluster_slug}.controller.lock.recovery")))
+}
+
 #[cfg(unix)]
 fn acquire_controller_recovery_lock(
     controller_path: &Path,
 ) -> Result<ControllerRecoveryLock, Box<dyn Error>> {
-    let recovery_path = controller_path.with_extension("lock.recovery");
+    let recovery_path = controller_recovery_lock_path(controller_path)?;
+    if let Some(parent) = recovery_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1059,6 +1104,106 @@ mod tests {
         assert!(!cluster_dir.exists());
         assert!(!reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name).unwrap());
         let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn absent_cluster_reset_fails_closed_on_a_malformed_lock() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hops-malformed-absent-cluster-reset-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let cluster_name = "project-dev";
+        let cluster_dir = state_dir.join("clusters/project-dev");
+        fs::create_dir_all(&cluster_dir).unwrap();
+        fs::write(cluster_dir.join("controller.lock"), "not json").unwrap();
+
+        let error =
+            reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name).unwrap_err();
+
+        assert!(error.to_string().contains("malformed"));
+        assert!(cluster_dir.exists());
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn absent_cluster_reset_preserves_state_when_workspace_cleanup_fails() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "hops-failed-workspace-cleanup-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let cluster_name = "project-dev";
+        let cluster_dir = state_dir.join("clusters/project-dev");
+        fs::create_dir_all(&cluster_dir).unwrap();
+        fs::write(cluster_dir.join("cluster-inventory.json"), "{}").unwrap();
+        fs::write(state_dir.join("envs"), "not a directory").unwrap();
+
+        assert!(reset_absent_cluster_state_at(&state_dir, &cluster_dir, cluster_name).is_err());
+        assert!(cluster_dir.exists());
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_cluster_reset_cannot_delete_a_concurrent_new_owner() {
+        use std::sync::{mpsc, Arc, Barrier};
+
+        for _ in 0..8 {
+            let root = std::env::temp_dir().join(format!(
+                "hops-reset-acquire-race-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let definition = root.join("project/.gitops/local/cluster.yaml");
+            fs::create_dir_all(definition.parent().unwrap()).unwrap();
+            let cluster_name = format!("reset-race-{}", uuid::Uuid::new_v4().simple());
+            let lock = controller_lock_path(&cluster_name).unwrap();
+            fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            fs::write(lock.parent().unwrap().join("cluster-inventory.json"), "{}").unwrap();
+
+            let barrier = Arc::new(Barrier::new(2));
+            let reset_barrier = Arc::clone(&barrier);
+            let reset_cluster_name = cluster_name.clone();
+            let reset_thread = std::thread::spawn(move || {
+                reset_barrier.wait();
+                reset_absent_cluster_state(&reset_cluster_name).map_err(|error| error.to_string())
+            });
+
+            let acquire_barrier = Arc::clone(&barrier);
+            let acquire_cluster_name = cluster_name.clone();
+            let acquire_definition = definition.clone();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let acquire_thread = std::thread::spawn(move || {
+                acquire_barrier.wait();
+                let handle = acquire_controller(
+                    &acquire_cluster_name,
+                    &acquire_definition,
+                    "kind-reset-race",
+                    false,
+                )
+                .map_err(|error| error.to_string())?;
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(handle);
+                Ok::<_, String>(())
+            });
+
+            ready_rx.recv().unwrap();
+            let reset_result = reset_thread.join().unwrap();
+            assert!(lock.exists(), "reset removed a concurrently acquired lock");
+            if let Err(error) = reset_result {
+                assert!(error.contains("still live") || error.contains("acquired live"));
+            }
+
+            release_tx.send(()).unwrap();
+            acquire_thread.join().unwrap().unwrap();
+            let recovery_lock = controller_recovery_lock_path(&lock).unwrap();
+            let _ = fs::remove_dir_all(lock.parent().unwrap());
+            let _ = fs::remove_file(recovery_lock);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

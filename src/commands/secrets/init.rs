@@ -1,7 +1,7 @@
 use super::{
     configured_aws_settings, configured_github_settings, configured_secret_paths,
-    configured_vault_settings, load_config, require_command, save_config, sort_value, CONFIG_FILE,
-    SOPS_FILE,
+    configured_vault_prompt_settings, load_config, require_command, save_config, sort_value,
+    CONFIG_FILE, SOPS_FILE,
 };
 use crate::commands::local::{kubectl_apply_stdin, run_cmd_output};
 use clap::Args;
@@ -287,7 +287,7 @@ fn configure_target_paths() -> Result<(), Box<dyn Error>> {
     let mut config = load_config()?;
     let aws = configured_aws_settings()?;
     let github = configured_github_settings()?;
-    let vault = configured_vault_settings()?;
+    let vault = configured_vault_prompt_settings()?;
 
     let aws_path: String = Input::new()
         .with_prompt("Subdirectory for AWS secrets")
