@@ -22,7 +22,6 @@ use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONTROLLER_SCHEMA_VERSION: u32 = 1;
@@ -353,13 +352,15 @@ fn controller_pid_is_live(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(true)
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        // SAFETY: signal 0 does not deliver a signal; it only checks whether
+        // the process exists and whether this user may inspect it.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
     #[cfg(not(unix))]
     {
@@ -880,6 +881,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unrepresentable_controller_pid_fails_closed() {
+        assert!(controller_pid_is_live(u32::MAX));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dead_matching_controller_lock_is_recovered() {
         let root = std::env::temp_dir().join(format!(
             "hops-controller-recovery-{}-{}",
@@ -897,7 +904,7 @@ mod tests {
             cluster_name: cluster_name.clone(),
             definition_path: definition.to_string_lossy().into_owned(),
             kube_context: "kind-recovery".into(),
-            pid: u32::MAX,
+            pid: i32::MAX as u32,
             started_at: 0,
         };
         fs::write(&lock, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
@@ -936,7 +943,7 @@ mod tests {
             cluster_name: cluster_name.clone(),
             definition_path: definition.to_string_lossy().into_owned(),
             kube_context: "kind-race".into(),
-            pid: u32::MAX,
+            pid: i32::MAX as u32,
             started_at: 0,
         };
         fs::write(&lock, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
@@ -987,7 +994,7 @@ mod tests {
             cluster_name: cluster_name.clone(),
             definition_path: "/another/worktree/.gitops/local/cluster.yaml".into(),
             kube_context: "kind-mismatch".into(),
-            pid: u32::MAX,
+            pid: i32::MAX as u32,
             started_at: 0,
         };
         fs::write(&lock, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
