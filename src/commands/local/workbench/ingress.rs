@@ -312,6 +312,22 @@ pub fn plan_from_runtime(runtime: &IngressAccessRuntime) -> IngressAccessPlan {
     }
 }
 
+pub fn plan_from_routes(
+    namespace: &str,
+    routes: &[IngressRoute],
+) -> Result<IngressAccessPlan, Box<dyn Error>> {
+    let routes = route_map(routes)?;
+    let urls = routes
+        .keys()
+        .map(|hostname| (hostname.clone(), format!("https://{hostname}")))
+        .collect();
+    Ok(IngressAccessPlan {
+        namespace: namespace.to_string(),
+        routes,
+        urls,
+    })
+}
+
 fn ensure_alias_ownership(
     state_dir: &Path,
     workspace: &str,
@@ -582,6 +598,23 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn plans_https_urls_from_declared_routes_without_mutation() {
+        let routes = vec![IngressRoute {
+            hostname: "app.feature.localhost".into(),
+            gateway: GatewayKey {
+                namespace: "ingress".into(),
+                name: "local".into(),
+            },
+        }];
+        let plan = plan_from_routes("feature", &routes).unwrap();
+        assert_eq!(
+            plan.urls.get("app.feature.localhost").map(String::as_str),
+            Some("https://app.feature.localhost")
+        );
+        assert_eq!(plan.namespace, "feature");
     }
 
     #[test]

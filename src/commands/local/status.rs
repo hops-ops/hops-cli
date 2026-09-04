@@ -1,13 +1,13 @@
-//! `hops local status` — workspace health: pods, URLs, delivery, host access.
-//!
-//! Self-heals a dead DNS supervisor / port-forwards by default so status is usable truth.
+//! `hops local status` — read-only workspace health and access state.
 
 use super::workbench::ingress::{
-    ensure_ingress_access, format_ingress_status, load_ingress_access_runtime, plan_from_runtime,
+    discover_ingress_routes, format_ingress_status, ingress_access_needs_heal,
+    load_ingress_access_runtime, plan_from_routes, plan_from_runtime as ingress_plan_from_runtime,
+    IngressAccessRuntime,
 };
 use super::workbench::net::{
-    discover_workspace_endpoints, ensure_host_access, format_status_card_with_listen,
-    host_access_status_line, load_host_access_runtime, plan_host_access, url_listen_status,
+    format_status_card_with_listen, host_access_needs_heal, host_access_status_line,
+    load_host_access_runtime, plan_from_runtime as host_plan_from_runtime, url_listen_status,
 };
 use super::workbench::registry::{activate_workspace_cluster, list_workspaces, load_workspace};
 use super::{local_state_dir, run_cmd_output};
@@ -21,12 +21,11 @@ pub struct StatusArgs {
     #[arg(long)]
     pub name: Option<String>,
 
-    /// Do not restart dead host-access processes (DNS supervisor / port-forwards).
-    /// By default status self-heals so FQDN URLs stay usable after pod rollouts.
-    #[arg(long, default_value_t = false)]
+    /// Deprecated compatibility flag; status is always read-only.
+    #[arg(long, default_value_t = false, hide = true)]
     pub no_heal: bool,
 
-    /// Exit 1 if any workspace is not usable (pods not Ready or URLs not listening).
+    /// Exit 1 if pods, ingress, or enabled optional access are unhealthy.
     #[arg(long, default_value_t = false)]
     pub check: bool,
 }
@@ -59,31 +58,24 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         }
         // Target the workspace's bound cluster before kubectl discovery.
         let _ = activate_workspace_cluster(ws);
-        let services = discover_workspace_endpoints(&ws.namespace).unwrap_or_default();
-
-        let (plan, healed) = if !args.no_heal && !services.is_empty() {
-            match ensure_host_access(&ws.namespace, &services, &state_dir, &ws.name) {
-                Ok((plan, _rt, healed)) => {
-                    if healed {
-                        println!("note:     host access restarted (self-heal)");
-                    }
-                    (plan, healed)
-                }
-                Err(e) => {
-                    log::warn!("host access heal failed: {e}");
-                    (plan_host_access(&ws.namespace, &services), false)
-                }
+        let host_access = load_host_access_runtime(&state_dir, &ws.name)?;
+        let listen = if let Some(runtime) = &host_access {
+            let plan = host_plan_from_runtime(runtime);
+            let listen = url_listen_status(&plan);
+            println!(
+                "{}",
+                format_status_card_with_listen(&ws.name, &plan, &listen)
+            );
+            if host_access_needs_heal(runtime) {
+                all_ok = false;
             }
+            listen
         } else {
-            (plan_host_access(&ws.namespace, &services), false)
+            println!("workspace: {}", ws.name);
+            println!("namespace: {}", ws.namespace);
+            println!("service access: disabled (enable explicitly with `hops local dns`)");
+            Default::default()
         };
-        let _ = healed;
-
-        let listen = url_listen_status(&plan);
-        println!(
-            "{}",
-            format_status_card_with_listen(&ws.name, &plan, &listen)
-        );
 
         // Pods
         match discover_pods(&ws.namespace) {
@@ -116,34 +108,30 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         println!("{}", delivery_status_line(&state_dir, &ws.name));
         println!("env:      {}", ws.env_path);
 
-        if let Some(rt) = load_host_access_runtime(&state_dir, &ws.name)? {
+        if let Some(rt) = &host_access {
             println!("{}", host_access_status_line(&rt));
-        } else if services.is_empty() {
-            println!("note:     no services listed yet — is the workspace up?");
-        } else {
-            println!("access processes: not recorded");
         }
 
-        if args.no_heal {
-            if let Some(runtime) = load_ingress_access_runtime(&state_dir, &ws.name)? {
-                let plan = plan_from_runtime(&runtime);
-                if super::workbench::ingress::ingress_access_needs_heal(&runtime) {
-                    all_ok = false;
-                }
-                println!("{}", format_ingress_status(&plan, &runtime));
+        if let Some(runtime) = load_ingress_access_runtime(&state_dir, &ws.name)? {
+            let plan = ingress_plan_from_runtime(&runtime);
+            if ingress_access_needs_heal(&runtime) {
+                all_ok = false;
             }
+            println!("{}", format_ingress_status(&plan, &runtime));
         } else {
-            match ensure_ingress_access(&ws.namespace, &state_dir, &ws.name) {
-                Ok((plan, runtime, restarted)) => {
-                    if restarted && !plan.urls.is_empty() {
-                        println!("note:     ingress access restarted (self-heal)");
-                    }
-                    if super::workbench::ingress::ingress_access_needs_heal(&runtime)
-                        && !plan.urls.is_empty()
-                    {
+            match discover_ingress_routes(&ws.namespace) {
+                Ok(routes) => {
+                    let plan = plan_from_routes(&ws.namespace, &routes)?;
+                    if plan.urls.is_empty() {
+                        println!("ingress:  (no HTTPRoute hostnames)");
+                    } else {
                         all_ok = false;
+                        let runtime = IngressAccessRuntime {
+                            namespace: ws.namespace.clone(),
+                            ..Default::default()
+                        };
+                        println!("{}", format_ingress_status(&plan, &runtime));
                     }
-                    println!("{}", format_ingress_status(&plan, &runtime));
                 }
                 Err(error) => {
                     all_ok = false;
@@ -152,13 +140,12 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // URL listen summary for --check (cluster FQDN endpoints)
-        for (name, ok) in &listen {
-            if !ok {
-                all_ok = false;
-                println!(
-                    "warn:     {name} FQDN not listening (port-forward dead or app not ready)"
-                );
+        if host_access.is_some() {
+            for (name, ok) in &listen {
+                if !ok {
+                    all_ok = false;
+                    println!("warn:     {name} optional Service access is not listening");
+                }
             }
         }
     }

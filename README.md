@@ -393,11 +393,10 @@ the pod through the mounted source tree; they do not require a Helm reconcile.
 
 ### Browser ingress with Gateway API
 
-Services keep their Kubernetes DNS URLs for direct access. An Environment can
-also expose browser-facing HTTPS names by applying ordinary Gateway API
-`HTTPRoute` resources. Hops discovers their `spec.hostnames` and Gateway parent
-references; no extra Environment fields or Hops-specific ingress objects are
-required.
+An Environment exposes browser-facing HTTPS names by applying ordinary Gateway
+API `HTTPRoute` resources. Hops discovers their `spec.hostnames` and Gateway
+parent references; no extra Environment fields or Hops-specific ingress
+objects are required.
 
 Local Helm charts compose route names from the protected values injected by
 Hops. The application owns any service prefix, including choosing no prefix for
@@ -432,17 +431,21 @@ data:
           nodePort: 30080
 ```
 
-Then reconcile browser access and print every URL:
+Environment reconciliation also reconciles browser access through Dory. Status
+only observes the resulting pods and ingress state:
 
 ```bash
+hops local gitops environment .gitops/local/environment.yaml --once
 hops local status --name feature-auth
 ```
 
-`local status` finds the controller-created Service by its standard
+Environment reconciliation finds the controller-created Service by its standard
 `gateway.networking.k8s.io/gateway-name` label, verifies the reserved NodePort,
 and reconciles every route hostname through Dory's custom-domain API. Multiple
 hostnames and worktree Environments share the cluster Gateway. Duplicate
 hostnames across Environments fail instead of silently stealing a route.
+`local status` never changes provider selection, host-access processes, or
+ingress registrations.
 
 The normal result has no visible port:
 
@@ -457,6 +460,20 @@ is no app-specific host file entry, local proxy process, or visible port.
 
 Environment and Cluster `--down` remove only the Dory custom domains recorded
 for the affected Environment. They do not remove another worktree's routes.
+
+Direct host access to Kubernetes Service FQDNs is an explicit compatibility
+and debugging mode. It modifies local DNS configuration and maintains
+per-Service kubectl port-forwards, so normal Gateway API browser workflows do
+not enable it:
+
+```bash
+hops local dns --name feature-auth
+hops local dns --name feature-auth --down
+```
+
+The first command enables or repairs that Environment's direct Service access;
+the second removes only that optional access while leaving ingress and the
+Environment running.
 
 Every successful Cluster pass atomically updates its inventory. A removed
 Cluster manifest is pruned only by its recorded API version, kind, namespace,

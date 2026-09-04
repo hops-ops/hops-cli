@@ -120,8 +120,10 @@ not a host `make run` you invent.
    is not “fixed” until:
    - API log shows `listening on http://0.0.0.0:8791` (not mid-`Compiling`)
    - UI log shows Vite ready
-3. **Hit the real URLs** (cluster DNS / host FQDN path), not only pod logs:
+3. **Prefer the Gateway API `.localhost` URL.** When debugging a Service that
+   has no HTTPRoute, explicitly enable the cluster DNS / host FQDN path first:
    ```bash
+   hops local dns --name dogfood
    UI=http://e2e-ui-ui.dogfood.svc.cluster.local:5180
    API=http://e2e-ui-api.dogfood.svc.cluster.local:8791
    curl -sS -o /dev/null -w '%{http_code}\n' "$UI/" "$UI/chat"
@@ -140,8 +142,9 @@ not a host `make run` you invent.
    experiments, or long GraphQL protocol essays when the pod never finished
    building. **Do not** declare success without curling the live UI paths.
 
-**Kube context:** use `kind-hops`; map host access uses cluster FQDNs
-(`*.svc.cluster.local`), not `localhost` alone.
+**Kube context:** use `kind-hops`. Browser ingress uses HTTPS `.localhost`
+routes automatically; optional direct Service access uses cluster FQDNs
+(`*.svc.cluster.local`) only after `hops local dns` is requested.
 
 ## Layout
 

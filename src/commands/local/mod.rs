@@ -2,6 +2,7 @@ mod aws;
 pub mod backend;
 mod cloudflare;
 mod destroy;
+mod dns;
 mod doctor;
 mod down;
 mod github;
@@ -150,6 +151,8 @@ pub enum LocalCommands {
     Down(down::DownArgs),
     /// Show local workbench workspace status and app URLs
     Status(status::StatusArgs),
+    /// Explicitly enable or repair direct Kubernetes Service DNS on this host
+    Dns(dns::DnsArgs),
     /// Local gitops: `cluster` (shared CP) or `environment` (app namespaces)
     Gitops(gitops::GitopsArgs),
     /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
@@ -184,6 +187,15 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
                 dory_name: args.dory_name.as_deref(),
             },
         );
+    }
+
+    // Observation and explicit Service-DNS access use each Environment's
+    // durable cluster binding. They do not resolve or persist a new provider
+    // selection as a side effect of status/access inspection.
+    match &args.command {
+        LocalCommands::Status(status_args) => return status::run(status_args),
+        LocalCommands::Dns(dns_args) => return dns::run(dns_args),
+        _ => {}
     }
 
     if let Some(name) = args
@@ -229,7 +241,9 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Resize(resize_args) => resize::run(backend, resize_args),
         LocalCommands::Doctor => doctor::run(),
         LocalCommands::Down(down_args) => down::run(down_args),
-        LocalCommands::Status(status_args) => status::run(status_args),
+        LocalCommands::Status(_) | LocalCommands::Dns(_) => {
+            unreachable!("status and dns return before provider activation")
+        }
         LocalCommands::Gitops(gitops_args) => gitops::run_environment_command(
             gitops_args,
             workbench::definition::ClusterOverrides {
@@ -645,6 +659,38 @@ mod tests {
                 Cli::try_parse_from(["hops-local-test", removed]).is_err(),
                 "interim command {removed:?} must stay removed"
             );
+        }
+    }
+
+    #[test]
+    fn status_is_observational_and_direct_service_dns_is_explicit() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        #[command(name = "hops-local-test")]
+        struct Cli {
+            #[command(flatten)]
+            local: LocalArgs,
+        }
+
+        let status = Cli::try_parse_from(["hops-local-test", "status", "--name", "feature"])
+            .expect("parse status");
+        match status.local.command {
+            LocalCommands::Status(status) => {
+                assert_eq!(status.name.as_deref(), Some("feature"));
+                assert!(!status.no_heal);
+            }
+            other => panic!("expected status, got {other:?}"),
+        }
+
+        let dns = Cli::try_parse_from(["hops-local-test", "dns", "--name", "feature", "--down"])
+            .expect("parse explicit Service DNS teardown");
+        match dns.local.command {
+            LocalCommands::Dns(dns) => {
+                assert_eq!(dns.name.as_deref(), Some("feature"));
+                assert!(dns.down);
+            }
+            other => panic!("expected dns, got {other:?}"),
         }
     }
 }
