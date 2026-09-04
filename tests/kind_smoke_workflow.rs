@@ -24,3 +24,17 @@ fn path_install_waits_for_canonical_oci_package_name() {
         "Kind smoke must not wait for the package's short internal metadata name"
     );
 }
+
+#[test]
+fn kind_backend_smoke_is_opt_in() {
+    let text = workflow_text();
+    for required in [
+        "workflow_dispatch:",
+        "contains(github.event.pull_request.labels.*.name, 'test-kind')",
+    ] {
+        assert!(
+            text.contains(required),
+            "Kind smoke must remain opt-in through manual dispatch or the test-kind label"
+        );
+    }
+}
