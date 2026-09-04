@@ -615,6 +615,18 @@ fn run_vault(args: &VaultSyncArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+pub(super) fn sync_vault_path(path: &Path) -> Result<(), Box<dyn Error>> {
+    run_vault(&VaultSyncArgs {
+        secret_path: Some(path.display().to_string()),
+        address: None,
+        mount: None,
+        path_prefix: None,
+        port_forward: false,
+        no_port_forward: false,
+        yes: true,
+    })
+}
+
 #[cfg(test)]
 fn collect_desired_vault_secrets(
     root: &Path,

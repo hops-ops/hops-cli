@@ -266,6 +266,9 @@ fn run_cluster_reconcile_loop(
             )
             .into());
         }
+        if !reconcile_cluster_secret_sync(&definition, dry_run) {
+            return Ok(());
+        }
         reconcile_cluster_environments_with_retry(&definition, dry_run)?;
         Ok(())
     };
@@ -278,9 +281,58 @@ fn run_cluster_reconcile_loop(
     run_cluster_watch(
         &cluster,
         &definition.cluster.mount_root,
+        definition
+            .cluster
+            .secret_sync
+            .as_ref()
+            .map(|secret_sync| secret_sync.path.as_path()),
         args.debounce,
         do_once,
     )
+}
+
+fn reconcile_cluster_secret_sync(
+    definition: &super::workbench::definition::LoadedDefinition,
+    dry_run: bool,
+) -> bool {
+    run_secret_sync_phase(
+        definition
+            .cluster
+            .secret_sync
+            .as_ref()
+            .map(|secret_sync| secret_sync.path.as_path()),
+        dry_run,
+        crate::commands::secrets::sync_vault_path,
+    )
+}
+
+fn run_secret_sync_phase<F>(secret_sync_path: Option<&Path>, dry_run: bool, sync: F) -> bool
+where
+    F: FnOnce(&Path) -> Result<(), Box<dyn Error>>,
+{
+    let Some(secret_sync_path) = secret_sync_path else {
+        return true;
+    };
+    if dry_run {
+        log::info!(
+            "Dry-run leaves configured local Vault inputs at {} unchanged",
+            secret_sync_path.display()
+        );
+        return true;
+    }
+
+    match sync(secret_sync_path) {
+        Ok(()) => true,
+        Err(error) => {
+            // A failed sync must not replace a healthy Environment with a
+            // partial render. The controller remains alive so a credential,
+            // Vault recovery, or watched input change can converge it later.
+            log::error!(
+                "Local Vault secret sync failed; Environment reconciliation is deferred: {error}"
+            );
+            false
+        }
+    }
 }
 
 fn reconcile_cluster_environments(
@@ -865,6 +917,7 @@ fn resolve_worktree_delivery(
 fn run_cluster_watch<F>(
     cluster: &Path,
     project_root: &Path,
+    secret_sync_root: Option<&Path>,
     debounce_secs: u64,
     mut rebuild: F,
 ) -> Result<(), Box<dyn Error>>
@@ -875,6 +928,7 @@ where
     let (tx, rx) = mpsc::channel();
     let cluster_c = cluster.to_path_buf();
     let project_root_c = project_root.to_path_buf();
+    let secret_sync_root_c = secret_sync_root.map(Path::to_path_buf);
 
     let mut watcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
@@ -883,9 +937,12 @@ where
                     if should_ignore_watch_path(p) {
                         continue;
                     }
-                    if should_reconcile_cluster_change(p, &cluster_c)
-                        || is_controller_owned_path(p, &project_root_c)
-                    {
+                    if is_cluster_watch_path(
+                        p,
+                        &cluster_c,
+                        &project_root_c,
+                        secret_sync_root_c.as_deref(),
+                    ) {
                         let _ = tx.send(());
                         break;
                     }
@@ -899,7 +956,7 @@ where
         watcher.watch(project_root, RecursiveMode::Recursive)?;
     }
     log::info!(
-        "Watching Cluster tree {} and project Environment/deploy paths (debounce {}s). Ctrl+C to stop.",
+        "Watching Cluster tree {}, project Environment/deploy paths, and configured secret inputs (debounce {}s). Ctrl+C to stop.",
         cluster.display(),
         debounce_secs
     );
@@ -914,6 +971,17 @@ where
             Err(e) => log::error!("Cluster reconcile failed: {e}"),
         }
     }
+}
+
+fn is_cluster_watch_path(
+    path: &Path,
+    cluster: &Path,
+    project_root: &Path,
+    secret_sync_root: Option<&Path>,
+) -> bool {
+    should_reconcile_cluster_change(path, cluster)
+        || is_controller_owned_path(path, project_root)
+        || secret_sync_root.is_some_and(|root| path.starts_with(root))
 }
 
 fn is_controller_owned_path(path: &Path, project_root: &Path) -> bool {
@@ -1073,6 +1141,45 @@ spec:
             source,
             &chart_roots,
         ));
+    }
+
+    #[test]
+    fn cluster_watch_includes_only_the_configured_secret_input_tree() {
+        let project_root = Path::new("/project");
+        let cluster = project_root.join(".gitops/local/cluster");
+        let secret_root = project_root.join("secrets/vault");
+
+        assert!(is_cluster_watch_path(
+            &secret_root.join("harmony/application/.env"),
+            &cluster,
+            project_root,
+            Some(&secret_root),
+        ));
+        assert!(!is_cluster_watch_path(
+            &project_root.join("secrets/not-configured/.env"),
+            &cluster,
+            project_root,
+            Some(&secret_root),
+        ));
+    }
+
+    #[test]
+    fn failed_secret_sync_defers_environment_phase_without_mutating_dry_runs() {
+        let path = Path::new("/project/secrets/vault");
+        let mut calls = 0;
+        let ready = run_secret_sync_phase(Some(path), false, |_| {
+            calls += 1;
+            Err("vault unavailable".into())
+        });
+        assert!(!ready);
+        assert_eq!(calls, 1);
+
+        let ready = run_secret_sync_phase(Some(path), true, |_| {
+            calls += 1;
+            Ok(())
+        });
+        assert!(ready);
+        assert_eq!(calls, 1);
     }
 
     #[test]
