@@ -10,7 +10,6 @@ use serde_yaml::Value;
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 
 pub(crate) fn run(args: &ObserveArgs) -> Result<(), Box<dyn Error>> {
     let specs = load_specs()?;
@@ -231,12 +230,14 @@ fn generate_eks_kubeconfig(
             "hops-xr-observe-{cluster_name}-{}-{attempt}.kubeconfig",
             std::process::id()
         ));
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&path)
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
             Ok(mut file) => {
                 file.write_all(kubeconfig.as_bytes())?;
                 return Ok(path);
