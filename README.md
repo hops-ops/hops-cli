@@ -230,6 +230,10 @@ spec:
   mountRoot: ../..
   # Optional; defaults to localhost. A leading dot is accepted and normalized.
   localDomain: gitkb.localhost
+  # Optional shared namespaces whose Cluster-owned HTTPRoutes need browser access.
+  browserIngress:
+    namespaces:
+      - platform-auth
   manifests:
     path: .gitops/local/cluster
   controlPlane:
@@ -248,6 +252,12 @@ Helm deploy. It must be `localhost` or a subdomain ending in `.localhost`.
 Omitting it preserves the default `<service>.<environment>.localhost` shape;
 for example, `gitkb.localhost` lets a chart render
 `<service>.<environment>.gitkb.localhost`.
+
+`browserIngress.namespaces` explicitly bounds discovery of HTTPRoutes created
+by Cluster-owned manifests or composites outside Environment namespaces. Hops
+registers those route hostnames through the same Dory Gateway path and records
+them under Cluster ownership. Omit the field when the Cluster has no shared
+browser endpoints.
 
 ### Environment definition
 
@@ -396,7 +406,8 @@ the pod through the mounted source tree; they do not require a Helm reconcile.
 An Environment exposes browser-facing HTTPS names by applying ordinary Gateway
 API `HTTPRoute` resources. Hops discovers their `spec.hostnames` and Gateway
 parent references; no extra Environment fields or Hops-specific ingress
-objects are required.
+objects are required. Shared Cluster components use the same route contract and
+declare their owning namespaces through `Cluster.spec.browserIngress`.
 
 Local Helm charts compose route names from the protected values injected by
 Hops. The application owns any service prefix, including choosing no prefix for
@@ -442,8 +453,10 @@ hops local status --name feature-auth
 Environment reconciliation finds the controller-created Service by its standard
 `gateway.networking.k8s.io/gateway-name` label, verifies the reserved NodePort,
 and reconciles every route hostname through Dory's custom-domain API. Multiple
-hostnames and worktree Environments share the cluster Gateway. Duplicate
-hostnames across Environments fail instead of silently stealing a route.
+hostnames, shared Cluster routes, and worktree Environments share the cluster
+Gateway. Duplicate hostnames across ingress owners fail instead of silently
+stealing a route. Cluster down removes Cluster-owned Dory registrations along
+with the Environment registrations it already owns.
 `local status` never changes provider selection, host-access processes, or
 ingress registrations.
 

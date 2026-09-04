@@ -73,8 +73,16 @@ pub struct ClusterDefinition {
     pub mount_root: PathBuf,
     pub manifests_path: PathBuf,
     pub local_domain: String,
+    pub browser_ingress: BrowserIngressDefinition,
     pub control_plane: ControlPlaneDefinition,
     pub secret_sync: Option<SecretSyncDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BrowserIngressDefinition {
+    /// Namespaces containing Cluster-owned HTTPRoutes that should be exposed
+    /// through the local browser ingress adapter.
+    pub namespaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -274,9 +282,18 @@ struct ClusterSpec {
     #[serde(default)]
     local_domain: Option<String>,
     #[serde(default)]
+    browser_ingress: Option<BrowserIngressSpec>,
+    #[serde(default)]
     control_plane: Option<ControlPlaneSpec>,
     #[serde(default)]
     secret_sync: Option<SecretSyncSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserIngressSpec {
+    #[serde(default)]
+    namespaces: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -550,6 +567,26 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
         })
         .transpose()?;
     let local_domain = normalize_local_domain(raw_cluster.spec.local_domain.as_deref())?;
+    let browser_ingress = raw_cluster
+        .spec
+        .browser_ingress
+        .map(|browser_ingress| -> Result<BrowserIngressDefinition, Box<dyn Error>> {
+            let mut namespaces = BTreeSet::new();
+            for namespace in browser_ingress.namespaces {
+                validate_dns_label("Cluster.spec.browserIngress.namespaces entry", &namespace)?;
+                if !namespaces.insert(namespace.clone()) {
+                    return Err(format!(
+                        "Cluster.spec.browserIngress.namespaces contains duplicate namespace {namespace:?}"
+                    )
+                    .into());
+                }
+            }
+            Ok(BrowserIngressDefinition {
+                namespaces: namespaces.into_iter().collect(),
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
     let control_plane = raw_cluster
         .spec
         .control_plane
@@ -577,6 +614,7 @@ pub fn load_definition(path: &Path) -> Result<LoadedDefinition, Box<dyn Error>> 
             mount_root,
             manifests_path,
             local_domain,
+            browser_ingress,
             control_plane,
             secret_sync,
         },
@@ -1269,6 +1307,46 @@ spec:
                 "{invalid:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn parses_and_validates_cluster_browser_ingress_namespaces() {
+        let fixture = Fixture::new();
+        let yaml = valid_yaml().replacen(
+            "  manifests:",
+            "  browserIngress:\n    namespaces:\n      - harmony-auth\n      - observability\n  manifests:",
+            1,
+        );
+        let loaded = load_definition(&fixture.write(&yaml)).unwrap();
+        assert_eq!(
+            loaded.cluster.browser_ingress.namespaces,
+            vec!["harmony-auth", "observability"]
+        );
+
+        for invalid in ["Harmony-Auth", "harmony_auth", " harmony-auth"] {
+            let yaml = valid_yaml().replacen(
+                "  manifests:",
+                &format!("  browserIngress:\n    namespaces:\n      - {invalid:?}\n  manifests:"),
+                1,
+            );
+            let error = load_definition(&fixture.write(&yaml)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Cluster.spec.browserIngress.namespaces entry"),
+                "{invalid:?}: {error}"
+            );
+        }
+
+        let duplicate = valid_yaml().replacen(
+            "  manifests:",
+            "  browserIngress:\n    namespaces:\n      - harmony-auth\n      - harmony-auth\n  manifests:",
+            1,
+        );
+        assert!(load_definition(&fixture.write(&duplicate))
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate namespace"));
     }
 
     #[test]
