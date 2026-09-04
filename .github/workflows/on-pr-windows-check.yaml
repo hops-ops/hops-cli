@@ -22,7 +22,7 @@ jobs:
           - i686-pc-windows-msvc
           - aarch64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
