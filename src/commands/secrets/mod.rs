@@ -52,6 +52,12 @@ pub enum SecretsCommands {
     Sync(sync::SyncArgs),
 }
 
+/// Synchronize one controller-declared ignored input tree through the same
+/// value-safe Vault adapter used by `hops secrets sync vault`.
+pub(crate) fn sync_vault_path(path: &Path) -> Result<(), Box<dyn Error>> {
+    sync::sync_vault_path(path)
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct RepoConfig {
     #[serde(default)]
