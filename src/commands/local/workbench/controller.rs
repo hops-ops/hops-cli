@@ -199,19 +199,9 @@ pub fn acquire_controller(
                 });
             }
             Ok(false) => {
-                let current_text = fs::read_to_string(&path).map_err(|read_error| {
-                    format!(
-                        "GitOps controller lock {} exists but cannot be read: {read_error}",
-                        path.display()
-                    )
-                })?;
-                let current: ControllerLease =
-                    serde_json::from_str(&current_text).map_err(|parse| {
-                        format!(
-                            "GitOps controller lock {} is malformed; refusing adoption: {parse}",
-                            path.display()
-                        )
-                    })?;
+                let Some(current) = read_controller_lease_if_present(&path)? else {
+                    continue;
+                };
                 if controller_lease_matches(&current, &lease) {
                     if current.pid == std::process::id() || controller_pid_is_live(current.pid) {
                         return Ok(ControllerHandle {
@@ -270,17 +260,37 @@ pub fn acquire_controller(
 }
 
 fn create_controller_lock(path: &Path, lease: &ControllerLease) -> Result<bool, Box<dyn Error>> {
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
     let encoded = serde_json::to_vec_pretty(lease)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("controller lock path has no UTF-8 filename")?;
+    let pending_path = path.with_file_name(format!(
+        ".{file_name}.pending-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending_path)?;
     if let Err(error) = file.write_all(&encoded).and_then(|_| file.sync_all()) {
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&pending_path);
         return Err(error.into());
     }
-    Ok(true)
+    let published = match fs::hard_link(&pending_path, path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = fs::remove_file(&pending_path) {
+        log::warn!(
+            "Could not remove pending controller lock {}: {}",
+            pending_path.display(),
+            error
+        );
+    }
+    published
 }
 
 fn controller_lease_matches(current: &ControllerLease, expected: &ControllerLease) -> bool {
@@ -927,55 +937,57 @@ mod tests {
     fn concurrent_dead_lock_recovery_establishes_one_owner() {
         use std::sync::{Arc, Barrier};
 
-        let root = std::env::temp_dir().join(format!(
-            "hops-controller-race-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let definition = root.join("project/.gitops/local/cluster.yaml");
-        fs::create_dir_all(definition.parent().unwrap()).unwrap();
-        let cluster_name = format!("race-{}", uuid::Uuid::new_v4().simple());
-        let lock = controller_lock_path(&cluster_name).unwrap();
-        fs::create_dir_all(lock.parent().unwrap()).unwrap();
-        let stale = ControllerLease {
-            schema_version: CONTROLLER_SCHEMA_VERSION,
-            mode: CONTROLLER_MODE.into(),
-            cluster_name: cluster_name.clone(),
-            definition_path: definition.to_string_lossy().into_owned(),
-            kube_context: "kind-race".into(),
-            pid: i32::MAX as u32,
-            started_at: 0,
-        };
-        fs::write(&lock, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+        for _ in 0..16 {
+            let root = std::env::temp_dir().join(format!(
+                "hops-controller-race-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let definition = root.join("project/.gitops/local/cluster.yaml");
+            fs::create_dir_all(definition.parent().unwrap()).unwrap();
+            let cluster_name = format!("race-{}", uuid::Uuid::new_v4().simple());
+            let lock = controller_lock_path(&cluster_name).unwrap();
+            fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            let stale = ControllerLease {
+                schema_version: CONTROLLER_SCHEMA_VERSION,
+                mode: CONTROLLER_MODE.into(),
+                cluster_name: cluster_name.clone(),
+                definition_path: definition.to_string_lossy().into_owned(),
+                kube_context: "kind-race".into(),
+                pid: i32::MAX as u32,
+                started_at: 0,
+            };
+            fs::write(&lock, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
 
-        let contenders = 8;
-        let barrier = Arc::new(Barrier::new(contenders));
-        let mut threads = Vec::new();
-        for _ in 0..contenders {
-            let barrier = Arc::clone(&barrier);
-            let cluster_name = cluster_name.clone();
-            let definition = definition.clone();
-            threads.push(std::thread::spawn(move || {
-                let result = acquire_controller(&cluster_name, &definition, "kind-race", false)
-                    .map_err(|error| error.to_string());
-                let is_owner = result
-                    .as_ref()
-                    .map(ControllerHandle::is_owner)
-                    .unwrap_or(false);
-                barrier.wait();
-                result.map(|_| is_owner)
-            }));
+            let contenders = 8;
+            let barrier = Arc::new(Barrier::new(contenders));
+            let mut threads = Vec::new();
+            for _ in 0..contenders {
+                let barrier = Arc::clone(&barrier);
+                let cluster_name = cluster_name.clone();
+                let definition = definition.clone();
+                threads.push(std::thread::spawn(move || {
+                    let result = acquire_controller(&cluster_name, &definition, "kind-race", false)
+                        .map_err(|error| error.to_string());
+                    let is_owner = result
+                        .as_ref()
+                        .map(ControllerHandle::is_owner)
+                        .unwrap_or(false);
+                    barrier.wait();
+                    result.map(|_| is_owner)
+                }));
+            }
+            let owner_count = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap().unwrap())
+                .filter(|is_owner| *is_owner)
+                .count();
+            assert_eq!(owner_count, 1);
+            assert!(!lock.exists());
+
+            let _ = fs::remove_dir_all(lock.parent().unwrap());
+            let _ = fs::remove_dir_all(root);
         }
-        let owner_count = threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap().unwrap())
-            .filter(|is_owner| *is_owner)
-            .count();
-        assert_eq!(owner_count, 1);
-        assert!(!lock.exists());
-
-        let _ = fs::remove_dir_all(lock.parent().unwrap());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
