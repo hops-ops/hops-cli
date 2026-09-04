@@ -3,6 +3,7 @@ mod encrypt;
 mod init;
 mod list;
 mod sync;
+mod vault;
 
 use clap::{Args, Subcommand};
 use rusoto_core::{HttpClient, Region};
@@ -23,6 +24,13 @@ const DEFAULT_AWS_REGION: &str = "us-east-1";
 const DEFAULT_AWS_SECRET_SUBDIR: &str = "aws";
 const DEFAULT_GITHUB_SECRET_SUBDIR: &str = "github";
 const DEFAULT_GITHUB_SHARED_SUBDIR: &str = "_shared";
+const DEFAULT_VAULT_SECRET_SUBDIR: &str = "vault";
+const DEFAULT_VAULT_ADDRESS: &str = "http://127.0.0.1:8200";
+const DEFAULT_VAULT_MOUNT: &str = "secret";
+const DEFAULT_VAULT_TOKEN_ENV: &str = "VAULT_TOKEN";
+const DEFAULT_VAULT_KUBE_NAMESPACE: &str = "vault";
+const DEFAULT_VAULT_KUBE_SERVICE: &str = "vault";
+const DEFAULT_VAULT_KUBE_LOCAL_PORT: u16 = 8200;
 
 #[derive(Args, Debug)]
 pub struct SecretsArgs {
@@ -40,7 +48,7 @@ pub enum SecretsCommands {
     Decrypt(decrypt::DecryptArgs),
     /// List local and remote secrets
     List,
-    /// Sync secrets to AWS Secrets Manager
+    /// Sync secrets to a configured destination
     Sync(sync::SyncArgs),
 }
 
@@ -58,6 +66,8 @@ struct SecretsConfig {
     #[serde(default)]
     github: GithubSecretsConfig,
     plaintext_dir: Option<String>,
+    #[serde(default)]
+    vault: VaultSecretsConfig,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -79,6 +89,27 @@ struct GithubSecretsConfig {
 struct GithubSharedSecretsConfig {
     path: Option<String>,
     repos: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct VaultSecretsConfig {
+    path: Option<String>,
+    address: Option<String>,
+    mount: Option<String>,
+    version: Option<String>,
+    path_prefix: Option<String>,
+    token_env: Option<String>,
+    #[serde(default)]
+    kube: VaultKubeConfig,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct VaultKubeConfig {
+    enabled: Option<bool>,
+    context: Option<String>,
+    namespace: Option<String>,
+    service: Option<String>,
+    local_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +219,55 @@ fn configured_github_settings() -> Result<GithubSecretsRuntimeConfig, Box<dyn Er
     })
 }
 
+fn configured_vault_settings() -> Result<VaultSecretsRuntimeConfig, Box<dyn Error>> {
+    let config = load_config()?;
+    let vault = config.secrets.vault;
+    let env_address = std::env::var("VAULT_ADDR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let version = vault.version.unwrap_or_else(|| "v2".to_string());
+    if version != "v1" && version != "v2" {
+        return Err(
+            format!("unsupported secrets.vault.version {version:?}: expected v1 or v2").into(),
+        );
+    }
+    let kube = vault.kube;
+    let mut settings = VaultSecretsRuntimeConfig {
+        path: vault
+            .path
+            .unwrap_or_else(|| DEFAULT_VAULT_SECRET_SUBDIR.to_string()),
+        address: vault
+            .address
+            .filter(|value| !value.trim().is_empty())
+            .or(env_address)
+            .unwrap_or_else(|| DEFAULT_VAULT_ADDRESS.to_string()),
+        mount: vault
+            .mount
+            .unwrap_or_else(|| DEFAULT_VAULT_MOUNT.to_string()),
+        version,
+        path_prefix: vault.path_prefix.unwrap_or_default(),
+        token_env: vault
+            .token_env
+            .unwrap_or_else(|| DEFAULT_VAULT_TOKEN_ENV.to_string()),
+        kube_enabled: kube.enabled.unwrap_or(true),
+        kube_context: kube.context,
+        kube_namespace: kube
+            .namespace
+            .unwrap_or_else(|| DEFAULT_VAULT_KUBE_NAMESPACE.to_string()),
+        kube_service: kube
+            .service
+            .unwrap_or_else(|| DEFAULT_VAULT_KUBE_SERVICE.to_string()),
+        kube_local_port: kube.local_port.unwrap_or(DEFAULT_VAULT_KUBE_LOCAL_PORT),
+    };
+    settings.address = settings.address.trim().trim_end_matches('/').to_string();
+    settings.mount = vault::validate_vault_path(&settings.mount, "secrets.vault.mount", false)?;
+    settings.path_prefix =
+        vault::validate_vault_path(&settings.path_prefix, "secrets.vault.path_prefix", true)?;
+    vault::validate_settings(&settings)?;
+    Ok(settings)
+}
+
 pub(crate) fn configured_secret_paths() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     let config = load_config()?;
     let plaintext = config
@@ -215,6 +295,21 @@ struct GithubSecretsRuntimeConfig {
     path: String,
     shared_path: String,
     shared_repos: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct VaultSecretsRuntimeConfig {
+    path: String,
+    address: String,
+    mount: String,
+    version: String,
+    path_prefix: String,
+    token_env: String,
+    kube_enabled: bool,
+    kube_context: Option<String>,
+    kube_namespace: String,
+    kube_service: String,
+    kube_local_port: u16,
 }
 
 fn selected_aws_profile() -> Option<String> {

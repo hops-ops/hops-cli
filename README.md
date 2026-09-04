@@ -346,7 +346,10 @@ The controller lock is stored under
 become a competing watcher. Conflicts for an existing backend are rejected
 rather than implicitly adopted. If the backend itself was deleted, Hops
 discards obsolete inventory and stale ownership before recreating it; a still
-running controller process must be stopped first.
+running controller process must be stopped first. If the backend is still
+running but an exact matching lock records a dead process, Hops serializes the
+handoff and recovers that lock automatically. Live owners, malformed locks,
+and locks for a different definition or context still fail closed.
 
 ### Add a worktree
 
@@ -521,7 +524,7 @@ ownership from names alone.
 - `config`
   - Build, install, reload, and uninstall Crossplane configuration packages against the connected cluster.
 - `secrets`
-  - Initialize secrets config, encrypt and decrypt local secrets, and sync repo-managed secrets to AWS Secrets Manager or GitHub repository secrets.
+  - Initialize secrets config, encrypt and decrypt local secrets, and sync repo-managed secrets to AWS Secrets Manager, GitHub repository secrets, or Vault KV.
 - `validate`
   - Generate configuration manifests from Upbound-format XRD projects for validation workflows.
 - `xr`
@@ -531,7 +534,7 @@ Microservice scaffolding previously available as `hops service` now lives in the
 
 ## Secrets
 
-`hops secrets init` sets up local secrets directories, `.sops.yaml`, and `.hops.yaml` so plaintext secrets can be encrypted locally and synced to AWS Secrets Manager or GitHub repository secrets.
+`hops secrets init` sets up local secrets directories, `.sops.yaml`, and `.hops.yaml` so plaintext secrets can be encrypted locally and synced to AWS Secrets Manager, GitHub repository secrets, or Vault KV.
 
 Typical layout:
 
@@ -564,6 +567,17 @@ secrets:
       repos:
         - repo-a
         - repo-b
+  vault:
+    path: vault
+    address: http://127.0.0.1:8200
+    mount: secret
+    version: v2
+    token_env: VAULT_TOKEN
+    kube:
+      enabled: true
+      namespace: vault
+      service: vault
+      local_port: 8200
 ```
 
 Encrypt and decrypt operate from the configured roots:
@@ -618,6 +632,30 @@ Examples:
 - `secrets/github/repo-a/actions.json` with `{"SLACK_WEBHOOK":"..."}` -> GitHub secret `SLACK_WEBHOOK` in `repo-a`
 - `secrets/github/repo-a/.env` with `NPM_TOKEN=...` -> GitHub secret `NPM_TOKEN` in `repo-a`
 - `secrets/github/_shared/ORG_TOKEN` -> synced to every configured shared target repo
+
+Vault sync reads only untracked, gitignored files below
+`<plaintext_dir>/<vault.path>`:
+
+```bash
+export VAULT_TOKEN=root # local development only
+hops secrets sync vault --no-port-forward --yes
+```
+
+Vault rules:
+
+- A `.json` object becomes one KV path; nested JSON values are stored as JSON strings.
+- Plain files in a directory roll up to one KV path keyed by filename.
+- A `.env` file rolls up to its directory's KV path as key/value properties.
+- Paths are relative to the configured Vault root; `path_prefix` optionally prepends a remote prefix.
+- KV v1 and v2 are supported. Unchanged maps are skipped and unspecified remote paths are never pruned.
+- The writer token is read only from `VAULT_TOKEN` (or `token_env`) and values are sent in the HTTP request body, never command arguments or logs.
+- Every input is validated before Vault is contacted. Symlinks, traversal, tracked files, non-ignored files, collisions, invalid paths, binary input, and oversized batches fail closed.
+- When the address is unreachable and `kube.enabled` is true, Hops opens a quiet `kubectl port-forward`; use `--no-port-forward` to require the configured address.
+
+Examples:
+
+- `secrets/vault/harmony/stripe/.env` -> KV `harmony/stripe`
+- `secrets/vault/harmony/oidc.json` -> KV `harmony/oidc`
 
 ## Create a Local Control Plane (standalone mode)
 

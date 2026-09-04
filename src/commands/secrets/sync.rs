@@ -1,6 +1,7 @@
 use super::{
     aws_clients, collect_local_secret_names, configured_aws_settings, configured_github_settings,
-    configured_secret_paths, derive_secret_name, require_command, run_command_output_string,
+    configured_secret_paths, configured_vault_settings, derive_secret_name, require_command,
+    run_command_output_string, vault,
 };
 use clap::{Args, Subcommand};
 use dialoguer::Confirm;
@@ -9,8 +10,8 @@ use rusoto_secretsmanager::{
     PutSecretValueRequest, SecretsManager, SecretsManagerClient, Tag, TagResourceRequest,
 };
 use rusoto_sts::{GetCallerIdentityRequest, Sts};
-use serde_json::Value as JsonValue;
-use std::collections::{HashMap, HashSet};
+use serde_json::{Map, Value as JsonValue};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -31,6 +32,8 @@ pub enum SyncTarget {
     Aws(AwsSyncArgs),
     /// Sync secrets to GitHub repository secrets
     Github(GithubSyncArgs),
+    /// Sync ignored local secrets to HashiCorp Vault KV
+    Vault(VaultSyncArgs),
 }
 
 #[derive(Args, Debug)]
@@ -75,10 +78,42 @@ pub struct GithubSyncArgs {
     pub yes: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct VaultSyncArgs {
+    /// Secret path to sync; must be inside the configured Vault secrets root
+    #[arg(long)]
+    pub secret_path: Option<String>,
+
+    /// Override secrets.vault.address or VAULT_ADDR
+    #[arg(long)]
+    pub address: Option<String>,
+
+    /// Override the configured KV mount
+    #[arg(long)]
+    pub mount: Option<String>,
+
+    /// Override the remote path prefix
+    #[arg(long)]
+    pub path_prefix: Option<String>,
+
+    /// Force a kubectl port-forward to the configured Vault service
+    #[arg(long, conflicts_with = "no_port_forward")]
+    pub port_forward: bool,
+
+    /// Fail instead of opening a port-forward when Vault is unreachable
+    #[arg(long)]
+    pub no_port_forward: bool,
+
+    /// Skip confirmation prompts
+    #[arg(short, long)]
+    pub yes: bool,
+}
+
 pub fn run(args: &SyncArgs) -> Result<(), Box<dyn Error>> {
     match &args.target {
         SyncTarget::Aws(aws_args) => run_aws(aws_args),
         SyncTarget::Github(github_args) => run_github(github_args),
+        SyncTarget::Vault(vault_args) => run_vault(vault_args),
     }
 }
 
@@ -435,6 +470,492 @@ fn sync_aws_secret(
         return;
     }
     *synced += 1;
+}
+
+const MAX_VAULT_FILES: usize = 512;
+const MAX_VAULT_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_VAULT_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq)]
+struct DesiredVaultSecret {
+    path: String,
+    data: Map<String, JsonValue>,
+    sources: Vec<PathBuf>,
+}
+
+fn run_vault(args: &VaultSyncArgs) -> Result<(), Box<dyn Error>> {
+    let mut settings = configured_vault_settings()?;
+    if let Some(mount) = &args.mount {
+        settings.mount = vault::validate_vault_path(mount, "--mount", false)?;
+    }
+    if let Some(prefix) = &args.path_prefix {
+        settings.path_prefix = vault::validate_vault_path(prefix, "--path-prefix", true)?;
+    }
+
+    let (plaintext_dir, _) = configured_secret_paths()?;
+    let configured_subdir = Path::new(&settings.path);
+    if settings.path.trim().is_empty()
+        || configured_subdir.is_absolute()
+        || configured_subdir.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::CurDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err("secrets.vault.path must be a relative path without parent traversal".into());
+    }
+    let configured_root = plaintext_dir.join(&settings.path);
+    reject_symlink(&configured_root)?;
+    let naming_root = configured_root.canonicalize().map_err(|error| {
+        format!(
+            "configured Vault secrets root {} is unavailable: {error}",
+            configured_root.display()
+        )
+    })?;
+    let requested_source = args
+        .secret_path
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| configured_root.clone());
+    reject_symlink(&requested_source)?;
+    let secret_source = requested_source.canonicalize().map_err(|error| {
+        format!(
+            "Vault secrets path {} is unavailable: {error}",
+            requested_source.display()
+        )
+    })?;
+    if !secret_source.starts_with(&naming_root) {
+        return Err(format!(
+            "Vault secrets path {} must remain inside configured root {}",
+            secret_source.display(),
+            naming_root.display()
+        )
+        .into());
+    }
+
+    let source_files = collect_vault_source_files(&secret_source)?;
+    if source_files.is_empty() {
+        return Err(format!(
+            "no supported Vault secret files found under {}",
+            secret_source.display()
+        )
+        .into());
+    }
+    ensure_vault_sources_are_ignored(&source_files)?;
+    let desired = build_desired_vault_secrets(&naming_root, &source_files)?;
+
+    let port_forward = if args.no_port_forward {
+        Some(false)
+    } else if args.port_forward {
+        Some(true)
+    } else {
+        None
+    };
+    let address_label = args.address.as_deref().unwrap_or(&settings.address);
+    log::info!(
+        "Syncing {} Vault path(s) from {} to {} (mount {})",
+        desired.len(),
+        secret_source.display(),
+        address_label,
+        settings.mount
+    );
+    let session = vault::open_session(&settings, args.address.as_deref(), port_forward)?;
+
+    let mut changed = 0usize;
+    for secret in desired {
+        let remote_path = if settings.path_prefix.is_empty() {
+            secret.path.clone()
+        } else {
+            format!("{}/{}", settings.path_prefix, secret.path)
+        };
+        let existing = session.read_data(&remote_path)?;
+        if existing
+            .as_ref()
+            .is_some_and(|data| vault::json_maps_equal(data, &secret.data))
+        {
+            log::info!("Vault secret {remote_path:?} is unchanged; skipping");
+            continue;
+        }
+        let action = if existing.is_some() {
+            "Update"
+        } else {
+            "Create"
+        };
+        if !args.yes
+            && !confirm(
+                &format!(
+                    "{} Vault secret '{}' from {} local file(s)?",
+                    action,
+                    remote_path,
+                    secret.sources.len()
+                ),
+                true,
+            )
+        {
+            continue;
+        }
+        session.write_data(&remote_path, &secret.data)?;
+        log::info!(
+            "{}d Vault secret {:?} ({} keys)",
+            action,
+            remote_path,
+            secret.data.len()
+        );
+        changed += 1;
+    }
+    log::info!(
+        "Vault sync complete: {} local file(s) checked, {} path(s) changed",
+        source_files.len(),
+        changed
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+fn collect_desired_vault_secrets(
+    root: &Path,
+    source: &Path,
+) -> Result<Vec<DesiredVaultSecret>, Box<dyn Error>> {
+    let files = collect_vault_source_files(source)?;
+    build_desired_vault_secrets(root, &files)
+}
+
+fn collect_vault_source_files(source: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let mut files = Vec::new();
+    let mut file_count = 0usize;
+    let mut total_bytes = 0u64;
+    collect_vault_source_files_inner(source, &mut files, &mut file_count, &mut total_bytes)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_vault_source_files_inner(
+    path: &Path,
+    files: &mut Vec<PathBuf>,
+    file_count: &mut usize,
+    total_bytes: &mut u64,
+) -> Result<(), Box<dyn Error>> {
+    let metadata = checked_secret_metadata(path, file_count, total_bytes)?;
+    if metadata.is_dir() {
+        let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            collect_vault_source_files_inner(&entry.path(), files, file_count, total_bytes)?;
+        }
+    } else if metadata.is_file() {
+        files.push(path.to_path_buf());
+    } else {
+        return Err(format!("unsupported Vault secret input: {}", path.display()).into());
+    }
+    Ok(())
+}
+
+fn build_desired_vault_secrets(
+    root: &Path,
+    files: &[PathBuf],
+) -> Result<Vec<DesiredVaultSecret>, Box<dyn Error>> {
+    let mut desired = BTreeMap::new();
+    let mut loose = BTreeMap::<String, (Map<String, JsonValue>, Vec<PathBuf>)>::new();
+    for file in files {
+        if file.extension().and_then(|extension| extension.to_str()) == Some("json") {
+            collect_vault_json(root, file, &mut desired)?;
+            continue;
+        }
+        let parent = file
+            .parent()
+            .ok_or("Vault secret file has no parent directory")?;
+        let path = relative_vault_path(root, parent, None)?;
+        let (data, sources) = loose.entry(path).or_default();
+        merge_vault_loose_file(file, data)?;
+        sources.push(file.clone());
+    }
+    for (path, (data, sources)) in loose {
+        insert_desired_vault_secret(&mut desired, path, data, sources)?;
+    }
+    Ok(desired.into_values().collect())
+}
+
+fn collect_vault_json(
+    root: &Path,
+    file: &Path,
+    desired: &mut BTreeMap<String, DesiredVaultSecret>,
+) -> Result<(), Box<dyn Error>> {
+    let contents = read_secret_text(file)?;
+    let parsed: JsonValue = serde_json::from_str(&contents)
+        .map_err(|error| format!("invalid Vault JSON file {}: {error}", file.display()))?;
+    let data = vault::object_to_vault_map(&parsed, &file.display().to_string())?;
+    validate_vault_data_keys(&data, file)?;
+    if data.is_empty() {
+        return Err(format!("Vault JSON file {} contains no keys", file.display()).into());
+    }
+    let path = relative_vault_path(root, file, Some("json"))?;
+    insert_desired_vault_secret(desired, path, data, vec![file.to_path_buf()])
+}
+
+fn merge_vault_loose_file(
+    file: &Path,
+    destination: &mut Map<String, JsonValue>,
+) -> Result<(), Box<dyn Error>> {
+    let contents = read_secret_text(file)?;
+    let incoming = if is_dotenv_file(file) {
+        parse_vault_dotenv_secret_map(&contents)
+            .map_err(|error| format!("invalid Vault dotenv file {}: {error}", file.display()))?
+    } else {
+        let key = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("Vault secret filename is not UTF-8: {}", file.display()))?;
+        let mut data = Map::new();
+        data.insert(
+            key.to_string(),
+            JsonValue::String(contents.trim().to_string()),
+        );
+        data
+    };
+    validate_vault_data_keys(&incoming, file)?;
+    if incoming.is_empty() {
+        return Err(format!("Vault secret file {} contains no keys", file.display()).into());
+    }
+    for (key, value) in incoming {
+        if destination.insert(key.clone(), value).is_some() {
+            return Err(format!(
+                "Vault key {key:?} is defined more than once in {}",
+                file.parent().unwrap_or(file).display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn parse_vault_dotenv_secret_map(contents: &str) -> Result<Map<String, JsonValue>, String> {
+    let mut map = Map::new();
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line
+            .strip_prefix("export ")
+            .map(str::trim_start)
+            .unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("invalid dotenv entry on line {}", index + 1));
+        };
+        let key = key.trim();
+        let mut chars = key.chars();
+        let valid_start = chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+        if !valid_start || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+            return Err(format!("invalid dotenv key on line {}", index + 1));
+        }
+        if map
+            .insert(
+                key.to_string(),
+                JsonValue::String(strip_matching_quotes(value.trim()).to_string()),
+            )
+            .is_some()
+        {
+            return Err(format!("duplicate dotenv key on line {}", index + 1));
+        }
+    }
+    Ok(map)
+}
+
+fn validate_vault_data_keys(
+    data: &Map<String, JsonValue>,
+    source: &Path,
+) -> Result<(), Box<dyn Error>> {
+    for key in data.keys() {
+        if key.is_empty()
+            || key.len() > 256
+            || key == "."
+            || key == ".."
+            || key.chars().any(char::is_control)
+        {
+            return Err(format!(
+                "Vault key in {} is empty, reserved, too long, or contains control characters",
+                source.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn insert_desired_vault_secret(
+    desired: &mut BTreeMap<String, DesiredVaultSecret>,
+    path: String,
+    data: Map<String, JsonValue>,
+    sources: Vec<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    if desired.contains_key(&path) {
+        return Err(format!("multiple local inputs map to Vault path {path:?}").into());
+    }
+    desired.insert(
+        path.clone(),
+        DesiredVaultSecret {
+            path,
+            data,
+            sources,
+        },
+    );
+    Ok(())
+}
+
+fn relative_vault_path(
+    root: &Path,
+    path: &Path,
+    strip_extension: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        format!(
+            "Vault secret input {} escaped configured root {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    let mut components = relative
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| "Vault secret path is not valid UTF-8".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let (Some(extension), Some(last)) = (strip_extension, components.last_mut()) {
+        let suffix = format!(".{extension}");
+        *last = last
+            .strip_suffix(&suffix)
+            .ok_or("Vault JSON path did not have the expected extension")?
+            .to_string();
+    }
+    vault::validate_vault_path(&components.join("/"), "derived Vault path", false)
+}
+
+fn checked_secret_metadata(
+    path: &Path,
+    file_count: &mut usize,
+    total_bytes: &mut u64,
+) -> Result<fs::Metadata, Box<dyn Error>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("Vault secret input cannot be a symlink: {}", path.display()).into());
+    }
+    if metadata.is_file() {
+        *file_count += 1;
+        *total_bytes = total_bytes.saturating_add(metadata.len());
+        if *file_count > MAX_VAULT_FILES {
+            return Err(format!("Vault sync exceeds the {MAX_VAULT_FILES}-file limit").into());
+        }
+        if metadata.len() > MAX_VAULT_FILE_BYTES {
+            return Err(format!(
+                "Vault secret file {} exceeds the 1 MiB limit",
+                path.display()
+            )
+            .into());
+        }
+        if *total_bytes > MAX_VAULT_TOTAL_BYTES {
+            return Err("Vault sync exceeds the 4 MiB total input limit".into());
+        }
+    }
+    Ok(metadata)
+}
+
+fn reject_symlink(path: &Path) -> Result<(), Box<dyn Error>> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(format!("Vault secret path cannot be a symlink: {}", path.display()).into());
+    }
+    Ok(())
+}
+
+fn read_secret_text(path: &Path) -> Result<String, Box<dyn Error>> {
+    String::from_utf8(fs::read(path)?)
+        .map_err(|_| format!("Vault secret file must be UTF-8 text: {}", path.display()).into())
+}
+
+fn ensure_vault_sources_are_ignored(files: &[PathBuf]) -> Result<(), Box<dyn Error>> {
+    ensure_vault_sources_are_ignored_at(&env::current_dir()?, files)
+}
+
+fn ensure_vault_sources_are_ignored_at(
+    workdir: &Path,
+    files: &[PathBuf],
+) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("git")
+        .current_dir(workdir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|error| format!("failed to inspect Git repository for Vault inputs: {error}"))?;
+    if !output.status.success() {
+        return Err("Vault sync requires a Git worktree so ignored inputs can be proven".into());
+    }
+    let git_root = PathBuf::from(String::from_utf8(output.stdout)?.trim()).canonicalize()?;
+    for file in files {
+        let canonical_file = file.canonicalize()?;
+        let relative = canonical_file.strip_prefix(&git_root).map_err(|_| {
+            format!(
+                "Vault secret file {} is outside the current Git worktree",
+                canonical_file.display()
+            )
+        })?;
+        let tracked = Command::new("git")
+            .current_dir(&git_root)
+            .args(["ls-files", "--error-unmatch", "--"])
+            .arg(relative)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        match tracked.code() {
+            Some(0) => {
+                return Err(format!(
+                    "refusing to read tracked Vault secret file {}",
+                    relative.display()
+                )
+                .into());
+            }
+            Some(1) => {}
+            _ => {
+                return Err(format!(
+                    "failed to determine whether Vault secret file is tracked: {}",
+                    relative.display()
+                )
+                .into());
+            }
+        }
+        let ignored = Command::new("git")
+            .current_dir(&git_root)
+            .args(["check-ignore", "--quiet", "--"])
+            .arg(relative)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        match ignored.code() {
+            Some(0) => {}
+            Some(1) => {
+                return Err(format!(
+                    "refusing to read Vault secret file that is not gitignored: {}",
+                    relative.display()
+                )
+                .into());
+            }
+            _ => {
+                return Err(format!(
+                    "failed to determine whether Vault secret file is gitignored: {}",
+                    relative.display()
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_github(args: &GithubSyncArgs) -> Result<(), Box<dyn Error>> {
@@ -1064,9 +1585,12 @@ fn parse_key_value(value: &str) -> Result<(String, String), String> {
 mod tests {
     use crate::commands::secrets::derive_secret_name;
     use serde_json::{json, Value as JsonValue};
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use super::{
+        collect_desired_vault_secrets, ensure_vault_sources_are_ignored_at,
         normalize_github_secret_name, parse_dotenv_secret_map, parse_github_dotenv_secret_map,
     };
 
@@ -1129,5 +1653,86 @@ mod tests {
                 ("FOO".to_string(), "bar".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn vault_inputs_map_env_directory_and_json_file_to_relative_paths() {
+        let root = temp_fixture("vault-map");
+        let vault_root = root.join("secrets/vault");
+        fs::create_dir_all(vault_root.join("harmony/stripe")).unwrap();
+        fs::create_dir_all(vault_root.join("harmony/auth")).unwrap();
+        fs::write(
+            vault_root.join("harmony/stripe/.env"),
+            "STRIPE_API_KEY=test-key\nSTRIPE_WEBHOOK_SECRET=test-hook\n",
+        )
+        .unwrap();
+        fs::write(
+            vault_root.join("harmony/auth/oidc.json"),
+            "{\"client_id\":\"test-client\"}",
+        )
+        .unwrap();
+
+        let desired = collect_desired_vault_secrets(&vault_root, &vault_root).unwrap();
+        assert_eq!(desired.len(), 2);
+        assert_eq!(desired[0].path, "harmony/auth/oidc");
+        assert_eq!(desired[0].data["client_id"], json!("test-client"));
+        assert_eq!(desired[1].path, "harmony/stripe");
+        assert_eq!(desired[1].data["STRIPE_API_KEY"], json!("test-key"));
+        assert_eq!(desired[1].data["STRIPE_WEBHOOK_SECRET"], json!("test-hook"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn vault_input_collisions_fail_before_sync() {
+        let root = temp_fixture("vault-collision");
+        let vault_root = root.join("secrets/vault");
+        fs::create_dir_all(vault_root.join("same")).unwrap();
+        fs::write(vault_root.join("same.json"), "{\"one\":\"value\"}").unwrap();
+        fs::write(vault_root.join("same/.env"), "TWO=value\n").unwrap();
+
+        let error = collect_desired_vault_secrets(&vault_root, &vault_root).unwrap_err();
+        assert!(error.to_string().contains("multiple local inputs map"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn vault_sync_accepts_only_ignored_untracked_files() {
+        let root = temp_fixture("vault-ignore");
+        let secret = root.join("secrets/vault/harmony/stripe/.env");
+        fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        fs::write(&secret, "TOKEN=test-value\n").unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        let error =
+            ensure_vault_sources_are_ignored_at(&root, std::slice::from_ref(&secret)).unwrap_err();
+        assert!(error.to_string().contains("not gitignored"));
+
+        fs::write(root.join(".gitignore"), "secrets/\n").unwrap();
+        ensure_vault_sources_are_ignored_at(&root, std::slice::from_ref(&secret)).unwrap();
+        assert!(Command::new("git")
+            .args(["add", "--force", "--", "secrets/vault/harmony/stripe/.env"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let error = ensure_vault_sources_are_ignored_at(&root, &[secret]).unwrap_err();
+        assert!(error.to_string().contains("tracked Vault secret file"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temp_fixture(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "hops-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
     }
 }
