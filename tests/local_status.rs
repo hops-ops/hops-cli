@@ -92,3 +92,46 @@ fn status_observes_without_persisting_or_healing_local_state() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn dns_enable_requires_a_binding_but_down_remains_offline() {
+    let root = std::env::temp_dir().join(format!(
+        "hops-local-dns-binding-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let home = root.join("home");
+    let envs = home.join(".hops/local/envs");
+    fs::create_dir_all(&envs).unwrap();
+    fs::write(
+        envs.join("feature.json"),
+        r#"{
+  "name": "feature",
+  "namespace": "feature",
+  "envPath": "/project/.gitops/local/environment.yaml"
+}"#,
+    )
+    .unwrap();
+
+    let enable = Command::new(env!("CARGO_BIN_EXE_hops-cli"))
+        .args(["local", "dns", "--name", "feature"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!enable.status.success());
+    assert!(String::from_utf8_lossy(&enable.stderr).contains("no durable cluster binding"));
+
+    let down = Command::new(env!("CARGO_BIN_EXE_hops-cli"))
+        .args(["local", "dns", "--name", "feature", "--down"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        down.status.success(),
+        "{}",
+        String::from_utf8_lossy(&down.stderr)
+    );
+    assert!(String::from_utf8_lossy(&down.stdout).contains("direct Service DNS disabled"));
+
+    fs::remove_dir_all(root).unwrap();
+}

@@ -41,7 +41,6 @@ pub fn run(args: &DnsArgs) -> Result<(), Box<dyn Error>> {
         if index > 0 {
             println!();
         }
-        let _ = activate_workspace_cluster(workspace);
         if args.down {
             stop_host_access(&state_dir, &workspace.name)?;
             println!(
@@ -50,6 +49,12 @@ pub fn run(args: &DnsArgs) -> Result<(), Box<dyn Error>> {
             );
             continue;
         }
+        activate_workspace_cluster(workspace).ok_or_else(|| {
+            format!(
+                "Environment {:?} has no durable cluster binding; reconcile it before enabling direct Service DNS",
+                workspace.name
+            )
+        })?;
 
         let services = discover_workspace_endpoints(&workspace.namespace)?;
         if services.is_empty() {

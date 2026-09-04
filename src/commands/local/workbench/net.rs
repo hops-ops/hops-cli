@@ -931,7 +931,18 @@ pub fn host_access_needs_heal(rt: &HostAccessRuntime) -> bool {
     if !rt.pids.iter().any(|p| pid_is_alive(*p)) {
         return true;
     }
-    for (endpoint_key, port) in &rt.service_ports {
+    let fallback_ports;
+    let service_ports = if rt.service_ports.is_empty() {
+        fallback_ports = rt
+            .ip_map
+            .keys()
+            .map(|service_key| (service_key.clone(), 80))
+            .collect::<BTreeMap<_, _>>();
+        &fallback_ports
+    } else {
+        &rt.service_ports
+    };
+    for (endpoint_key, port) in service_ports {
         let service_key = service_key_from_endpoint_key(endpoint_key);
         let Some(ip) = rt.ip_map.get(service_key) else {
             return true;
@@ -1059,7 +1070,18 @@ fn services_from_runtime(rt: &HostAccessRuntime) -> Vec<ServiceEndpoint> {
 
 pub fn url_listen_status(plan: &HostAccessPlan) -> BTreeMap<String, bool> {
     let mut out = BTreeMap::new();
-    for (endpoint_key, port) in &plan.service_ports {
+    let fallback_ports;
+    let service_ports = if plan.service_ports.is_empty() {
+        fallback_ports = plan
+            .ip_map
+            .keys()
+            .map(|service_key| (service_key.clone(), 80))
+            .collect::<BTreeMap<_, _>>();
+        &fallback_ports
+    } else {
+        &plan.service_ports
+    };
+    for (endpoint_key, port) in service_ports {
         let service_key = service_key_from_endpoint_key(endpoint_key);
         let listening = plan
             .ip_map
@@ -1328,6 +1350,23 @@ mod tests {
             ..runtime
         };
         assert!(host_access_runtime_matches_services(&current, &services));
+    }
+
+    #[test]
+    fn legacy_runtime_checks_its_displayed_port_80_endpoint() {
+        let runtime = HostAccessRuntime {
+            namespace: "sample-app".into(),
+            pids: vec![std::process::id()],
+            ip_map: BTreeMap::from([("sample-app/api".into(), "not-an-ip".into())]),
+            ..Default::default()
+        };
+        let plan = plan_from_runtime(&runtime);
+        assert_eq!(
+            plan.urls.get("sample-app/api").map(String::as_str),
+            Some("http://api.sample-app.svc.cluster.local:80")
+        );
+        assert_eq!(url_listen_status(&plan).get("sample-app/api"), Some(&false));
+        assert!(host_access_needs_heal(&runtime));
     }
 
     #[test]
