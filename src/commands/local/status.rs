@@ -1,9 +1,8 @@
 //! `hops local status` — read-only workspace health and access state.
 
 use super::workbench::ingress::{
-    discover_ingress_routes, format_ingress_status, ingress_access_needs_heal,
-    load_ingress_access_runtime, plan_from_routes, plan_from_runtime as ingress_plan_from_runtime,
-    IngressAccessRuntime,
+    discover_ingress_routes, format_ingress_status, ingress_access_matches_plan,
+    load_ingress_access_runtime, plan_from_routes, IngressAccessRuntime,
 };
 use super::workbench::net::{
     format_status_card_with_listen, host_access_needs_heal, host_access_status_line,
@@ -112,18 +111,21 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
             println!("{}", host_access_status_line(&rt));
         }
 
-        if let Some(runtime) = load_ingress_access_runtime(&state_dir, &ws.name)? {
-            let plan = ingress_plan_from_runtime(&runtime);
-            if ingress_access_needs_heal(&runtime) {
-                all_ok = false;
-            }
-            println!("{}", format_ingress_status(&plan, &runtime));
-        } else {
-            match discover_ingress_routes(&ws.namespace) {
-                Ok(routes) => {
-                    let plan = plan_from_routes(&ws.namespace, &routes)?;
+        let ingress_runtime = load_ingress_access_runtime(&state_dir, &ws.name)?;
+        match discover_ingress_routes(&ws.namespace) {
+            Ok(routes) => match plan_from_routes(&ws.namespace, &routes) {
+                Ok(plan) => {
                     if plan.urls.is_empty() {
                         println!("ingress:  (no HTTPRoute hostnames)");
+                        if ingress_runtime.is_some() {
+                            all_ok = false;
+                            println!("warn:     stale ingress runtime is still recorded");
+                        }
+                    } else if let Some(runtime) = &ingress_runtime {
+                        if !ingress_access_matches_plan(&plan, runtime) {
+                            all_ok = false;
+                        }
+                        println!("{}", format_ingress_status(&plan, runtime));
                     } else {
                         all_ok = false;
                         let runtime = IngressAccessRuntime {
@@ -135,8 +137,12 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
                 }
                 Err(error) => {
                     all_ok = false;
-                    println!("ingress:  unavailable ({error})");
+                    println!("ingress:  invalid ({error})");
                 }
+            },
+            Err(error) => {
+                all_ok = false;
+                println!("ingress:  unavailable ({error})");
             }
         }
 

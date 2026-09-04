@@ -417,6 +417,17 @@ pub fn ingress_access_needs_heal(runtime: &IngressAccessRuntime) -> bool {
         .any(|(hostname, port)| domains.get(hostname) != Some(port))
 }
 
+pub fn ingress_access_matches_plan(
+    plan: &IngressAccessPlan,
+    runtime: &IngressAccessRuntime,
+) -> bool {
+    runtime.namespace == plan.namespace
+        && runtime.adapter == DORY_ADAPTER
+        && runtime.routes == plan.routes
+        && runtime.aliases.keys().eq(plan.urls.keys())
+        && !ingress_access_needs_heal(runtime)
+}
+
 fn route_map(routes: &[IngressRoute]) -> Result<BTreeMap<String, GatewayKey>, Box<dyn Error>> {
     let mut result: BTreeMap<String, GatewayKey> = BTreeMap::new();
     for route in routes {
@@ -549,7 +560,7 @@ pub fn format_ingress_status(plan: &IngressAccessPlan, runtime: &IngressAccessRu
     if plan.urls.is_empty() {
         return "ingress:  (no HTTPRoute hostnames)".into();
     }
-    let up = !ingress_access_needs_heal(runtime);
+    let up = ingress_access_matches_plan(plan, runtime);
     let mut lines = vec![format!(
         "ingress:  Gateway API via Dory [{}]",
         if up { "up" } else { "down" }
@@ -615,6 +626,29 @@ mod tests {
             Some("https://app.feature.localhost")
         );
         assert_eq!(plan.namespace, "feature");
+    }
+
+    #[test]
+    fn runtime_must_match_the_current_route_plan() {
+        let gateway = GatewayKey {
+            namespace: "ingress".into(),
+            name: "local".into(),
+        };
+        let plan = IngressAccessPlan {
+            namespace: "feature".into(),
+            routes: BTreeMap::from([("app.feature.localhost".into(), gateway.clone())]),
+            urls: BTreeMap::from([(
+                "app.feature.localhost".into(),
+                "https://app.feature.localhost".into(),
+            )]),
+        };
+        let stale = IngressAccessRuntime {
+            namespace: "feature".into(),
+            adapter: DORY_ADAPTER.into(),
+            aliases: BTreeMap::from([("old.feature.localhost".into(), 443)]),
+            routes: BTreeMap::from([("old.feature.localhost".into(), gateway)]),
+        };
+        assert!(!ingress_access_matches_plan(&plan, &stale));
     }
 
     #[test]
