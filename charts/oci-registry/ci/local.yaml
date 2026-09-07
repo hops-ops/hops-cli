@@ -1,0 +1,17 @@
+# Render fixture: encryption must be verified on the actual laptop storage.
+tls:
+  existingSecret: hops-local-registry-tls
+storage:
+  pvc:
+    encryptionConfirmed: true
+access:
+  uploadSubjects:
+    - kind: Group
+      apiGroup: rbac.authorization.k8s.io
+      name: crossplane-developers
+  pullPeers:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: crossplane-system
+    - ipBlock:
+        cidr: 192.0.2.0/24

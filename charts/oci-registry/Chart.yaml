@@ -1,0 +1,6 @@
+apiVersion: v2
+name: oci-registry
+description: Private Crossplane development artifacts, uploaded through the Kubernetes API
+type: application
+version: 0.1.0
+appVersion: "2.8.3"

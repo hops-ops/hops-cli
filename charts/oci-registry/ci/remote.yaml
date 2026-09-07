@@ -1,0 +1,24 @@
+# Render fixture only: replace documentation CIDRs and existing infra bindings.
+tls:
+  existingSecret: development-registry-tls
+storage:
+  type: s3
+  s3:
+    bucket: example-existing-development-artifacts
+    region: us-east-2
+    kmsKeyId: alias/development-artifacts
+serviceAccount:
+  automountServiceAccountToken: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/development-registry
+access:
+  uploadSubjects:
+    - kind: Group
+      apiGroup: rbac.authorization.k8s.io
+      name: crossplane-developers
+  pullPeers:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: crossplane-system
+    - ipBlock:
+        cidr: 192.0.2.0/24

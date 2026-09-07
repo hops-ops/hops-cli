@@ -1,0 +1,57 @@
+{{- if and (eq .Values.storage.type "pvc") (not .Values.storage.pvc.encryptionConfirmed) }}
+{{- fail "PVC storage requires storage.pvc.encryptionConfirmed=true after verifying backing-storage encryption" }}
+{{- end }}
+{{- if empty .Values.access.pullPeers }}
+{{- fail "access.pullPeers must explicitly allow Crossplane and runtime-node read traffic" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.name }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "oci.labels" . | nindent 4 }}
+data:
+  write.yml: |
+    version: 0.1
+    log:
+      level: warn
+      accesslog:
+        disabled: true
+    storage:
+      {{- include "oci.storage" . | nindent 6 }}
+      maintenance:
+        uploadpurging:
+          enabled: false
+    http:
+      # Only kubelet port-forward can reach this listener from outside the pod.
+      addr: 127.0.0.1:5001
+      relativeurls: true
+    health:
+      storagedriver:
+        enabled: true
+        interval: 10s
+        threshold: 3
+  read.yml: |
+    version: 0.1
+    log:
+      level: warn
+      accesslog:
+        disabled: true
+    storage:
+      {{- include "oci.storage" . | nindent 6 }}
+      maintenance:
+        readonly:
+          enabled: true
+        uploadpurging:
+          enabled: false
+    http:
+      addr: :5000
+      tls:
+        certificate: /certs/tls.crt
+        key: /certs/tls.key
+    health:
+      storagedriver:
+        enabled: true
+        interval: 10s
+        threshold: 3
