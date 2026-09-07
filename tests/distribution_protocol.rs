@@ -203,7 +203,11 @@ fn distribution_chart_protocol_tls_readonly_and_restart_durability() {
         assert!(result.status.success());
         // Distribution validates upload session state before method dispatch;
         // an unknown PATCH session is 404, not 405. Neither path may mutate.
-        let denied = if method == "PATCH" { b"\n404" } else { b"\n405" };
+        let denied = if method == "PATCH" {
+            b"\n404"
+        } else {
+            b"\n405"
+        };
         assert!(
             result.stdout.ends_with(denied),
             "{method}: {}",
