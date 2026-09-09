@@ -886,6 +886,7 @@ mod tests {
                 name: "feature-auth".into(),
                 namespace: "feature-auth-ns".into(),
                 cluster_ref: "project-dev".into(),
+                scope: super::super::definition::EnvironmentScope::Project,
                 local_domain: "gitkb.localhost".into(),
                 root: PathBuf::from("/project"),
                 values: environment_values,

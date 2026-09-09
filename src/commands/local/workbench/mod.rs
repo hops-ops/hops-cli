@@ -10,6 +10,7 @@ pub mod cluster_gitops;
 pub mod controller;
 pub mod definition;
 pub mod delivery;
+pub mod machine;
 pub mod ingress;
 pub mod net;
 pub mod reconcile;

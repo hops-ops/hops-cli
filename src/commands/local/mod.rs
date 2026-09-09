@@ -5,9 +5,11 @@ mod destroy;
 mod dns;
 mod doctor;
 mod down;
+mod env;
 mod github;
 mod gitops;
 pub mod gitops_write;
+mod init;
 mod install;
 mod listmonk;
 pub mod package_install;
@@ -15,6 +17,8 @@ mod reset;
 mod resize;
 mod start;
 mod status;
+mod tui;
+mod up;
 mod uninstall;
 pub mod workbench;
 mod zitadel;
@@ -145,10 +149,18 @@ pub enum LocalCommands {
     Start(start::StartArgs),
     /// Resize the local cluster VM without destroying cluster state (colima cluster provider only)
     Resize(resize::ResizeArgs),
-    /// Check what `hops local start` set up and report drift
+    /// Check Cluster health and report machine-cluster identity drift
     Doctor,
-    /// Bring down a local workbench workspace
+    /// Create or reconnect the one machine Cluster
+    Up(up::UpArgs),
+    /// Stop the machine Cluster (no --name) or one Environment (`--name`)
     Down(down::DownArgs),
+    /// Write committed Cluster / platform / Environment files
+    Init(init::InitArgs),
+    /// Catalog, enable, and disable Environments (off until enable)
+    Env(env::EnvArgs),
+    /// Interactive catalog of Cluster + Environments
+    Tui(tui::TuiArgs),
     /// Show local workbench workspace status and app URLs
     Status(status::StatusArgs),
     /// Explicitly enable or repair direct Kubernetes Service DNS on this host
@@ -172,21 +184,27 @@ pub enum LocalCommands {
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
-    if let LocalCommands::Gitops(gitops::GitopsArgs {
-        command: gitops::GitopsCommands::Cluster(cluster),
-    }) = &args.command
-    {
-        return gitops::run_cluster(
-            cluster,
-            workbench::definition::ClusterOverrides {
-                cluster_provider: args.cluster_provider,
-                docker_provider: args.docker_provider,
-                legacy_backend: args.backend,
-                cluster_name: args.cluster_name.as_deref(),
-                context: args.context.as_deref(),
-                dory_name: args.dory_name.as_deref(),
-            },
-        );
+    let overrides = workbench::definition::ClusterOverrides {
+        cluster_provider: args.cluster_provider,
+        docker_provider: args.docker_provider,
+        legacy_backend: args.backend,
+        cluster_name: args.cluster_name.as_deref(),
+        context: args.context.as_deref(),
+        dory_name: args.dory_name.as_deref(),
+        machine_name: None,
+    };
+    match &args.command {
+        LocalCommands::Gitops(gitops::GitopsArgs {
+            command: gitops::GitopsCommands::Cluster(cluster),
+        }) => return gitops::run_cluster(cluster, overrides),
+        LocalCommands::Up(up_args) => return up::run(up_args, overrides),
+        LocalCommands::Down(down_args) if down_args.name.is_none() => {
+            return down::run(down_args, overrides)
+        }
+        LocalCommands::Init(init_args) => return init::run(init_args),
+        LocalCommands::Env(env_args) => return env::run(env_args, overrides),
+        LocalCommands::Tui(tui_args) => return tui::run(tui_args, overrides),
+        _ => {}
     }
 
     // Observation and explicit Service-DNS access use each Environment's
@@ -240,7 +258,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Start(start_args) => start::run(backend, start_args),
         LocalCommands::Resize(resize_args) => resize::run(backend, resize_args),
         LocalCommands::Doctor => doctor::run(),
-        LocalCommands::Down(down_args) => down::run(down_args),
+        LocalCommands::Down(down_args) => down::run(down_args, overrides),
         LocalCommands::Status(_) | LocalCommands::Dns(_) => {
             unreachable!("status and dns return before provider activation")
         }
@@ -253,8 +271,13 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
                 cluster_name: args.cluster_name.as_deref(),
                 context: args.context.as_deref(),
                 dory_name: args.dory_name.as_deref(),
+                machine_name: None,
             },
         ),
+        LocalCommands::Up(_)
+        | LocalCommands::Init(_)
+        | LocalCommands::Env(_)
+        | LocalCommands::Tui(_) => unreachable!("up/init/env/tui return before provider activation"),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Cloudflare(cloudflare_args) => cloudflare::run(cloudflare_args),
         LocalCommands::Github(github_args) => github::run(github_args),

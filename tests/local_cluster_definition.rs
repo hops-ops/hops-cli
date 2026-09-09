@@ -337,7 +337,10 @@ fn rejects_unknown_fields_and_escaping_paths_before_mutation() {
     fixture.write_definition(&escape);
     let output = fixture.run();
     assert!(!output.status.success());
-    assert!(output_text(&output).contains("must be relative"));
+    assert!(
+        output_text(&output).contains("must be $HOME")
+            || output_text(&output).contains("unable to canonicalize")
+    );
     fixture.assert_no_mutation();
 }
 
