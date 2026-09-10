@@ -274,6 +274,32 @@ fn up_from_leaf_yaml_does_not_create_second_cluster() {
 }
 
 #[test]
+fn env_discover_keeps_worktrees_distinct() {
+    let fixture = Fixture::new();
+    let main = fixture.root.join(".gitops/local/environment.yaml");
+    let wt = fixture
+        .root
+        .join(".worktrees/feature-auth/.gitops/local/environment.yaml");
+    fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    fs::write(&main, ENV_YAML).unwrap();
+    fs::write(&wt, ENV_YAML).unwrap();
+    let output = Fixture::output(fixture.command().args(["local", "env", "discover"]));
+    assert!(output.status.success(), "{:?}", Fixture::stdout_stderr(&output));
+    let catalog = fixture.root.join("home/.hops/local/catalog");
+    let files: Vec<_> = fs::read_dir(&catalog)
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            (path.extension().and_then(|ext| ext.to_str()) == Some("json")).then_some(path)
+        })
+        .collect();
+    assert_eq!(files.len(), 2, "worktree and main must not share a catalog file");
+    let list = Fixture::output(fixture.command().args(["local", "env", "list"]));
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(stdout.contains("feature-auth"), "{stdout}");
+}
+
+#[test]
 fn cluster_name_escape_hatch_warns() {
     let fixture = Fixture::new();
     let output = Fixture::output(

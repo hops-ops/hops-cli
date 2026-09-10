@@ -37,7 +37,7 @@ fn print_entries(entries: &[CatalogEntry]) -> io::Result<()> {
         writeln!(
             io::stdout(),
             "  [{flag}] {}  {}",
-            entry.name,
+            entry.runtime_name,
             entry.source.display()
         )?;
     }
@@ -50,7 +50,7 @@ fn apply_multiselect(
 ) -> Result<(), Box<dyn Error>> {
     let items: Vec<String> = entries
         .iter()
-        .map(|entry| format!("{} ({})", entry.name, entry.source.display()))
+        .map(|entry| format!("{} ({})", entry.runtime_name, entry.source.display()))
         .collect();
     let defaults: Vec<bool> = entries.iter().map(|entry| entry.enabled).collect();
     let selected = MultiSelect::with_theme(&ColorfulTheme::default())
@@ -66,11 +66,11 @@ fn apply_multiselect(
         }
         let command = if want {
             env::EnvCommands::Enable(env::NameArgs {
-                name: entry.name.clone(),
+                name: entry.runtime_name.clone(),
             })
         } else {
             env::EnvCommands::Disable(env::NameArgs {
-                name: entry.name.clone(),
+                name: entry.runtime_name.clone(),
             })
         };
         env::run(

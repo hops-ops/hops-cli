@@ -1096,6 +1096,16 @@ fn resolve_mount_root(
     relative: &Path,
     field: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
+    if relative == Path::new("$HOME") || relative == Path::new("~") {
+        let home = std::env::var("HOME").map_err(|_| {
+            format!("{field} $HOME requires the HOME environment variable")
+        })?;
+        let resolved = PathBuf::from(home).canonicalize().map_err(|error| {
+            format!("unable to canonicalize HOME for {field}: {error}")
+        })?;
+        ensure_within(&resolved, definition_root, field)?;
+        return Ok(resolved);
+    }
     if relative.is_absolute() {
         let home = std::env::var("HOME").map_err(|_| {
             format!("{field} absolute path requires HOME; got {}", relative.display())

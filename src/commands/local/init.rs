@@ -58,7 +58,6 @@ fn init_cluster(args: &InitPathArgs) -> Result<(), Box<dyn Error>> {
     let manifests = root.join(".gitops/local/cluster");
     fail_if_exists(&yaml, args.force)?;
     fs::create_dir_all(&manifests)?;
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     let body = format!(
         "apiVersion: hops.local/v1alpha1\n\
          kind: Cluster\n\
@@ -67,7 +66,7 @@ fn init_cluster(args: &InitPathArgs) -> Result<(), Box<dyn Error>> {
          spec:\n\
            clusterProvider: kind\n\
            dockerProvider: dory\n\
-           mountRoot: {home}\n\
+           mountRoot: $HOME\n\
            manifests:\n\
              path: .gitops/local/cluster\n\
            controlPlane:\n\
