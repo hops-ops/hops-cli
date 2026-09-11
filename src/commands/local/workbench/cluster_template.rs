@@ -3,8 +3,8 @@
 //! `hops local up` materializes this embed to `$HOME/.gitops/local/cluster`
 //! (the path `Cluster.spec.mountRoot: $HOME` + `manifests.path:
 //! .gitops/local/cluster` already resolves to). Project
-//! `.gitops/local/cluster/` extras overlay on top. `shared/` is never copied
-//! into Cluster manifests.
+//! `.gitops/local/cluster/` extras overlay on top. `shared/` and Harmony
+//! identity fixtures are never copied into Cluster manifests.
 
 use super::definition::{
     CLUSTER_MANIFESTS_PATH, DEFAULT_CROSSPLANE_CHART, DEFAULT_CROSSPLANE_VERSION,
@@ -35,12 +35,6 @@ pub const FILES: &[(&str, &str)] = &[
     cluster_file!("configurations/istio-stack.yaml"),
     cluster_file!("configurations/psql-stack.yaml"),
     cluster_file!("configurations/secret-stack.yaml"),
-    cluster_file!("identity/features.yaml"),
-    cluster_file!("identity/machine-users.yaml"),
-    cluster_file!("identity/personas.yaml"),
-    cluster_file!("identity/project.yaml"),
-    cluster_file!("identity/secret-outputs.yaml"),
-    cluster_file!("identity/smtp.yaml"),
     cluster_file!("providerconfigs/helm.yaml"),
     cluster_file!("providerconfigs/kubernetes.yaml"),
     cluster_file!("providerconfigs/zitadel.yaml"),
@@ -330,7 +324,12 @@ mod tests {
             .iter()
             .any(|(path, _)| *path == "providerconfigs/kubernetes.yaml"));
         assert!(FILES.iter().any(|(path, _)| *path == "stacks/auth.yaml"));
+        assert!(FILES.iter().any(|(path, _)| *path == "providers/zitadel.yaml"));
+        assert!(FILES
+            .iter()
+            .any(|(path, _)| *path == "providerconfigs/zitadel.yaml"));
         assert!(!FILES.iter().any(|(path, _)| path.starts_with("shared/")));
+        assert!(!FILES.iter().any(|(path, _)| path.starts_with("identity/")));
     }
 
     #[test]
