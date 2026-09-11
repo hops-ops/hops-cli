@@ -93,7 +93,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       (github.event.action == 'closed' ||
       (github.event.action == 'unlabeled' && github.event.label.name == 'preview'))
-    uses: hops-ops/workflows-gitops/.github/workflows/preview-cleanup.yaml@6f50d1ded5ab0336cd97008886c7147a3da5c585 # v2.0.0
+    uses: hops-ops/workflows-gitops/.github/workflows/preview-cleanup.yaml@6bb5d1aeae0f9f550e08a651cb7ecb998a5da4cb # v2.1.0
     permissions:
       contents: write
       issues: write
