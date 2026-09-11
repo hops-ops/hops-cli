@@ -1,0 +1,18 @@
+# Istio overlays this onto every automatically generated local Gateway Service.
+# Hops publishes the same stable node-side port when it creates the Kind cluster;
+# the host-side port remains cluster-specific and is discovered by the CLI.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-istio-gateway-defaults
+  namespace: istio-system
+  labels:
+    gateway.istio.io/defaults-for-class: istio
+data:
+  service: |
+    spec:
+      type: NodePort
+      ports:
+        - name: http
+          port: 80
+          nodePort: 30080

@@ -1,0 +1,12 @@
+# Gateway API CRDs are a Cluster-level prerequisite shared by every Environment.
+apiVersion: hops.ops.com.ai/v1alpha1
+kind: GatewayAPIStack
+metadata:
+  name: harmony-local
+  namespace: default
+spec:
+  managementPolicies: ["*"]
+  clusterName: harmony-local
+  helmProviderConfigRef:
+    name: default
+    kind: ProviderConfig

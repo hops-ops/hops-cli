@@ -1,0 +1,16 @@
+# Reconciled once per Cluster from .gitops/cluster.
+apiVersion: instance.zitadel.m.crossplane.io/v1alpha1
+kind: Features
+metadata:
+  name: harmony-login-v2
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: harmony-local
+spec:
+  managementPolicies: ["*"]
+  forProvider:
+    loginV2:
+      - required: false
+  providerConfigRef:
+    name: default
+    kind: ProviderConfig

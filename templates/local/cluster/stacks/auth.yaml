@@ -1,0 +1,36 @@
+# Reconciled once per Cluster from .gitops/cluster.
+apiVersion: hops.ops.com.ai/v1alpha1
+kind: AuthStack
+metadata:
+  name: zitadel
+  namespace: default
+spec:
+  managementPolicies: ["*"]
+  clusterName: harmony-local
+  helmProviderConfigRef:
+    name: default
+    kind: ProviderConfig
+  kubernetesProviderConfigRef:
+    name: default
+    kind: ProviderConfig
+  namespace: harmony-auth
+  domain: auth.gitkb.localhost
+  externalSecure: true
+  gateway:
+    enabled: true
+    parentRef:
+      name: platform
+      namespace: istio-ingress
+      sectionName: http
+  externalSecrets:
+    enabled: false
+  firstInstance:
+    org: harmony-local
+    masterkey:
+      secretRef:
+        name: zitadel-masterkey
+  database:
+    embedded:
+      storage:
+        size: 2Gi
+        class: psql

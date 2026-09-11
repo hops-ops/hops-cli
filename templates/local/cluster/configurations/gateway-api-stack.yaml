@@ -1,0 +1,7 @@
+# Reconciled once per Cluster from .gitops/local/cluster.
+apiVersion: pkg.crossplane.io/v1
+kind: Configuration
+metadata:
+  name: hops-ops-gateway-api-stack
+spec:
+  package: ghcr.io/hops-ops/gateway-api-stack:v0.4.1

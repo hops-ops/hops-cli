@@ -7,11 +7,12 @@
 
 pub mod cluster_dns;
 pub mod cluster_gitops;
+pub mod cluster_template;
 pub mod controller;
 pub mod definition;
 pub mod delivery;
-pub mod machine;
 pub mod ingress;
+pub mod machine;
 pub mod net;
 pub mod reconcile;
 pub mod registry;

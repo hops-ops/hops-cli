@@ -1,0 +1,21 @@
+# Reconciled once per Cluster from .gitops/cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: harmony-auth
+  labels:
+    app.kubernetes.io/part-of: harmony-local
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: harmony-system
+  labels:
+    app.kubernetes.io/part-of: harmony-local
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-system
+  labels:
+    app.kubernetes.io/part-of: harmony-local

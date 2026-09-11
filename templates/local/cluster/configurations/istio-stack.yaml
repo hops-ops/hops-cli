@@ -1,0 +1,7 @@
+# Reconciled once per Cluster from .gitops/local/cluster.
+apiVersion: pkg.crossplane.io/v1
+kind: Configuration
+metadata:
+  name: hops-ops-istio-stack
+spec:
+  package: ghcr.io/hops-ops/istio-stack:v1.4.1

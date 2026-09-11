@@ -58,21 +58,32 @@ fn init_cluster(args: &InitPathArgs) -> Result<(), Box<dyn Error>> {
     let manifests = root.join(".gitops/local/cluster");
     fail_if_exists(&yaml, args.force)?;
     fs::create_dir_all(&manifests)?;
+    let overlay_readme = manifests.join("README.md");
+    if args.force || !overlay_readme.exists() {
+        fs::write(
+            overlay_readme,
+            "# Cluster overlay\n\n\
+             Machine Cluster manifests come from hops-cli (`hops local up`).\n\
+             Add extra YAML here; it overlays the CLI template by relative path.\n\
+             Do not put shared app workloads here — use a cluster-scoped Environment.\n",
+        )?;
+    }
     let body = format!(
-        "apiVersion: hops.local/v1alpha1\n\
-         kind: Cluster\n\
-         metadata:\n\
-           name: {name}\n\
-         spec:\n\
-           clusterProvider: kind\n\
-           dockerProvider: dory\n\
-           mountRoot: $HOME\n\
-           manifests:\n\
-             path: .gitops/local/cluster\n\
-           controlPlane:\n\
-             crossplane:\n\
-               chart: {chart}\n\
-               version: \"{version}\"\n",
+        r#"apiVersion: hops.local/v1alpha1
+kind: Cluster
+metadata:
+  name: {name}
+spec:
+  clusterProvider: kind
+  dockerProvider: dory
+  mountRoot: $HOME
+  manifests:
+    path: .gitops/local/cluster
+  controlPlane:
+    crossplane:
+      chart: {chart}
+      version: "{version}"
+"#,
         name = DEFAULT_MACHINE_CLUSTER_NAME,
         chart = DEFAULT_CROSSPLANE_CHART,
         version = DEFAULT_CROSSPLANE_VERSION,
@@ -90,17 +101,18 @@ fn init_environment(args: &InitPathArgs) -> Result<(), Box<dyn Error>> {
     fail_if_exists(&yaml, args.force)?;
     fs::create_dir_all(yaml.parent().unwrap())?;
     let body = format!(
-        "apiVersion: hops.local/v1alpha1\n\
-         kind: Environment\n\
-         metadata:\n\
-           name: local\n\
-         spec:\n\
-           clusterRef:\n\
-             name: {name}\n\
-           root: .\n\
-           values:\n\
-             local: true\n\
-           deploys: []\n",
+        r#"apiVersion: hops.local/v1alpha1
+kind: Environment
+metadata:
+  name: local
+spec:
+  clusterRef:
+    name: {name}
+  root: .
+  values:
+    local: true
+  deploys: []
+"#,
         name = DEFAULT_MACHINE_CLUSTER_NAME,
     );
     fs::write(&yaml, body)?;
@@ -117,29 +129,26 @@ fn init_platform(args: &InitPathArgs) -> Result<(), Box<dyn Error>> {
     fs::write(
         &yaml,
         format!(
-            "apiVersion: hops.local/v1alpha1\n\
-             kind: Environment\n\
-             metadata:\n\
-               name: hops-platform\n\
-             spec:\n\
-               scope: cluster\n\
-               clusterRef:\n\
-                 name: {name}\n\
-               root: .\n\
-               namespace: hops-platform\n\
-               deploys:\n\
-                 - path: .gitops/local/platform/minio\n\
-                   type: helm\n\
-                 - path: .gitops/local/platform/mailpit\n\
-                   type: helm\n",
+            r#"apiVersion: hops.local/v1alpha1
+kind: Environment
+metadata:
+  name: hops-platform
+spec:
+  scope: cluster
+  clusterRef:
+    name: {name}
+  root: .
+  namespace: hops-platform
+  deploys:
+    - path: .gitops/local/platform/minio
+      type: helm
+    - path: .gitops/local/platform/mailpit
+      type: helm
+"#,
             name = DEFAULT_MACHINE_CLUSTER_NAME,
         ),
     )?;
-    write_chart(
-        &root.join(".gitops/local/platform/minio"),
-        "minio",
-        9000,
-    )?;
+    write_chart(&root.join(".gitops/local/platform/minio"), "minio", 9000)?;
     write_chart(
         &root.join(".gitops/local/platform/mailpit"),
         "mailpit",
@@ -157,17 +166,18 @@ fn write_chart(dir: &Path, name: &str, port: u16) -> Result<(), Box<dyn Error>> 
     fs::write(
         dir.join("templates/service.yaml"),
         format!(
-            "apiVersion: v1\n\
-             kind: Service\n\
-             metadata:\n\
-               name: {name}\n\
-             spec:\n\
-               selector:\n\
-                 app.kubernetes.io/name: {name}\n\
-               ports:\n\
-                 - name: http\n\
-                   port: {port}\n\
-                   targetPort: http\n"
+            r#"apiVersion: v1
+kind: Service
+metadata:
+  name: {name}
+spec:
+  selector:
+    app.kubernetes.io/name: {name}
+  ports:
+    - name: http
+      port: {port}
+      targetPort: http
+"#
         ),
     )?;
     Ok(())

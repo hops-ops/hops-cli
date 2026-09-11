@@ -2,7 +2,7 @@
 
 use super::gitops::{self, EnvironmentArgs};
 use super::local_state_dir;
-use super::workbench::definition::{ClusterOverrides, DEFAULT_ENVIRONMENT_FILE};
+use super::workbench::definition::ClusterOverrides;
 use super::workbench::machine::{self, DEFAULT_MACHINE_CLUSTER_NAME};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -266,12 +266,7 @@ fn walk_gitops(
     if skip && depth > 0 {
         return Ok(());
     }
-    for name in [DEFAULT_ENVIRONMENT_FILE, ".gitops/local/platform.yaml"] {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            found.push(candidate);
-        }
-    }
+    collect_environment_documents(&dir.join(".gitops/local"), found);
     if depth == max_depth {
         return Ok(());
     }
@@ -286,6 +281,45 @@ fn walk_gitops(
         }
     }
     Ok(())
+}
+
+fn collect_environment_documents(local_dir: &Path, found: &mut Vec<PathBuf>) {
+    let read = match fs::read_dir(local_dir) {
+        Ok(read) => read,
+        Err(_) => return,
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some("cluster.yaml") {
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        if environment_kind(&path).as_deref() != Some("Environment") {
+            continue;
+        }
+        found.push(path);
+    }
+}
+
+fn environment_kind(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&raw).ok()?;
+    value.get("kind")?.as_str().map(ToOwned::to_owned)
+}
+
+fn environment_scope_from_file(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&raw).ok()?;
+    value
+        .get("spec")?
+        .get("scope")?
+        .as_str()
+        .map(ToOwned::to_owned)
 }
 
 fn environment_name_from_file(path: &Path) -> Option<String> {
@@ -345,6 +379,14 @@ fn catalog_id(source: &Path) -> String {
 }
 
 fn runtime_name_for_source(source: &Path) -> String {
+    if environment_scope_from_file(source).as_deref() == Some("cluster") {
+        if let Some(name) = environment_name_from_file(source) {
+            let slug = slug(&name);
+            if !slug.is_empty() {
+                return slug;
+            }
+        }
+    }
     let checkout = source.ancestors().nth(3).unwrap_or(source);
     if let Some(label) = worktree_label(checkout) {
         return slug(&label);

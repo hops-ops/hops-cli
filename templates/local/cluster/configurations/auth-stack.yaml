@@ -1,0 +1,8 @@
+# Reconciled once per Cluster from .gitops/local/cluster.
+apiVersion: pkg.crossplane.io/v1
+kind: Configuration
+metadata:
+  name: hops-ops-auth-stack
+spec:
+  # v1.9.0 adds the HumanUser API used by the cluster-owned local personas.
+  package: ghcr.io/hops-ops/auth-stack:v1.9.0

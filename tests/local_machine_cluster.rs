@@ -300,6 +300,72 @@ fn env_discover_keeps_worktrees_distinct() {
 }
 
 #[test]
+fn up_materializes_cli_template_and_skips_shared_overlay() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.root.join(".gitops/local/cluster/shared")).unwrap();
+    fs::write(
+        fixture.root.join(".gitops/local/cluster/extra.yaml"),
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: extra\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join(".gitops/local/cluster/shared/minio.yaml"),
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: minio-should-not-land\n",
+    )
+    .unwrap();
+    let output = Fixture::output(fixture.command().args(["local", "up", "--once", "--dry-run"]));
+    assert!(
+        output.status.success(),
+        "{:?}",
+        Fixture::stdout_stderr(&output)
+    );
+    let profile = fixture.root.join("home/.gitops/local/cluster");
+    assert!(
+        profile.join("providers/helm.yaml").is_file(),
+        "CLI template providers must land in $HOME/.gitops/local/cluster"
+    );
+    let helm = fs::read_to_string(profile.join("providers/helm.yaml")).unwrap();
+    assert!(helm.contains("provider-helm:v1.3.0"), "{helm}");
+    assert!(profile.join("extra.yaml").is_file());
+    assert!(!profile.join("shared/minio.yaml").exists());
+    let yaml = fs::read_to_string(fixture.root.join("home/.gitops/local/cluster.yaml")).unwrap();
+    assert!(yaml.contains("name: hops"), "{yaml}");
+    assert!(yaml.contains("mountRoot: $HOME"), "{yaml}");
+}
+
+#[test]
+fn env_discover_finds_cluster_scoped_extra_yaml() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join(".gitops/local/environment.yaml"), ENV_YAML).unwrap();
+    fs::write(
+        fixture.root.join(".gitops/local/harmony-system.yaml"),
+        r#"apiVersion: hops.local/v1alpha1
+kind: Environment
+metadata:
+  name: harmony-system
+spec:
+  scope: cluster
+  clusterRef:
+    name: hops
+  namespace: harmony-system
+  root: .
+  deploys: []
+"#,
+    )
+    .unwrap();
+    let output = Fixture::output(fixture.command().args(["local", "env", "discover"]));
+    assert!(
+        output.status.success(),
+        "{:?}",
+        Fixture::stdout_stderr(&output)
+    );
+    let list = Fixture::output(fixture.command().args(["local", "env", "list"]));
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(stdout.contains("harmony-system"), "{stdout}");
+    assert!(stdout.contains("demo") || stdout.contains("off"), "{stdout}");
+}
+
+#[test]
 fn cluster_name_escape_hatch_warns() {
     let fixture = Fixture::new();
     let output = Fixture::output(

@@ -45,10 +45,10 @@ pub const CLUSTER_MANIFESTS_PATH: &str = ".gitops/local/cluster";
 
 /// Read `metadata.name` from a Cluster document without activating a backend.
 pub fn load_cluster_document_name(path: &Path) -> Result<String, Box<dyn Error>> {
-    let raw = fs::read_to_string(path)
-        .map_err(|error| format!("read {}: {error}", path.display()))?;
-    let value: Value = serde_yaml::from_str(&raw)
-        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let value: Value =
+        serde_yaml::from_str(&raw).map_err(|error| format!("parse {}: {error}", path.display()))?;
     let name = value
         .get("metadata")
         .and_then(|metadata| metadata.get("name"))
@@ -1097,22 +1097,24 @@ fn resolve_mount_root(
     field: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
     if relative == Path::new("$HOME") || relative == Path::new("~") {
-        let home = std::env::var("HOME").map_err(|_| {
-            format!("{field} $HOME requires the HOME environment variable")
-        })?;
-        let resolved = PathBuf::from(home).canonicalize().map_err(|error| {
-            format!("unable to canonicalize HOME for {field}: {error}")
-        })?;
+        let home = std::env::var("HOME")
+            .map_err(|_| format!("{field} $HOME requires the HOME environment variable"))?;
+        let resolved = PathBuf::from(home)
+            .canonicalize()
+            .map_err(|error| format!("unable to canonicalize HOME for {field}: {error}"))?;
         ensure_within(&resolved, definition_root, field)?;
         return Ok(resolved);
     }
     if relative.is_absolute() {
         let home = std::env::var("HOME").map_err(|_| {
-            format!("{field} absolute path requires HOME; got {}", relative.display())
+            format!(
+                "{field} absolute path requires HOME; got {}",
+                relative.display()
+            )
         })?;
-        let home = PathBuf::from(home).canonicalize().map_err(|error| {
-            format!("unable to canonicalize HOME for {field}: {error}")
-        })?;
+        let home = PathBuf::from(home)
+            .canonicalize()
+            .map_err(|error| format!("unable to canonicalize HOME for {field}: {error}"))?;
         let resolved = relative.canonicalize().map_err(|error| {
             format!(
                 "unable to canonicalize {field} {}: {error}",
@@ -1685,14 +1687,16 @@ spec:
     fn rejects_absolute_traversal_and_symlink_escape() {
         let fixture = Fixture::new();
         let absolute = valid_yaml().replacen("mountRoot: ../..", "mountRoot: /tmp", 1);
-        assert!(load_definition(&fixture.write(&absolute))
-            .unwrap_err()
-            .to_string()
-            .contains("must be $HOME")
+        assert!(
+            load_definition(&fixture.write(&absolute))
+                .unwrap_err()
+                .to_string()
+                .contains("must be $HOME")
                 || load_definition(&fixture.write(&absolute))
                     .unwrap_err()
                     .to_string()
-                    .contains("unable to canonicalize"));
+                    .contains("unable to canonicalize")
+        );
 
         let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
         let traversal = valid_environment_yaml().replacen("root: .", "root: ../outside", 1);

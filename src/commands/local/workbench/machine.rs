@@ -28,10 +28,10 @@ pub fn load(state_dir: &Path) -> Result<Option<MachineClusterRecord>, Box<dyn Er
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(&path)
-        .map_err(|error| format!("read {}: {error}", path.display()))?;
-    let record: MachineClusterRecord = serde_json::from_str(&raw)
-        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let raw =
+        fs::read_to_string(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let record: MachineClusterRecord =
+        serde_json::from_str(&raw).map_err(|error| format!("parse {}: {error}", path.display()))?;
     if record.name.trim().is_empty() {
         return Err(format!("{}: Cluster name must not be empty", path.display()).into());
     }

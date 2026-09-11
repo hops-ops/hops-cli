@@ -1,0 +1,25 @@
+# Reconciled once per Cluster from .gitops/cluster.
+apiVersion: smtp.zitadel.m.crossplane.io/v1alpha1
+kind: Config
+metadata:
+  name: harmony-local-mailpit
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: harmony-local
+spec:
+  managementPolicies: ["*"]
+  forProvider:
+    description: Harmony local workbench Mailpit
+    host: mailpit.harmony-system.svc.cluster.local:1025
+    passwordSecretRef:
+      name: harmony-local-smtp
+      key: password
+    replyToAddress: noreply@harmony.local
+    senderAddress: noreply@harmony.local
+    senderName: Harmony Local
+    setActive: true
+    tls: false
+    user: harmony-local
+  providerConfigRef:
+    name: default
+    kind: ProviderConfig
