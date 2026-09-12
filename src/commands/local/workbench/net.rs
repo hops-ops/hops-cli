@@ -1403,11 +1403,11 @@ mod tests {
     #[test]
     fn parse_cluster_dns_from_env_value() {
         let refs = regex_lite_cluster_dns(
-            "http://zitadel-zitadel.auth.svc.cluster.local:8080/oauth/v2/keys",
+            "http://zitadel.auth.svc.cluster.local:8080/oauth/v2/keys",
         );
         assert_eq!(
             refs,
-            vec![("auth".into(), "zitadel-zitadel".into(), Some(8080))]
+            vec![("auth".into(), "zitadel".into(), Some(8080))]
         );
     }
 

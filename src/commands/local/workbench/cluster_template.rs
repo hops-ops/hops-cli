@@ -323,7 +323,9 @@ mod tests {
         assert!(FILES
             .iter()
             .any(|(path, _)| *path == "providerconfigs/kubernetes.yaml"));
-        assert!(FILES.iter().any(|(path, _)| *path == "stacks/auth.yaml"));
+        assert!(FILES.iter().any(|(path, contents)| *path == "stacks/auth.yaml"
+            && contents.contains("namespace: auth")
+            && contents.contains("fullnameOverride: zitadel")));
         assert!(FILES.iter().any(|(path, _)| *path == "providers/zitadel.yaml"));
         assert!(FILES
             .iter()
@@ -351,7 +353,7 @@ spec:
   localDomain: gitkb.localhost
   browserIngress:
     namespaces:
-      - harmony-auth
+      - auth
   manifests:
     path: .gitops/local/cluster
 "#,
@@ -379,7 +381,7 @@ spec:
         assert!(body.contains("name: hops"), "{body}");
         assert!(!body.contains("name: harmony"), "{body}");
         assert!(body.contains("localDomain: gitkb.localhost"), "{body}");
-        assert!(body.contains("harmony-auth"), "{body}");
+        assert!(body.contains("- auth"), "{body}");
         assert!(body.contains("mountRoot: $HOME"));
         let manifests = home.join(".gitops/local/cluster");
         assert!(manifests.join(MANAGED_MARKER).is_file());

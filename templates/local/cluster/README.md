@@ -5,7 +5,8 @@ This tree is embedded in hops-cli and materialized by `hops local up` to
 
 It is the machine Cluster desired state: Crossplane packages (helm/k8s/zitadel
 providers and ProviderConfigs) and platform stacks (AuthStack, gateway, Istio,
-PSQL, secrets/Vault). AuthStack is the working Zitadel install.
+PSQL, secrets/Vault). AuthStack installs Zitadel as Service `zitadel` in
+namespace `auth` (`zitadel.auth.svc.cluster.local`).
 
 Project extras overlay from `<repo>/.gitops/local/cluster/` (last write wins by
 relative path). Do not put shared app workloads or product identity here —

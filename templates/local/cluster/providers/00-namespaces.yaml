@@ -2,9 +2,9 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: harmony-auth
+  name: auth
   labels:
-    app.kubernetes.io/part-of: harmony-local
+    app.kubernetes.io/part-of: hops-local
 ---
 apiVersion: v1
 kind: Namespace

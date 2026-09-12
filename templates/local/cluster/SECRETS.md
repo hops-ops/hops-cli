@@ -57,7 +57,7 @@ creates:
 
 | Namespace | Secret | Keys |
 |---|---|---|
-| `harmony-auth` | `zitadel-masterkey` | `masterkey` |
+| `auth` | `zitadel-masterkey` | `masterkey` |
 | `harmony-system` | `harmony-minio` | `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` |
 | `default` | `harmony-local-human-passwords` | `approved-admin`, `waitlisted`, `iac-approved`, `device-login`, `fixture-owner`, `fixture-viewer`, `bob`, `alice`, `carol` |
 | `default` | `harmony-local-smtp` | `password` |
@@ -73,17 +73,17 @@ The SMTP password is a local-only generated credential. The declarative
 credentials and exposes its inbox at
 `http://mailpit.harmony-system.svc.cluster.local:8025`.
 
-`harmony-auth` is the cluster-specific internal namespace. Provider bootstrap
-continues to use its Service FQDN, while browser OIDC uses the AuthStack's
-Gateway-backed `https://auth.gitkb.localhost` issuer.
+`auth` is the Cluster Zitadel namespace. Provider bootstrap uses
+`zitadel.auth.svc.cluster.local`; browser OIDC uses the AuthStack Gateway
+issuer `https://auth.gitkb.localhost`.
 
 After AuthStack is Ready, configure the Zitadel provider from its generated
 admin PAT:
 
 ```bash
-hops local zitadel --context kind-harmony --source-context kind-harmony \
-  --source-namespace harmony-auth \
-  --domain zitadel-zitadel.harmony-auth.svc.cluster.local --port 8080 --insecure
+hops local zitadel --context kind-hops --source-context kind-hops \
+  --source-namespace auth \
+  --domain zitadel.auth.svc.cluster.local --port 8080 --insecure
 
 ```
 
