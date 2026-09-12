@@ -173,30 +173,37 @@ pub(crate) fn open_session(
 fn probe_vault(session: &VaultSession, token_env: &str) -> Result<(), Box<dyn Error>> {
     let health_url = format!("{}/v1/sys/health", session.address);
     match ureq::get(&health_url)
-        .timeout(Duration::from_secs(5))
+        .config()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .http_status_as_error(false)
+        .build()
         .call()
     {
-        Ok(_)
-        | Err(ureq::Error::Status(429, _))
-        | Err(ureq::Error::Status(472, _))
-        | Err(ureq::Error::Status(473, _))
-        | Err(ureq::Error::Status(501, _))
-        | Err(ureq::Error::Status(503, _)) => {}
-        Err(ureq::Error::Status(code, _)) => {
-            return Err(format!("Vault health check failed with HTTP {code}").into());
-        }
+        Ok(response) => match response.status().as_u16() {
+            200..=399 | 429 | 472 | 473 | 501 | 503 => {}
+            code => {
+                return Err(format!("Vault health check failed with HTTP {code}").into());
+            }
+        },
         Err(_) => return Err("Vault health check failed before receiving a response".into()),
     }
 
     let lookup_url = format!("{}/v1/auth/token/lookup-self", session.address);
     match ureq::get(&lookup_url)
-        .set("X-Vault-Token", &session.token)
-        .timeout(Duration::from_secs(5))
+        .header("X-Vault-Token", &session.token)
+        .config()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .http_status_as_error(false)
+        .build()
         .call()
     {
-        Ok(_) => Ok(()),
-        Err(ureq::Error::Status(code, _)) => {
-            Err(format!("Vault rejected the token from {token_env} with HTTP {code}").into())
+        Ok(response) => {
+            let code = response.status().as_u16();
+            if (200..300).contains(&code) {
+                Ok(())
+            } else {
+                Err(format!("Vault rejected the token from {token_env} with HTTP {code}").into())
+            }
         }
         Err(_) => Err("Vault token validation failed before receiving a response".into()),
     }
@@ -309,12 +316,24 @@ impl VaultSession {
     ) -> Result<Option<Map<String, JsonValue>>, Box<dyn Error>> {
         let url = self.data_url(secret_path);
         match ureq::get(&url)
-            .set("X-Vault-Token", &self.token)
-            .timeout(Duration::from_secs(15))
+            .header("X-Vault-Token", &self.token)
+            .config()
+            .timeout_global(Some(Duration::from_secs(15)))
+            .http_status_as_error(false)
+            .build()
             .call()
         {
-            Ok(response) => {
-                let body: JsonValue = response.into_json().map_err(|_| {
+            Ok(mut response) => {
+                let code = response.status().as_u16();
+                if code == 404 {
+                    return Ok(None);
+                }
+                if !(200..300).contains(&code) {
+                    return Err(
+                        format!("Vault read failed for {secret_path:?} with HTTP {code}").into()
+                    );
+                }
+                let body: JsonValue = response.body_mut().read_json().map_err(|_| {
                     format!("Vault returned invalid JSON while reading {secret_path:?}")
                 })?;
                 let data = if self.version == "v1" {
@@ -333,10 +352,6 @@ impl VaultSession {
                     )
                     .into()),
                 }
-            }
-            Err(ureq::Error::Status(404, _)) => Ok(None),
-            Err(ureq::Error::Status(code, _)) => {
-                Err(format!("Vault read failed for {secret_path:?} with HTTP {code}").into())
             }
             Err(_) => Err(format!(
                 "Vault read failed for {secret_path:?} before receiving a response"
@@ -357,14 +372,20 @@ impl VaultSession {
             json!({ "data": data })
         };
         match ureq::post(&url)
-            .set("X-Vault-Token", &self.token)
-            .set("Content-Type", "application/json")
-            .timeout(Duration::from_secs(15))
-            .send_json(body)
+            .header("X-Vault-Token", &self.token)
+            .config()
+            .timeout_global(Some(Duration::from_secs(15)))
+            .http_status_as_error(false)
+            .build()
+            .send_json(&body)
         {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(code, _)) => {
-                Err(format!("Vault write failed for {secret_path:?} with HTTP {code}").into())
+            Ok(response) => {
+                let code = response.status().as_u16();
+                if (200..300).contains(&code) {
+                    Ok(())
+                } else {
+                    Err(format!("Vault write failed for {secret_path:?} with HTTP {code}").into())
+                }
             }
             Err(_) => Err(format!(
                 "Vault write failed for {secret_path:?} before receiving a response"
