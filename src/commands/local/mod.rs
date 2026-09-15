@@ -160,12 +160,12 @@ pub enum LocalCommands {
     /// Catalog, enable, and disable Environments (off until enable)
     Env(env::EnvArgs),
     /// Toggle catalogued Environments
-    #[command(name = "envs", alias = "tui")]
+    #[command(name = "envs")]
     Envs(tui::TuiArgs),
     /// Show live cluster + workspace status (`--urls` for HTTPRoute URLs only)
     Status(status::StatusArgs),
     /// Port-forward Kubernetes Service FQDNs onto this host
-    #[command(name = "fwd", alias = "dns")]
+    #[command(name = "fwd")]
     Fwd(dns::DnsArgs),
     /// Local gitops: `cluster` (shared CP) or `environment` (app namespaces)
     Gitops(gitops::GitopsArgs),
@@ -719,12 +719,14 @@ mod tests {
             }
             other => panic!("expected fwd, got {other:?}"),
         }
-        let dns_alias = Cli::try_parse_from(["hops-local-test", "dns", "--name", "feature"])
-            .expect("dns remains a hidden alias for fwd");
-        match dns_alias.local.command {
-            LocalCommands::Fwd(_) => {}
-            other => panic!("expected fwd alias, got {other:?}"),
-        }
+        assert!(
+            Cli::try_parse_from(["hops-local-test", "dns", "--name", "feature"]).is_err(),
+            "dns must not remain as an alias"
+        );
+        assert!(
+            Cli::try_parse_from(["hops-local-test", "tui"]).is_err(),
+            "tui must not remain as an alias"
+        );
         let envs = Cli::try_parse_from(["hops-local-test", "envs"]).expect("parse envs");
         match envs.local.command {
             LocalCommands::Envs(_) => {}
