@@ -206,7 +206,9 @@ impl KubectlApplier for SystemKubectl {
         // when the pack is not installed) does not prevent core Deploy/Service apply.
         let mut hard_errors = Vec::new();
         for doc in parse_yaml_docs(yaml)? {
-            let doc = serde_yaml::to_string(&doc)?;
+            // JSON, not YAML: serde_yaml round-trips `yes`/`on`/`no` as unquoted
+            // YAML 1.1 booleans, and kubectl then rejects container args.
+            let doc = serde_json::to_string(&doc)?;
             match crate::commands::local::kubectl_apply_stdin(&doc) {
                 Ok(()) => {}
                 Err(e) => {
