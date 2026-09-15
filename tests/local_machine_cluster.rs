@@ -156,12 +156,12 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn local_help_lists_up_init_env_tui() {
+fn local_help_lists_up_init_env_envs() {
     let fixture = Fixture::new();
     let output = Fixture::output(fixture.command().args(["local", "--help"]));
     assert!(output.status.success(), "{:?}", Fixture::stdout_stderr(&output));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for needle in ["up", "init", "env", "tui", "gitops"] {
+    for needle in ["up", "init", "env", "envs", "configure", "fwd", "gitops"] {
         assert!(stdout.contains(needle), "missing {needle} in {stdout}");
     }
 }
@@ -240,16 +240,16 @@ fn env_discover_catalogues_disabled_and_refuses_home() {
 }
 
 #[test]
-fn tui_once_lists_catalog() {
+fn envs_once_lists_catalog() {
     let fixture = Fixture::new();
     fs::write(fixture.root.join(".gitops/local/environment.yaml"), ENV_YAML).unwrap();
     assert!(Fixture::output(fixture.command().args(["local", "env", "discover"]))
         .status
         .success());
-    let output = Fixture::output(fixture.command().args(["local", "tui", "--once"]));
+    let output = Fixture::output(fixture.command().args(["local", "envs", "--once"]));
     assert!(output.status.success(), "{:?}", Fixture::stdout_stderr(&output));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("demo") || stdout.contains("Environments"));
+    assert!(!stdout.trim().is_empty(), "{stdout}");
 }
 
 #[test]

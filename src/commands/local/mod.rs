@@ -1,6 +1,7 @@
 mod aws;
 pub mod backend;
 mod cloudflare;
+mod configure;
 mod destroy;
 mod dns;
 mod doctor;
@@ -153,6 +154,8 @@ pub enum LocalCommands {
     Doctor,
     /// Create or reconnect the one machine Cluster
     Up(up::UpArgs),
+    /// Show or change machine Cluster settings (hostPath, localDomain, name)
+    Configure(configure::ConfigureArgs),
     /// Stop the machine Cluster (no --name) or one Environment (`--name`)
     Down(down::DownArgs),
     /// Write committed Cluster / platform / Environment files
@@ -200,6 +203,9 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
             command: gitops::GitopsCommands::Cluster(cluster),
         }) => return gitops::run_cluster(cluster, overrides),
         LocalCommands::Up(up_args) => return up::run(up_args, overrides),
+        LocalCommands::Configure(configure_args) => {
+            return configure::run(configure_args, overrides)
+        }
         LocalCommands::Down(down_args) if down_args.name.is_none() => {
             return down::run(down_args, overrides)
         }
@@ -277,9 +283,12 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
             },
         ),
         LocalCommands::Up(_)
+        | LocalCommands::Configure(_)
         | LocalCommands::Init(_)
         | LocalCommands::Env(_)
-        | LocalCommands::Envs(_) => unreachable!("up/init/env/envs return before provider activation"),
+        | LocalCommands::Envs(_) => {
+            unreachable!("up/configure/init/env/envs return before provider activation")
+        }
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Cloudflare(cloudflare_args) => cloudflare::run(cloudflare_args),
         LocalCommands::Github(github_args) => github::run(github_args),

@@ -52,7 +52,17 @@ pub fn run(args: &UpArgs, overrides: ClusterOverrides<'_>) -> Result<(), Box<dyn
         .or_else(|| cwd_yaml.exists().then_some(cwd_yaml.clone()));
     let home =
         PathBuf::from(std::env::var("HOME").map_err(|_| "HOME is required for hops local up")?);
-    let source = cluster_template::materialize(&home, overlay.as_deref(), &machine_name)?;
+    let host_path = resolve_up_host_path(record.as_ref(), &home)?;
+    let local_domain = record
+        .as_ref()
+        .and_then(|record| record.local_domain.clone());
+    let source = cluster_template::materialize(
+        &home,
+        overlay.as_deref(),
+        &machine_name,
+        Some(&host_path),
+        local_domain.as_deref(),
+    )?;
 
     if cwd_yaml.exists() && args.path.is_none() {
         if let Ok(leaf) = definition::load_cluster_document_name(&cwd_yaml) {
@@ -68,6 +78,8 @@ pub fn run(args: &UpArgs, overrides: ClusterOverrides<'_>) -> Result<(), Box<dyn
         name: machine_name.clone(),
         kube_context: kube_context_for_name(&machine_name),
         source: source.clone(),
+        host_path: Some(host_path),
+        local_domain,
     };
     if !args.dry_run {
         machine::save(&state_dir, &record)?;
@@ -86,6 +98,29 @@ pub fn run(args: &UpArgs, overrides: ClusterOverrides<'_>) -> Result<(), Box<dyn
         ..overrides
     };
     gitops::run_cluster(&cluster_args, overrides)
+}
+
+fn resolve_up_host_path(
+    record: Option<&MachineClusterRecord>,
+    home: &Path,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(path) = record.and_then(|record| record.host_path.clone()) {
+        return Ok(path);
+    }
+    if let Some(record) = record {
+        if let Some(path) = host_path_from_cluster_yaml(&record.source) {
+            return Ok(path);
+        }
+        return Ok(home.canonicalize().unwrap_or_else(|_| home.to_path_buf()));
+    }
+    machine::prompt_host_path(&machine::default_host_path())
+}
+
+fn host_path_from_cluster_yaml(source: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(source).ok()?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&raw).ok()?;
+    let mount = value.get("spec")?.get("mountRoot")?.as_str()?;
+    machine::expand_host_path(mount).ok()
 }
 
 fn warn_escape_hatch() -> io::Result<()> {

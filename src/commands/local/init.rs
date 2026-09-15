@@ -1,10 +1,11 @@
 //! `hops local init` — write committed Cluster / platform / Environment files.
 
+use super::local_state_dir;
 use super::workbench::definition::{
     DEFAULT_CROSSPLANE_CHART, DEFAULT_CROSSPLANE_VERSION, DEFAULT_DEFINITION_FILE,
     DEFAULT_ENVIRONMENT_FILE,
 };
-use super::workbench::machine::DEFAULT_MACHINE_CLUSTER_NAME;
+use super::workbench::machine::{self, DEFAULT_MACHINE_CLUSTER_NAME};
 use clap::{Args, Subcommand};
 use std::error::Error;
 use std::fs;
@@ -31,6 +32,10 @@ pub struct InitPathArgs {
     /// Directory to initialize (defaults to cwd).
     #[arg(long)]
     pub path: Option<PathBuf>,
+
+    /// Host directory bind-mounted into the kind node (Cluster.spec.mountRoot).
+    #[arg(long = "host-path")]
+    pub host_path: Option<PathBuf>,
 
     /// Overwrite existing files.
     #[arg(long, default_value_t = false)]
@@ -68,6 +73,11 @@ fn init_cluster(args: &InitPathArgs) -> Result<(), Box<dyn Error>> {
              Do not put shared app workloads here — use a cluster-scoped Environment.\n",
         )?;
     }
+    let host_path = match &args.host_path {
+        Some(path) => machine::expand_host_path(&path.display().to_string())?,
+        None => machine::prompt_host_path(&machine::default_host_path())?,
+    };
+    let mount_root = mount_root_for_yaml(&host_path);
     let body = format!(
         r#"apiVersion: hops.local/v1alpha1
 kind: Cluster
@@ -76,7 +86,7 @@ metadata:
 spec:
   clusterProvider: kind
   dockerProvider: dory
-  mountRoot: $HOME
+  mountRoot: {mount_root}
   manifests:
     path: .gitops/local/cluster
   controlPlane:
@@ -90,9 +100,34 @@ spec:
     );
     fs::create_dir_all(yaml.parent().unwrap())?;
     fs::write(&yaml, body)?;
+    persist_host_path(&host_path)?;
     println!("Wrote {}", yaml.display());
     println!("Wrote {}", manifests.display());
+    println!("hostPath {}", host_path.display());
     Ok(())
+}
+
+fn mount_root_for_yaml(host_path: &Path) -> String {
+    let home = std::env::var("HOME")
+        .ok()
+        .and_then(|home| PathBuf::from(home).canonicalize().ok());
+    let host = host_path
+        .canonicalize()
+        .unwrap_or_else(|_| host_path.to_path_buf());
+    if home.as_ref() == Some(&host) {
+        "$HOME".to_string()
+    } else {
+        host.display().to_string()
+    }
+}
+
+fn persist_host_path(host_path: &Path) -> Result<(), Box<dyn Error>> {
+    let state_dir = local_state_dir()?;
+    let Some(mut record) = machine::load(&state_dir)? else {
+        return Ok(());
+    };
+    record.host_path = Some(host_path.to_path_buf());
+    machine::save(&state_dir, &record)
 }
 
 fn init_environment(args: &InitPathArgs) -> Result<(), Box<dyn Error>> {

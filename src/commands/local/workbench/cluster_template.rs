@@ -60,6 +60,8 @@ pub fn materialize(
     home: &Path,
     overlay_cluster_yaml: Option<&Path>,
     machine_name: &str,
+    host_path: Option<&Path>,
+    local_domain: Option<&str>,
 ) -> Result<PathBuf, Box<dyn Error>> {
     let home = home.canonicalize().map_err(|error| {
         format!(
@@ -85,7 +87,13 @@ pub fn materialize(
         "Materialized by hops local up from the CLI local-cluster template.\n\
          Project extras overlay from <repo>/.gitops/local/cluster/. Do not edit in place.\n",
     )?;
-    let body = cluster_document_yaml(machine_name, overlay_cluster_yaml, &home)?;
+    let body = cluster_document_yaml(
+        machine_name,
+        overlay_cluster_yaml,
+        &home,
+        host_path.unwrap_or(&home),
+        local_domain,
+    )?;
     fs::write(&yaml_path, body)?;
     Ok(yaml_path)
 }
@@ -179,6 +187,8 @@ fn cluster_document_yaml(
     machine_name: &str,
     overlay_cluster_yaml: Option<&Path>,
     home: &Path,
+    host_path: &Path,
+    configured_domain: Option<&str>,
 ) -> Result<String, Box<dyn Error>> {
     let name = if machine_name.trim().is_empty() {
         DEFAULT_MACHINE_CLUSTER_NAME
@@ -193,7 +203,9 @@ fn cluster_document_yaml(
         .local_domain
         .as_deref()
         .filter(|value| !value.is_empty())
+        .or(configured_domain.filter(|value| !value.is_empty()))
         .unwrap_or(DEFAULT_LOCAL_DOMAIN);
+    let mount_root = mount_root_yaml(home, host_path);
     let mut body = format!(
         r#"apiVersion: hops.local/v1alpha1
 kind: Cluster
@@ -202,7 +214,7 @@ metadata:
 spec:
   clusterProvider: kind
   dockerProvider: dory
-  mountRoot: $HOME
+  mountRoot: {mount_root}
   manifests:
     path: {manifests}
   controlPlane:
@@ -230,6 +242,18 @@ spec:
         }
     }
     Ok(body)
+}
+
+fn mount_root_yaml(home: &Path, host_path: &Path) -> String {
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let host = host_path
+        .canonicalize()
+        .unwrap_or_else(|_| host_path.to_path_buf());
+    if host == home {
+        "$HOME".to_string()
+    } else {
+        host.display().to_string()
+    }
 }
 
 #[derive(Default)]
@@ -374,6 +398,8 @@ spec:
             &home,
             Some(&project.join(".gitops/local/cluster.yaml")),
             "hops",
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(yaml, home.join(".gitops/local/cluster.yaml"));
@@ -397,7 +423,7 @@ spec:
         let manifests = home.join(".gitops/local/cluster");
         fs::create_dir_all(&manifests).unwrap();
         fs::write(manifests.join("stray.yaml"), "kind: ConfigMap\n").unwrap();
-        let err = materialize(&home, None, "hops").unwrap_err();
+        let err = materialize(&home, None, "hops", None, None).unwrap_err();
         assert!(err.to_string().contains("not hops-managed"), "{err}");
         cleanup(&home);
     }
