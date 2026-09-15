@@ -738,16 +738,7 @@ pub fn load_environment_definition(
     debug_assert_eq!(raw.api_version, API_VERSION);
     debug_assert_eq!(raw.kind, "Environment");
     validate_dns_label("Environment.metadata.name", &raw.metadata.name)?;
-    let checkout_root = if source.ends_with(DEFAULT_ENVIRONMENT_FILE) {
-        source.ancestors().nth(3).ok_or_else(|| {
-            format!(
-                "Environment definition has no containing checkout: {}",
-                source.display()
-            )
-        })?
-    } else {
-        definition_root.as_path()
-    };
+    let checkout_root = gitops_local_checkout_root(&source, &definition_root)?;
     let name = name_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -996,6 +987,42 @@ fn normalize_local_domain(value: Option<&str>) -> Result<String, Box<dyn Error>>
         validate_dns_label("Cluster.spec.localDomain label", label)?;
     }
     Ok(normalized.to_string())
+}
+
+/// `.gitops/local/<file>.yaml` lives two levels under the checkout, whether
+/// the file is `environment.yaml` or an extra Environment like `harmony-system.yaml`.
+fn gitops_local_checkout_root<'a>(
+    source: &'a Path,
+    definition_root: &'a Path,
+) -> Result<&'a Path, Box<dyn Error>> {
+    if is_gitops_local_yaml(source) {
+        source.ancestors().nth(3).ok_or_else(|| {
+            format!(
+                "Environment definition has no containing checkout: {}",
+                source.display()
+            )
+            .into()
+        })
+    } else {
+        Ok(definition_root)
+    }
+}
+
+fn is_gitops_local_yaml(source: &Path) -> bool {
+    let mut components = source.components().rev();
+    let Some(Component::Normal(file)) = components.next() else {
+        return false;
+    };
+    if !file.to_string_lossy().ends_with(".yaml") {
+        return false;
+    }
+    matches!(
+        components.next(),
+        Some(Component::Normal(name)) if name == "local"
+    ) && matches!(
+        components.next(),
+        Some(Component::Normal(name)) if name == ".gitops"
+    )
 }
 
 fn resolve_bounded_path(
@@ -1275,6 +1302,40 @@ spec:
         assert_eq!(
             environment.environment.deploys[0].deploy_type,
             DeployType::Helm
+        );
+    }
+
+    #[test]
+    fn extra_environment_yaml_under_gitops_local_uses_checkout_root() {
+        let fixture = Fixture::new();
+        let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
+        fs::create_dir_all(fixture.root.join(".gitops/local/harmony-system")).unwrap();
+        let source = fixture.root.join(".gitops/local/harmony-system.yaml");
+        fs::write(
+            &source,
+            r#"apiVersion: hops.local/v1alpha1
+kind: Environment
+metadata:
+  name: harmony-system
+spec:
+  scope: cluster
+  clusterRef:
+    name: project-dev
+  namespace: harmony-system
+  root: .
+  deploys:
+    - path: .gitops/local/harmony-system
+      type: k8s
+      recursive: true
+"#,
+        )
+        .unwrap();
+        let environment = load_environment_definition(&source, &loaded, None, None).unwrap();
+        assert_eq!(environment.environment.name, "harmony-system");
+        assert_eq!(environment.environment.root, fixture.root);
+        assert_eq!(
+            environment.environment.deploys[0].source_path,
+            fixture.root.join(".gitops/local/harmony-system")
         );
     }
 
