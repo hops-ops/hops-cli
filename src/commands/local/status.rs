@@ -61,23 +61,95 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         return print_urls(&workspaces, args.all);
     }
 
+    if args.all {
+        return print_verbose(&state_dir, &workspaces, args);
+    }
+
     let mut all_ok = true;
     let mut shown = 0usize;
     for ws in workspaces.iter() {
-        if !args.all && args.name.is_none() && !workspace_is_live(ws) {
+        if args.name.is_none() && !workspace_is_live(ws) {
             continue;
         }
+        let _ = activate_workspace_cluster(ws);
+        let pods = match discover_pods(&ws.namespace) {
+            Ok(pods) => pods,
+            Err(_) => {
+                if args.name.is_some() {
+                    println!("{}: cluster unreachable", ws.name);
+                    all_ok = false;
+                }
+                continue;
+            }
+        };
+        let running = pods.iter().any(|p| p.phase == "Running");
+        if args.name.is_none() && !running {
+            continue;
+        }
+        let urls = discover_ingress_routes(&ws.namespace)
+            .ok()
+            .and_then(|routes| plan_from_routes(&ws.namespace, &routes).ok())
+            .map(|plan| plan.urls.into_values().collect::<Vec<_>>())
+            .unwrap_or_default();
         if shown > 0 {
             println!();
         }
         shown += 1;
+        let ready = pods.iter().filter(|p| p.ready).count();
+        let total = pods
+            .iter()
+            .filter(|p| p.phase == "Running" || p.phase == "Pending")
+            .count();
+        let cluster = ws.cluster_name.as_deref().unwrap_or("-");
+        println!("{}  {cluster}  {ready}/{total} ready", ws.name);
+        if urls.is_empty() {
+            println!("  (no public URLs)");
+        } else {
+            for url in &urls {
+                println!("  {url}");
+            }
+        }
+        for p in pods.iter().filter(|p| p.phase == "Running" && !p.ready) {
+            all_ok = false;
+            println!(
+                "  not ready: {} {}/{}",
+                p.name, p.ready_containers, p.total_containers
+            );
+        }
+        if !running {
+            all_ok = false;
+            println!("  (no running pods)");
+        }
+    }
+
+    if shown == 0 {
+        println!(
+            "No running workspaces. Pass --all for stale records, or --urls for HTTPRoute URLs."
+        );
+    }
+
+    if args.check && !all_ok {
+        return Err("one or more workspaces are not ready (see above)".into());
+    }
+    Ok(())
+}
+
+fn print_verbose(
+    state_dir: &Path,
+    workspaces: &[WorkspaceRecord],
+    args: &StatusArgs,
+) -> Result<(), Box<dyn Error>> {
+    let mut all_ok = true;
+    for (i, ws) in workspaces.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
         if let Some(cn) = ws.cluster_name.as_deref() {
             let ctx = ws.kube_context.as_deref().unwrap_or("-");
             println!("cluster:  {cn} (context {ctx})");
         }
-        // Target the workspace's bound cluster before kubectl discovery.
         let _ = activate_workspace_cluster(ws);
-        let host_access = load_host_access_runtime(&state_dir, &ws.name)?;
+        let host_access = load_host_access_runtime(state_dir, &ws.name)?;
         let listen = if let Some(runtime) = &host_access {
             let plan = host_plan_from_runtime(runtime);
             let listen = url_listen_status(&plan);
@@ -96,7 +168,6 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
             Default::default()
         };
 
-        // Pods
         match discover_pods(&ws.namespace) {
             Ok(pods) if !pods.is_empty() => {
                 println!("pods:");
@@ -124,23 +195,19 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         if let Some(d) = &ws.delivery_mode {
             println!("delivery: {d}");
         }
-        println!("{}", delivery_status_line(&state_dir, &ws.name));
+        println!("{}", delivery_status_line(state_dir, &ws.name));
         println!("env:      {}", ws.env_path);
 
         if let Some(rt) = &host_access {
             println!("{}", host_access_status_line(&rt));
         }
 
-        let ingress_runtime = load_ingress_access_runtime(&state_dir, &ws.name)?;
+        let ingress_runtime = load_ingress_access_runtime(state_dir, &ws.name)?;
         match discover_ingress_routes(&ws.namespace) {
             Ok(routes) => match plan_from_routes(&ws.namespace, &routes) {
                 Ok(plan) => {
                     if plan.urls.is_empty() {
                         println!("ingress:  (no HTTPRoute hostnames)");
-                        if ingress_runtime.is_some() {
-                            all_ok = false;
-                            println!("warn:     stale ingress runtime is still recorded");
-                        }
                     } else if let Some(runtime) = &ingress_runtime {
                         if !ingress_access_matches_plan(&plan, runtime) {
                             all_ok = false;
@@ -175,11 +242,6 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
             }
         }
     }
-
-    if shown == 0 {
-        println!("No live workspaces. Pass --all for stale records, or --urls for HTTPRoute URLs.");
-    }
-
     if args.check && !all_ok {
         return Err("one or more workspaces are not ready (see above)".into());
     }
