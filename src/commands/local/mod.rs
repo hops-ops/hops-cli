@@ -159,12 +159,14 @@ pub enum LocalCommands {
     Init(init::InitArgs),
     /// Catalog, enable, and disable Environments (off until enable)
     Env(env::EnvArgs),
-    /// Interactive catalog of Cluster + Environments
-    Tui(tui::TuiArgs),
-    /// Show live workspace status (`--urls` for HTTPRoute URLs only)
+    /// Toggle catalogued Environments
+    #[command(name = "envs", alias = "tui")]
+    Envs(tui::TuiArgs),
+    /// Show live cluster + workspace status (`--urls` for HTTPRoute URLs only)
     Status(status::StatusArgs),
-    /// Explicitly enable or repair direct Kubernetes Service DNS on this host
-    Dns(dns::DnsArgs),
+    /// Port-forward Kubernetes Service FQDNs onto this host
+    #[command(name = "fwd", alias = "dns")]
+    Fwd(dns::DnsArgs),
     /// Local gitops: `cluster` (shared CP) or `environment` (app namespaces)
     Gitops(gitops::GitopsArgs),
     /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
@@ -203,7 +205,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         }
         LocalCommands::Init(init_args) => return init::run(init_args),
         LocalCommands::Env(env_args) => return env::run(env_args, overrides),
-        LocalCommands::Tui(tui_args) => return tui::run(tui_args, overrides),
+        LocalCommands::Envs(tui_args) => return tui::run(tui_args, overrides),
         _ => {}
     }
 
@@ -212,7 +214,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
     // selection as a side effect of status/access inspection.
     match &args.command {
         LocalCommands::Status(status_args) => return status::run(status_args),
-        LocalCommands::Dns(dns_args) => return dns::run(dns_args),
+        LocalCommands::Fwd(dns_args) => return dns::run(dns_args),
         _ => {}
     }
 
@@ -259,8 +261,8 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Resize(resize_args) => resize::run(backend, resize_args),
         LocalCommands::Doctor => doctor::run(),
         LocalCommands::Down(down_args) => down::run(down_args, overrides),
-        LocalCommands::Status(_) | LocalCommands::Dns(_) => {
-            unreachable!("status and dns return before provider activation")
+        LocalCommands::Status(_) | LocalCommands::Fwd(_) => {
+            unreachable!("status and fwd return before provider activation")
         }
         LocalCommands::Gitops(gitops_args) => gitops::run_environment_command(
             gitops_args,
@@ -277,7 +279,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Up(_)
         | LocalCommands::Init(_)
         | LocalCommands::Env(_)
-        | LocalCommands::Tui(_) => unreachable!("up/init/env/tui return before provider activation"),
+        | LocalCommands::Envs(_) => unreachable!("up/init/env/envs return before provider activation"),
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Cloudflare(cloudflare_args) => cloudflare::run(cloudflare_args),
         LocalCommands::Github(github_args) => github::run(github_args),
@@ -708,14 +710,25 @@ mod tests {
             other => panic!("expected status, got {other:?}"),
         }
 
-        let dns = Cli::try_parse_from(["hops-local-test", "dns", "--name", "feature", "--down"])
-            .expect("parse explicit Service DNS teardown");
-        match dns.local.command {
-            LocalCommands::Dns(dns) => {
+        let fwd = Cli::try_parse_from(["hops-local-test", "fwd", "--name", "feature", "--down"])
+            .expect("parse explicit Service port-forward teardown");
+        match fwd.local.command {
+            LocalCommands::Fwd(dns) => {
                 assert_eq!(dns.name.as_deref(), Some("feature"));
                 assert!(dns.down);
             }
-            other => panic!("expected dns, got {other:?}"),
+            other => panic!("expected fwd, got {other:?}"),
+        }
+        let dns_alias = Cli::try_parse_from(["hops-local-test", "dns", "--name", "feature"])
+            .expect("dns remains a hidden alias for fwd");
+        match dns_alias.local.command {
+            LocalCommands::Fwd(_) => {}
+            other => panic!("expected fwd alias, got {other:?}"),
+        }
+        let envs = Cli::try_parse_from(["hops-local-test", "envs"]).expect("parse envs");
+        match envs.local.command {
+            LocalCommands::Envs(_) => {}
+            other => panic!("expected envs, got {other:?}"),
         }
 
         let urls = Cli::try_parse_from(["hops-local-test", "status", "--urls"]).expect("parse urls");

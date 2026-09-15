@@ -8,10 +8,11 @@ use super::workbench::net::{
     format_status_card_with_listen, host_access_needs_heal, host_access_status_line,
     load_host_access_runtime, plan_from_runtime as host_plan_from_runtime, url_listen_status,
 };
+use super::workbench::machine;
 use super::workbench::registry::{
     activate_workspace_cluster, list_workspaces, load_workspace, WorkspaceRecord,
 };
-use super::{local_state_dir, run_cmd_output};
+use super::{local_state_dir, run_cmd_output, HOPS_KUBE_CONTEXT_ENV};
 use clap::Args;
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -60,6 +61,9 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
     if args.urls {
         return print_urls(&workspaces, args.all);
     }
+
+    print_cluster_section(&state_dir)?;
+    println!();
 
     if args.all {
         return print_verbose(&state_dir, &workspaces, args);
@@ -134,6 +138,108 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn print_cluster_section(state_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let Some(record) = machine::load(state_dir)? else {
+        println!("cluster  (none)  run `hops local up`");
+        return Ok(());
+    };
+    println!("cluster  {}  {}", record.name, record.kube_context);
+    std::env::set_var(HOPS_KUBE_CONTEXT_ENV, &record.kube_context);
+    if let Ok(nodes) = kubectl_json(&["get", "nodes", "-o", "json"]) {
+        for item in items(&nodes) {
+            let name = meta_name(item);
+            let version = item
+                .pointer("/status/nodeInfo/kubeletVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            let ready = condition_ready(item, "Ready");
+            println!("  node            {name}  {version}  {ready}");
+        }
+    } else {
+        println!("  (cluster unreachable)");
+        return Ok(());
+    }
+    if let Ok(authstacks) = kubectl_json(&["get", "authstack", "-A", "-o", "json"]) {
+        for item in items(&authstacks) {
+            let name = meta_name(item);
+            let ready = condition_ready(item, "Ready");
+            println!("  authstack       {name}  {ready}");
+        }
+    }
+    if let Ok(configs) = kubectl_json(&["get", "configurations.pkg.crossplane.io", "-o", "json"]) {
+        for item in items(&configs) {
+            let name = meta_name(item);
+            let package = package_ref(item);
+            let ready = pkg_ready(item);
+            println!("  configuration   {name}  {package}  {ready}");
+        }
+    }
+    if let Ok(providers) = kubectl_json(&["get", "providers.pkg.crossplane.io", "-o", "json"]) {
+        for item in items(&providers) {
+            let name = meta_name(item);
+            let package = package_ref(item);
+            let ready = pkg_ready(item);
+            println!("  provider        {name}  {package}  {ready}");
+        }
+    }
+    Ok(())
+}
+
+fn kubectl_json(args: &[&str]) -> Result<serde_json::Value, Box<dyn Error>> {
+    let raw = run_cmd_output("kubectl", args)?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+fn items(value: &serde_json::Value) -> &[serde_json::Value] {
+    value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+}
+
+fn meta_name(item: &serde_json::Value) -> &str {
+    item.pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-")
+}
+
+fn package_ref(item: &serde_json::Value) -> String {
+    let raw = item
+        .pointer("/spec/package")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    raw.rsplit('/').next().unwrap_or(raw).to_string()
+}
+
+fn condition_ready(item: &serde_json::Value, ty: &str) -> &'static str {
+    let Some(conditions) = item.pointer("/status/conditions").and_then(|v| v.as_array()) else {
+        return "-";
+    };
+    for condition in conditions {
+        if condition.get("type").and_then(|v| v.as_str()) == Some(ty) {
+            return if condition.get("status").and_then(|v| v.as_str()) == Some("True") {
+                "Ready"
+            } else {
+                "NotReady"
+            };
+        }
+    }
+    "-"
+}
+
+fn pkg_ready(item: &serde_json::Value) -> &'static str {
+    let healthy = condition_ready(item, "Healthy");
+    let installed = condition_ready(item, "Installed");
+    if healthy == "Ready" && installed == "Ready" {
+        "Ready"
+    } else if installed == "Ready" {
+        "Installed"
+    } else {
+        "NotReady"
+    }
+}
+
 fn print_verbose(
     state_dir: &Path,
     workspaces: &[WorkspaceRecord],
@@ -164,7 +270,7 @@ fn print_verbose(
         } else {
             println!("workspace: {}", ws.name);
             println!("namespace: {}", ws.namespace);
-            println!("service access: disabled (enable explicitly with `hops local dns`)");
+            println!("service access: disabled (enable explicitly with `hops local fwd`)");
             Default::default()
         };
 
