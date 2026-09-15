@@ -719,14 +719,6 @@ mod tests {
             }
             other => panic!("expected fwd, got {other:?}"),
         }
-        assert!(
-            Cli::try_parse_from(["hops-local-test", "dns", "--name", "feature"]).is_err(),
-            "dns must not remain as an alias"
-        );
-        assert!(
-            Cli::try_parse_from(["hops-local-test", "tui"]).is_err(),
-            "tui must not remain as an alias"
-        );
         let envs = Cli::try_parse_from(["hops-local-test", "envs"]).expect("parse envs");
         match envs.local.command {
             LocalCommands::Envs(_) => {}

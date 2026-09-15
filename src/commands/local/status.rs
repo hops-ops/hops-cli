@@ -144,6 +144,9 @@ fn print_cluster_section(state_dir: &Path) -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
     println!("cluster  {}  {}", record.name, record.kube_context);
+    if let Some(host_path) = cluster_host_path(&record.source) {
+        println!("  hostPath        {}", host_path.display());
+    }
     std::env::set_var(HOPS_KUBE_CONTEXT_ENV, &record.kube_context);
     if let Ok(nodes) = kubectl_json(&["get", "nodes", "-o", "json"]) {
         for item in items(&nodes) {
@@ -183,6 +186,19 @@ fn print_cluster_section(state_dir: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+fn cluster_host_path(source: &Path) -> Option<std::path::PathBuf> {
+    let raw = std::fs::read_to_string(source).ok()?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&raw).ok()?;
+    let mount = value.get("spec")?.get("mountRoot")?.as_str()?;
+    if mount == "$HOME" || mount == "~" {
+        return std::env::var("HOME")
+            .ok()
+            .and_then(|home| std::path::PathBuf::from(home).canonicalize().ok());
+    }
+    let path = std::path::PathBuf::from(mount);
+    path.canonicalize().ok().or(Some(path))
 }
 
 fn kubectl_json(args: &[&str]) -> Result<serde_json::Value, Box<dyn Error>> {
