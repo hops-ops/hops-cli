@@ -34,7 +34,7 @@ spec:
   externalSecrets:
     enabled: false
   firstInstance:
-    org: harmony-local
+    org: hops
     masterkey:
       secretRef:
         name: zitadel-masterkey
