@@ -2,15 +2,18 @@
 
 use super::workbench::ingress::{
     discover_ingress_routes, format_ingress_status, ingress_access_matches_plan,
-    load_ingress_access_runtime, plan_from_routes, IngressAccessRuntime,
+    ingress_routes_from_value, load_ingress_access_runtime, plan_from_routes, IngressAccessRuntime,
 };
 use super::workbench::net::{
     format_status_card_with_listen, host_access_needs_heal, host_access_status_line,
     load_host_access_runtime, plan_from_runtime as host_plan_from_runtime, url_listen_status,
 };
-use super::workbench::registry::{activate_workspace_cluster, list_workspaces, load_workspace};
+use super::workbench::registry::{
+    activate_workspace_cluster, list_workspaces, load_workspace, WorkspaceRecord,
+};
 use super::{local_state_dir, run_cmd_output};
 use clap::Args;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::Path;
 
@@ -19,6 +22,14 @@ pub struct StatusArgs {
     /// Show only this workspace.
     #[arg(long)]
     pub name: Option<String>,
+
+    /// Print only public *.localhost URLs from HTTPRoutes.
+    #[arg(long, default_value_t = false)]
+    pub urls: bool,
+
+    /// Include stale workspaces and missing kube contexts.
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
 
     /// Deprecated compatibility flag; status is always read-only.
     #[arg(long, default_value_t = false, hide = true)]
@@ -46,11 +57,20 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    if args.urls {
+        return print_urls(&workspaces, args.all);
+    }
+
     let mut all_ok = true;
-    for (i, ws) in workspaces.iter().enumerate() {
-        if i > 0 {
+    let mut shown = 0usize;
+    for ws in workspaces.iter() {
+        if !args.all && args.name.is_none() && !workspace_is_live(ws) {
+            continue;
+        }
+        if shown > 0 {
             println!();
         }
+        shown += 1;
         if let Some(cn) = ws.cluster_name.as_deref() {
             let ctx = ws.kube_context.as_deref().unwrap_or("-");
             println!("cluster:  {cn} (context {ctx})");
@@ -156,10 +176,75 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         }
     }
 
+    if shown == 0 {
+        println!("No live workspaces. Pass --all for stale records, or --urls for HTTPRoute URLs.");
+    }
+
     if args.check && !all_ok {
         return Err("one or more workspaces are not ready (see above)".into());
     }
     Ok(())
+}
+
+fn print_urls(workspaces: &[WorkspaceRecord], all: bool) -> Result<(), Box<dyn Error>> {
+    let mut seen_ctx = BTreeSet::new();
+    let mut urls = BTreeSet::new();
+    for ws in workspaces {
+        if !all && !workspace_is_live(ws) {
+            continue;
+        }
+        let ctx = ws.kube_context.as_deref().unwrap_or("");
+        if ctx.is_empty() || !seen_ctx.insert(ctx.to_string()) {
+            continue;
+        }
+        if !kube_context_exists(ctx) {
+            continue;
+        }
+        let _ = activate_workspace_cluster(ws);
+        match run_cmd_output("kubectl", &["get", "httproute", "-A", "-o", "json"]) {
+            Ok(json) => {
+                let value: serde_json::Value = serde_json::from_str(&json)?;
+                for route in ingress_routes_from_value("", &value) {
+                    if route.hostname.ends_with(".localhost") {
+                        urls.insert(format!("https://{}", route.hostname));
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    if urls.is_empty() {
+        if let Ok(json) = run_cmd_output("kubectl", &["get", "httproute", "-A", "-o", "json"]) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+                for route in ingress_routes_from_value("", &value) {
+                    if route.hostname.ends_with(".localhost") {
+                        urls.insert(format!("https://{}", route.hostname));
+                    }
+                }
+            }
+        }
+    }
+    if urls.is_empty() {
+        println!("(no HTTPRoute *.localhost hostnames on live clusters)");
+        return Ok(());
+    }
+    for url in urls {
+        println!("{url}");
+    }
+    Ok(())
+}
+
+fn workspace_is_live(ws: &WorkspaceRecord) -> bool {
+    match ws.kube_context.as_deref().filter(|ctx| !ctx.is_empty()) {
+        Some(ctx) => kube_context_exists(ctx),
+        None => true,
+    }
+}
+
+fn kube_context_exists(ctx: &str) -> bool {
+    run_cmd_output("kubectl", &["config", "get-contexts", "-o", "name"])
+        .ok()
+        .is_some_and(|out| out.lines().any(|line| line.trim() == ctx))
 }
 
 #[derive(Debug)]

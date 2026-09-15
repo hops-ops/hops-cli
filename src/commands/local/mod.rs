@@ -161,7 +161,7 @@ pub enum LocalCommands {
     Env(env::EnvArgs),
     /// Interactive catalog of Cluster + Environments
     Tui(tui::TuiArgs),
-    /// Show local workbench workspace status and app URLs
+    /// Show live workspace status (`--urls` for HTTPRoute URLs only)
     Status(status::StatusArgs),
     /// Explicitly enable or repair direct Kubernetes Service DNS on this host
     Dns(dns::DnsArgs),
@@ -702,6 +702,8 @@ mod tests {
             LocalCommands::Status(status) => {
                 assert_eq!(status.name.as_deref(), Some("feature"));
                 assert!(!status.no_heal);
+                assert!(!status.urls);
+                assert!(!status.all);
             }
             other => panic!("expected status, got {other:?}"),
         }
@@ -714,6 +716,12 @@ mod tests {
                 assert!(dns.down);
             }
             other => panic!("expected dns, got {other:?}"),
+        }
+
+        let urls = Cli::try_parse_from(["hops-local-test", "status", "--urls"]).expect("parse urls");
+        match urls.local.command {
+            LocalCommands::Status(status) => assert!(status.urls),
+            other => panic!("expected status --urls, got {other:?}"),
         }
     }
 }
