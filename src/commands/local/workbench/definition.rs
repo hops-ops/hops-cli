@@ -131,6 +131,7 @@ pub struct EnvironmentDefinition {
     pub root: PathBuf,
     pub values: Mapping,
     pub deploys: Vec<DeployDefinition>,
+    pub secret_sync: Option<SecretSyncDefinition>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +362,8 @@ struct EnvironmentSpec {
     #[serde(default)]
     values: Mapping,
     deploys: Vec<DeploySpec>,
+    #[serde(default)]
+    secret_sync: Option<SecretSyncSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -815,6 +818,21 @@ pub fn load_environment_definition(
         deploys.push(deploy_definition);
     }
 
+    let secret_sync = raw
+        .spec
+        .secret_sync
+        .map(|secret| {
+            resolve_bounded_path(
+                &cluster.cluster.mount_root,
+                checkout_root,
+                &secret.path,
+                &format!("Environment {name:?} spec.secretSync.path"),
+                true,
+            )
+            .map(|path| SecretSyncDefinition { path })
+        })
+        .transpose()?;
+
     Ok(LoadedEnvironment {
         source,
         environment: EnvironmentDefinition {
@@ -826,6 +844,7 @@ pub fn load_environment_definition(
             root,
             values: raw.spec.values,
             deploys,
+            secret_sync,
         },
     })
 }

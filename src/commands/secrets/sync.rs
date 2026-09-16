@@ -621,7 +621,7 @@ pub(super) fn sync_vault_path(path: &Path) -> Result<(), Box<dyn Error>> {
         address: None,
         mount: None,
         path_prefix: None,
-        port_forward: false,
+        port_forward: true,
         no_port_forward: false,
         yes: true,
     })

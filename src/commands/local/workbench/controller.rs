@@ -606,6 +606,17 @@ pub fn reconcile_environment<H: HelmRunner, K: KubectlApplier, R: KustomizeRunne
     kubectl: &K,
 ) -> Result<Vec<ReconcileResult>, Box<dyn Error>> {
     ensure_environment_namespace(opts, kubectl)?;
+    if !opts.dry_run {
+        if let Some(secret_sync) = &loaded.environment.secret_sync {
+            crate::commands::secrets::sync_vault_path(&secret_sync.path).map_err(|error| {
+                format!(
+                    "Environment {} secretSync {}: {error}",
+                    loaded.environment.name,
+                    secret_sync.path.display()
+                )
+            })?;
+        }
+    }
     let mut results = Vec::new();
     let mut errors = Vec::new();
     for deploy in &loaded.environment.deploys {
@@ -891,6 +902,7 @@ mod tests {
                 root: PathBuf::from("/project"),
                 values: environment_values,
                 deploys: vec![deploy.clone()],
+                secret_sync: None,
             },
         };
 

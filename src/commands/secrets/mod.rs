@@ -257,7 +257,11 @@ fn configured_vault_settings() -> Result<VaultSecretsRuntimeConfig, Box<dyn Erro
             .token_env
             .unwrap_or_else(|| DEFAULT_VAULT_TOKEN_ENV.to_string()),
         kube_enabled: kube.enabled.unwrap_or(true),
-        kube_context: kube.context,
+        kube_context: std::env::var("HOPS_KUBE_CONTEXT")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or(kube.context),
         kube_namespace: kube
             .namespace
             .unwrap_or_else(|| DEFAULT_VAULT_KUBE_NAMESPACE.to_string()),
