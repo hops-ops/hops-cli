@@ -616,8 +616,16 @@ fn run_vault(args: &VaultSyncArgs) -> Result<(), Box<dyn Error>> {
 }
 
 pub(super) fn sync_vault_path(path: &Path) -> Result<(), Box<dyn Error>> {
+    let secret_source = path.canonicalize().map_err(|error| {
+        format!(
+            "Vault secrets path {} is unavailable: {error}",
+            path.display()
+        )
+    })?;
+    let git_root = git_toplevel(&secret_source)?;
+    let _cwd = CwdGuard::enter(&git_root)?;
     run_vault(&VaultSyncArgs {
-        secret_path: Some(path.display().to_string()),
+        secret_path: Some(secret_source.display().to_string()),
         address: None,
         mount: None,
         path_prefix: None,
@@ -625,6 +633,45 @@ pub(super) fn sync_vault_path(path: &Path) -> Result<(), Box<dyn Error>> {
         no_port_forward: false,
         yes: true,
     })
+}
+
+struct CwdGuard(PathBuf);
+
+impl CwdGuard {
+    fn enter(dir: &Path) -> Result<Self, Box<dyn Error>> {
+        let previous = env::current_dir()?;
+        env::set_current_dir(dir).map_err(|error| {
+            format!("unable to use Git worktree {} for Vault sync: {error}", dir.display())
+        })?;
+        Ok(Self(previous))
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = env::set_current_dir(&self.0);
+    }
+}
+
+fn git_toplevel(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().ok_or("Vault secrets path has no parent")?
+    };
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|error| format!("failed to inspect Git repository for Vault inputs: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Vault sync requires a Git worktree at {}",
+            dir.display()
+        )
+        .into());
+    }
+    Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()).canonicalize()?)
 }
 
 #[cfg(test)]
