@@ -424,6 +424,7 @@ fn is_soft_apply_error(msg: &str) -> bool {
         || lower.contains("no matches for")
         || lower.contains("ensure crds are installed")
         || lower.contains("the server doesn't have a resource type")
+        || (lower.contains("the job") && lower.contains("field is immutable"))
 }
 
 /// Merge chart-level deploy values with runtime inject.
