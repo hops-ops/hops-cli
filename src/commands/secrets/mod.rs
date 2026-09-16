@@ -225,7 +225,7 @@ fn configured_github_settings() -> Result<GithubSecretsRuntimeConfig, Box<dyn Er
     })
 }
 
-fn configured_vault_settings() -> Result<VaultSecretsRuntimeConfig, Box<dyn Error>> {
+pub(super) fn configured_vault_settings() -> Result<VaultSecretsRuntimeConfig, Box<dyn Error>> {
     let config = load_config()?;
     let vault = config.secrets.vault;
     let env_address = std::env::var("VAULT_ADDR")
