@@ -598,6 +598,45 @@ fn environment_helm_values(
     values
 }
 
+fn run_environment_setup(loaded: &LoadedEnvironment) -> Result<(), Box<dyn Error>> {
+    use std::process::Command;
+    for (index, script) in loaded.environment.setup.iter().enumerate() {
+        log::info!(
+            "Environment {} setup[{}]: {}",
+            loaded.environment.name,
+            index,
+            script.display()
+        );
+        let status = Command::new("bash")
+            .arg(script)
+            .current_dir(&loaded.environment.root)
+            .env(
+                "HOPS_LOCAL_CONTEXT",
+                std::env::var("HOPS_KUBE_CONTEXT").unwrap_or_default(),
+            )
+            .status()
+            .map_err(|error| {
+                format!(
+                    "Environment {} setup[{}] {}: {error}",
+                    loaded.environment.name,
+                    index,
+                    script.display()
+                )
+            })?;
+        if !status.success() {
+            return Err(format!(
+                "Environment {} setup[{}] {} exited {}",
+                loaded.environment.name,
+                index,
+                script.display(),
+                status
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 pub fn reconcile_environment<H: HelmRunner, K: KubectlApplier, R: KustomizeRunner>(
     loaded: &LoadedEnvironment,
     opts: &ReconcileOptions,
@@ -606,6 +645,9 @@ pub fn reconcile_environment<H: HelmRunner, K: KubectlApplier, R: KustomizeRunne
     kubectl: &K,
 ) -> Result<Vec<ReconcileResult>, Box<dyn Error>> {
     ensure_environment_namespace(opts, kubectl)?;
+    if !opts.dry_run && opts.run_setup {
+        run_environment_setup(loaded)?;
+    }
     if !opts.dry_run {
         if let Some(secret_sync) = &loaded.environment.secret_sync {
             crate::commands::secrets::sync_vault_path(&secret_sync.path).map_err(|error| {
@@ -903,6 +945,7 @@ mod tests {
                 values: environment_values,
                 deploys: vec![deploy.clone()],
                 secret_sync: None,
+                setup: Vec::new(),
             },
         };
 

@@ -33,6 +33,8 @@ pub struct ReconcileOptions {
     pub delivery_mode: Option<String>,
     /// When true, only render (no apply). Used by tests.
     pub dry_run: bool,
+    /// Run Environment.spec.setup scripts (enable only, not watch).
+    pub run_setup: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1223,6 +1225,7 @@ metadata:
             app_delivery_host_paths: BTreeMap::new(),
             delivery_mode: None,
             dry_run: true,
+            run_setup: false,
         };
 
         let result = reconcile_deploy_chart(
@@ -1307,6 +1310,7 @@ metadata:
             app_delivery_host_paths: BTreeMap::new(),
             delivery_mode: None,
             dry_run: false,
+            run_setup: false,
         };
 
         let raw = reconcile_deploy(
@@ -1490,6 +1494,7 @@ metadata:
             app_delivery_host_paths: hosts,
             delivery_mode: Some("hostPath".into()),
             dry_run: true,
+            run_setup: false,
         };
         let ui = build_runtime_values(&opts, "e2e-ui-ui");
         let api = build_runtime_values(&opts, "e2e-ui-api");

@@ -462,6 +462,7 @@ fn reconcile_cluster_environments(
             app_delivery_host_paths: hosts,
             delivery_mode: Some(delivery_strategy.as_str().into()),
             dry_run,
+            run_setup: false,
         };
         match reconcile_environment(loaded, &opts, &SystemHelm, &SystemKustomize, &SystemKubectl) {
             Ok(results) => {
@@ -747,6 +748,7 @@ fn run_environment_definition(
         app_delivery_host_paths,
         delivery_mode: Some(delivery_strategy.as_str().into()),
         dry_run: args.dry_run,
+        run_setup: !args.dry_run && !args.down,
     };
 
     let reconcile = || -> Result<(), Box<dyn Error>> {

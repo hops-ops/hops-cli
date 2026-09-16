@@ -132,6 +132,8 @@ pub struct EnvironmentDefinition {
     pub values: Mapping,
     pub deploys: Vec<DeployDefinition>,
     pub secret_sync: Option<SecretSyncDefinition>,
+    /// Checkout-relative scripts run on `hops local env enable`, before secretSync.
+    pub setup: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +366,14 @@ struct EnvironmentSpec {
     deploys: Vec<DeploySpec>,
     #[serde(default)]
     secret_sync: Option<SecretSyncSpec>,
+    #[serde(default)]
+    setup: Vec<SetupSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetupSpec {
+    path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -833,6 +843,25 @@ pub fn load_environment_definition(
         })
         .transpose()?;
 
+    let mut setup = Vec::new();
+    for (index, hook) in raw.spec.setup.into_iter().enumerate() {
+        let path = resolve_bounded_path(
+            &cluster.cluster.mount_root,
+            checkout_root,
+            &hook.path,
+            &format!("Environment {name:?} spec.setup[{index}].path"),
+            false,
+        )?;
+        if !path.is_file() {
+            return Err(format!(
+                "Environment {name:?} spec.setup[{index}].path is not a file: {}",
+                path.display()
+            )
+            .into());
+        }
+        setup.push(path);
+    }
+
     Ok(LoadedEnvironment {
         source,
         environment: EnvironmentDefinition {
@@ -845,6 +874,7 @@ pub fn load_environment_definition(
             values: raw.spec.values,
             deploys,
             secret_sync,
+            setup,
         },
     })
 }
