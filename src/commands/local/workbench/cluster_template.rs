@@ -222,16 +222,20 @@ spec:
       chart: {chart}
       version: "{version}"
   localDomain: {domain}
+  browserIngress:
+    namespaces:
 "#,
         manifests = CLUSTER_MANIFESTS_PATH,
         chart = DEFAULT_CROSSPLANE_CHART,
         version = DEFAULT_CROSSPLANE_VERSION,
     );
-    if !overlay.browser_ingress_namespaces.is_empty() {
-        body.push_str("  browserIngress:\n    namespaces:\n");
-        for namespace in &overlay.browser_ingress_namespaces {
-            body.push_str(&format!("      - {namespace}\n"));
-        }
+    let ingress_namespaces = if overlay.browser_ingress_namespaces.is_empty() {
+        vec!["auth".to_string()]
+    } else {
+        overlay.browser_ingress_namespaces.clone()
+    };
+    for namespace in &ingress_namespaces {
+        body.push_str(&format!("      - {namespace}\n"));
     }
     if let Some(secret) = overlay.secret_sync_path.as_ref() {
         if let Some(relative) = rewrite_secret_sync(overlay_cluster_yaml, secret, home) {
