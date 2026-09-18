@@ -351,10 +351,14 @@ mod tests {
         assert!(FILES
             .iter()
             .any(|(path, _)| *path == "providerconfigs/kubernetes.yaml"));
-        assert!(FILES.iter().any(|(path, contents)| *path == "stacks/auth.yaml"
-            && contents.contains("namespace: auth")
-            && contents.contains("fullnameOverride: zitadel")));
-        assert!(FILES.iter().any(|(path, _)| *path == "providers/zitadel.yaml"));
+        assert!(FILES
+            .iter()
+            .any(|(path, contents)| *path == "stacks/auth.yaml"
+                && contents.contains("namespace: auth")
+                && contents.contains("fullnameOverride: zitadel")));
+        assert!(FILES
+            .iter()
+            .any(|(path, _)| *path == "providers/zitadel.yaml"));
         assert!(FILES
             .iter()
             .any(|(path, _)| *path == "providerconfigs/zitadel.yaml"));

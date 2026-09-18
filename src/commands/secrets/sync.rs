@@ -642,7 +642,10 @@ impl CwdGuard {
     fn enter(dir: &Path) -> Result<Self, Box<dyn Error>> {
         let previous = env::current_dir()?;
         env::set_current_dir(dir).map_err(|error| {
-            format!("unable to use Git worktree {} for Vault sync: {error}", dir.display())
+            format!(
+                "unable to use Git worktree {} for Vault sync: {error}",
+                dir.display()
+            )
         })?;
         Ok(Self(previous))
     }
@@ -712,11 +715,7 @@ fn git_toplevel(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
         .output()
         .map_err(|error| format!("failed to inspect Git repository for Vault inputs: {error}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "Vault sync requires a Git worktree at {}",
-            dir.display()
-        )
-        .into());
+        return Err(format!("Vault sync requires a Git worktree at {}", dir.display()).into());
     }
     Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()).canonicalize()?)
 }

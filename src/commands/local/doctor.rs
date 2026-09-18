@@ -118,7 +118,9 @@ fn report_machine_cluster_warnings() {
     }
     if let Ok(state_dir) = super::local_state_dir() {
         if let Ok(Some(record)) = machine::load(&state_dir) {
-            let cwd_yaml = std::env::current_dir().ok().map(|cwd| cwd.join(DEFAULT_DEFINITION_FILE));
+            let cwd_yaml = std::env::current_dir()
+                .ok()
+                .map(|cwd| cwd.join(DEFAULT_DEFINITION_FILE));
             if let Some(path) = cwd_yaml.filter(|path| path.exists()) {
                 if let Ok(leaf) = definition::load_cluster_document_name(&path) {
                     if leaf != record.name {

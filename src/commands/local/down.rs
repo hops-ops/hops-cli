@@ -2,6 +2,7 @@
 
 use super::gitops::{self, ClusterArgs};
 use super::local_state_dir;
+use super::run_cmd;
 use super::workbench::definition::ClusterOverrides;
 use super::workbench::delivery::stop_delivery_runtime;
 use super::workbench::ingress::stop_ingress_access;
@@ -11,7 +12,6 @@ use super::workbench::registry::{
     activate_workspace_cluster, list_workspaces, load_workspace, namespace_for_name,
     remove_workspace,
 };
-use super::run_cmd;
 use clap::Args;
 use std::error::Error;
 

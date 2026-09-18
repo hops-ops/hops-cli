@@ -330,7 +330,7 @@ impl VaultSession {
                 }
                 if !(200..300).contains(&code) {
                     return Err(
-                        format!("Vault read failed for {secret_path:?} with HTTP {code}").into()
+                        format!("Vault read failed for {secret_path:?} with HTTP {code}").into(),
                     );
                 }
                 let body: JsonValue = response.body_mut().read_json().map_err(|_| {

@@ -180,9 +180,8 @@ fn print_config(state_dir: &Path) -> Result<(), Box<dyn Error>> {
     println!("  dockerProvider   {docker}");
     println!("  localDomain      {domain}");
     if let Some(chart) = yaml_nested(&record.source, &["controlPlane", "crossplane", "chart"]) {
-        let version =
-            yaml_nested(&record.source, &["controlPlane", "crossplane", "version"])
-                .unwrap_or_else(|| "-".into());
+        let version = yaml_nested(&record.source, &["controlPlane", "crossplane", "version"])
+            .unwrap_or_else(|| "-".into());
         println!("  crossplane       {chart}:{version}");
     }
     println!("reset required to change: hostPath, name, clusterProvider, dockerProvider");

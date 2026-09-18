@@ -136,18 +136,25 @@ pub struct RegistryClient {
     agent: ureq::Agent,
 }
 
+fn content_digest(headers: &ureq::http::HeaderMap) -> Option<&str> {
+    headers
+        .get("Docker-Content-Digest")
+        .and_then(|value| value.to_str().ok())
+}
+
 impl RegistryClient {
     pub fn loopback(port: u16, timeout: Duration) -> Result<Self> {
         if port == 0 || timeout.is_zero() {
             return Err("registry port and timeout must be nonzero".into());
         }
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .max_redirects(0)
+            .proxy(None)
+            .build();
         Ok(Self {
             base: format!("http://{}", SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
-            agent: ureq::AgentBuilder::new()
-                .timeout(timeout)
-                .redirects(0)
-                .try_proxy_from_env(false)
-                .build(),
+            agent: ureq::Agent::new_with_config(config),
         })
     }
 
@@ -170,16 +177,16 @@ impl RegistryClient {
         match self
             .agent
             .head(&url)
-            .set("Accept", MANIFEST_MEDIA_TYPE)
+            .header("Accept", MANIFEST_MEDIA_TYPE)
             .call()
         {
             Ok(response) if response.status() == 200 => {
-                if response.header("Docker-Content-Digest") != Some(expected) {
+                if content_digest(response.headers()) != Some(expected) {
                     return Err("registry HEAD returned a different digest".into());
                 }
                 Ok(true)
             }
-            Err(ureq::Error::Status(404, _)) => Ok(false),
+            Err(ureq::Error::StatusCode(404)) => Ok(false),
             _ => Err("registry HEAD failed; retry without changing the pin".into()),
         }
     }
@@ -201,24 +208,26 @@ impl RegistryClient {
             let response = self
                 .agent
                 .post(&format!("{}/v2/{repository}/blobs/uploads/", self.base))
-                .set("Content-Length", "0")
-                .call()
+                .header("Content-Length", "0")
+                .send(&[] as &[u8])
                 .map_err(|_| "registry upload start failed; retry without changing the pin")?;
             if response.status() != 202 {
                 return Err("registry rejected blob upload start".into());
             }
             let location = response
-                .header("Location")
+                .headers()
+                .get("Location")
+                .and_then(|value| value.to_str().ok())
                 .ok_or("upload Location missing")?;
             let location = upload_location(repository, location, &expected_blob)?;
             let response = self
                 .agent
                 .put(&format!("{}{location}", self.base))
-                .set("Content-Type", "application/octet-stream")
-                .send_bytes(&blob.bytes)
+                .header("Content-Type", "application/octet-stream")
+                .send(blob.bytes.as_slice())
                 .map_err(|_| "registry blob upload interrupted; retry without changing the pin")?;
             if response.status() != 201
-                || response.header("Docker-Content-Digest") != Some(&expected_blob)
+                || content_digest(response.headers()) != Some(&expected_blob)
             {
                 return Err("registry did not confirm uploaded blob digest".into());
             }
@@ -232,10 +241,10 @@ impl RegistryClient {
                 "{}/v2/{repository}/manifests/{expected}",
                 self.base
             ))
-            .set("Content-Type", MANIFEST_MEDIA_TYPE)
-            .send_bytes(&image.manifest)
+            .header("Content-Type", MANIFEST_MEDIA_TYPE)
+            .send(image.manifest.as_slice())
             .map_err(|_| "registry manifest upload failed; retry without changing the pin")?;
-        if response.status() != 201 || response.header("Docker-Content-Digest") != Some(&expected) {
+        if response.status() != 201 || content_digest(response.headers()) != Some(&expected) {
             return Err("registry did not confirm uploaded manifest digest".into());
         }
         self.verify_manifest(repository, &image.manifest)?;
@@ -244,21 +253,22 @@ impl RegistryClient {
 
     fn verify_manifest(&self, repository: &str, manifest: &[u8]) -> Result<()> {
         let expected = digest(manifest);
-        let response = self
+        let mut response = self
             .agent
             .get(&format!(
                 "{}/v2/{repository}/manifests/{expected}",
                 self.base
             ))
-            .set("Accept", MANIFEST_MEDIA_TYPE)
+            .header("Accept", MANIFEST_MEDIA_TYPE)
             .call()
             .map_err(|_| "uploaded manifest cannot be read back; do not activate")?;
-        if response.status() != 200 || response.header("Docker-Content-Digest") != Some(&expected) {
+        if response.status() != 200 || content_digest(response.headers()) != Some(&expected) {
             return Err("manifest readback returned a different digest".into());
         }
         let mut bytes = Vec::new();
         response
-            .into_reader()
+            .body_mut()
+            .as_reader()
             .take(manifest.len() as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| "manifest readback interrupted; do not activate")?;

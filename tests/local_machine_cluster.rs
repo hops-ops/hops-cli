@@ -159,7 +159,11 @@ impl Drop for Fixture {
 fn local_help_lists_up_init_env_envs() {
     let fixture = Fixture::new();
     let output = Fixture::output(fixture.command().args(["local", "--help"]));
-    assert!(output.status.success(), "{:?}", Fixture::stdout_stderr(&output));
+    assert!(
+        output.status.success(),
+        "{:?}",
+        Fixture::stdout_stderr(&output)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     for needle in ["up", "init", "env", "envs", "configure", "fwd", "gitops"] {
         assert!(stdout.contains(needle), "missing {needle} in {stdout}");
@@ -176,7 +180,11 @@ fn init_cluster_writes_committed_files_and_not_catalog() {
             .args(["local", "init", "cluster", "--path"])
             .arg(&dest),
     );
-    assert!(output.status.success(), "{:?}", Fixture::stdout_stderr(&output));
+    assert!(
+        output.status.success(),
+        "{:?}",
+        Fixture::stdout_stderr(&output)
+    );
     assert!(dest.join(".gitops/local/cluster.yaml").is_file());
     assert!(dest.join(".gitops/local/cluster").is_dir());
     let yaml = fs::read_to_string(dest.join(".gitops/local/cluster.yaml")).unwrap();
@@ -194,10 +202,16 @@ fn init_platform_and_environment_write_scope() {
             .args(["local", "init", "platform", "--path"])
             .arg(&dest),
     );
-    assert!(platform.status.success(), "{:?}", Fixture::stdout_stderr(&platform));
+    assert!(
+        platform.status.success(),
+        "{:?}",
+        Fixture::stdout_stderr(&platform)
+    );
     let yaml = fs::read_to_string(dest.join(".gitops/local/platform.yaml")).unwrap();
     assert!(yaml.contains("scope: cluster"));
-    assert!(dest.join(".gitops/local/platform/minio/Chart.yaml").is_file());
+    assert!(dest
+        .join(".gitops/local/platform/minio/Chart.yaml")
+        .is_file());
     let env = Fixture::output(
         fixture
             .command()
@@ -212,9 +226,17 @@ fn init_platform_and_environment_write_scope() {
 #[test]
 fn env_discover_catalogues_disabled_and_refuses_home() {
     let fixture = Fixture::new();
-    fs::write(fixture.root.join(".gitops/local/environment.yaml"), ENV_YAML).unwrap();
+    fs::write(
+        fixture.root.join(".gitops/local/environment.yaml"),
+        ENV_YAML,
+    )
+    .unwrap();
     let output = Fixture::output(fixture.command().args(["local", "env", "discover"]));
-    assert!(output.status.success(), "{:?}", Fixture::stdout_stderr(&output));
+    assert!(
+        output.status.success(),
+        "{:?}",
+        Fixture::stdout_stderr(&output)
+    );
     let catalog = fixture.root.join("home/.hops/local/catalog");
     let json = fs::read_dir(&catalog)
         .unwrap()
@@ -242,12 +264,22 @@ fn env_discover_catalogues_disabled_and_refuses_home() {
 #[test]
 fn envs_once_lists_catalog() {
     let fixture = Fixture::new();
-    fs::write(fixture.root.join(".gitops/local/environment.yaml"), ENV_YAML).unwrap();
-    assert!(Fixture::output(fixture.command().args(["local", "env", "discover"]))
-        .status
-        .success());
+    fs::write(
+        fixture.root.join(".gitops/local/environment.yaml"),
+        ENV_YAML,
+    )
+    .unwrap();
+    assert!(
+        Fixture::output(fixture.command().args(["local", "env", "discover"]))
+            .status
+            .success()
+    );
     let output = Fixture::output(fixture.command().args(["local", "envs", "--once"]));
-    assert!(output.status.success(), "{:?}", Fixture::stdout_stderr(&output));
+    assert!(
+        output.status.success(),
+        "{:?}",
+        Fixture::stdout_stderr(&output)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.trim().is_empty(), "{stdout}");
 }
@@ -255,10 +287,22 @@ fn envs_once_lists_catalog() {
 #[test]
 fn up_from_leaf_yaml_does_not_create_second_cluster() {
     let fixture = Fixture::new();
-    let first = Fixture::output(fixture.command().args(["local", "up", "--once", "--dry-run"]));
-    assert!(first.status.success(), "{:?}", Fixture::stdout_stderr(&first));
+    let first = Fixture::output(
+        fixture
+            .command()
+            .args(["local", "up", "--once", "--dry-run"]),
+    );
+    assert!(
+        first.status.success(),
+        "{:?}",
+        Fixture::stdout_stderr(&first)
+    );
     fs::write(fixture.root.join(".gitops/local/cluster.yaml"), LEAF_YAML).unwrap();
-    let second = Fixture::output(fixture.command().args(["local", "up", "--once", "--dry-run"]));
+    let second = Fixture::output(
+        fixture
+            .command()
+            .args(["local", "up", "--once", "--dry-run"]),
+    );
     let (_out, err) = Fixture::stdout_stderr(&second);
     assert!(second.status.success(), "{err}");
     assert!(
@@ -270,7 +314,12 @@ fn up_from_leaf_yaml_does_not_create_second_cluster() {
         .lines()
         .filter(|line| line.contains("kind create"))
         .count();
-    assert_eq!(creates, 0, "dry-run must not kind create: {}", fixture.log());
+    assert_eq!(
+        creates,
+        0,
+        "dry-run must not kind create: {}",
+        fixture.log()
+    );
 }
 
 #[test]
@@ -284,7 +333,11 @@ fn env_discover_keeps_worktrees_distinct() {
     fs::write(&main, ENV_YAML).unwrap();
     fs::write(&wt, ENV_YAML).unwrap();
     let output = Fixture::output(fixture.command().args(["local", "env", "discover"]));
-    assert!(output.status.success(), "{:?}", Fixture::stdout_stderr(&output));
+    assert!(
+        output.status.success(),
+        "{:?}",
+        Fixture::stdout_stderr(&output)
+    );
     let catalog = fixture.root.join("home/.hops/local/catalog");
     let files: Vec<_> = fs::read_dir(&catalog)
         .unwrap()
@@ -293,7 +346,11 @@ fn env_discover_keeps_worktrees_distinct() {
             (path.extension().and_then(|ext| ext.to_str()) == Some("json")).then_some(path)
         })
         .collect();
-    assert_eq!(files.len(), 2, "worktree and main must not share a catalog file");
+    assert_eq!(
+        files.len(),
+        2,
+        "worktree and main must not share a catalog file"
+    );
     let list = Fixture::output(fixture.command().args(["local", "env", "list"]));
     let stdout = String::from_utf8_lossy(&list.stdout);
     assert!(stdout.contains("feature-auth"), "{stdout}");
@@ -313,7 +370,11 @@ fn up_materializes_cli_template_and_skips_shared_overlay() {
         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: minio-should-not-land\n",
     )
     .unwrap();
-    let output = Fixture::output(fixture.command().args(["local", "up", "--once", "--dry-run"]));
+    let output = Fixture::output(
+        fixture
+            .command()
+            .args(["local", "up", "--once", "--dry-run"]),
+    );
     assert!(
         output.status.success(),
         "{:?}",
@@ -336,7 +397,11 @@ fn up_materializes_cli_template_and_skips_shared_overlay() {
 #[test]
 fn env_discover_finds_cluster_scoped_extra_yaml() {
     let fixture = Fixture::new();
-    fs::write(fixture.root.join(".gitops/local/environment.yaml"), ENV_YAML).unwrap();
+    fs::write(
+        fixture.root.join(".gitops/local/environment.yaml"),
+        ENV_YAML,
+    )
+    .unwrap();
     fs::write(
         fixture.root.join(".gitops/local/harmony-system.yaml"),
         r#"apiVersion: hops.local/v1alpha1
@@ -362,17 +427,23 @@ spec:
     let list = Fixture::output(fixture.command().args(["local", "env", "list"]));
     let stdout = String::from_utf8_lossy(&list.stdout);
     assert!(stdout.contains("harmony-system"), "{stdout}");
-    assert!(stdout.contains("demo") || stdout.contains("off"), "{stdout}");
+    assert!(
+        stdout.contains("demo") || stdout.contains("off"),
+        "{stdout}"
+    );
 }
 
 #[test]
 fn cluster_name_escape_hatch_warns() {
     let fixture = Fixture::new();
-    let output = Fixture::output(
-        fixture
-            .command()
-            .args(["local", "up", "--once", "--dry-run", "--cluster-name", "hops"]),
-    );
+    let output = Fixture::output(fixture.command().args([
+        "local",
+        "up",
+        "--once",
+        "--dry-run",
+        "--cluster-name",
+        "hops",
+    ]));
     let (_out, err) = Fixture::stdout_stderr(&output);
     assert!(output.status.success(), "{err}");
     assert!(err.contains("escape hatch"), "{err}");

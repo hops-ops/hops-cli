@@ -115,10 +115,7 @@ fn apply_multiselect(
                 name: entry.runtime_name.clone(),
             })
         };
-        env::run(
-            &env::EnvArgs { command },
-            ClusterOverrides { ..overrides },
-        )?;
+        env::run(&env::EnvArgs { command }, ClusterOverrides { ..overrides })?;
     }
     Ok(())
 }

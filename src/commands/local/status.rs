@@ -4,11 +4,11 @@ use super::workbench::ingress::{
     discover_ingress_routes, format_ingress_status, ingress_access_matches_plan,
     ingress_routes_from_value, load_ingress_access_runtime, plan_from_routes, IngressAccessRuntime,
 };
+use super::workbench::machine;
 use super::workbench::net::{
     format_status_card_with_listen, host_access_needs_heal, host_access_status_line,
     load_host_access_runtime, plan_from_runtime as host_plan_from_runtime, url_listen_status,
 };
-use super::workbench::machine;
 use super::workbench::registry::{
     activate_workspace_cluster, list_workspaces, load_workspace, WorkspaceRecord,
 };
@@ -229,7 +229,10 @@ fn package_ref(item: &serde_json::Value) -> String {
 }
 
 fn condition_ready(item: &serde_json::Value, ty: &str) -> &'static str {
-    let Some(conditions) = item.pointer("/status/conditions").and_then(|v| v.as_array()) else {
+    let Some(conditions) = item
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array())
+    else {
         return "-";
     };
     for condition in conditions {

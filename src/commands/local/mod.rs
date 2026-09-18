@@ -19,8 +19,8 @@ mod resize;
 mod start;
 mod status;
 mod tui;
-mod up;
 mod uninstall;
+mod up;
 pub mod workbench;
 mod zitadel;
 
@@ -734,7 +734,8 @@ mod tests {
             other => panic!("expected envs, got {other:?}"),
         }
 
-        let urls = Cli::try_parse_from(["hops-local-test", "status", "--urls"]).expect("parse urls");
+        let urls =
+            Cli::try_parse_from(["hops-local-test", "status", "--urls"]).expect("parse urls");
         match urls.local.command {
             LocalCommands::Status(status) => assert!(status.urls),
             other => panic!("expected status --urls, got {other:?}"),
