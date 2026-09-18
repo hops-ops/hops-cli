@@ -688,7 +688,17 @@ mod tests {
             other => panic!("expected GitOps Cluster, got {other:?}"),
         }
 
-        for removed in ["up", "open", "stop"] {
+        match Cli::try_parse_from(["hops-local-test", "up"]).expect("parse local up") {
+            Cli {
+                local:
+                    LocalArgs {
+                        command: LocalCommands::Up(_),
+                        ..
+                    },
+            } => {}
+            other => panic!("expected local up, got {other:?}"),
+        }
+        for removed in ["open", "stop"] {
             assert!(
                 Cli::try_parse_from(["hops-local-test", removed]).is_err(),
                 "interim command {removed:?} must stay removed"
