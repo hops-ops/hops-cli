@@ -79,12 +79,9 @@ fn status_observes_without_persisting_or_healing_local_state() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("service access: disabled"), "{stdout}");
-    assert!(stdout.contains("app-1: Running 1/1  [ok]"), "{stdout}");
-    assert!(
-        stdout.contains("ingress:  (no HTTPRoute hostnames)"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("1/1 ready"), "{stdout}");
+    assert!(stdout.contains("(no public URLs)"), "{stdout}");
+    assert!(stdout.contains("run `hops local up`"), "{stdout}");
     assert_eq!(fs::read_to_string(&record).unwrap(), record_contents);
     assert!(!state.join("providers.json").exists());
     assert!(!state.join("backend").exists());
@@ -94,9 +91,9 @@ fn status_observes_without_persisting_or_healing_local_state() {
 }
 
 #[test]
-fn dns_enable_requires_a_binding_but_down_remains_offline() {
+fn fwd_enable_requires_a_binding_but_down_remains_offline() {
     let root = std::env::temp_dir().join(format!(
-        "hops-local-dns-binding-{}-{}",
+        "hops-local-fwd-binding-{}-{}",
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
@@ -114,7 +111,7 @@ fn dns_enable_requires_a_binding_but_down_remains_offline() {
     .unwrap();
 
     let enable = Command::new(env!("CARGO_BIN_EXE_hops-cli"))
-        .args(["local", "dns", "--name", "feature"])
+        .args(["local", "fwd", "--name", "feature"])
         .env("HOME", &home)
         .output()
         .unwrap();
@@ -122,7 +119,7 @@ fn dns_enable_requires_a_binding_but_down_remains_offline() {
     assert!(String::from_utf8_lossy(&enable.stderr).contains("no durable cluster binding"));
 
     let down = Command::new(env!("CARGO_BIN_EXE_hops-cli"))
-        .args(["local", "dns", "--name", "feature", "--down"])
+        .args(["local", "fwd", "--name", "feature", "--down"])
         .env("HOME", &home)
         .output()
         .unwrap();
