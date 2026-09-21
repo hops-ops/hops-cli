@@ -1,0 +1,9 @@
+# Reconciled once per Cluster from .gitops/cluster.
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: crossplane-contrib-provider-helm
+spec:
+  package: xpkg.crossplane.io/crossplane-contrib/provider-helm:v1.3.0
+  runtimeConfigRef:
+    name: local-dev-helm

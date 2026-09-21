@@ -1,0 +1,25 @@
+# Reconciled once per Cluster from .gitops/cluster.
+apiVersion: hops.ops.com.ai/v1alpha1
+kind: PSQLStack
+metadata:
+  name: harmony-local
+  namespace: default
+spec:
+  managementPolicies: ["*"]
+  clusterName: harmony-local
+  helmProviderConfigRef:
+    name: default
+    kind: ProviderConfig
+  kubernetesProviderConfigRef:
+    name: default
+    kind: ProviderConfig
+  storageClass:
+    enabled: true
+    name: psql
+    provisioner: rancher.io/local-path
+    allowVolumeExpansion: false
+    parameters: {}
+  snapshotClass:
+    enabled: false
+  scaleToZeroPlugin:
+    enabled: false

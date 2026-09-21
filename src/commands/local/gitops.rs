@@ -35,7 +35,10 @@ use notify::{RecursiveMode, Watcher};
 use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+#[cfg(test)]
 use std::fs;
+#[cfg(test)]
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -264,6 +267,9 @@ fn run_cluster_reconcile_loop(
             r.pruned.len(),
             r.errors.len()
         );
+        for error in &r.errors {
+            log::warn!("cluster gitops: {error}");
+        }
         if !r.errors.is_empty() && r.applied.is_empty() {
             return Err(format!(
                 "cluster gitops failed ({} error(s)); first: {}",
@@ -385,7 +391,7 @@ fn reconcile_cluster_environments(
     definition: &super::workbench::definition::LoadedDefinition,
     dry_run: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let environment_files = discover_environment_definitions(&definition.cluster.mount_root)?;
+    let environment_files = enabled_environment_sources()?;
     let kube_context = super::kube_context_from_env()
         .unwrap_or_else(|| format!("kind-{}", definition.cluster.name));
     let mut errors = Vec::new();
@@ -456,6 +462,7 @@ fn reconcile_cluster_environments(
             app_delivery_host_paths: hosts,
             delivery_mode: Some(delivery_strategy.as_str().into()),
             dry_run,
+            run_setup: false,
         };
         match reconcile_environment(loaded, &opts, &SystemHelm, &SystemKustomize, &SystemKubectl) {
             Ok(results) => {
@@ -563,7 +570,32 @@ fn reconcile_cluster_environments_with_retry(
     Err(last_error.unwrap_or_else(|| "Environment reconcile failed".into()))
 }
 
+fn enabled_environment_sources() -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    Ok(super::env::load_entries(&local_state_dir()?)?
+        .into_iter()
+        .filter(|entry| entry.enabled)
+        .map(|entry| entry.source)
+        .collect())
+}
+
+fn is_home_path(path: &Path) -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let Ok(home) = PathBuf::from(home).canonicalize() else {
+        return false;
+    };
+    path.canonicalize().ok().as_ref() == Some(&home)
+}
+
+#[cfg(test)]
 fn discover_environment_definitions(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    if is_home_path(root) {
+        return Err(
+            "refusing to crawl $HOME for Environment definitions; enable Environments from the catalog (`hops local env enable`)"
+                .into(),
+        );
+    }
     let mut found = Vec::new();
     discover_environment_definitions_rec(root, &mut found)?;
     found.sort();
@@ -571,6 +603,7 @@ fn discover_environment_definitions(root: &Path) -> Result<Vec<PathBuf>, Box<dyn
     Ok(found)
 }
 
+#[cfg(test)]
 fn discover_environment_definitions_rec(
     directory: &Path,
     found: &mut Vec<PathBuf>,
@@ -578,7 +611,12 @@ fn discover_environment_definitions_rec(
     if !directory.is_dir() {
         return Ok(());
     }
-    for entry in fs::read_dir(directory)? {
+    let read = match fs::read_dir(directory) {
+        Ok(read) => read,
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in read {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
@@ -590,7 +628,17 @@ fn discover_environment_definitions_rec(
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("");
-            if matches!(name, ".git" | "node_modules" | "target" | "dist" | "build") {
+            if matches!(
+                name,
+                ".git"
+                    | "node_modules"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | "Library"
+                    | ".Trash"
+                    | ".hops"
+            ) {
                 continue;
             }
             discover_environment_definitions_rec(&path, found)?;
@@ -700,6 +748,7 @@ fn run_environment_definition(
         app_delivery_host_paths,
         delivery_mode: Some(delivery_strategy.as_str().into()),
         dry_run: args.dry_run,
+        run_setup: !args.dry_run && !args.down,
     };
 
     let reconcile = || -> Result<(), Box<dyn Error>> {
@@ -998,11 +1047,31 @@ where
         })?;
 
     watcher.watch(cluster, RecursiveMode::Recursive)?;
-    if project_root != cluster && project_root.is_dir() {
+    if project_root != cluster && project_root.is_dir() && !is_home_path(project_root) {
         watcher.watch(project_root, RecursiveMode::Recursive)?;
+    } else if is_home_path(project_root) {
+        log::info!(
+            "not watching Cluster.mountRoot $HOME; watching the Cluster tree and enabled Environments only"
+        );
+        for source in enabled_environment_sources()? {
+            if let Some(parent) = source.parent() {
+                if parent.is_dir() {
+                    if let Err(error) = watcher.watch(parent, RecursiveMode::Recursive) {
+                        log::warn!("watch {}: {error}", parent.display());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(secret_root) = secret_sync_root {
+        if secret_root.is_dir() && !secret_root.starts_with(cluster) {
+            if let Err(error) = watcher.watch(secret_root, RecursiveMode::Recursive) {
+                log::warn!("watch {}: {error}", secret_root.display());
+            }
+        }
     }
     log::info!(
-        "Watching Cluster tree {}, project Environment/deploy paths, and configured secret inputs (debounce {}s). Ctrl+C to stop.",
+        "Watching Cluster tree {}, enabled Environment paths, and configured secret inputs (debounce {}s). Ctrl+C to stop.",
         cluster.display(),
         debounce_secs
     );

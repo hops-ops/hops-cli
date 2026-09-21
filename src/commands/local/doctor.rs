@@ -18,6 +18,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         _ => log::info!("Checking local cluster setup (current kube context)..."),
     }
 
+    report_machine_cluster_warnings();
+
     let mut d = Doctor::new();
 
     d.section("Crossplane");
@@ -98,6 +100,48 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             d.failed_count()
         )
         .into())
+    }
+}
+
+fn report_machine_cluster_warnings() {
+    use super::workbench::definition::{self, DEFAULT_DEFINITION_FILE};
+    use super::workbench::machine;
+    use std::io::{self, Write};
+
+    let names = super::backend::kind::list_cluster_names();
+    if names.len() > 1 {
+        let _ = writeln!(
+            io::stderr(),
+            "warning: multiple hops-managed kind clusters are present ({}); happy path is one machine cluster. --cluster-name is an escape hatch.",
+            names.join(", ")
+        );
+    }
+    if let Ok(state_dir) = super::local_state_dir() {
+        if let Ok(Some(record)) = machine::load(&state_dir) {
+            let cwd_yaml = std::env::current_dir()
+                .ok()
+                .map(|cwd| cwd.join(DEFAULT_DEFINITION_FILE));
+            if let Some(path) = cwd_yaml.filter(|path| path.exists()) {
+                if let Ok(leaf) = definition::load_cluster_document_name(&path) {
+                    if leaf != record.name {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "warning: {} names Cluster {leaf:?} but the machine cluster is {:?}; `hops local up` reconnects and does not create a second kind cluster.",
+                            path.display(),
+                            record.name
+                        );
+                    }
+                }
+            }
+            if names.len() > 1 {
+                let _ = writeln!(
+                    io::stderr(),
+                    "warning: machine cluster is {:?}; extra clusters: {}",
+                    record.name,
+                    names.join(", ")
+                );
+            }
+        }
     }
 }
 

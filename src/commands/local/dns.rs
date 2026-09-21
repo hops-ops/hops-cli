@@ -1,4 +1,4 @@
-//! Explicit opt-in direct access to Kubernetes Service FQDNs from the host.
+//! `hops local fwd` — opt-in port-forwards for Kubernetes Service FQDNs.
 
 use super::local_state_dir;
 use super::workbench::net::{

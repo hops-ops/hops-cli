@@ -2,15 +2,19 @@
 
 use super::workbench::ingress::{
     discover_ingress_routes, format_ingress_status, ingress_access_matches_plan,
-    load_ingress_access_runtime, plan_from_routes, IngressAccessRuntime,
+    ingress_routes_from_value, load_ingress_access_runtime, plan_from_routes, IngressAccessRuntime,
 };
+use super::workbench::machine;
 use super::workbench::net::{
     format_status_card_with_listen, host_access_needs_heal, host_access_status_line,
     load_host_access_runtime, plan_from_runtime as host_plan_from_runtime, url_listen_status,
 };
-use super::workbench::registry::{activate_workspace_cluster, list_workspaces, load_workspace};
-use super::{local_state_dir, run_cmd_output};
+use super::workbench::registry::{
+    activate_workspace_cluster, list_workspaces, load_workspace, WorkspaceRecord,
+};
+use super::{local_state_dir, run_cmd_output, HOPS_KUBE_CONTEXT_ENV};
 use clap::Args;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::Path;
 
@@ -19,6 +23,14 @@ pub struct StatusArgs {
     /// Show only this workspace.
     #[arg(long)]
     pub name: Option<String>,
+
+    /// Print only public *.localhost URLs from HTTPRoutes.
+    #[arg(long, default_value_t = false)]
+    pub urls: bool,
+
+    /// Include stale workspaces and missing kube contexts.
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
 
     /// Deprecated compatibility flag; status is always read-only.
     #[arg(long, default_value_t = false, hide = true)]
@@ -46,6 +58,212 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    if args.urls {
+        return print_urls(&workspaces, args.all);
+    }
+
+    print_cluster_section(&state_dir)?;
+    println!();
+
+    if args.all {
+        return print_verbose(&state_dir, &workspaces, args);
+    }
+
+    let mut all_ok = true;
+    let mut shown = 0usize;
+    for ws in workspaces.iter() {
+        if args.name.is_none() && !workspace_is_live(ws) {
+            continue;
+        }
+        let _ = activate_workspace_cluster(ws);
+        let pods = match discover_pods(&ws.namespace) {
+            Ok(pods) => pods,
+            Err(_) => {
+                if args.name.is_some() {
+                    println!("{}: cluster unreachable", ws.name);
+                    all_ok = false;
+                }
+                continue;
+            }
+        };
+        let running = pods.iter().any(|p| p.phase == "Running");
+        if args.name.is_none() && !running {
+            continue;
+        }
+        let urls = discover_ingress_routes(&ws.namespace)
+            .ok()
+            .and_then(|routes| plan_from_routes(&ws.namespace, &routes).ok())
+            .map(|plan| plan.urls.into_values().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if shown > 0 {
+            println!();
+        }
+        shown += 1;
+        let ready = pods.iter().filter(|p| p.ready).count();
+        let total = pods
+            .iter()
+            .filter(|p| p.phase == "Running" || p.phase == "Pending")
+            .count();
+        let cluster = ws.cluster_name.as_deref().unwrap_or("-");
+        println!("{}  {cluster}  {ready}/{total} ready", ws.name);
+        if urls.is_empty() {
+            println!("  (no public URLs)");
+        } else {
+            for url in &urls {
+                println!("  {url}");
+            }
+        }
+        for p in pods.iter().filter(|p| p.phase == "Running" && !p.ready) {
+            all_ok = false;
+            println!(
+                "  not ready: {} {}/{}",
+                p.name, p.ready_containers, p.total_containers
+            );
+        }
+        if !running {
+            all_ok = false;
+            println!("  (no running pods)");
+        }
+    }
+
+    if shown == 0 {
+        println!(
+            "No running workspaces. Pass --all for stale records, or --urls for HTTPRoute URLs."
+        );
+    }
+
+    if args.check && !all_ok {
+        return Err("one or more workspaces are not ready (see above)".into());
+    }
+    Ok(())
+}
+
+fn print_cluster_section(state_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let Some(record) = machine::load(state_dir)? else {
+        println!("cluster  (none)  run `hops local up`");
+        return Ok(());
+    };
+    println!("cluster  {}  {}", record.name, record.kube_context);
+    if let Some(host_path) = cluster_host_path(&record.source) {
+        println!("  hostPath        {}", host_path.display());
+    }
+    std::env::set_var(HOPS_KUBE_CONTEXT_ENV, &record.kube_context);
+    if let Ok(nodes) = kubectl_json(&["get", "nodes", "-o", "json"]) {
+        for item in items(&nodes) {
+            let name = meta_name(item);
+            let version = item
+                .pointer("/status/nodeInfo/kubeletVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            let ready = condition_ready(item, "Ready");
+            println!("  node            {name}  {version}  {ready}");
+        }
+    } else {
+        println!("  (cluster unreachable)");
+        return Ok(());
+    }
+    if let Ok(authstacks) = kubectl_json(&["get", "authstack", "-A", "-o", "json"]) {
+        for item in items(&authstacks) {
+            let name = meta_name(item);
+            let ready = condition_ready(item, "Ready");
+            println!("  authstack       {name}  {ready}");
+        }
+    }
+    if let Ok(configs) = kubectl_json(&["get", "configurations.pkg.crossplane.io", "-o", "json"]) {
+        for item in items(&configs) {
+            let name = meta_name(item);
+            let package = package_ref(item);
+            let ready = pkg_ready(item);
+            println!("  configuration   {name}  {package}  {ready}");
+        }
+    }
+    if let Ok(providers) = kubectl_json(&["get", "providers.pkg.crossplane.io", "-o", "json"]) {
+        for item in items(&providers) {
+            let name = meta_name(item);
+            let package = package_ref(item);
+            let ready = pkg_ready(item);
+            println!("  provider        {name}  {package}  {ready}");
+        }
+    }
+    Ok(())
+}
+
+fn cluster_host_path(source: &Path) -> Option<std::path::PathBuf> {
+    let raw = std::fs::read_to_string(source).ok()?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&raw).ok()?;
+    let mount = value.get("spec")?.get("mountRoot")?.as_str()?;
+    if mount == "$HOME" || mount == "~" {
+        return std::env::var("HOME")
+            .ok()
+            .and_then(|home| std::path::PathBuf::from(home).canonicalize().ok());
+    }
+    let path = std::path::PathBuf::from(mount);
+    path.canonicalize().ok().or(Some(path))
+}
+
+fn kubectl_json(args: &[&str]) -> Result<serde_json::Value, Box<dyn Error>> {
+    let raw = run_cmd_output("kubectl", args)?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+fn items(value: &serde_json::Value) -> &[serde_json::Value] {
+    value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+}
+
+fn meta_name(item: &serde_json::Value) -> &str {
+    item.pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-")
+}
+
+fn package_ref(item: &serde_json::Value) -> String {
+    let raw = item
+        .pointer("/spec/package")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    raw.rsplit('/').next().unwrap_or(raw).to_string()
+}
+
+fn condition_ready(item: &serde_json::Value, ty: &str) -> &'static str {
+    let Some(conditions) = item
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array())
+    else {
+        return "-";
+    };
+    for condition in conditions {
+        if condition.get("type").and_then(|v| v.as_str()) == Some(ty) {
+            return if condition.get("status").and_then(|v| v.as_str()) == Some("True") {
+                "Ready"
+            } else {
+                "NotReady"
+            };
+        }
+    }
+    "-"
+}
+
+fn pkg_ready(item: &serde_json::Value) -> &'static str {
+    let healthy = condition_ready(item, "Healthy");
+    let installed = condition_ready(item, "Installed");
+    if healthy == "Ready" && installed == "Ready" {
+        "Ready"
+    } else if installed == "Ready" {
+        "Installed"
+    } else {
+        "NotReady"
+    }
+}
+
+fn print_verbose(
+    state_dir: &Path,
+    workspaces: &[WorkspaceRecord],
+    args: &StatusArgs,
+) -> Result<(), Box<dyn Error>> {
     let mut all_ok = true;
     for (i, ws) in workspaces.iter().enumerate() {
         if i > 0 {
@@ -55,9 +273,8 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
             let ctx = ws.kube_context.as_deref().unwrap_or("-");
             println!("cluster:  {cn} (context {ctx})");
         }
-        // Target the workspace's bound cluster before kubectl discovery.
         let _ = activate_workspace_cluster(ws);
-        let host_access = load_host_access_runtime(&state_dir, &ws.name)?;
+        let host_access = load_host_access_runtime(state_dir, &ws.name)?;
         let listen = if let Some(runtime) = &host_access {
             let plan = host_plan_from_runtime(runtime);
             let listen = url_listen_status(&plan);
@@ -72,11 +289,10 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         } else {
             println!("workspace: {}", ws.name);
             println!("namespace: {}", ws.namespace);
-            println!("service access: disabled (enable explicitly with `hops local dns`)");
+            println!("service access: disabled (enable explicitly with `hops local fwd`)");
             Default::default()
         };
 
-        // Pods
         match discover_pods(&ws.namespace) {
             Ok(pods) if !pods.is_empty() => {
                 println!("pods:");
@@ -104,23 +320,19 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
         if let Some(d) = &ws.delivery_mode {
             println!("delivery: {d}");
         }
-        println!("{}", delivery_status_line(&state_dir, &ws.name));
+        println!("{}", delivery_status_line(state_dir, &ws.name));
         println!("env:      {}", ws.env_path);
 
         if let Some(rt) = &host_access {
             println!("{}", host_access_status_line(&rt));
         }
 
-        let ingress_runtime = load_ingress_access_runtime(&state_dir, &ws.name)?;
+        let ingress_runtime = load_ingress_access_runtime(state_dir, &ws.name)?;
         match discover_ingress_routes(&ws.namespace) {
             Ok(routes) => match plan_from_routes(&ws.namespace, &routes) {
                 Ok(plan) => {
                     if plan.urls.is_empty() {
                         println!("ingress:  (no HTTPRoute hostnames)");
-                        if ingress_runtime.is_some() {
-                            all_ok = false;
-                            println!("warn:     stale ingress runtime is still recorded");
-                        }
                     } else if let Some(runtime) = &ingress_runtime {
                         if !ingress_access_matches_plan(&plan, runtime) {
                             all_ok = false;
@@ -155,11 +367,71 @@ pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
             }
         }
     }
-
     if args.check && !all_ok {
         return Err("one or more workspaces are not ready (see above)".into());
     }
     Ok(())
+}
+
+fn print_urls(workspaces: &[WorkspaceRecord], all: bool) -> Result<(), Box<dyn Error>> {
+    let mut seen_ctx = BTreeSet::new();
+    let mut urls = BTreeSet::new();
+    for ws in workspaces {
+        if !all && !workspace_is_live(ws) {
+            continue;
+        }
+        let ctx = ws.kube_context.as_deref().unwrap_or("");
+        if ctx.is_empty() || !seen_ctx.insert(ctx.to_string()) {
+            continue;
+        }
+        if !kube_context_exists(ctx) {
+            continue;
+        }
+        let _ = activate_workspace_cluster(ws);
+        match run_cmd_output("kubectl", &["get", "httproute", "-A", "-o", "json"]) {
+            Ok(json) => {
+                let value: serde_json::Value = serde_json::from_str(&json)?;
+                for route in ingress_routes_from_value("", &value) {
+                    if route.hostname.ends_with(".localhost") {
+                        urls.insert(format!("https://{}", route.hostname));
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    if urls.is_empty() {
+        if let Ok(json) = run_cmd_output("kubectl", &["get", "httproute", "-A", "-o", "json"]) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+                for route in ingress_routes_from_value("", &value) {
+                    if route.hostname.ends_with(".localhost") {
+                        urls.insert(format!("https://{}", route.hostname));
+                    }
+                }
+            }
+        }
+    }
+    if urls.is_empty() {
+        println!("(no HTTPRoute *.localhost hostnames on live clusters)");
+        return Ok(());
+    }
+    for url in urls {
+        println!("{url}");
+    }
+    Ok(())
+}
+
+fn workspace_is_live(ws: &WorkspaceRecord) -> bool {
+    match ws.kube_context.as_deref().filter(|ctx| !ctx.is_empty()) {
+        Some(ctx) => kube_context_exists(ctx),
+        None => true,
+    }
+}
+
+fn kube_context_exists(ctx: &str) -> bool {
+    run_cmd_output("kubectl", &["config", "get-contexts", "-o", "name"])
+        .ok()
+        .is_some_and(|out| out.lines().any(|line| line.trim() == ctx))
 }
 
 #[derive(Debug)]

@@ -1,0 +1,31 @@
+# One shared ingress Gateway serves every independently named local Environment.
+apiVersion: hops.ops.com.ai/v1alpha1
+kind: IstioStack
+metadata:
+  name: harmony-local
+  namespace: default
+spec:
+  managementPolicies: ["*"]
+  clusterName: harmony-local
+  helmProviderConfigRef:
+    name: default
+    kind: ProviderConfig
+  kubernetesProviderConfigRef:
+    name: default
+    kind: ProviderConfig
+  namespace: istio-system
+  chartVersion: "1.29.2"
+  ingressGateway:
+    enabled: true
+    name: platform
+    namespace: istio-ingress
+    gatewayClassName: istio
+    listeners:
+      - name: http
+        port: 80
+        protocol: HTTP
+        allowedRoutes:
+          namespaces:
+            from: All
+  awsLoadBalancerController:
+    enabled: false

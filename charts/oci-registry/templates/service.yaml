@@ -1,0 +1,19 @@
+{{- range $mode := list "read" "write" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $.Values.name }}{{ if eq $mode "write" }}-upload{{ end }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "oci.labels" $ | nindent 4 }}
+    hops.ops.com.ai/registry-access: {{ $mode }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "oci.selector" $ | nindent 4 }}
+  ports:
+    - name: {{ $mode }}
+      port: {{ if eq $mode "read" }}5000{{ else }}5001{{ end }}
+      targetPort: {{ $mode }}
+{{- end }}

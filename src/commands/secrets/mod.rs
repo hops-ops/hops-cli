@@ -225,7 +225,7 @@ fn configured_github_settings() -> Result<GithubSecretsRuntimeConfig, Box<dyn Er
     })
 }
 
-fn configured_vault_settings() -> Result<VaultSecretsRuntimeConfig, Box<dyn Error>> {
+pub(super) fn configured_vault_settings() -> Result<VaultSecretsRuntimeConfig, Box<dyn Error>> {
     let config = load_config()?;
     let vault = config.secrets.vault;
     let env_address = std::env::var("VAULT_ADDR")
@@ -257,7 +257,11 @@ fn configured_vault_settings() -> Result<VaultSecretsRuntimeConfig, Box<dyn Erro
             .token_env
             .unwrap_or_else(|| DEFAULT_VAULT_TOKEN_ENV.to_string()),
         kube_enabled: kube.enabled.unwrap_or(true),
-        kube_context: kube.context,
+        kube_context: std::env::var("HOPS_KUBE_CONTEXT")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or(kube.context),
         kube_namespace: kube
             .namespace
             .unwrap_or_else(|| DEFAULT_VAULT_KUBE_NAMESPACE.to_string()),

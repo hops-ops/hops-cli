@@ -798,21 +798,29 @@ pub fn resize(_size: &SizeArgs) -> Result<(), Box<dyn Error>> {
 /// Whether the hops kind cluster exists (running or stopped). Missing binary
 /// or failing command reads as "no cluster".
 pub fn cluster_exists() -> bool {
+    let name = active_cluster_name();
+    list_cluster_names().iter().any(|line| line == &name)
+}
+
+/// Names reported by `kind get clusters`. Missing binary reads as empty.
+pub fn list_cluster_names() -> Vec<String> {
     if !command_exists("kind") {
-        return false;
+        return Vec::new();
     }
     let mut cmd = kind_cmd(&["get", "clusters"]);
     let output = match cmd.output() {
         Ok(o) => o,
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
     if !output.status.success() {
-        return false;
+        return Vec::new();
     }
-    let name = active_cluster_name();
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .any(|line| line.trim() == name)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn node_running() -> bool {

@@ -1,0 +1,45 @@
+# Reconciled once per Cluster from .gitops/local/cluster.
+#
+# The zitadel chart fullname is `{release}` when the release name already
+# contains "zitadel", else `{release}-zitadel`. AuthStack names the Helm
+# release `{xr.name}-zitadel`, so XR name `zitadel` becomes Service
+# `zitadel-zitadel`. fullnameOverride pins the API Service to `zitadel` in
+# ns `auth` → zitadel.auth.svc.cluster.local. Login UI is `{fullname}-login`
+# (`zitadel-login`); do not set login.fullnameOverride to the same value.
+apiVersion: hops.ops.com.ai/v1alpha1
+kind: AuthStack
+metadata:
+  name: auth
+  namespace: default
+spec:
+  managementPolicies: ["*"]
+  clusterName: hops
+  helmProviderConfigRef:
+    name: default
+    kind: ProviderConfig
+  kubernetesProviderConfigRef:
+    name: default
+    kind: ProviderConfig
+  namespace: auth
+  chartValues:
+    fullnameOverride: zitadel
+  domain: auth.gitkb.localhost
+  externalSecure: true
+  gateway:
+    enabled: true
+    parentRef:
+      name: platform
+      namespace: istio-ingress
+      sectionName: http
+  externalSecrets:
+    enabled: false
+  firstInstance:
+    org: hops
+    masterkey:
+      secretRef:
+        name: zitadel-masterkey
+  database:
+    embedded:
+      storage:
+        size: 2Gi
+        class: psql

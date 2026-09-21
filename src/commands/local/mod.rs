@@ -1,13 +1,16 @@
 mod aws;
 pub mod backend;
 mod cloudflare;
+mod configure;
 mod destroy;
 mod dns;
 mod doctor;
 mod down;
+mod env;
 mod github;
 mod gitops;
 pub mod gitops_write;
+mod init;
 mod install;
 mod listmonk;
 pub mod package_install;
@@ -15,7 +18,9 @@ mod reset;
 mod resize;
 mod start;
 mod status;
+mod tui;
 mod uninstall;
+mod up;
 pub mod workbench;
 mod zitadel;
 
@@ -145,14 +150,26 @@ pub enum LocalCommands {
     Start(start::StartArgs),
     /// Resize the local cluster VM without destroying cluster state (colima cluster provider only)
     Resize(resize::ResizeArgs),
-    /// Check what `hops local start` set up and report drift
+    /// Check Cluster health and report machine-cluster identity drift
     Doctor,
-    /// Bring down a local workbench workspace
+    /// Create or reconnect the one machine Cluster
+    Up(up::UpArgs),
+    /// Show or change machine Cluster settings (hostPath, localDomain, name)
+    Configure(configure::ConfigureArgs),
+    /// Stop the machine Cluster (no --name) or one Environment (`--name`)
     Down(down::DownArgs),
-    /// Show local workbench workspace status and app URLs
+    /// Write committed Cluster / platform / Environment files
+    Init(init::InitArgs),
+    /// Catalog, enable, and disable Environments (off until enable)
+    Env(env::EnvArgs),
+    /// Toggle catalogued Environments
+    #[command(name = "envs")]
+    Envs(tui::TuiArgs),
+    /// Show live cluster + workspace status (`--urls` for HTTPRoute URLs only)
     Status(status::StatusArgs),
-    /// Explicitly enable or repair direct Kubernetes Service DNS on this host
-    Dns(dns::DnsArgs),
+    /// Port-forward Kubernetes Service FQDNs onto this host
+    #[command(name = "fwd")]
+    Fwd(dns::DnsArgs),
     /// Local gitops: `cluster` (shared CP) or `environment` (app namespaces)
     Gitops(gitops::GitopsArgs),
     /// Configure crossplane-contrib provider-family-aws and AWS ProviderConfig
@@ -172,21 +189,30 @@ pub enum LocalCommands {
 }
 
 pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
-    if let LocalCommands::Gitops(gitops::GitopsArgs {
-        command: gitops::GitopsCommands::Cluster(cluster),
-    }) = &args.command
-    {
-        return gitops::run_cluster(
-            cluster,
-            workbench::definition::ClusterOverrides {
-                cluster_provider: args.cluster_provider,
-                docker_provider: args.docker_provider,
-                legacy_backend: args.backend,
-                cluster_name: args.cluster_name.as_deref(),
-                context: args.context.as_deref(),
-                dory_name: args.dory_name.as_deref(),
-            },
-        );
+    let overrides = workbench::definition::ClusterOverrides {
+        cluster_provider: args.cluster_provider,
+        docker_provider: args.docker_provider,
+        legacy_backend: args.backend,
+        cluster_name: args.cluster_name.as_deref(),
+        context: args.context.as_deref(),
+        dory_name: args.dory_name.as_deref(),
+        machine_name: None,
+    };
+    match &args.command {
+        LocalCommands::Gitops(gitops::GitopsArgs {
+            command: gitops::GitopsCommands::Cluster(cluster),
+        }) => return gitops::run_cluster(cluster, overrides),
+        LocalCommands::Up(up_args) => return up::run(up_args, overrides),
+        LocalCommands::Configure(configure_args) => {
+            return configure::run(configure_args, overrides)
+        }
+        LocalCommands::Down(down_args) if down_args.name.is_none() => {
+            return down::run(down_args, overrides)
+        }
+        LocalCommands::Init(init_args) => return init::run(init_args),
+        LocalCommands::Env(env_args) => return env::run(env_args, overrides),
+        LocalCommands::Envs(tui_args) => return tui::run(tui_args, overrides),
+        _ => {}
     }
 
     // Observation and explicit Service-DNS access use each Environment's
@@ -194,7 +220,7 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
     // selection as a side effect of status/access inspection.
     match &args.command {
         LocalCommands::Status(status_args) => return status::run(status_args),
-        LocalCommands::Dns(dns_args) => return dns::run(dns_args),
+        LocalCommands::Fwd(dns_args) => return dns::run(dns_args),
         _ => {}
     }
 
@@ -240,9 +266,9 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
         LocalCommands::Start(start_args) => start::run(backend, start_args),
         LocalCommands::Resize(resize_args) => resize::run(backend, resize_args),
         LocalCommands::Doctor => doctor::run(),
-        LocalCommands::Down(down_args) => down::run(down_args),
-        LocalCommands::Status(_) | LocalCommands::Dns(_) => {
-            unreachable!("status and dns return before provider activation")
+        LocalCommands::Down(down_args) => down::run(down_args, overrides),
+        LocalCommands::Status(_) | LocalCommands::Fwd(_) => {
+            unreachable!("status and fwd return before provider activation")
         }
         LocalCommands::Gitops(gitops_args) => gitops::run_environment_command(
             gitops_args,
@@ -253,8 +279,16 @@ pub fn run(args: &LocalArgs) -> Result<(), Box<dyn Error>> {
                 cluster_name: args.cluster_name.as_deref(),
                 context: args.context.as_deref(),
                 dory_name: args.dory_name.as_deref(),
+                machine_name: None,
             },
         ),
+        LocalCommands::Up(_)
+        | LocalCommands::Configure(_)
+        | LocalCommands::Init(_)
+        | LocalCommands::Env(_)
+        | LocalCommands::Envs(_) => {
+            unreachable!("up/configure/init/env/envs return before provider activation")
+        }
         LocalCommands::Aws(aws_args) => aws::run(aws_args),
         LocalCommands::Cloudflare(cloudflare_args) => cloudflare::run(cloudflare_args),
         LocalCommands::Github(github_args) => github::run(github_args),
@@ -654,7 +688,17 @@ mod tests {
             other => panic!("expected GitOps Cluster, got {other:?}"),
         }
 
-        for removed in ["up", "open", "stop"] {
+        match Cli::try_parse_from(["hops-local-test", "up"]).expect("parse local up") {
+            Cli {
+                local:
+                    LocalArgs {
+                        command: LocalCommands::Up(_),
+                        ..
+                    },
+            } => {}
+            other => panic!("expected local up, got {other:?}"),
+        }
+        for removed in ["open", "stop"] {
             assert!(
                 Cli::try_parse_from(["hops-local-test", removed]).is_err(),
                 "interim command {removed:?} must stay removed"
@@ -679,18 +723,32 @@ mod tests {
             LocalCommands::Status(status) => {
                 assert_eq!(status.name.as_deref(), Some("feature"));
                 assert!(!status.no_heal);
+                assert!(!status.urls);
+                assert!(!status.all);
             }
             other => panic!("expected status, got {other:?}"),
         }
 
-        let dns = Cli::try_parse_from(["hops-local-test", "dns", "--name", "feature", "--down"])
-            .expect("parse explicit Service DNS teardown");
-        match dns.local.command {
-            LocalCommands::Dns(dns) => {
+        let fwd = Cli::try_parse_from(["hops-local-test", "fwd", "--name", "feature", "--down"])
+            .expect("parse explicit Service port-forward teardown");
+        match fwd.local.command {
+            LocalCommands::Fwd(dns) => {
                 assert_eq!(dns.name.as_deref(), Some("feature"));
                 assert!(dns.down);
             }
-            other => panic!("expected dns, got {other:?}"),
+            other => panic!("expected fwd, got {other:?}"),
+        }
+        let envs = Cli::try_parse_from(["hops-local-test", "envs"]).expect("parse envs");
+        match envs.local.command {
+            LocalCommands::Envs(_) => {}
+            other => panic!("expected envs, got {other:?}"),
+        }
+
+        let urls =
+            Cli::try_parse_from(["hops-local-test", "status", "--urls"]).expect("parse urls");
+        match urls.local.command {
+            LocalCommands::Status(status) => assert!(status.urls),
+            other => panic!("expected status --urls, got {other:?}"),
         }
     }
 }

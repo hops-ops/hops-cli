@@ -1,0 +1,35 @@
+# This chart does not provision clusters, cloud storage, DNS, or certificates.
+name: registry
+image: registry:2.8.3
+tls:
+  # Must contain tls.crt and tls.key, trusted by Crossplane AND runtime nodes.
+  existingSecret: ""
+storage:
+  type: pvc
+  pvc:
+    existingClaim: ""
+    size: 20Gi
+    storageClassName: null
+    # Explicit operator attestation: the backing volume/host is encrypted.
+    encryptionConfirmed: false
+  s3:
+    bucket: ""
+    region: ""
+    rootDirectory: /hops-development
+    kmsKeyId: ""
+serviceAccount:
+  annotations: {}
+  # Enable only when the selected workload identity requires a projected token.
+  automountServiceAccountToken: false
+access:
+  # Kubernetes RBAC subjects; no credentials. Empty means no upload grants.
+  uploadSubjects: []
+  # Namespaces/pods and node CIDRs allowed to reach the HTTPS read endpoint.
+  # Explicitly include node networks: runtime image pulls originate on nodes.
+  pullPeers: []
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi

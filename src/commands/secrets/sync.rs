@@ -616,15 +616,108 @@ fn run_vault(args: &VaultSyncArgs) -> Result<(), Box<dyn Error>> {
 }
 
 pub(super) fn sync_vault_path(path: &Path) -> Result<(), Box<dyn Error>> {
+    let secret_source = path.canonicalize().map_err(|error| {
+        format!(
+            "Vault secrets path {} is unavailable: {error}",
+            path.display()
+        )
+    })?;
+    let git_root = git_toplevel(&secret_source)?;
+    let _cwd = CwdGuard::enter(&git_root)?;
+    ensure_vault_token_from_cluster()?;
     run_vault(&VaultSyncArgs {
-        secret_path: Some(path.display().to_string()),
+        secret_path: Some(secret_source.display().to_string()),
         address: None,
         mount: None,
         path_prefix: None,
-        port_forward: false,
+        port_forward: true,
         no_port_forward: false,
         yes: true,
     })
+}
+
+struct CwdGuard(PathBuf);
+
+impl CwdGuard {
+    fn enter(dir: &Path) -> Result<Self, Box<dyn Error>> {
+        let previous = env::current_dir()?;
+        env::set_current_dir(dir).map_err(|error| {
+            format!(
+                "unable to use Git worktree {} for Vault sync: {error}",
+                dir.display()
+            )
+        })?;
+        Ok(Self(previous))
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = env::set_current_dir(&self.0);
+    }
+}
+
+fn ensure_vault_token_from_cluster() -> Result<(), Box<dyn Error>> {
+    if env::var("VAULT_TOKEN")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Ok(());
+    }
+    let settings = super::configured_vault_settings()?;
+    let mut command = Command::new("kubectl");
+    if let Some(context) = &settings.kube_context {
+        command.arg("--context").arg(context);
+    }
+    let output = command
+        .args([
+            "--namespace",
+            &settings.kube_namespace,
+            "exec",
+            "vault-0",
+            "--",
+            "cat",
+            "/vault/data/.hops-init",
+        ])
+        .output()
+        .map_err(|error| format!("failed to read local Vault init token: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Vault token not in {}; kubectl exec vault-0 .hops-init failed: {}",
+            settings.token_env,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let token = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Initial Root Token:").map(str::trim))
+        .filter(|value| !value.is_empty())
+        .ok_or("Vault init file has no Initial Root Token")?;
+    env::set_var(&settings.token_env, token);
+    log::info!(
+        "using local Vault root token from {}/vault-0",
+        settings.kube_namespace
+    );
+    Ok(())
+}
+
+fn git_toplevel(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().ok_or("Vault secrets path has no parent")?
+    };
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|error| format!("failed to inspect Git repository for Vault inputs: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("Vault sync requires a Git worktree at {}", dir.display()).into());
+    }
+    Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()).canonicalize()?)
 }
 
 #[cfg(test)]

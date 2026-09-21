@@ -33,6 +33,8 @@ pub struct ReconcileOptions {
     pub delivery_mode: Option<String>,
     /// When true, only render (no apply). Used by tests.
     pub dry_run: bool,
+    /// Run Environment.spec.setup scripts (enable only, not watch).
+    pub run_setup: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -206,7 +208,9 @@ impl KubectlApplier for SystemKubectl {
         // when the pack is not installed) does not prevent core Deploy/Service apply.
         let mut hard_errors = Vec::new();
         for doc in parse_yaml_docs(yaml)? {
-            let doc = serde_yaml::to_string(&doc)?;
+            // JSON, not YAML: serde_yaml round-trips `yes`/`on`/`no` as unquoted
+            // YAML 1.1 booleans, and kubectl then rejects container args.
+            let doc = serde_json::to_string(&doc)?;
             match crate::commands::local::kubectl_apply_stdin(&doc) {
                 Ok(()) => {}
                 Err(e) => {
@@ -422,6 +426,7 @@ fn is_soft_apply_error(msg: &str) -> bool {
         || lower.contains("no matches for")
         || lower.contains("ensure crds are installed")
         || lower.contains("the server doesn't have a resource type")
+        || (lower.contains("the job") && lower.contains("field is immutable"))
 }
 
 /// Merge chart-level deploy values with runtime inject.
@@ -1220,6 +1225,7 @@ metadata:
             app_delivery_host_paths: BTreeMap::new(),
             delivery_mode: None,
             dry_run: true,
+            run_setup: false,
         };
 
         let result = reconcile_deploy_chart(
@@ -1304,6 +1310,7 @@ metadata:
             app_delivery_host_paths: BTreeMap::new(),
             delivery_mode: None,
             dry_run: false,
+            run_setup: false,
         };
 
         let raw = reconcile_deploy(
@@ -1487,6 +1494,7 @@ metadata:
             app_delivery_host_paths: hosts,
             delivery_mode: Some("hostPath".into()),
             dry_run: true,
+            run_setup: false,
         };
         let ui = build_runtime_values(&opts, "e2e-ui-ui");
         let api = build_runtime_values(&opts, "e2e-ui-api");

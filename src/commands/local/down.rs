@@ -1,28 +1,61 @@
-//! `hops local down` — stop workspace host access, delivery, and optionally purge namespace.
+//! `hops local down` — stop the machine Cluster, or one Environment with `--name`.
 
+use super::gitops::{self, ClusterArgs};
+use super::local_state_dir;
+use super::run_cmd;
+use super::workbench::definition::ClusterOverrides;
 use super::workbench::delivery::stop_delivery_runtime;
 use super::workbench::ingress::stop_ingress_access;
+use super::workbench::machine;
 use super::workbench::net::stop_host_access;
 use super::workbench::registry::{
     activate_workspace_cluster, list_workspaces, load_workspace, namespace_for_name,
     remove_workspace,
 };
-use super::{local_state_dir, run_cmd};
 use clap::Args;
 use std::error::Error;
 
 #[derive(Args, Debug)]
 pub struct DownArgs {
-    /// Workspace name (default: only workspace if exactly one registered).
+    /// Environment name. Without this flag, stop the machine Cluster.
     #[arg(long)]
     pub name: Option<String>,
 
-    /// Delete the workspace namespace and labeled resources.
+    /// Delete the Environment namespace (requires `--name`).
     #[arg(long, default_value_t = false)]
     pub purge: bool,
 }
 
-pub fn run(args: &DownArgs) -> Result<(), Box<dyn Error>> {
+pub fn run(args: &DownArgs, overrides: ClusterOverrides<'_>) -> Result<(), Box<dyn Error>> {
+    if args.name.is_none() {
+        if args.purge {
+            return Err("`hops local down --purge` requires --name <environment>".into());
+        }
+        return down_machine_cluster(overrides);
+    }
+    down_environment(args)
+}
+
+fn down_machine_cluster(overrides: ClusterOverrides<'_>) -> Result<(), Box<dyn Error>> {
+    let state_dir = local_state_dir()?;
+    let record = machine::load(&state_dir)?
+        .ok_or("No machine Cluster record; nothing to stop. Run `hops local up` first.")?;
+    let cluster_args = ClusterArgs {
+        path: Some(record.source.clone()),
+        down: true,
+        once: true,
+        watch: false,
+        debounce: 1,
+        dry_run: false,
+    };
+    let overrides = ClusterOverrides {
+        machine_name: Some(&record.name),
+        ..overrides
+    };
+    gitops::run_cluster(&cluster_args, overrides)
+}
+
+fn down_environment(args: &DownArgs) -> Result<(), Box<dyn Error>> {
     let state_dir = local_state_dir()?;
     let name = match &args.name {
         Some(n) => n.clone(),

@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Values.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "oci.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ .Values.name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "oci.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "oci.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Values.name }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        {{- range $mode := list "read" "write" }}
+        - name: {{ $mode }}
+          image: {{ $.Values.image | quote }}
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "/etc/distribution/{{ $mode }}.yml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: {{ $mode }}
+              containerPort: {{ if eq $mode "read" }}5000{{ else }}5001{{ end }}
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/distribution
+              readOnly: true
+            {{- if eq $.Values.storage.type "pvc" }}
+            - name: data
+              mountPath: /var/lib/registry
+              readOnly: {{ eq $mode "read" }}
+            {{- end }}
+            {{- if eq $mode "read" }}
+            - name: tls
+              mountPath: /certs
+              readOnly: true
+            {{- end }}
+          readinessProbe:
+            {{- if eq $mode "read" }}
+            httpGet:
+              scheme: HTTPS
+              path: /v2/
+              port: read
+            {{- else }}
+            exec:
+              command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5001/v2/"]
+            {{- end }}
+            periodSeconds: 5
+            timeoutSeconds: 15
+            failureThreshold: 6
+        {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Values.name }}-config
+        - name: tls
+          secret:
+            secretName: {{ required "tls.existingSecret is required" .Values.tls.existingSecret }}
+        {{- if eq .Values.storage.type "pvc" }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.storage.pvc.existingClaim | default (printf "%s-pvc" .Values.name) }}
+        {{- end }}

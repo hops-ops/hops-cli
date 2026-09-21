@@ -43,6 +43,20 @@ pub const DEFAULT_CROSSPLANE_VERSION: &str = "2.4.0";
 pub const DEFAULT_LOCAL_DOMAIN: &str = "localhost";
 pub const CLUSTER_MANIFESTS_PATH: &str = ".gitops/local/cluster";
 
+/// Read `metadata.name` from a Cluster document without activating a backend.
+pub fn load_cluster_document_name(path: &Path) -> Result<String, Box<dyn Error>> {
+    let raw =
+        fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let value: Value =
+        serde_yaml::from_str(&raw).map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let name = value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("name"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{}: Cluster.metadata.name is required", path.display()))?;
+    Ok(name.to_string())
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClusterOverrides<'a> {
     pub cluster_provider: Option<ClusterProvider>,
@@ -51,6 +65,9 @@ pub struct ClusterOverrides<'a> {
     pub cluster_name: Option<&'a str>,
     pub context: Option<&'a str>,
     pub dory_name: Option<&'a str>,
+    /// When set by `hops local up`, this is the machine Cluster identity.
+    /// Leaf `Cluster.metadata.name` is not used to create a second kind cluster.
+    pub machine_name: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,10 +126,22 @@ pub struct EnvironmentDefinition {
     pub name: String,
     pub namespace: String,
     pub cluster_ref: String,
+    pub scope: EnvironmentScope,
     pub local_domain: String,
     pub root: PathBuf,
     pub values: Mapping,
     pub deploys: Vec<DeployDefinition>,
+    pub secret_sync: Option<SecretSyncDefinition>,
+    /// Checkout-relative scripts run on `hops local env enable`, before secretSync.
+    pub setup: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvironmentScope {
+    #[default]
+    Project,
+    Cluster,
 }
 
 /// Renderer for one explicit Environment deploy directory.
@@ -329,10 +358,22 @@ struct EnvironmentSpec {
     cluster_ref: ClusterReference,
     root: PathBuf,
     #[serde(default)]
+    scope: EnvironmentScope,
+    #[serde(default)]
     namespace: Option<String>,
     #[serde(default)]
     values: Mapping,
     deploys: Vec<DeploySpec>,
+    #[serde(default)]
+    secret_sync: Option<SecretSyncSpec>,
+    #[serde(default)]
+    setup: Vec<SetupSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetupSpec {
+    path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,7 +425,21 @@ fn prepare_cluster_with_mount_validation(
 
     // All parsing, identity, provider, and filesystem validation happens
     // before process state, local state, or the cluster can be mutated.
-    let definition = load_definition(&source)?;
+    let mut definition = load_definition(&source)?;
+    if let Some(machine) = overrides
+        .machine_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if definition.cluster.name != machine {
+            log::warn!(
+                "Cluster.metadata.name {:?} in {} differs from machine cluster {machine:?}; using {machine:?} so a second kind cluster is not created",
+                definition.cluster.name,
+                definition.source.display()
+            );
+            definition.cluster.name = machine.to_string();
+        }
+    }
     validate_overrides(&definition, overrides)?;
 
     if let Some(name) = overrides
@@ -696,21 +751,15 @@ pub fn load_environment_definition(
     debug_assert_eq!(raw.api_version, API_VERSION);
     debug_assert_eq!(raw.kind, "Environment");
     validate_dns_label("Environment.metadata.name", &raw.metadata.name)?;
-    let checkout_root = if source.ends_with(DEFAULT_ENVIRONMENT_FILE) {
-        source.ancestors().nth(3).ok_or_else(|| {
-            format!(
-                "Environment definition has no containing checkout: {}",
-                source.display()
-            )
-        })?
-    } else {
-        definition_root.as_path()
-    };
+    let checkout_root = gitops_local_checkout_root(&source, &definition_root)?;
     let name = name_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| default_name_from_cwd(checkout_root));
+        .unwrap_or_else(|| match raw.spec.scope {
+            EnvironmentScope::Cluster => raw.metadata.name.clone(),
+            EnvironmentScope::Project => default_name_from_cwd(checkout_root),
+        });
     validate_dns_label("Environment runtime name", &name)?;
     if raw.spec.cluster_ref.name != cluster.cluster.name {
         return Err(format!(
@@ -724,7 +773,10 @@ pub fn load_environment_definition(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .or(raw.spec.namespace)
-        .unwrap_or_else(|| name.clone());
+        .unwrap_or_else(|| match raw.spec.scope {
+            EnvironmentScope::Cluster => "hops-platform".to_string(),
+            EnvironmentScope::Project => name.clone(),
+        });
     validate_dns_label("Environment namespace", &namespace)?;
     let root = resolve_bounded_path(
         &cluster.cluster.mount_root,
@@ -776,16 +828,53 @@ pub fn load_environment_definition(
         deploys.push(deploy_definition);
     }
 
+    let secret_sync = raw
+        .spec
+        .secret_sync
+        .map(|secret| {
+            resolve_bounded_path(
+                &cluster.cluster.mount_root,
+                checkout_root,
+                &secret.path,
+                &format!("Environment {name:?} spec.secretSync.path"),
+                true,
+            )
+            .map(|path| SecretSyncDefinition { path })
+        })
+        .transpose()?;
+
+    let mut setup = Vec::new();
+    for (index, hook) in raw.spec.setup.into_iter().enumerate() {
+        let path = resolve_bounded_path(
+            &cluster.cluster.mount_root,
+            checkout_root,
+            &hook.path,
+            &format!("Environment {name:?} spec.setup[{index}].path"),
+            false,
+        )?;
+        if !path.is_file() {
+            return Err(format!(
+                "Environment {name:?} spec.setup[{index}].path is not a file: {}",
+                path.display()
+            )
+            .into());
+        }
+        setup.push(path);
+    }
+
     Ok(LoadedEnvironment {
         source,
         environment: EnvironmentDefinition {
             name,
             namespace,
             cluster_ref: raw.spec.cluster_ref.name,
+            scope: raw.spec.scope,
             local_domain: cluster.cluster.local_domain.clone(),
             root,
             values: raw.spec.values,
             deploys,
+            secret_sync,
+            setup,
         },
     })
 }
@@ -949,6 +1038,42 @@ fn normalize_local_domain(value: Option<&str>) -> Result<String, Box<dyn Error>>
     Ok(normalized.to_string())
 }
 
+/// `.gitops/local/<file>.yaml` lives two levels under the checkout, whether
+/// the file is `environment.yaml` or an extra Environment like `harmony-system.yaml`.
+fn gitops_local_checkout_root<'a>(
+    source: &'a Path,
+    definition_root: &'a Path,
+) -> Result<&'a Path, Box<dyn Error>> {
+    if is_gitops_local_yaml(source) {
+        source.ancestors().nth(3).ok_or_else(|| {
+            format!(
+                "Environment definition has no containing checkout: {}",
+                source.display()
+            )
+            .into()
+        })
+    } else {
+        Ok(definition_root)
+    }
+}
+
+fn is_gitops_local_yaml(source: &Path) -> bool {
+    let mut components = source.components().rev();
+    let Some(Component::Normal(file)) = components.next() else {
+        return false;
+    };
+    if !file.to_string_lossy().ends_with(".yaml") {
+        return false;
+    }
+    matches!(
+        components.next(),
+        Some(Component::Normal(name)) if name == "local"
+    ) && matches!(
+        components.next(),
+        Some(Component::Normal(name)) if name == ".gitops"
+    )
+}
+
 fn resolve_bounded_path(
     boundary: &Path,
     base: &Path,
@@ -1047,8 +1172,41 @@ fn resolve_mount_root(
     relative: &Path,
     field: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
+    if relative == Path::new("$HOME") || relative == Path::new("~") {
+        let home = std::env::var("HOME")
+            .map_err(|_| format!("{field} $HOME requires the HOME environment variable"))?;
+        let resolved = PathBuf::from(home)
+            .canonicalize()
+            .map_err(|error| format!("unable to canonicalize HOME for {field}: {error}"))?;
+        ensure_within(&resolved, definition_root, field)?;
+        return Ok(resolved);
+    }
     if relative.is_absolute() {
-        return Err(format!("{field} must be relative, got {}", relative.display()).into());
+        let home = std::env::var("HOME").map_err(|_| {
+            format!(
+                "{field} absolute path requires HOME; got {}",
+                relative.display()
+            )
+        })?;
+        let home = PathBuf::from(home)
+            .canonicalize()
+            .map_err(|error| format!("unable to canonicalize HOME for {field}: {error}"))?;
+        let resolved = relative.canonicalize().map_err(|error| {
+            format!(
+                "unable to canonicalize {field} {}: {error}",
+                relative.display()
+            )
+        })?;
+        if resolved != home {
+            return Err(format!(
+                "{field} absolute path must be $HOME ({}); got {}",
+                home.display(),
+                resolved.display()
+            )
+            .into());
+        }
+        ensure_within(&resolved, definition_root, field)?;
+        return Ok(resolved);
     }
 
     let candidate = definition_root.join(relative);
@@ -1193,6 +1351,40 @@ spec:
         assert_eq!(
             environment.environment.deploys[0].deploy_type,
             DeployType::Helm
+        );
+    }
+
+    #[test]
+    fn extra_environment_yaml_under_gitops_local_uses_checkout_root() {
+        let fixture = Fixture::new();
+        let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
+        fs::create_dir_all(fixture.root.join(".gitops/local/harmony-system")).unwrap();
+        let source = fixture.root.join(".gitops/local/harmony-system.yaml");
+        fs::write(
+            &source,
+            r#"apiVersion: hops.local/v1alpha1
+kind: Environment
+metadata:
+  name: harmony-system
+spec:
+  scope: cluster
+  clusterRef:
+    name: project-dev
+  namespace: harmony-system
+  root: .
+  deploys:
+    - path: .gitops/local/harmony-system
+      type: k8s
+      recursive: true
+"#,
+        )
+        .unwrap();
+        let environment = load_environment_definition(&source, &loaded, None, None).unwrap();
+        assert_eq!(environment.environment.name, "harmony-system");
+        assert_eq!(environment.environment.root, fixture.root);
+        assert_eq!(
+            environment.environment.deploys[0].source_path,
+            fixture.root.join(".gitops/local/harmony-system")
         );
     }
 
@@ -1605,10 +1797,16 @@ spec:
     fn rejects_absolute_traversal_and_symlink_escape() {
         let fixture = Fixture::new();
         let absolute = valid_yaml().replacen("mountRoot: ../..", "mountRoot: /tmp", 1);
-        assert!(load_definition(&fixture.write(&absolute))
-            .unwrap_err()
-            .to_string()
-            .contains("must be relative"));
+        assert!(
+            load_definition(&fixture.write(&absolute))
+                .unwrap_err()
+                .to_string()
+                .contains("must be $HOME")
+                || load_definition(&fixture.write(&absolute))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unable to canonicalize")
+        );
 
         let loaded = load_definition(&fixture.write(valid_yaml())).unwrap();
         let traversal = valid_environment_yaml().replacen("root: .", "root: ../outside", 1);
