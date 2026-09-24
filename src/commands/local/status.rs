@@ -20,6 +20,10 @@ use std::path::Path;
 
 #[derive(Args, Debug)]
 pub struct StatusArgs {
+    /// Emit the bounded, versioned local status contract.
+    #[arg(long, conflicts_with = "urls")]
+    pub json: bool,
+
     /// Show only this workspace.
     #[arg(long)]
     pub name: Option<String>,
@@ -43,6 +47,9 @@ pub struct StatusArgs {
 
 pub fn run(args: &StatusArgs) -> Result<(), Box<dyn Error>> {
     let state_dir = local_state_dir()?;
+    if args.json {
+        return super::json_output::status(&state_dir, args.name.as_deref(), args.check);
+    }
     let workspaces = if let Some(name) = &args.name {
         match load_workspace(&state_dir, name)? {
             Some(r) => vec![r],

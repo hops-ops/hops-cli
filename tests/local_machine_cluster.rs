@@ -448,3 +448,83 @@ fn cluster_name_escape_hatch_warns() {
     assert!(output.status.success(), "{err}");
     assert!(err.contains("escape hatch"), "{err}");
 }
+
+#[test]
+fn status_json_reports_effective_cluster_and_workspace_health() {
+    let fixture = Fixture::new();
+    let state = fixture.root.join("home/.hops/local");
+    fs::create_dir_all(state.join("envs")).unwrap();
+    let output = Fixture::output(
+        fixture
+            .command()
+            .args(["local", "status", "--all", "--json"]),
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["cluster"]["state"], "absent_record");
+    fs::write(state.join("cluster.json"), r#"{"name":"hops","kubeContext":"kind-hops","source":"/fixture/cluster.yaml","hostPath":"/fixture","localDomain":"gitkb.localhost"}"#).unwrap();
+    fs::write(state.join("envs/demo.json"), r#"{"name":"demo","namespace":"demo","envPath":"/fixture/env.yaml","projectRoot":"/fixture","clusterName":"hops","kubeContext":"kind-hops"}"#).unwrap();
+    for (mode, expected) in [
+        ("ready", "ready"),
+        ("degraded", "degraded"),
+        ("down", "unreachable"),
+        ("missing", "missing_context"),
+    ] {
+        let tool = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOPS_TEST_COMMAND_LOG"
+case "$*" in
+  *get-contexts*) test '{mode}' = missing || echo kind-hops; exit 0;;
+esac
+test '{mode}' = down && exit 1
+if test '{mode}' = degraded; then status=False; else status=True; fi
+printf '{{"items":[{{"status":{{"conditions":[{{"type":"Ready","status":"%s"}},{{"type":"Healthy","status":"True"}},{{"type":"Installed","status":"True"}}]}}}}]}}' "$status"
+"#
+        );
+        fs::write(fixture.bin.join("kubectl"), tool).unwrap();
+        let output = Fixture::output(
+            fixture
+                .command()
+                .args(["local", "status", "--all", "--json"])
+                .env("HOPS_KUBE_CONTEXT", "must-not-use"),
+        );
+        assert!(
+            output.status.success(),
+            "{:?}",
+            Fixture::stdout_stderr(&output)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["cluster"]["state"], expected);
+        assert_eq!(value["workspaces"][0]["health"]["state"], expected);
+    }
+    let log = fixture.log();
+    assert!(!log.contains("must-not-use"));
+    assert!(!log.contains("apply") && !log.contains("delete"));
+}
+
+#[test]
+fn catalog_json_is_sorted_read_only_and_redacts_stored_errors() {
+    let fixture = Fixture::new();
+    let catalog = fixture.root.join("home/.hops/local/catalog");
+    fs::create_dir_all(&catalog).unwrap();
+    for (id, enabled) in [("b", true), ("a", false)] {
+        fs::write(
+            catalog.join(format!("{id}.json")),
+            serde_json::json!({
+                "id": id, "name": "same-template", "runtimeName": id,
+                "source": format!("/fixture/{id}/env.yaml"), "enabled": enabled,
+                "lastError": "token=SECRET"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let output = Fixture::output(fixture.command().args(["local", "env", "list", "--json"]));
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["entries"][0]["id"], "a");
+    assert_eq!(value["entries"][0]["enabled"], false);
+    assert_eq!(value["entries"][1]["enabled"], true);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET"));
+    assert!(fixture.log().is_empty());
+}

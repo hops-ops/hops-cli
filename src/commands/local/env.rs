@@ -24,7 +24,7 @@ pub enum EnvCommands {
     /// Copy discovered Environment documents into `~/.hops/local/catalog` (off)
     Discover(DiscoverArgs),
     /// List catalogued Environments
-    List,
+    List(ListArgs),
     /// Reconcile a catalogued Environment
     Enable(NameArgs),
     /// Unregister and prune a catalogued Environment
@@ -36,6 +36,13 @@ pub struct DiscoverArgs {
     /// Root to scan. Defaults to cwd. `$HOME` is rejected.
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ListArgs {
+    /// Emit the bounded, versioned catalog contract.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -63,7 +70,7 @@ pub struct CatalogEntry {
 pub fn run(args: &EnvArgs, overrides: ClusterOverrides<'_>) -> Result<(), Box<dyn Error>> {
     match &args.command {
         EnvCommands::Discover(discover) => discover_into_catalog(discover),
-        EnvCommands::List => list_catalog(),
+        EnvCommands::List(args) => list_catalog(args.json),
         EnvCommands::Enable(name) => set_enabled(&name.name, true, overrides),
         EnvCommands::Disable(name) => set_enabled(&name.name, false, overrides),
     }
@@ -161,8 +168,32 @@ fn discover_into_catalog(args: &DiscoverArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn list_catalog() -> Result<(), Box<dyn Error>> {
-    let entries = load_entries(&local_state_dir()?)?;
+fn list_catalog(json: bool) -> Result<(), Box<dyn Error>> {
+    let result = load_entries(&local_state_dir()?);
+    let mut entries = if json {
+        result.map_err(|_| "invalid local catalog records")?
+    } else {
+        result?
+    };
+    if json {
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        let records = entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "id": entry.id, "name": entry.name, "runtime_name": entry.runtime_name,
+                    "source": entry.source, "enabled": entry.enabled,
+                    // Stored errors can contain subprocess output or credentials. Export only a safe code.
+                    "last_error": entry.last_error.as_ref().map(|_| "reconciliation_failed")
+                })
+            })
+            .collect();
+        return super::json_output::print_bounded(
+            serde_json::json!({"schema_version": 1}),
+            "entries",
+            records,
+        );
+    }
     if entries.is_empty() {
         println!("No catalogued Environments. Run `hops local env discover`.");
         return Ok(());
@@ -445,4 +476,32 @@ pub fn print_status_card(state_dir: &Path) -> io::Result<()> {
         None => writeln!(io::stdout(), "Cluster: (none) — run `hops local up`")?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod json_contract_tests {
+    use super::*;
+    #[test]
+    fn stable_id_selects_repeated_template_without_name_fallback() {
+        let entries = vec![
+            CatalogEntry {
+                id: "source-a".into(),
+                name: "template".into(),
+                runtime_name: "a".into(),
+                source: "/a/env.yaml".into(),
+                enabled: false,
+                last_error: None,
+            },
+            CatalogEntry {
+                id: "source-b".into(),
+                name: "template".into(),
+                runtime_name: "b".into(),
+                source: "/b/env.yaml".into(),
+                enabled: false,
+                last_error: None,
+            },
+        ];
+        assert_eq!(resolve_catalog_index(&entries, "source-b").unwrap(), 1);
+        assert!(resolve_catalog_index(&entries, "template").is_err());
+    }
 }
