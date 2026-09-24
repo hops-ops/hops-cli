@@ -260,27 +260,55 @@ fn run_cluster_reconcile_loop(
 ) -> Result<(), Box<dyn Error>> {
     let do_once = || -> Result<(), Box<dyn Error>> {
         log::info!("cluster gitops → local CP: {}", cluster.display());
-        let r = reconcile_cluster_dir_with_inventory(&cluster, &inventory, dry_run)?;
-        log::info!(
-            "cluster gitops: {} applied, {} pruned, {} error(s)",
-            r.applied.len(),
-            r.pruned.len(),
-            r.errors.len()
-        );
-        for error in &r.errors {
-            log::warn!("cluster gitops: {error}");
+        let started = Instant::now();
+        let mut pass = 0;
+        loop {
+            pass += 1;
+            let result = reconcile_cluster_dir_with_inventory(&cluster, &inventory, dry_run)?;
+            if result.errors.is_empty() {
+                log::info!(
+                    "cluster gitops: {} applied, {} pruned, 0 error(s)",
+                    result.applied.len(),
+                    result.pruned.len()
+                );
+                break;
+            }
+
+            let pending_api = result.errors.iter().all(|error| pending_cluster_api(error));
+            if pass == 1 || pass % 6 == 0 || !pending_api {
+                log::warn!(
+                    "cluster gitops: {} applied, {} pending, {}s elapsed",
+                    result.applied.len(),
+                    result.errors.len(),
+                    started.elapsed().as_secs()
+                );
+                for error in &result.errors {
+                    log::warn!("cluster gitops: {error}");
+                }
+            }
+            if dry_run || !pending_api {
+                return Err(format!(
+                    "cluster gitops failed ({} error(s)); first: {}",
+                    result.errors.len(),
+                    result.errors.first().map(String::as_str).unwrap_or("")
+                )
+                .into());
+            }
+            if started.elapsed() >= Duration::from_secs(15 * 60) {
+                return Err(format!(
+                    "timed out waiting for Cluster APIs after {}s ({} manifest(s) pending); first: {}",
+                    started.elapsed().as_secs(),
+                    result.errors.len(),
+                    result.errors.first().map(String::as_str).unwrap_or("")
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_secs(5));
         }
-        if !r.errors.is_empty() && r.applied.is_empty() {
-            return Err(format!(
-                "cluster gitops failed ({} error(s)); first: {}",
-                r.errors.len(),
-                r.errors.first().map(String::as_str).unwrap_or("")
-            )
-            .into());
+        if !dry_run {
+            wait_for_cluster_packages_healthy()?;
         }
-        if !reconcile_cluster_secret_sync(&definition, dry_run) {
-            return Ok(());
-        }
+        reconcile_cluster_secret_sync(&definition, dry_run)?;
         reconcile_cluster_environments_with_retry(&definition, dry_run)?;
         reconcile_cluster_browser_ingress(&definition, dry_run)?;
         Ok(())
@@ -302,6 +330,87 @@ fn run_cluster_reconcile_loop(
         args.debounce,
         do_once,
     )
+}
+
+fn pending_cluster_api(error: &str) -> bool {
+    error.contains("no matches for kind")
+        || error.contains("resource mapping not found")
+        || error.contains("the server could not find the requested resource")
+}
+
+fn wait_for_cluster_packages_healthy() -> Result<(), Box<dyn Error>> {
+    let started = Instant::now();
+    let mut polls = 0;
+    loop {
+        polls += 1;
+        let output = super::run_cmd_output(
+            "kubectl",
+            &[
+                "get",
+                "provider.pkg.crossplane.io,configuration.pkg.crossplane.io,function.pkg.crossplane.io",
+                "-o",
+                "json",
+            ],
+        )?;
+        let pending = pending_crossplane_packages(&output)?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if polls == 1 || polls % 6 == 0 {
+            log::info!(
+                "Waiting for {} Crossplane package(s) Installed and Healthy ({}s elapsed): {}",
+                pending.len(),
+                started.elapsed().as_secs(),
+                pending.join(", ")
+            );
+        }
+        if started.elapsed() >= Duration::from_secs(15 * 60) {
+            return Err(format!(
+                "timed out waiting for Crossplane packages Installed and Healthy after {}s: {}",
+                started.elapsed().as_secs(),
+                pending.join(", ")
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn pending_crossplane_packages(output: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let response: serde_json::Value = serde_json::from_str(output)?;
+    let items = response
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("Crossplane package list has no items array")?;
+    Ok(items
+        .iter()
+        .filter(|item| {
+            ["Installed", "Healthy"].iter().any(|expected| {
+                item.pointer("/status/conditions")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|conditions| {
+                        conditions.iter().find(|condition| {
+                            condition.get("type").and_then(serde_json::Value::as_str)
+                                == Some(expected)
+                        })
+                    })
+                    .and_then(|condition| condition.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some("True")
+            })
+        })
+        .map(|item| {
+            format!(
+                "{}/{}",
+                item.get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Package"),
+                item.pointer("/metadata/name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<unnamed>")
+            )
+        })
+        .collect())
 }
 
 fn cluster_ingress_workspace_name(cluster_name: &str) -> String {
@@ -346,7 +455,7 @@ fn reconcile_cluster_browser_ingress(
 fn reconcile_cluster_secret_sync(
     definition: &super::workbench::definition::LoadedDefinition,
     dry_run: bool,
-) -> bool {
+) -> Result<(), Box<dyn Error>> {
     run_secret_sync_phase(
         definition
             .cluster
@@ -358,33 +467,29 @@ fn reconcile_cluster_secret_sync(
     )
 }
 
-fn run_secret_sync_phase<F>(secret_sync_path: Option<&Path>, dry_run: bool, sync: F) -> bool
+fn run_secret_sync_phase<F>(
+    secret_sync_path: Option<&Path>,
+    dry_run: bool,
+    sync: F,
+) -> Result<(), Box<dyn Error>>
 where
     F: FnOnce(&Path) -> Result<(), Box<dyn Error>>,
 {
     let Some(secret_sync_path) = secret_sync_path else {
-        return true;
+        return Ok(());
     };
     if dry_run {
         log::info!(
             "Dry-run leaves configured local Vault inputs at {} unchanged",
             secret_sync_path.display()
         );
-        return true;
+        return Ok(());
     }
 
-    match sync(secret_sync_path) {
-        Ok(()) => true,
-        Err(error) => {
-            // A failed sync must not replace a healthy Environment with a
-            // partial render. The controller remains alive so a credential,
-            // Vault recovery, or watched input change can converge it later.
-            log::error!(
-                "Local Vault secret sync failed; Environment reconciliation is deferred: {error}"
-            );
-            false
-        }
-    }
+    sync(secret_sync_path).map_err(|error| {
+        format!("Local Vault secret sync failed; Environment reconciliation is deferred: {error}")
+            .into()
+    })
 }
 
 fn reconcile_cluster_environments(
@@ -673,8 +778,24 @@ fn run_environment(
             .as_deref()
             .ok_or("gitops environment --down requires --name")?;
         let state_dir = local_state_dir()?;
-        let record = load_workspace(&state_dir, name)?
-            .ok_or_else(|| format!("Environment {name:?} has no durable registration"))?;
+        let Some(record) = load_workspace(&state_dir, name)? else {
+            // A deleted backend resets obsolete registrations before its new
+            // controller has a chance to recreate enabled Environments.  An
+            // exact snapshot may still prove cleanup, but a bare catalog
+            // name never authorizes inferred Kubernetes deletion.
+            if let Some(cluster_name) = overrides.machine_name {
+                if down_environment(cluster_name, name)? {
+                    log::info!("Environment {name:?} cleaned up from its ownership snapshot");
+                } else {
+                    log::info!(
+                        "Environment {name:?} is already down; no ownership snapshot exists"
+                    );
+                }
+            } else {
+                log::info!("Environment {name:?} is already down; no durable registration exists");
+            }
+            return Ok(());
+        };
         let cluster_name = record
             .cluster_name
             .as_deref()
@@ -1282,19 +1403,48 @@ spec:
     fn failed_secret_sync_defers_environment_phase_without_mutating_dry_runs() {
         let path = Path::new("/project/secrets/vault");
         let mut calls = 0;
-        let ready = run_secret_sync_phase(Some(path), false, |_| {
+        let error = run_secret_sync_phase(Some(path), false, |_| {
             calls += 1;
             Err("vault unavailable".into())
-        });
-        assert!(!ready);
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("vault unavailable"));
         assert_eq!(calls, 1);
 
-        let ready = run_secret_sync_phase(Some(path), true, |_| {
+        run_secret_sync_phase(Some(path), true, |_| {
             calls += 1;
             Ok(())
-        });
-        assert!(ready);
+        })
+        .unwrap();
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn pending_cluster_api_errors_are_retryable_without_hiding_other_failures() {
+        assert!(pending_cluster_api(
+            "resource mapping not found for name: \"default\": no matches for kind \"ProviderConfig\" in version \"helm.m.crossplane.io/v1beta1\"\nensure CRDs are installed first"
+        ));
+        assert!(pending_cluster_api(
+            "the server could not find the requested resource"
+        ));
+        assert!(!pending_cluster_api(
+            "forbidden: User cannot create secrets"
+        ));
+        assert!(!pending_cluster_api("error validating YAML"));
+    }
+
+    #[test]
+    fn package_readiness_uses_each_healthy_condition() {
+        let response = r#"{"items":[
+            {"kind":"Provider","metadata":{"name":"ready"},"status":{"conditions":[{"type":"Installed","status":"True"},{"type":"Healthy","status":"True"}]}},
+            {"kind":"Configuration","metadata":{"name":"installing"},"status":{"conditions":[{"type":"Installed","status":"True"},{"type":"Healthy","status":"False"}]}},
+            {"kind":"Function","metadata":{"name":"pending"},"status":{}}
+        ]}"#;
+        assert_eq!(
+            pending_crossplane_packages(response).unwrap(),
+            ["Configuration/installing", "Function/pending"]
+        );
+        assert!(pending_crossplane_packages("{}").is_err());
     }
 
     #[test]

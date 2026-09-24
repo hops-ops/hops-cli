@@ -10,10 +10,10 @@ use super::reconcile::{
     ensure_environment_namespace, HelmRunner, KubectlApplier, KustomizeRunner, ReconcileOptions,
     ReconcileResult,
 };
+use crate::commands::local::local_state_dir;
 use crate::commands::local::workbench::registry::{
     list_workspaces, remove_workspace, WorkspaceRecord,
 };
-use crate::commands::local::{kubectl_command, local_state_dir};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::error::Error;
@@ -22,6 +22,7 @@ use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONTROLLER_SCHEMA_VERSION: u32 = 1;
@@ -793,6 +794,9 @@ pub fn down_environment(
     if snapshot.namespace.is_empty() {
         return Err("Environment ownership snapshot has no namespace; refusing cleanup".into());
     }
+    if snapshot.kube_context.trim().is_empty() {
+        return Err("Environment ownership snapshot has no kube context; refusing cleanup".into());
+    }
     if let Ok(state_dir) = local_state_dir() {
         if let Err(error) = super::ingress::stop_ingress_access(&state_dir, environment_name) {
             log::warn!("Environment ingress-access cleanup: {error}");
@@ -833,7 +837,11 @@ pub fn down_environment(
             "--ignore-not-found=true",
             "--wait=true",
         ];
-        let output = kubectl_command(&args).output()?;
+        let output = Command::new("kubectl")
+            .arg("--context")
+            .arg(&snapshot.kube_context)
+            .args(args)
+            .output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
