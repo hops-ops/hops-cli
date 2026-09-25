@@ -309,8 +309,8 @@ fn run_cluster_reconcile_loop(
             wait_for_cluster_packages_healthy()?;
         }
         reconcile_cluster_secret_sync(&definition, dry_run)?;
-        reconcile_cluster_environments_with_retry(&definition, dry_run)?;
         reconcile_cluster_browser_ingress(&definition, dry_run)?;
+        reconcile_cluster_environments_with_retry(&definition, dry_run)?;
         Ok(())
     };
 
@@ -329,6 +329,7 @@ fn run_cluster_reconcile_loop(
             .map(|secret_sync| secret_sync.path.as_path()),
         args.debounce,
         do_once,
+        || reconcile_all_browser_ingress(&definition),
     )
 }
 
@@ -415,6 +416,24 @@ fn pending_crossplane_packages(output: &str) -> Result<Vec<String>, Box<dyn Erro
 
 fn cluster_ingress_workspace_name(cluster_name: &str) -> String {
     format!("cluster-ingress-{cluster_name}")
+}
+
+/// Host routing must converge when controllers create routes asynchronously,
+/// and after Dory restarts, without reapplying application workloads.
+fn reconcile_all_browser_ingress(
+    definition: &super::workbench::definition::LoadedDefinition,
+) -> Result<(), Box<dyn Error>> {
+    reconcile_cluster_browser_ingress(definition, false)?;
+    for snapshot in list_environment_snapshots(&definition.cluster.name)? {
+        reconcile_browser_ingress(
+            definition.cluster.cluster_provider,
+            definition.cluster.docker_provider,
+            false,
+            &snapshot.namespace,
+            &snapshot.name,
+        )?;
+    }
+    Ok(())
 }
 
 fn reconcile_cluster_browser_ingress(
@@ -891,6 +910,7 @@ fn run_environment_definition(
                 &namespace,
                 delivery_strategy,
             )?;
+            reconcile_cluster_browser_ingress(&cluster, false)?;
             reconcile_browser_ingress(
                 cluster.cluster.cluster_provider,
                 cluster.cluster.docker_provider,
@@ -1130,15 +1150,17 @@ fn resolve_worktree_delivery(
 
 // ── shared watch helpers ─────────────────────────────────────────────────────
 
-fn run_cluster_watch<F>(
+fn run_cluster_watch<F, G>(
     cluster: &Path,
     project_root: &Path,
     secret_sync_root: Option<&Path>,
     debounce_secs: u64,
     mut rebuild: F,
+    mut reconcile_ingress: G,
 ) -> Result<(), Box<dyn Error>>
 where
     F: FnMut() -> Result<(), Box<dyn Error>>,
+    G: FnMut() -> Result<(), Box<dyn Error>>,
 {
     let debounce = Duration::from_secs(debounce_secs);
     let (tx, rx) = mpsc::channel();
@@ -1198,8 +1220,18 @@ where
     );
 
     loop {
-        rx.recv().map_err(|_| "watcher channel closed")?;
-        wait_for_quiet(&rx, debounce)?;
+        match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(()) => wait_for_quiet(&rx, debounce)?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = reconcile_ingress() {
+                    log::warn!("Browser ingress reconciliation: {error}");
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("watcher channel closed".into())
+            }
+        }
         log::info!("──────────────────────────────────────────────");
         log::info!("Cluster gitops change, applying to local CP...");
         match rebuild() {
