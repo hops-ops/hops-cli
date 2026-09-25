@@ -47,7 +47,15 @@ fn query(context: &str, args: &[&str]) -> Result<Value, &'static str> {
         .output()
         .map_err(|_| "command_unavailable")?;
     if !output.status.success() {
-        return Err("unreachable");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let state = if stderr.contains("Error from server (Forbidden):") {
+            "forbidden"
+        } else if stderr.contains("the server doesn't have a resource type") {
+            "unavailable"
+        } else {
+            "unreachable"
+        };
+        return Err(state);
     }
     if output.stdout.len() > MAX_BYTES {
         return Err("truncated");
@@ -98,6 +106,9 @@ pub(super) fn status(
     let mut workspaces = strict_workspaces(state_dir)?;
     if let Some(name) = name {
         workspaces.retain(|w| w.name == name);
+        if workspaces.is_empty() {
+            return Err(format!("Workspace `{name}` is not registered.").into());
+        }
     }
     workspaces.sort_by(|a, b| {
         a.namespace.cmp(&b.namespace).then(

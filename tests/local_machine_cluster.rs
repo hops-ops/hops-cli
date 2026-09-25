@@ -467,6 +467,9 @@ fn status_json_reports_effective_cluster_and_workspace_health() {
         ("ready", "ready"),
         ("degraded", "degraded"),
         ("down", "unreachable"),
+        ("forbidden", "forbidden"),
+        ("unavailable", "unavailable"),
+        ("empty", "not_found"),
         ("missing", "missing_context"),
     ] {
         let tool = format!(
@@ -476,6 +479,9 @@ case "$*" in
   *get-contexts*) test '{mode}' = missing || echo kind-hops; exit 0;;
 esac
 test '{mode}' = down && exit 1
+if test '{mode}' = forbidden; then echo 'Error from server (Forbidden): private details' >&2; exit 1; fi
+if test '{mode}' = unavailable; then echo "error: the server doesn't have a resource type" >&2; exit 1; fi
+if test '{mode}' = empty; then echo '{{"items":[]}}'; exit 0; fi
 if test '{mode}' = degraded; then status=False; else status=True; fi
 printf '{{"items":[{{"status":{{"conditions":[{{"type":"Ready","status":"%s"}},{{"type":"Healthy","status":"True"}},{{"type":"Installed","status":"True"}}]}}}}]}}' "$status"
 "#
@@ -527,4 +533,22 @@ fn catalog_json_is_sorted_read_only_and_redacts_stored_errors() {
     assert_eq!(value["entries"][1]["enabled"], true);
     assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET"));
     assert!(fixture.log().is_empty());
+}
+
+#[test]
+fn status_json_rejects_unknown_workspace_before_queries() {
+    let fixture = Fixture::new();
+    for check in [false, true] {
+        let mut command = fixture.command();
+        command.args(["local", "status", "--name", "unknown", "--json"]);
+        if check {
+            command.arg("--check");
+        }
+        let output = Fixture::output(&mut command);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("Workspace `unknown` is not registered."));
+        assert!(fixture.log().is_empty());
+    }
 }

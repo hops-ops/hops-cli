@@ -1250,7 +1250,9 @@ cargo test
 Status reports only the recorded machine context, never the ambient current
 context. Workspace bindings that differ are `context_mismatch`; missing context,
 absent record, unreachable cluster, empty resources (`not_found`), malformed JSON,
-and degraded readiness remain distinct. `--check --json` prints the document
+and degraded readiness remain distinct. RBAC denials are `forbidden`; missing
+resource types are `unavailable`, distinct from an empty successful query
+(`not_found`). An unknown `--name` fails before health queries or JSON output. `--check --json` prints the document
 before returning nonzero when readiness is not established.
 
 Catalog entries include stable `id`, template `name`, `runtime_name`, `source`,
