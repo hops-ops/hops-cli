@@ -82,6 +82,12 @@ pub fn materialize(
             }
         }
     }
+    // Explicit machine overrides survive template refresh and project changes.
+    // Local package builds use this layer until their release is available.
+    let overrides = gitops_local.join("overrides");
+    if overrides.is_dir() {
+        overlay_manifests(&overrides, &manifests)?;
+    }
     fs::write(
         manifests.join(MANAGED_MARKER),
         "Materialized by hops local up from the CLI local-cluster template.\n\
@@ -422,6 +428,26 @@ spec:
         assert!(manifests.join("providers/helm.yaml").is_file());
         assert!(manifests.join("extra/addon.yaml").is_file());
         assert!(!manifests.join("shared/minio.yaml").exists());
+        cleanup(&home);
+    }
+
+    #[test]
+    fn machine_package_override_survives_repeated_materialization() {
+        let home = temp_home();
+        let overrides = home.join(".gitops/local/overrides/configurations");
+        fs::create_dir_all(&overrides).unwrap();
+        let pin = "kind: Configuration\nmetadata:\n  name: hops-ops-auth-stack\nspec:\n  package: registry.local/auth:dev\n";
+        fs::write(overrides.join("auth-stack.yaml"), pin).unwrap();
+        for _ in 0..2 {
+            materialize(&home, None, "hops", None, None).unwrap();
+            assert_eq!(
+                fs::read_to_string(
+                    home.join(".gitops/local/cluster/configurations/auth-stack.yaml")
+                )
+                .unwrap(),
+                pin
+            );
+        }
         cleanup(&home);
     }
 
