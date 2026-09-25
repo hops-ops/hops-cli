@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "cluster": {
+    "name": "hops",
+    "kube_context": "kind-hops",
+    "source": "/fixture/cluster.yaml",
+    "host_path": "/fixture",
+    "local_domain": "gitkb.localhost",
+    "state": "ready",
+    "nodes": {
+      "state": "ready",
+      "total": 1,
+      "ready": 1
+    },
+    "configurations": {
+      "state": "ready",
+      "total": 1,
+      "ready": 1
+    },
+    "providers": {
+      "state": "ready",
+      "total": 1,
+      "ready": 1
+    },
+    "authstacks": {
+      "state": "ready",
+      "total": 1,
+      "ready": 1
+    }
+  },
+  "workspaces": [
+    {
+      "name": "demo",
+      "namespace": "demo",
+      "env_path": "/fixture/demo/.gitops/local/environment.yaml",
+      "project_root": "/fixture/demo",
+      "cluster_name": "hops",
+      "kube_context": "kind-hops",
+      "health": {
+        "state": "ready",
+        "total": 1,
+        "ready": 1
+      }
+    }
+  ],
+  "truncation": {
+    "records_omitted": 0
+  }
+}

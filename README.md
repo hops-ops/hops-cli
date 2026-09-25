@@ -1248,3 +1248,29 @@ LOG_LEVEL=debug hops local start
 ```bash
 cargo test
 ```
+
+### Local JSON contract (v1)
+
+`hops local status --all --json` and `hops local env list --json` emit a single
+`schema_version: 1` document. Canonical examples are in
+`tests/fixtures/local-json/v1/`. Text output is unchanged when `--json` is absent.
+Status reports only the recorded machine context, never the ambient current
+context. Workspace bindings that differ are `context_mismatch`; missing context,
+absent record, unreachable cluster, empty resources (`not_found`), malformed JSON,
+and degraded readiness remain distinct. RBAC denials are `forbidden`; missing
+resource types are `unavailable`, distinct from an empty successful query
+(`not_found`). An unknown `--name` fails before health queries or JSON output. `--check --json` prints the document
+before returning nonzero when readiness is not established.
+
+Catalog entries include stable `id`, template `name`, `runtime_name`, `source`,
+`enabled`, and a safe `last_error` code (`reconciliation_failed`) rather than raw
+subprocess output. Use the **stable ID** as the positional selector for
+`hops local env enable <id>` or `hops local env disable <id>`; template names can
+be ambiguous across worktrees. Disable unregisters and prunes resources.
+
+Both documents cap records at 256 and UTF-8 stdout at 1,048,576 bytes including
+the newline. Catalog order is ID; workspace order is namespace then Environment
+path. `truncation.records_omitted` counts every omitted record. Oversized fixed
+envelopes fail with a bounded error instead of emitting partial JSON. Read modes
+never reconcile, activate, or heal resources. JSON action output is not provided;
+action callers should reread catalog and status after a successful command.

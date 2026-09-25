@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "fixture-demo",
+      "name": "demo",
+      "runtime_name": "demo",
+      "source": "/fixture/demo/.gitops/local/environment.yaml",
+      "enabled": true,
+      "last_error": null
+    },
+    {
+      "id": "fixture-off",
+      "name": "demo",
+      "runtime_name": "off",
+      "source": "/fixture/off/.gitops/local/environment.yaml",
+      "enabled": false,
+      "last_error": null
+    }
+  ],
+  "truncation": {
+    "records_omitted": 0
+  }
+}

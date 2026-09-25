@@ -12,6 +12,7 @@ mod gitops;
 pub mod gitops_write;
 mod init;
 mod install;
+mod json_output;
 mod listmonk;
 pub mod package_install;
 mod reset;
