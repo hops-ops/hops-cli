@@ -360,7 +360,10 @@ rather than implicitly adopted. If the backend itself was deleted, Hops
 discards obsolete inventory and stale ownership before recreating it. Catalog
 entries and their enabled selections persist across `down`/`up` and backend
 recreation; `hops local env disable NAME` also works before a new durable
-Environment registration exists. A still running controller process must be
+Environment registration exists. Disabling an Environment deletes its
+namespace when the ownership snapshot records the matching namespace UID and
+the namespace still has that Environment's Hops ownership labels; a shared or
+unproven namespace is retained. A still running controller process must be
 stopped first. If the backend is still
 running but an exact matching lock records a dead process, Hops serializes the
 handoff and recovers that lock automatically. Live owners, malformed locks,
