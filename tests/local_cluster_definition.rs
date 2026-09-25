@@ -114,6 +114,9 @@ YAML
       exit 0
     fi
     case "$*" in
+      *'get provider.pkg.crossplane.io,configuration.pkg.crossplane.io,function.pkg.crossplane.io -o json')
+        printf '%s\n' '{"items":[]}'
+        ;;
       *'get nodes -o json')
         printf '%s\n' '{"items":[{"metadata":{"name":"project-dev-control-plane"}}]}'
         ;;

@@ -18,6 +18,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Args, Debug)]
@@ -624,6 +626,7 @@ pub(super) fn sync_vault_path(path: &Path) -> Result<(), Box<dyn Error>> {
     })?;
     let git_root = git_toplevel(&secret_source)?;
     let _cwd = CwdGuard::enter(&git_root)?;
+    wait_for_local_vault_ready()?;
     ensure_vault_token_from_cluster()?;
     run_vault(&VaultSyncArgs {
         secret_path: Some(secret_source.display().to_string()),
@@ -634,6 +637,68 @@ pub(super) fn sync_vault_path(path: &Path) -> Result<(), Box<dyn Error>> {
         no_port_forward: false,
         yes: true,
     })
+}
+
+fn wait_for_local_vault_ready() -> Result<(), Box<dyn Error>> {
+    let settings = configured_vault_settings()?;
+    if !settings.kube_enabled {
+        return Ok(());
+    }
+    let context = settings.kube_context.as_deref().ok_or(
+        "local Vault sync needs the selected Kubernetes context; start the Cluster with `hops local up`",
+    )?;
+    let started = Instant::now();
+    log::info!(
+        "Waiting for local Vault pod {}/vault-0 Ready in context {}...",
+        settings.kube_namespace,
+        context
+    );
+    let mut polls = 0;
+    loop {
+        polls += 1;
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "--namespace",
+                &settings.kube_namespace,
+                "get",
+                "pod",
+                "vault-0",
+                "-o",
+                "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}",
+            ])
+            .output()?;
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "True" {
+            return Ok(());
+        }
+        let detail = String::from_utf8_lossy(&output.stderr);
+        if detail.contains("context \"") && detail.contains("does not exist") {
+            return Err(format!(
+                "selected Kubernetes context {context:?} is unavailable: {}",
+                detail.trim()
+            )
+            .into());
+        }
+        if started.elapsed() >= Duration::from_secs(15 * 60) {
+            return Err(format!(
+                "timed out waiting for local Vault pod {}/vault-0 Ready in context {} after {}s: {}",
+                settings.kube_namespace,
+                context,
+                started.elapsed().as_secs(),
+                detail.trim()
+            )
+            .into());
+        }
+        if polls % 6 == 0 {
+            log::info!(
+                "Still waiting for local Vault pod {}/vault-0 Ready ({}s elapsed)...",
+                settings.kube_namespace,
+                started.elapsed().as_secs()
+            );
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
 }
 
 struct CwdGuard(PathBuf);
@@ -658,13 +723,13 @@ impl Drop for CwdGuard {
 }
 
 fn ensure_vault_token_from_cluster() -> Result<(), Box<dyn Error>> {
-    if env::var("VAULT_TOKEN")
+    let settings = super::configured_vault_settings()?;
+    if env::var(&settings.token_env)
         .ok()
         .is_some_and(|value| !value.trim().is_empty())
     {
         return Ok(());
     }
-    let settings = super::configured_vault_settings()?;
     let mut command = Command::new("kubectl");
     if let Some(context) = &settings.kube_context {
         command.arg("--context").arg(context);

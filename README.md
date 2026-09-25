@@ -188,8 +188,8 @@ installed with write access to the selected staging and preview repositories.
 
 The local workbench has two Kubernetes-shaped resources:
 
-- **Cluster** describes one durable local control plane and its shared
-  Crossplane resources. There is normally one Cluster per project/meta root.
+- **Cluster** describes the machine's durable local control plane and its shared
+  Crossplane resources.
 - **Environment** describes the applications that should run for one checkout
   or worktree. Environment definitions are independent of the Cluster, so a
   worktree can be added or removed without editing `cluster.yaml`.
@@ -324,17 +324,18 @@ Each local workload chart is deliberately separate from its cloud chart:
 
 ### Start the Cluster controller
 
-From the project/meta root:
+From a project or meta root:
 
 ```bash
-# Defaults to .gitops/local/cluster.yaml.
-hops local gitops cluster
+# Creates or reconnects the machine Cluster.
+hops local up
 
 # One reconcile for CI/scripts; do not enter the watcher.
-hops local gitops cluster ./.gitops/local/cluster.yaml --once
+hops local up --once
 ```
 
-`gitops cluster` is the canonical GitOps entry point. It:
+`hops local up` is the machine Cluster entry point; `gitops cluster` remains an
+advanced entry to the same controller. It:
 
 1. Validates the Cluster, providers, paths, and manifest identities before
    touching the backend.
@@ -343,20 +344,27 @@ hops local gitops cluster ./.gitops/local/cluster.yaml --once
    pinned Crossplane Helm seed. This Helm seed is the one intentional
    prerequisite outside the file-owned tree because it creates the APIs needed
    by the remaining manifests.
-4. Applies `.gitops/local/cluster/` and records a last-known-good inventory of
-   exact object identities and content revisions.
-5. Discovers every `.gitops/local/environment.yaml` below `mountRoot`, renders
-   each Environment's explicit deploy paths with their declared renderer, and
-   applies them to their namespaces.
-6. Keeps one foreground watcher for the Cluster tree, discovered Environments,
-   and their explicitly selected renderer directories.
+4. Applies the Cluster tree, retries manifests while their CRDs register, and
+   waits for Crossplane packages to report Installed and Healthy. It records
+   a last-known-good inventory of exact object identities and content revisions.
+5. If local Vault sync is configured, waits for Vault to become Ready before
+   syncing secrets. It then reconciles the **enabled** catalog Environments.
+6. Keeps one foreground watcher for the Cluster tree, enabled Environments,
+   and their explicitly selected renderer directories. A failed first boot
+   returns a bounded error instead of reporting a ready watcher.
 
 The controller lock is stored under
 `~/.hops/local/clusters/<cluster>/controller.lock`. A second process cannot
 become a competing watcher. Conflicts for an existing backend are rejected
 rather than implicitly adopted. If the backend itself was deleted, Hops
-discards obsolete inventory and stale ownership before recreating it; a still
-running controller process must be stopped first. If the backend is still
+discards obsolete inventory and stale ownership before recreating it. Catalog
+entries and their enabled selections persist across `down`/`up` and backend
+recreation; `hops local env disable NAME` also works before a new durable
+Environment registration exists. Disabling an Environment deletes its
+namespace when the ownership snapshot records the matching namespace UID and
+the namespace still has that Environment's Hops ownership labels; a shared or
+unproven namespace is retained. A still running controller process must be
+stopped first. If the backend is still
 running but an exact matching lock records a dead process, Hops serializes the
 handoff and recovers that lock automatically. Live owners, malformed locks,
 and locks for a different definition or context still fail closed.
@@ -365,14 +373,13 @@ and locks for a different definition or context still fail closed.
 
 Put the worktree under the configured `mountRoot`, ensure it contains its
 `.gitops/local/environment.yaml`, and give the worktree directory the desired
-runtime name. The running Cluster controller discovers the file and reconciles
-it into a namespace of the same name:
+runtime name. Discover and enable it explicitly:
 
 ```bash
 git worktree add .worktrees/feature-auth feature/auth
 
-# Usually the single Cluster watcher is enough.
-hops local gitops cluster
+hops local env discover .worktrees/feature-auth
+hops local env enable feature-auth
 ```
 
 If a newly created meta-repo worktree has not populated its nested repositories
@@ -393,7 +400,7 @@ hops local gitops environment ./.gitops/local/environment.yaml --once
 The watcher uses a short debounce and reacts to:
 
 - Cluster YAML under `.gitops/local/cluster/`
-- Environment definitions under `mountRoot`
+- enabled Environment definitions from the local catalog
 - referenced explicit deploy directories (Helm, raw Kubernetes, or Kustomize)
 - `.gitops/test-users` or other explicitly selected renderer directories
 - `.gitops/promote` paths when a promotion chart is explicitly selected

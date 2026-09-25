@@ -285,6 +285,115 @@ fn envs_once_lists_catalog() {
 }
 
 #[test]
+fn disable_after_cluster_reset_clears_selection_without_inferred_deletion() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join(".gitops/local/environment.yaml"),
+        ENV_YAML,
+    )
+    .unwrap();
+    assert!(
+        Fixture::output(fixture.command().args(["local", "env", "discover"]))
+            .status
+            .success()
+    );
+    let catalog = fixture.root.join("home/.hops/local/catalog");
+    let entry_path = fs::read_dir(&catalog)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut entry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&entry_path).unwrap()).unwrap();
+    entry["enabled"] = true.into();
+    let runtime_name = entry["runtimeName"].as_str().unwrap().to_string();
+    fs::write(&entry_path, serde_json::to_vec_pretty(&entry).unwrap()).unwrap();
+
+    let output =
+        Fixture::output(
+            fixture
+                .command()
+                .args(["local", "env", "disable", &runtime_name]),
+        );
+    assert!(
+        output.status.success(),
+        "{:?}",
+        Fixture::stdout_stderr(&output)
+    );
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&entry_path).unwrap()).unwrap();
+    assert_eq!(saved["enabled"], false);
+    assert!(!fixture.log().contains("kubectl --context"));
+}
+
+#[test]
+fn disable_uses_the_context_in_its_exact_ownership_snapshot() {
+    let fixture = Fixture::new();
+    let state = fixture.root.join("home/.hops/local");
+    fs::create_dir_all(state.join("catalog")).unwrap();
+    fs::create_dir_all(state.join("envs")).unwrap();
+    fs::create_dir_all(state.join("clusters/hops/environments")).unwrap();
+    fs::write(
+        state.join("catalog/demo.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "id": "demo", "name": "demo", "runtimeName": "demo",
+            "source": fixture.root.join(".gitops/local/environment.yaml"),
+            "enabled": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state.join("envs/demo.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "demo", "namespace": "demo", "envPath": "/project/environment.yaml",
+            "clusterName": "hops", "kubeContext": "kind-hops"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state.join("clusters/hops/environments/demo.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1, "clusterName": "hops", "kubeContext": "kind-hops",
+            "name": "demo", "namespace": "demo", "sourcePath": "/project/environment.yaml",
+            "root": "/project", "namespaceExclusive": false,
+            "deploys": [{
+                "sourceRoot": "/project", "sourcePath": "/project/app/.gitops/local",
+                "appName": "app", "objects": [{
+                    "apiVersion": "v1", "kind": "ConfigMap", "namespace": "demo", "name": "owned"
+                }]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = Fixture::output(
+        fixture
+            .command()
+            .env("HOPS_KUBE_CONTEXT", "kind-harmony")
+            .args(["local", "env", "disable", "demo"]),
+    );
+    assert!(
+        output.status.success(),
+        "{:?}",
+        Fixture::stdout_stderr(&output)
+    );
+    let log = fixture.log();
+    assert!(
+        log.contains("kubectl --context kind-hops delete configmap owned --namespace demo"),
+        "{log}"
+    );
+    assert!(!log.contains("kind-harmony delete"), "{log}");
+    assert!(!state.join("clusters/hops/environments/demo.json").exists());
+    assert!(!state.join("envs/demo.json").exists());
+    let catalog: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join("catalog/demo.json")).unwrap()).unwrap();
+    assert_eq!(catalog["enabled"], false);
+}
+
+#[test]
 fn up_from_leaf_yaml_does_not_create_second_cluster() {
     let fixture = Fixture::new();
     let first = Fixture::output(
@@ -318,6 +427,14 @@ fn up_from_leaf_yaml_does_not_create_second_cluster() {
         creates,
         0,
         "dry-run must not kind create: {}",
+        fixture.log()
+    );
+    assert!(
+        fixture
+            .log()
+            .lines()
+            .any(|line| line.starts_with("kubectl --context kind-hops ")),
+        "Cluster dry-run must target its selected context: {}",
         fixture.log()
     );
 }

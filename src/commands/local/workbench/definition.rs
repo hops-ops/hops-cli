@@ -462,15 +462,15 @@ fn prepare_cluster_with_mount_validation(
         }
     }
 
-    let explicit_context = overrides
-        .context
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    // A new kind cluster has no kubeconfig context yet.  Still pin every
+    // kubectl/Helm/Vault child process to its declared destination so a
+    // pre-existing current-context cannot receive bootstrap operations.
+    let selected_context = expected_context(&definition, overrides);
     let active_backend = backend::activate_with_providers(
         Some(definition.cluster.cluster_provider),
         Some(definition.cluster.docker_provider),
         Some(&definition.cluster.name),
-        explicit_context,
+        Some(&selected_context),
     )?;
     backend::persist_providers(
         backend::providers::ProviderPair {
@@ -483,7 +483,7 @@ fn prepare_cluster_with_mount_validation(
     log::info!(
         "Cluster '{}' selected: context={} clusterProvider={} dockerProvider={} mountRoot={} definition={}",
         definition.cluster.name,
-        expected_context(&definition, overrides),
+        selected_context,
         definition.cluster.cluster_provider,
         definition.cluster.docker_provider,
         definition.cluster.mount_root.display(),

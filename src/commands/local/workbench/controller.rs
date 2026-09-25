@@ -8,12 +8,12 @@
 use super::definition::{DeployType, LoadedEnvironment};
 use super::reconcile::{
     ensure_environment_namespace, HelmRunner, KubectlApplier, KustomizeRunner, ReconcileOptions,
-    ReconcileResult,
+    ReconcileResult, MANAGED_BY_VALUE, WORKSPACE_ENV_LABEL,
 };
+use crate::commands::local::local_state_dir;
 use crate::commands::local::workbench::registry::{
     list_workspaces, remove_workspace, WorkspaceRecord,
 };
-use crate::commands::local::{kubectl_command, local_state_dir};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::error::Error;
@@ -22,6 +22,7 @@ use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONTROLLER_SCHEMA_VERSION: u32 = 1;
@@ -506,9 +507,12 @@ pub struct EnvironmentSnapshot {
     pub source_path: String,
     pub root: String,
     pub deploys: Vec<EnvironmentDeploySnapshot>,
-    /// Namespace deletion is never inferred. This remains false until a
-    /// future explicit exclusivity contract records otherwise.
+    /// True only when this Environment has a matching, uniquely registered
+    /// Hops namespace and its UID was recorded at reconciliation time.
+    #[serde(default)]
     pub namespace_exclusive: bool,
+    #[serde(default)]
+    pub namespace_uid: Option<String>,
 }
 
 pub fn environment_state_path(
@@ -545,6 +549,12 @@ pub fn save_environment_snapshot(
     if deploys.len() != environment.environment.deploys.len() {
         return Err("cannot persist Environment ownership: reconcile result count does not match deploy count".into());
     }
+    let namespace_uid = exclusive_namespace_uid(
+        cluster_name,
+        kube_context,
+        &environment.environment.name,
+        &environment.environment.namespace,
+    )?;
     let snapshot = EnvironmentSnapshot {
         schema_version: CONTROLLER_SCHEMA_VERSION,
         cluster_name: cluster_name.to_string(),
@@ -554,7 +564,8 @@ pub fn save_environment_snapshot(
         source_path: environment.source.to_string_lossy().into_owned(),
         root: environment.environment.root.to_string_lossy().into_owned(),
         deploys,
-        namespace_exclusive: false,
+        namespace_exclusive: namespace_uid.is_some(),
+        namespace_uid,
     };
     let path = environment_state_path(cluster_name, &snapshot.name)?;
     if let Some(parent) = path.parent() {
@@ -564,6 +575,76 @@ pub fn save_environment_snapshot(
     fs::write(&temp, serde_json::to_vec_pretty(&snapshot)?)?;
     fs::rename(&temp, &path)?;
     Ok(path)
+}
+
+fn exclusive_namespace_uid(
+    cluster_name: &str,
+    kube_context: &str,
+    environment_name: &str,
+    namespace: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if namespace != environment_name {
+        return Ok(None);
+    }
+    let snapshots = list_environment_snapshots(cluster_name)?;
+    if snapshots
+        .iter()
+        .any(|snapshot| snapshot.name != environment_name && snapshot.namespace == namespace)
+    {
+        return Ok(None);
+    }
+    let Some(live) = read_namespace(kube_context, namespace)? else {
+        return Ok(None);
+    };
+    if !namespace_has_environment_labels(&live, environment_name) {
+        return Ok(None);
+    }
+    Ok(live
+        .pointer("/metadata/uid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|uid| !uid.is_empty())
+        .map(str::to_string))
+}
+
+fn read_namespace(
+    kube_context: &str,
+    namespace: &str,
+) -> Result<Option<serde_json::Value>, Box<dyn Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            kube_context,
+            "get",
+            "namespace",
+            namespace,
+            "-o",
+            "json",
+            "--ignore-not-found=true",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot inspect Environment namespace {namespace}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    if output.stdout.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&output.stdout)?))
+}
+
+fn namespace_has_environment_labels(namespace: &serde_json::Value, environment_name: &str) -> bool {
+    let labels = namespace.pointer("/metadata/labels");
+    labels
+        .and_then(|labels| labels.get("app.kubernetes.io/managed-by"))
+        .and_then(serde_json::Value::as_str)
+        == Some(MANAGED_BY_VALUE)
+        && labels
+            .and_then(|labels| labels.get(WORKSPACE_ENV_LABEL))
+            .and_then(serde_json::Value::as_str)
+            == Some(environment_name)
 }
 
 /// Render and reconcile every explicit deploy directory in a validated
@@ -780,9 +861,9 @@ pub fn list_environment_snapshots(
     Ok(snapshots)
 }
 
-/// Delete only objects proven by the last accepted Environment snapshot. A
-/// missing snapshot is an already-down/no-proven-ownership result and performs
-/// no inferred namespace or label deletion.
+/// Delete objects proven by the last accepted Environment snapshot, then its
+/// namespace only when the recorded UID and live ownership labels still match.
+/// A missing snapshot is an already-down/no-proven-ownership result.
 pub fn down_environment(
     cluster_name: &str,
     environment_name: &str,
@@ -793,6 +874,12 @@ pub fn down_environment(
     if snapshot.namespace.is_empty() {
         return Err("Environment ownership snapshot has no namespace; refusing cleanup".into());
     }
+    if snapshot.kube_context.trim().is_empty() {
+        return Err("Environment ownership snapshot has no kube context; refusing cleanup".into());
+    }
+    // A namespace that was replaced after reconciliation may contain another
+    // owner's objects with the same names. Check before deleting any object.
+    owned_namespace_present(&snapshot)?;
     if let Ok(state_dir) = local_state_dir() {
         if let Err(error) = super::ingress::stop_ingress_access(&state_dir, environment_name) {
             log::warn!("Environment ingress-access cleanup: {error}");
@@ -833,7 +920,11 @@ pub fn down_environment(
             "--ignore-not-found=true",
             "--wait=true",
         ];
-        let output = kubectl_command(&args).output()?;
+        let output = Command::new("kubectl")
+            .arg("--context")
+            .arg(&snapshot.kube_context)
+            .args(args)
+            .output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
@@ -845,10 +936,86 @@ pub fn down_environment(
             .into());
         }
     }
+    delete_exclusive_namespace(cluster_name, &snapshot)?;
     let path = environment_state_path(cluster_name, environment_name)?;
     fs::remove_file(path)?;
     if let Ok(state_dir) = local_state_dir() {
         let _ = remove_workspace(&state_dir, environment_name)?;
+    }
+    Ok(true)
+}
+
+fn delete_exclusive_namespace(
+    cluster_name: &str,
+    snapshot: &EnvironmentSnapshot,
+) -> Result<(), Box<dyn Error>> {
+    if !snapshot.namespace_exclusive {
+        return Ok(());
+    }
+    if list_environment_snapshots(cluster_name)?
+        .iter()
+        .any(|other| other.name != snapshot.name && other.namespace == snapshot.namespace)
+    {
+        log::info!(
+            "Leaving shared Environment namespace {} in place",
+            snapshot.namespace
+        );
+        return Ok(());
+    }
+    if !owned_namespace_present(snapshot)? {
+        return Ok(());
+    }
+    log::info!(
+        "Deleting owned Environment namespace {}",
+        snapshot.namespace
+    );
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &snapshot.kube_context,
+            "delete",
+            "namespace",
+            &snapshot.namespace,
+            "--ignore-not-found=true",
+            "--wait=true",
+            "--timeout=2m",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "Environment namespace {} deletion failed: {}",
+            snapshot.namespace,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn owned_namespace_present(snapshot: &EnvironmentSnapshot) -> Result<bool, Box<dyn Error>> {
+    if !snapshot.namespace_exclusive {
+        return Ok(false);
+    }
+    let recorded_uid = snapshot
+        .namespace_uid
+        .as_deref()
+        .filter(|uid| !uid.is_empty())
+        .ok_or("exclusive Environment snapshot has no namespace UID")?;
+    if snapshot.namespace != snapshot.name {
+        return Err("exclusive Environment namespace does not match its recorded name".into());
+    }
+    let Some(live) = read_namespace(&snapshot.kube_context, &snapshot.namespace)? else {
+        return Ok(false);
+    };
+    let live_uid = live
+        .pointer("/metadata/uid")
+        .and_then(serde_json::Value::as_str);
+    if live_uid != Some(recorded_uid) || !namespace_has_environment_labels(&live, &snapshot.name) {
+        return Err(format!(
+            "Environment namespace {} no longer matches its recorded UID and ownership labels; refusing deletion",
+            snapshot.namespace
+        )
+        .into());
     }
     Ok(true)
 }
