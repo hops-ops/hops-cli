@@ -1354,10 +1354,11 @@ mod tests {
         for _ in 0..100_000 {
             tx.send(()).unwrap();
         }
-        wait_for_quiet(&rx, Duration::from_secs(60), Duration::ZERO).unwrap();
+        let started = Instant::now();
+        wait_for_quiet(&rx, Duration::from_secs(60), Duration::from_millis(20)).unwrap();
         assert!(
-            rx.try_recv().is_ok(),
-            "maximum wait must win over queued events"
+            started.elapsed() < Duration::from_secs(1),
+            "event processing must not extend the maximum wait to the debounce deadline"
         );
     }
 
