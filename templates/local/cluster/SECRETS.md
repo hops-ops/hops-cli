@@ -75,7 +75,7 @@ credentials and exposes its inbox at
 
 `auth` is the Cluster Zitadel namespace. Provider bootstrap uses
 `zitadel.auth.svc.cluster.local`; browser OIDC uses the AuthStack Gateway
-issuer `https://auth.gitkb.localhost`.
+issuer `https://auth.hops.localhost`.
 
 After AuthStack is Ready, configure the Zitadel provider from its generated
 admin PAT:
