@@ -229,7 +229,7 @@ spec:
   # Relative to .gitops/local/cluster.yaml. ../.. is the project root.
   mountRoot: ../..
   # Optional; defaults to localhost. A leading dot is accepted and normalized.
-  localDomain: gitkb.localhost
+  localDomain: hops.localhost
   # Optional shared namespaces whose Cluster-owned HTTPRoutes need browser access.
   browserIngress:
     namespaces:
@@ -250,8 +250,8 @@ recreate/reset guidance; Hops never silently deletes it.
 `localDomain` is the trusted local hostname suffix injected into every local
 Helm deploy. It must be `localhost` or a subdomain ending in `.localhost`.
 Omitting it preserves the default `<service>.<environment>.localhost` shape;
-for example, `gitkb.localhost` lets a chart render
-`<service>.<environment>.gitkb.localhost`.
+for example, `hops.localhost` lets a chart render
+`<service>.<environment>.hops.localhost`.
 
 `browserIngress.namespaces` explicitly bounds discovery of HTTPRoutes created
 by Cluster-owned manifests or composites outside Environment namespaces. Hops
@@ -470,8 +470,8 @@ ingress registrations.
 The normal result has no visible port:
 
 ```text
-https://feature-auth.gitkb.localhost
-https://console.feature-auth.gitkb.localhost
+https://feature-auth.hops.localhost
+https://console.feature-auth.hops.localhost
 ```
 
 Dory owns trusted local TLS and standard ports 80/443; Istio owns routing inside
@@ -1218,7 +1218,7 @@ graph to render. Then inspect the migration plan:
 hops xr migrate \
   --kind RegistryCache \
   --name production \
-  --source-context kind-gitkb-aws-bootstrap \
+  --source-context kind-hops-aws-bootstrap \
   --source-namespace default \
   --target-context arn:aws:eks:us-east-2:065328823520:cluster/production \
   --target-namespace production
