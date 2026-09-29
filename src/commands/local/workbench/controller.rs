@@ -691,6 +691,8 @@ fn run_environment_setup(loaded: &LoadedEnvironment) -> Result<(), Box<dyn Error
         let status = Command::new("bash")
             .arg(script)
             .current_dir(&loaded.environment.root)
+            .env("HOPS_ENVIRONMENT_NAME", &loaded.environment.name)
+            .env("HOPS_ENVIRONMENT_NAMESPACE", &loaded.environment.namespace)
             .env(
                 "HOPS_LOCAL_CONTEXT",
                 std::env::var("HOPS_KUBE_CONTEXT").unwrap_or_default(),
@@ -910,7 +912,7 @@ pub fn down_environment(
             )
             .into());
         }
-        let kind = object.kind.to_ascii_lowercase();
+        let kind = owned_resource_type(&object);
         let args = [
             "delete",
             kind.as_str(),
@@ -1020,6 +1022,15 @@ fn owned_namespace_present(snapshot: &EnvironmentSnapshot) -> Result<bool, Box<d
     Ok(true)
 }
 
+// Namespaced and legacy cluster-scoped providers share Kind names. Always
+// address the recorded API group so cleanup cannot target the wrong resource.
+fn owned_resource_type(object: &OwnedObject) -> String {
+    match object.api_version.split_once('/') {
+        Some((group, _)) => format!("{}.{}", object.kind.to_ascii_lowercase(), group),
+        None => object.kind.to_ascii_lowercase(),
+    }
+}
+
 fn owned_objects_from_yaml(yaml: &str) -> Result<Vec<OwnedObject>, Box<dyn Error>> {
     let mut objects = Vec::new();
     for document in serde_yaml::Deserializer::from_str(yaml) {
@@ -1084,6 +1095,23 @@ pub fn validate_environment_identity(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cleanup_uses_recorded_group_for_ambiguous_provider_kinds() {
+        let mut object = super::OwnedObject {
+            api_version: "application.zitadel.m.crossplane.io/v1alpha1".into(),
+            kind: "OIDC".into(),
+            namespace: "test".into(),
+            name: "web".into(),
+        };
+        assert_eq!(
+            super::owned_resource_type(&object),
+            "oidc.application.zitadel.m.crossplane.io"
+        );
+        object.api_version = "v1".into();
+        object.kind = "Service".into();
+        assert_eq!(super::owned_resource_type(&object), "service");
+    }
+
     use super::*;
 
     #[test]

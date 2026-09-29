@@ -309,8 +309,8 @@ fn run_cluster_reconcile_loop(
             wait_for_cluster_packages_healthy()?;
         }
         reconcile_cluster_secret_sync(&definition, dry_run)?;
-        reconcile_cluster_environments_with_retry(&definition, dry_run)?;
         reconcile_cluster_browser_ingress(&definition, dry_run)?;
+        reconcile_cluster_environments_with_retry(&definition, dry_run)?;
         Ok(())
     };
 
@@ -329,6 +329,7 @@ fn run_cluster_reconcile_loop(
             .map(|secret_sync| secret_sync.path.as_path()),
         args.debounce,
         do_once,
+        || reconcile_all_browser_ingress(&definition),
     )
 }
 
@@ -415,6 +416,50 @@ fn pending_crossplane_packages(output: &str) -> Result<Vec<String>, Box<dyn Erro
 
 fn cluster_ingress_workspace_name(cluster_name: &str) -> String {
     format!("cluster-ingress-{cluster_name}")
+}
+
+/// Host routing must converge when controllers create routes asynchronously,
+/// and after Dory restarts, without reapplying application workloads.
+fn reconcile_all_browser_ingress(
+    definition: &super::workbench::definition::LoadedDefinition,
+) -> Result<(), Box<dyn Error>> {
+    let mut errors = Vec::new();
+    if let Err(error) = reconcile_cluster_browser_ingress(definition, false) {
+        errors.push(format!("Cluster: {error}"));
+    }
+    match list_environment_snapshots(&definition.cluster.name) {
+        Ok(snapshots) => errors.extend(reconcile_each(snapshots, |snapshot| {
+            reconcile_browser_ingress(
+                definition.cluster.cluster_provider,
+                definition.cluster.docker_provider,
+                false,
+                &snapshot.namespace,
+                &snapshot.name,
+            )
+            .map_err(|error| format!("{}/{}: {error}", snapshot.namespace, snapshot.name))
+        })),
+        Err(error) => errors.push(format!("Environment snapshots: {error}")),
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Browser ingress reconciliation failed:\n  - {}",
+            errors.join("\n  - ")
+        )
+        .into())
+    }
+}
+
+/// Attempt every independent target, retaining failures for a single report.
+fn reconcile_each<T>(
+    targets: impl IntoIterator<Item = T>,
+    mut reconcile: impl FnMut(T) -> Result<(), String>,
+) -> Vec<String> {
+    targets
+        .into_iter()
+        .filter_map(|target| reconcile(target).err())
+        .collect()
 }
 
 fn reconcile_cluster_browser_ingress(
@@ -891,6 +936,7 @@ fn run_environment_definition(
                 &namespace,
                 delivery_strategy,
             )?;
+            reconcile_cluster_browser_ingress(&cluster, false)?;
             reconcile_browser_ingress(
                 cluster.cluster.cluster_provider,
                 cluster.cluster.docker_provider,
@@ -1072,7 +1118,7 @@ where
     loop {
         rx.recv()
             .map_err(|_| "Environment watcher channel closed")?;
-        wait_for_quiet(&rx, debounce)?;
+        wait_for_quiet(&rx, debounce, Duration::from_secs(15))?;
         if !environment_file.exists() {
             log::info!(
                 "Environment definition {} was removed; purging Environment `{}`",
@@ -1130,15 +1176,17 @@ fn resolve_worktree_delivery(
 
 // ── shared watch helpers ─────────────────────────────────────────────────────
 
-fn run_cluster_watch<F>(
+fn run_cluster_watch<F, G>(
     cluster: &Path,
     project_root: &Path,
     secret_sync_root: Option<&Path>,
     debounce_secs: u64,
     mut rebuild: F,
+    mut reconcile_ingress: G,
 ) -> Result<(), Box<dyn Error>>
 where
     F: FnMut() -> Result<(), Box<dyn Error>>,
+    G: FnMut() -> Result<(), Box<dyn Error>>,
 {
     let debounce = Duration::from_secs(debounce_secs);
     let (tx, rx) = mpsc::channel();
@@ -1198,13 +1246,27 @@ where
     );
 
     loop {
-        rx.recv().map_err(|_| "watcher channel closed")?;
-        wait_for_quiet(&rx, debounce)?;
+        match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(()) => wait_for_quiet(&rx, debounce, Duration::from_secs(15))?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = reconcile_ingress() {
+                    log::warn!("Browser ingress reconciliation: {error}");
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("watcher channel closed".into())
+            }
+        }
         log::info!("──────────────────────────────────────────────");
         log::info!("Cluster gitops change, applying to local CP...");
         match rebuild() {
             Ok(()) => log::info!("Cluster reconcile succeeded."),
             Err(e) => log::error!("Cluster reconcile failed: {e}"),
+        }
+        // A failed rebuild must not prevent repair of already deployed routes.
+        if let Err(error) = reconcile_ingress() {
+            log::warn!("Browser ingress reconciliation: {error}");
         }
     }
 }
@@ -1240,10 +1302,18 @@ fn is_controller_owned_path(path: &Path, project_root: &Path) -> bool {
     matches!(*scope, "local" | "test-users" | "promote")
 }
 
-fn wait_for_quiet(rx: &mpsc::Receiver<()>, debounce: Duration) -> Result<(), Box<dyn Error>> {
+/// Debounce bursts without allowing a continuous event stream to starve work.
+fn wait_for_quiet(
+    rx: &mpsc::Receiver<()>,
+    debounce: Duration,
+    max_wait: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let max_deadline = Instant::now() + max_wait;
     let mut deadline = Instant::now() + debounce;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline
+            .min(max_deadline)
+            .saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Ok(());
         }
@@ -1262,6 +1332,45 @@ mod tests {
     use super::super::workbench::definition::load_definition;
     use super::*;
     use std::fs;
+
+    #[test]
+    fn ingress_reconciliation_attempts_targets_after_failures() {
+        let mut attempted = Vec::new();
+        let errors = reconcile_each(["broken", "healthy", "also-broken"], |target| {
+            attempted.push(target);
+            if target == "healthy" {
+                Ok(())
+            } else {
+                Err(target.to_string())
+            }
+        });
+        assert_eq!(attempted, ["broken", "healthy", "also-broken"]);
+        assert_eq!(errors, ["broken", "also-broken"]);
+    }
+
+    #[test]
+    fn debounce_is_bounded_even_when_events_are_queued() {
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..100_000 {
+            tx.send(()).unwrap();
+        }
+        let started = Instant::now();
+        wait_for_quiet(&rx, Duration::from_secs(60), Duration::from_millis(20)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "event processing must not extend the maximum wait to the debounce deadline"
+        );
+    }
+
+    #[test]
+    fn debounce_returns_after_quiet_and_reports_disconnect() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(()).unwrap();
+        wait_for_quiet(&rx, Duration::from_millis(1), Duration::from_secs(1)).unwrap();
+        assert!(rx.try_recv().is_err());
+        drop(tx);
+        assert!(wait_for_quiet(&rx, Duration::from_secs(1), Duration::from_secs(1)).is_err());
+    }
 
     #[test]
     fn renders_reusable_environment_for_runtime_identity() {

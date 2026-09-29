@@ -23,7 +23,12 @@ spec:
   namespace: auth
   chartValues:
     fullnameOverride: zitadel
-  domain: auth.gitkb.localhost
+    zitadel:
+      configmapConfig:
+        ExternalPort: 443
+  domain: auth.hops.localhost
+  # Keep this local rollout on the already verified chart version.
+  version: "9.34.1"
   externalSecure: true
   gateway:
     enabled: true
