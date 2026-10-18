@@ -1,6 +1,6 @@
 # This chart does not provision clusters, cloud storage, DNS, or certificates.
 name: registry
-image: registry:2.8.3
+image: registry:3.1.2
 tls:
   # Must contain tls.crt and tls.key, trusted by Crossplane AND runtime nodes.
   existingSecret: ""
