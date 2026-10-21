@@ -967,6 +967,7 @@ fn delete_exclusive_namespace(
     if !owned_namespace_present(snapshot)? {
         return Ok(());
     }
+    delete_namespace_crossplane_resources(snapshot)?;
     log::info!(
         "Deleting owned Environment namespace {}",
         snapshot.namespace
@@ -992,6 +993,63 @@ fn delete_exclusive_namespace(
         .into());
     }
     Ok(())
+}
+
+/// Delete every Crossplane composite and managed resource left in the owned
+/// namespace, and wait for them, before the namespace itself goes. A
+/// terminating namespace rejects new objects, so a managed resource that is
+/// still finalizing there cannot recreate its ProviderConfigUsage, never
+/// reaches its external API, and holds the namespace forever. This also
+/// catches resources missing from the recorded snapshot.
+fn delete_namespace_crossplane_resources(
+    snapshot: &EnvironmentSnapshot,
+) -> Result<(), Box<dyn Error>> {
+    log::info!(
+        "Deleting Crossplane resources in Environment namespace {}",
+        snapshot.namespace
+    );
+    let output = Command::new("kubectl")
+        .args(crossplane_cleanup_args(
+            &snapshot.kube_context,
+            &snapshot.namespace,
+        ))
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // A cluster without Crossplane has no `composite`/`managed` categories.
+    if crossplane_categories_missing(&stderr) {
+        return Ok(());
+    }
+    Err(format!(
+        "Crossplane resources in Environment namespace {} were not deleted: {}",
+        snapshot.namespace,
+        stderr.trim()
+    )
+    .into())
+}
+
+fn crossplane_cleanup_args(kube_context: &str, namespace: &str) -> Vec<String> {
+    [
+        "--context",
+        kube_context,
+        "delete",
+        "composite,managed",
+        "--all",
+        "--namespace",
+        namespace,
+        "--ignore-not-found=true",
+        "--wait=true",
+        "--timeout=5m",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect()
+}
+
+fn crossplane_categories_missing(stderr: &str) -> bool {
+    stderr.contains("the server doesn't have a resource type")
 }
 
 fn owned_namespace_present(snapshot: &EnvironmentSnapshot) -> Result<bool, Box<dyn Error>> {
@@ -1110,6 +1168,32 @@ mod tests {
         object.api_version = "v1".into();
         object.kind = "Service".into();
         assert_eq!(super::owned_resource_type(&object), "service");
+    }
+
+    #[test]
+    fn namespace_cleanup_waits_for_crossplane_resources_first() {
+        let args = super::crossplane_cleanup_args("kind-hops", "feature-x");
+        assert_eq!(
+            args,
+            [
+                "--context",
+                "kind-hops",
+                "delete",
+                "composite,managed",
+                "--all",
+                "--namespace",
+                "feature-x",
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout=5m",
+            ]
+        );
+        assert!(super::crossplane_categories_missing(
+            "error: the server doesn't have a resource type \"composite\""
+        ));
+        assert!(!super::crossplane_categories_missing(
+            "error: timed out waiting for the condition"
+        ));
     }
 
     use super::*;

@@ -1408,31 +1408,27 @@ exit 0
         let proxy = KindDockerProxy::with_real_docker(fake_docker).unwrap();
         let mut node = Command::new("docker");
         proxy.apply(&mut node).unwrap();
-        let node_status = node
-            .env("HOPS_TEST_DOCKER_CALLS", &calls)
-            .args([
-                "run",
-                "--name",
-                "dogfood-control-plane",
-                "--label",
-                "io.x-k8s.kind.role=control-plane",
-                "--label",
-                "io.x-k8s.kind.cluster=dogfood",
-                "--volume",
-                "/var",
-                "kindest/node:v1.36.1",
-            ])
-            .status()
-            .unwrap();
+        node.env("HOPS_TEST_DOCKER_CALLS", &calls).args([
+            "run",
+            "--name",
+            "dogfood-control-plane",
+            "--label",
+            "io.x-k8s.kind.role=control-plane",
+            "--label",
+            "io.x-k8s.kind.cluster=dogfood",
+            "--volume",
+            "/var",
+            "kindest/node:v1.36.1",
+        ]);
+        let node_status = status_when_not_busy(&mut node);
         assert!(node_status.success());
 
         let mut unrelated = Command::new("docker");
         proxy.apply(&mut unrelated).unwrap();
-        let unrelated_status = unrelated
+        unrelated
             .env("HOPS_TEST_DOCKER_CALLS", &calls)
-            .args(["ps", "--quiet"])
-            .status()
-            .unwrap();
+            .args(["ps", "--quiet"]);
+        let unrelated_status = status_when_not_busy(&mut unrelated);
         assert!(unrelated_status.success());
 
         let calls = fs::read_to_string(&calls).unwrap();
@@ -1510,6 +1506,22 @@ exit 0
 
         drop(proxy);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Run a command whose scripts this test just wrote. Exec can fail with
+    /// ETXTBSY while another test thread's forked child still holds a write
+    /// fd for the script (inherited between its fork and exec); retry briefly.
+    #[cfg(unix)]
+    fn status_when_not_busy(command: &mut Command) -> std::process::ExitStatus {
+        for _ in 0..50 {
+            match command.status() {
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => return result.unwrap(),
+            }
+        }
+        command.status().unwrap()
     }
 
     #[cfg(unix)]
