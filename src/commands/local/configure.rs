@@ -4,8 +4,9 @@ use super::gitops::{self, ClusterArgs};
 use super::local_state_dir;
 use super::workbench::cluster_template;
 use super::workbench::definition::ClusterOverrides;
-use super::workbench::machine::{self, kube_context_for_name, MachineClusterRecord};
+use super::workbench::machine::{self, kube_context_for, MachineClusterRecord};
 use crate::commands::local::backend::kind;
+use crate::commands::local::backend::providers::ClusterProvider;
 use clap::Args;
 use std::error::Error;
 use std::io::IsTerminal;
@@ -55,9 +56,10 @@ pub fn run(args: &ConfigureArgs, overrides: ClusterOverrides<'_>) -> Result<(), 
         &record.name,
         record.host_path.as_deref(),
         record.local_domain.as_deref(),
+        record.provider_pair(),
     )?;
     record.source = source;
-    record.kube_context = kube_context_for_name(&record.name);
+    record.kube_context = kube_context_for(&record.name, record.provider_pair());
     machine::save(&state_dir, &record)?;
     println!(
         "Wrote {}  hostPath={}",
@@ -71,7 +73,11 @@ pub fn run(args: &ConfigureArgs, overrides: ClusterOverrides<'_>) -> Result<(), 
     match apply {
         ApplyKind::Write => Ok(()),
         ApplyKind::Restart | ApplyKind::Reset => {
-            if apply == ApplyKind::Reset && kind::cluster_exists() {
+            // Only kind bakes hostPath/name into the node; vendor clusters restart.
+            if apply == ApplyKind::Reset
+                && record.provider_pair().cluster == ClusterProvider::Kind
+                && kind::cluster_exists()
+            {
                 kind::destroy()?;
             }
             let cluster_args = ClusterArgs {
@@ -120,7 +126,7 @@ fn apply_set(
                 return Err("name must not be empty".into());
             }
             record.name = value.to_string();
-            record.kube_context = kube_context_for_name(value);
+            record.kube_context = kube_context_for(value, record.provider_pair());
             Ok(ApplyKind::Reset)
         }
         other => Err(format!(

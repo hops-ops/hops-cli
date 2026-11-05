@@ -738,6 +738,11 @@ hops config install --repo hops-ops/aws-auto-eks-cluster --version v0.11.0
   k3s **NodePort** on the engine docker bridge (`{dory-k8s-ip}:30500`) because
   dockerd runs *inside* the engine — Mac `localhost` is the wrong plane. The
   VM is sized in the Dory app, so hops sizing flags don't apply.
+- **orbstack** — [OrbStack](https://orbstack.dev)'s built-in single-node k3s
+  (context `orbstack`). Memory goes back to macOS when idle, any Mac path
+  works as a `hostPath` at the same path, and Istio runs in ambient mode.
+  `--cluster-provider orbstack` implies `--docker-provider orbstack`. See
+  [Using OrbStack](#using-orbstack).
 
 Select both dimensions explicitly:
 
@@ -749,8 +754,35 @@ The chosen pair is persisted to `~/.hops/local/providers.json` on a successful
 start, so later commands can target the same cluster without repeating flags.
 
 Unless `--context` is given, kubectl commands automatically use the backend's
-kubeconfig context (`colima`, `kind-hops`, or `hops-dory`), regardless of your
-current-context.
+kubeconfig context (`colima`, `kind-hops`, `hops-dory`, or `orbstack`),
+regardless of your current-context.
+
+#### Using OrbStack
+
+```bash
+brew install --cask orbstack        # or: hops local install --cluster-provider orbstack
+hops local start --cluster-provider orbstack
+```
+
+`hops local start` runs `orb start k8s`, which enables OrbStack's Kubernetes and
+starts OrbStack if needed without restarting its other containers. OrbStack
+switches the kubeconfig current-context to `orbstack` when the cluster comes
+up, so hops switches it back to the context you had. `hops local destroy` runs
+`orb delete k8s` (cluster data is deleted and Kubernetes is disabled).
+
+k3s runs on OrbStack's dockerd, which resolves `*.svc.cluster.local`, so
+packages are pushed to and pulled from
+`registry.crossplane-system.svc.cluster.local:5000`. The only node wiring is
+listing that registry in `~/.orbstack/config/docker.json` `insecure-registries`
+(it serves a self-signed certificate). That step runs once and restarts the
+engine. `hops local up` with the orbstack provider also points istio-cni at
+the k3s CNI paths (`/var/lib/rancher/k3s/...`), which ambient capture needs.
+
+The VM is sized with `orb config set cpu <n>` / `orb config set memory_mib
+<mib>` (a ceiling; unused memory is returned to macOS), so hops sizing flags
+don't apply. To reach `*.k8s.orb.local` and Service domains from the Mac, allow
+**Local Network** access for your terminal and for your browser's helper
+process in System Settings → Privacy & Security.
 
 #### Using dory
 

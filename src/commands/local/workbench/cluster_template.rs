@@ -11,6 +11,8 @@ use super::definition::{
     DEFAULT_LOCAL_DOMAIN,
 };
 use super::machine::DEFAULT_MACHINE_CLUSTER_NAME;
+use crate::commands::local::backend::orbstack;
+use crate::commands::local::backend::providers::{ClusterProvider, ProviderPair};
 use serde_yaml::Value;
 use std::error::Error;
 use std::fs;
@@ -62,6 +64,7 @@ pub fn materialize(
     machine_name: &str,
     host_path: Option<&Path>,
     local_domain: Option<&str>,
+    providers: ProviderPair,
 ) -> Result<PathBuf, Box<dyn Error>> {
     let home = home.canonicalize().map_err(|error| {
         format!(
@@ -74,6 +77,9 @@ pub fn materialize(
     let yaml_path = gitops_local.join("cluster.yaml");
     prepare_manifests_dir(&manifests)?;
     write_embed(&manifests)?;
+    if providers.cluster == ClusterProvider::Orbstack {
+        set_k3s_istio_cni_paths(&manifests.join(ISTIO_STACK_FILE))?;
+    }
     if let Some(overlay) = overlay_cluster_yaml {
         if let Some(parent) = overlay.parent() {
             let extras = parent.join("cluster");
@@ -99,9 +105,31 @@ pub fn materialize(
         &home,
         host_path.unwrap_or(&home),
         local_domain,
+        providers,
     )?;
     fs::write(&yaml_path, body)?;
     Ok(yaml_path)
+}
+
+const ISTIO_STACK_FILE: &str = "stacks/istio.yaml";
+
+/// k3s keeps CNI binaries and config outside the chart's default paths, so
+/// istio-cni must be pointed at them for ambient capture to work.
+fn set_k3s_istio_cni_paths(path: &Path) -> Result<(), Box<dyn Error>> {
+    let raw = fs::read_to_string(path)?;
+    let mut doc: Value = serde_yaml::from_str(&raw)?;
+    let spec = doc
+        .get_mut("spec")
+        .and_then(Value::as_mapping_mut)
+        .ok_or_else(|| format!("{} has no spec", path.display()))?;
+    let values: Value = serde_yaml::from_str(&format!(
+        "values:\n  cni:\n    cniBinDir: {}\n    cniConfDir: {}\n",
+        orbstack::ISTIO_CNI_BIN_DIR,
+        orbstack::ISTIO_CNI_CONF_DIR
+    ))?;
+    spec.insert(Value::from("cni"), values);
+    fs::write(path, serde_yaml::to_string(&doc)?)?;
+    Ok(())
 }
 
 fn prepare_manifests_dir(manifests: &Path) -> Result<(), Box<dyn Error>> {
@@ -195,6 +223,7 @@ fn cluster_document_yaml(
     home: &Path,
     host_path: &Path,
     configured_domain: Option<&str>,
+    providers: ProviderPair,
 ) -> Result<String, Box<dyn Error>> {
     let name = if machine_name.trim().is_empty() {
         DEFAULT_MACHINE_CLUSTER_NAME
@@ -218,8 +247,8 @@ kind: Cluster
 metadata:
   name: {name}
 spec:
-  clusterProvider: kind
-  dockerProvider: dory
+  clusterProvider: {cluster_provider}
+  dockerProvider: {docker_provider}
   mountRoot: {mount_root}
   manifests:
     path: {manifests}
@@ -231,6 +260,8 @@ spec:
   browserIngress:
     namespaces:
 "#,
+        cluster_provider = providers.cluster,
+        docker_provider = providers.docker,
         manifests = CLUSTER_MANIFESTS_PATH,
         chart = DEFAULT_CROSSPLANE_CHART,
         version = DEFAULT_CROSSPLANE_VERSION,
@@ -414,6 +445,7 @@ spec:
             "hops",
             None,
             None,
+            ProviderPair::kind_on_dory(),
         )
         .unwrap();
         assert_eq!(yaml, home.join(".gitops/local/cluster.yaml"));
@@ -423,6 +455,8 @@ spec:
         assert!(body.contains("localDomain: gitkb.localhost"), "{body}");
         assert!(body.contains("- auth"), "{body}");
         assert!(body.contains("mountRoot: $HOME"));
+        assert!(body.contains("clusterProvider: kind"), "{body}");
+        assert!(body.contains("dockerProvider: dory"), "{body}");
         let manifests = home.join(".gitops/local/cluster");
         assert!(manifests.join(MANAGED_MARKER).is_file());
         assert!(manifests.join("providers/helm.yaml").is_file());
@@ -439,7 +473,15 @@ spec:
         let pin = "kind: Configuration\nmetadata:\n  name: hops-ops-auth-stack\nspec:\n  package: registry.local/auth:dev\n";
         fs::write(overrides.join("auth-stack.yaml"), pin).unwrap();
         for _ in 0..2 {
-            materialize(&home, None, "hops", None, None).unwrap();
+            materialize(
+                &home,
+                None,
+                "hops",
+                None,
+                None,
+                ProviderPair::kind_on_dory(),
+            )
+            .unwrap();
             assert_eq!(
                 fs::read_to_string(
                     home.join(".gitops/local/cluster/configurations/auth-stack.yaml")
@@ -452,12 +494,62 @@ spec:
     }
 
     #[test]
+    fn orbstack_cluster_sets_providers_and_k3s_istio_cni_paths() {
+        let home = temp_home();
+        let orbstack = ProviderPair {
+            cluster: ClusterProvider::Orbstack,
+            docker: crate::commands::local::backend::providers::DockerProvider::Orbstack,
+        };
+        let yaml = materialize(&home, None, "hops", None, None, orbstack).unwrap();
+        let body = fs::read_to_string(&yaml).unwrap();
+        assert!(body.contains("clusterProvider: orbstack"), "{body}");
+        assert!(body.contains("dockerProvider: orbstack"), "{body}");
+
+        let istio = home.join(".gitops/local/cluster").join(ISTIO_STACK_FILE);
+        let doc: Value = serde_yaml::from_str(&fs::read_to_string(istio).unwrap()).unwrap();
+        let cni = &doc["spec"]["cni"]["values"]["cni"];
+        assert_eq!(cni["cniBinDir"].as_str(), Some(orbstack::ISTIO_CNI_BIN_DIR));
+        assert_eq!(
+            cni["cniConfDir"].as_str(),
+            Some(orbstack::ISTIO_CNI_CONF_DIR)
+        );
+        assert_eq!(doc["spec"]["chartVersion"].as_str(), Some("1.29.2"));
+        cleanup(&home);
+    }
+
+    #[test]
+    fn kind_cluster_keeps_default_istio_cni_paths() {
+        let home = temp_home();
+        materialize(
+            &home,
+            None,
+            "hops",
+            None,
+            None,
+            ProviderPair::kind_on_dory(),
+        )
+        .unwrap();
+        let istio = home.join(".gitops/local/cluster").join(ISTIO_STACK_FILE);
+        let doc: Value = serde_yaml::from_str(&fs::read_to_string(istio).unwrap()).unwrap();
+        assert!(doc["spec"].get("cni").is_none());
+        cleanup(&home);
+    }
+
+    #[test]
     fn refuses_unmanaged_existing_cluster_dir() {
         let home = temp_home();
         let manifests = home.join(".gitops/local/cluster");
         fs::create_dir_all(&manifests).unwrap();
         fs::write(manifests.join("stray.yaml"), "kind: ConfigMap\n").unwrap();
-        let err = materialize(&home, None, "hops", None, None).unwrap_err();
+        let err = materialize(
+            &home,
+            None,
+            "hops",
+            None,
+            None,
+            ProviderPair::kind_on_dory(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not hops-managed"), "{err}");
         cleanup(&home);
     }

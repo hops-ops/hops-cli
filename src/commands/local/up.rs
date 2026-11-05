@@ -1,11 +1,12 @@
 //! `hops local up` — create or reconnect the one machine Cluster.
 
+use super::backend::providers::{resolve_provider_pair, ClusterProvider, ProviderPair};
 use super::gitops::{self, ClusterArgs};
 use super::local_state_dir;
 use super::workbench::cluster_template;
 use super::workbench::definition::{self, ClusterOverrides, DEFAULT_DEFINITION_FILE};
 use super::workbench::machine::{
-    self, kube_context_for_name, MachineClusterRecord, DEFAULT_MACHINE_CLUSTER_NAME,
+    self, kube_context_for, MachineClusterRecord, DEFAULT_MACHINE_CLUSTER_NAME,
 };
 use clap::Args;
 use std::error::Error;
@@ -56,12 +57,14 @@ pub fn run(args: &UpArgs, overrides: ClusterOverrides<'_>) -> Result<(), Box<dyn
     let local_domain = record
         .as_ref()
         .and_then(|record| record.local_domain.clone());
+    let providers = resolve_up_providers(&overrides, record.as_ref())?;
     let source = cluster_template::materialize(
         &home,
         overlay.as_deref(),
         &machine_name,
         Some(&host_path),
         local_domain.as_deref(),
+        providers,
     )?;
 
     if cwd_yaml.exists() && args.path.is_none() {
@@ -72,14 +75,17 @@ pub fn run(args: &UpArgs, overrides: ClusterOverrides<'_>) -> Result<(), Box<dyn
         }
     }
 
-    warn_multiple_kind_clusters(&machine_name)?;
+    if providers.cluster == ClusterProvider::Kind {
+        warn_multiple_kind_clusters(&machine_name)?;
+    }
 
     let record = MachineClusterRecord {
         name: machine_name.clone(),
-        kube_context: kube_context_for_name(&machine_name),
+        kube_context: kube_context_for(&machine_name, providers),
         source: source.clone(),
         host_path: Some(host_path),
         local_domain,
+        providers: Some(providers),
     };
     if !args.dry_run {
         machine::save(&state_dir, &record)?;
@@ -98,6 +104,22 @@ pub fn run(args: &UpArgs, overrides: ClusterOverrides<'_>) -> Result<(), Box<dyn
         ..overrides
     };
     gitops::run_cluster(&cluster_args, overrides)
+}
+
+/// Provider flags pick (or switch) the machine's providers; otherwise the
+/// recorded pair, then kind on Dory.
+fn resolve_up_providers(
+    overrides: &ClusterOverrides<'_>,
+    record: Option<&MachineClusterRecord>,
+) -> Result<ProviderPair, Box<dyn Error>> {
+    if let Some(pair) =
+        resolve_provider_pair(overrides.cluster_provider, overrides.docker_provider)?
+    {
+        return Ok(pair);
+    }
+    Ok(record
+        .map(MachineClusterRecord::provider_pair)
+        .unwrap_or_else(ProviderPair::kind_on_dory))
 }
 
 fn resolve_up_host_path(

@@ -19,6 +19,8 @@ pub enum ClusterProvider {
     Dory,
     /// Colima embedded k3s.
     Colima,
+    /// OrbStack built-in k3s (context `orbstack`).
+    Orbstack,
 }
 
 /// Container engine kind/tools talk to.
@@ -29,6 +31,8 @@ pub enum DockerProvider {
     Dory,
     /// Colima docker.
     Colima,
+    /// OrbStack engine (`~/.orbstack/run/docker.sock`).
+    Orbstack,
     /// Default / DOCKER_HOST / docker context.
     Docker,
 }
@@ -39,6 +43,7 @@ impl ClusterProvider {
             ClusterProvider::Kind => "kind",
             ClusterProvider::Dory => "dory",
             ClusterProvider::Colima => "colima",
+            ClusterProvider::Orbstack => "orbstack",
         }
     }
 }
@@ -48,6 +53,7 @@ impl DockerProvider {
         match self {
             DockerProvider::Dory => "dory",
             DockerProvider::Colima => "colima",
+            DockerProvider::Orbstack => "orbstack",
             DockerProvider::Docker => "docker",
         }
     }
@@ -72,8 +78,9 @@ impl FromStr for ClusterProvider {
             "kind" => Ok(ClusterProvider::Kind),
             "dory" => Ok(ClusterProvider::Dory),
             "colima" => Ok(ClusterProvider::Colima),
+            "orbstack" => Ok(ClusterProvider::Orbstack),
             other => Err(format!(
-                "unknown cluster-provider '{other}' (expected kind, dory, colima)"
+                "unknown cluster-provider '{other}' (expected kind, dory, colima, orbstack)"
             )),
         }
     }
@@ -85,9 +92,10 @@ impl FromStr for DockerProvider {
         match s.trim().to_ascii_lowercase().as_str() {
             "dory" => Ok(DockerProvider::Dory),
             "colima" => Ok(DockerProvider::Colima),
+            "orbstack" => Ok(DockerProvider::Orbstack),
             "docker" | "default" => Ok(DockerProvider::Docker),
             other => Err(format!(
-                "unknown docker-provider '{other}' (expected dory, colima, docker)"
+                "unknown docker-provider '{other}' (expected dory, colima, orbstack, docker)"
             )),
         }
     }
@@ -116,20 +124,25 @@ impl ProviderPair {
             ClusterProvider::Kind => Backend::Kind,
             ClusterProvider::Dory => Backend::Dory,
             ClusterProvider::Colima => Backend::Colima,
+            ClusterProvider::Orbstack => Backend::Orbstack,
         }
     }
 
-    /// Reject impossible combinations (product dory k8s only on dory engine).
+    /// Reject impossible combinations (a vendor's k8s only on its own engine).
     pub fn validate(self) -> Result<(), String> {
         match (self.cluster, self.docker) {
             (ClusterProvider::Kind, _) => Ok(()),
             (ClusterProvider::Dory, DockerProvider::Dory) => Ok(()),
             (ClusterProvider::Colima, DockerProvider::Colima) => Ok(()),
+            (ClusterProvider::Orbstack, DockerProvider::Orbstack) => Ok(()),
             (ClusterProvider::Dory, other) => Err(format!(
                 "cluster-provider dory requires docker-provider dory (got {other})"
             )),
             (ClusterProvider::Colima, other) => Err(format!(
                 "cluster-provider colima requires docker-provider colima (got {other})"
+            )),
+            (ClusterProvider::Orbstack, other) => Err(format!(
+                "cluster-provider orbstack requires docker-provider orbstack (got {other})"
             )),
         }
     }
@@ -158,9 +171,14 @@ pub fn resolve_provider_pair(
         }
     };
 
+    // OrbStack's k8s only runs on its own engine, so it implies the pair.
+    let default_docker = match cluster_provider {
+        Some(ClusterProvider::Orbstack) => DockerProvider::Orbstack,
+        _ => base.docker,
+    };
     let pair = ProviderPair {
         cluster: cluster_provider.unwrap_or(base.cluster),
-        docker: docker_provider.unwrap_or(base.docker),
+        docker: docker_provider.unwrap_or(default_docker),
     };
     pair.validate()?;
     Ok(Some(pair))
@@ -187,12 +205,17 @@ pub fn provider_pair_for_legacy_backend(backend: Backend) -> ProviderPair {
             cluster: ClusterProvider::Colima,
             docker: DockerProvider::Colima,
         },
+        Backend::Orbstack => ProviderPair {
+            cluster: ClusterProvider::Orbstack,
+            docker: DockerProvider::Orbstack,
+        },
     }
 }
 
 /// Apply docker-provider to process env for kind (and docker CLI).
 ///
 /// - `dory`: set DOCKER_HOST to `unix://$HOME/.dory/dory.sock` when unset
+/// - `orbstack`: set DOCKER_HOST to `unix://$HOME/.orbstack/run/docker.sock` when unset
 /// - `colima`: leave alone (colima context usually already selected)
 /// - `docker`: leave alone
 pub fn apply_docker_provider_env(dp: DockerProvider) -> Result<(), Box<dyn Error>> {
@@ -212,6 +235,22 @@ pub fn apply_docker_provider_env(dp: DockerProvider) -> Result<(), Box<dyn Error
                     )
                     .into());
                 }
+            }
+            Ok(())
+        }
+        DockerProvider::Orbstack => {
+            if std::env::var_os("DOCKER_HOST").is_none() {
+                let sock = super::orbstack::engine_socket()?;
+                if !sock.exists() {
+                    return Err(format!(
+                        "docker-provider orbstack: socket {} missing; run `orb start`",
+                        sock.display()
+                    )
+                    .into());
+                }
+                let host = format!("unix://{}", sock.display());
+                log::info!("docker-provider orbstack: DOCKER_HOST={host}");
+                std::env::set_var("DOCKER_HOST", host);
             }
             Ok(())
         }
@@ -283,6 +322,29 @@ mod tests {
     }
 
     #[test]
+    fn orbstack_cluster_implies_orbstack_docker() {
+        let pair = resolve_provider_pair(Some(ClusterProvider::Orbstack), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pair.docker, DockerProvider::Orbstack);
+        assert_eq!(pair.as_backend(), Backend::Orbstack);
+        assert_eq!(provider_pair_for_legacy_backend(Backend::Orbstack), pair);
+    }
+
+    #[test]
+    fn orbstack_provider_names_round_trip() {
+        assert_eq!(
+            "orbstack".parse::<ClusterProvider>().unwrap(),
+            ClusterProvider::Orbstack
+        );
+        assert_eq!(
+            "OrbStack".parse::<DockerProvider>().unwrap(),
+            DockerProvider::Orbstack
+        );
+        assert_eq!(ClusterProvider::Orbstack.to_string(), "orbstack");
+    }
+
+    #[test]
     fn resolve_neither_returns_none() {
         assert!(resolve_provider_pair(None, None).unwrap().is_none());
     }
@@ -295,12 +357,19 @@ mod tests {
             (ClusterProvider::Kind, DockerProvider::Docker),
             (ClusterProvider::Dory, DockerProvider::Dory),
             (ClusterProvider::Colima, DockerProvider::Colima),
+            (ClusterProvider::Kind, DockerProvider::Orbstack),
+            (ClusterProvider::Orbstack, DockerProvider::Orbstack),
         ];
         let rejected = [
             (ClusterProvider::Dory, DockerProvider::Colima),
             (ClusterProvider::Dory, DockerProvider::Docker),
             (ClusterProvider::Colima, DockerProvider::Dory),
             (ClusterProvider::Colima, DockerProvider::Docker),
+            (ClusterProvider::Dory, DockerProvider::Orbstack),
+            (ClusterProvider::Colima, DockerProvider::Orbstack),
+            (ClusterProvider::Orbstack, DockerProvider::Dory),
+            (ClusterProvider::Orbstack, DockerProvider::Colima),
+            (ClusterProvider::Orbstack, DockerProvider::Docker),
         ];
 
         for (cluster, docker) in accepted {

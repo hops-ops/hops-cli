@@ -985,6 +985,7 @@ fn expected_context(definition: &LoadedDefinition, overrides: ClusterOverrides<'
     match definition.cluster.cluster_provider {
         ClusterProvider::Kind => format!("kind-{}", definition.cluster.name),
         ClusterProvider::Colima => "colima".to_string(),
+        ClusterProvider::Orbstack => Backend::Orbstack.kube_context(),
         ClusterProvider::Dory => overrides
             .dory_name
             .map(str::trim)

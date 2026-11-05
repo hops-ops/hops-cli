@@ -7,6 +7,7 @@
 mod colima;
 mod dory;
 pub(crate) mod kind;
+pub(crate) mod orbstack;
 pub mod providers;
 
 pub use providers::{
@@ -71,6 +72,8 @@ pub enum Backend {
     Kind,
     /// k3s on dory's shared-VM engine, via the `dory` CLI
     Dory,
+    /// OrbStack's built-in k3s, via the `orb` CLI
+    Orbstack,
 }
 
 impl Backend {
@@ -80,6 +83,7 @@ impl Backend {
             Backend::Colima => "colima",
             Backend::Kind => "kind",
             Backend::Dory => "dory",
+            Backend::Orbstack => "orbstack",
         }
     }
 
@@ -90,6 +94,7 @@ impl Backend {
             Backend::Kind => kind::kube_context_name(),
             // Merged into ~/.kube/config (default name hops-dory; see dory::context_name).
             Backend::Dory => dory::context_name(),
+            Backend::Orbstack => orbstack::CONTEXT_NAME.to_string(),
         }
     }
 
@@ -98,6 +103,7 @@ impl Backend {
             Backend::Colima => colima::install(),
             Backend::Kind => kind::install(),
             Backend::Dory => dory::install(),
+            Backend::Orbstack => orbstack::install(),
         }
     }
 
@@ -106,6 +112,7 @@ impl Backend {
             Backend::Colima => colima::uninstall(),
             Backend::Kind => kind::uninstall(),
             Backend::Dory => dory::uninstall(),
+            Backend::Orbstack => orbstack::uninstall(),
         }
     }
 
@@ -115,6 +122,7 @@ impl Backend {
             Backend::Colima => colima::instance_exists(),
             Backend::Kind => kind::cluster_exists(),
             Backend::Dory => dory::cluster_exists(),
+            Backend::Orbstack => orbstack::cluster_exists(),
         }
     }
 
@@ -125,6 +133,7 @@ impl Backend {
             Backend::Colima => colima::start(size, assume_yes),
             Backend::Kind => kind::start(size),
             Backend::Dory => dory::start(size),
+            Backend::Orbstack => orbstack::start(size),
         }
     }
 
@@ -133,6 +142,7 @@ impl Backend {
             Backend::Colima => colima::stop(),
             Backend::Kind => kind::stop(),
             Backend::Dory => dory::stop(),
+            Backend::Orbstack => orbstack::stop(),
         }
     }
 
@@ -141,6 +151,7 @@ impl Backend {
             Backend::Colima => colima::destroy(),
             Backend::Kind => kind::destroy(),
             Backend::Dory => dory::destroy(),
+            Backend::Orbstack => orbstack::destroy(),
         }
     }
 
@@ -149,6 +160,7 @@ impl Backend {
             Backend::Colima => colima::reset(),
             Backend::Kind => kind::reset(),
             Backend::Dory => dory::reset(),
+            Backend::Orbstack => orbstack::reset(),
         }
     }
 
@@ -157,6 +169,7 @@ impl Backend {
             Backend::Colima => colima::resize(size),
             Backend::Kind => kind::resize(size),
             Backend::Dory => dory::resize(size),
+            Backend::Orbstack => orbstack::resize(size),
         }
     }
 
@@ -170,6 +183,8 @@ impl Backend {
             Backend::Kind => Ok(()),
             // k3s registries.yaml is written in wire_registry once ClusterIP is known.
             Backend::Dory => dory::ensure_registry_trust(),
+            // OrbStack's dockerd runs the node; list the registry as insecure there.
+            Backend::Orbstack => orbstack::ensure_registry_trust(),
         }
     }
 
@@ -183,6 +198,7 @@ impl Backend {
             Backend::Colima => colima::sync_hosts_entry(cluster_ip),
             Backend::Kind => kind::wire_registry(cluster_ip),
             Backend::Dory => dory::wire_registry(cluster_ip),
+            Backend::Orbstack => orbstack::wire_registry(cluster_ip),
         }
     }
 
@@ -209,6 +225,10 @@ impl Backend {
             // where its published kind port terminates the TLS request with EOF.
             Backend::Kind => kind_registry_push(kind::registry_host_port()),
             Backend::Colima => crate::commands::local::package_install::REGISTRY_PUSH.to_string(),
+            // OrbStack's dockerd resolves the Service name, so push where pods pull.
+            Backend::Orbstack => {
+                crate::commands::local::package_install::REGISTRY_PULL_INCLUSTER.to_string()
+            }
         }
     }
 }
@@ -231,8 +251,9 @@ impl FromStr for Backend {
             "colima" => Ok(Backend::Colima),
             "kind" => Ok(Backend::Kind),
             "dory" => Ok(Backend::Dory),
+            "orbstack" => Ok(Backend::Orbstack),
             other => Err(format!(
-                "unknown persisted cluster provider '{}' (expected colima, kind, or dory)",
+                "unknown persisted cluster provider '{}' (expected colima, kind, dory, or orbstack)",
                 other
             )),
         }
@@ -556,7 +577,12 @@ mod tests {
 
     #[test]
     fn backend_name_round_trips_through_from_str() {
-        for backend in [Backend::Colima, Backend::Kind, Backend::Dory] {
+        for backend in [
+            Backend::Colima,
+            Backend::Kind,
+            Backend::Dory,
+            Backend::Orbstack,
+        ] {
             assert_eq!(backend.name().parse::<Backend>().unwrap(), backend);
         }
         assert!("podman".parse::<Backend>().is_err());
