@@ -78,9 +78,9 @@ pub fn materialize(
     let yaml_path = gitops_local.join("cluster.yaml");
     prepare_manifests_dir(&manifests)?;
     write_embed(&manifests)?;
-    if providers.cluster == ClusterProvider::Orbstack {
-        set_k3s_istio_cni_paths(&manifests.join(ISTIO_STACK_FILE))?;
-        add_https_listener(&manifests.join(ISTIO_STACK_FILE))?;
+    let orbstack = providers.cluster == ClusterProvider::Orbstack;
+    if orbstack {
+        // Overlays may replace these defaults.
         fs::write(
             manifests.join(GATEWAY_DEFAULTS_FILE),
             ORBSTACK_GATEWAY_DEFAULTS,
@@ -99,6 +99,11 @@ pub fn materialize(
     let overrides = gitops_local.join("overrides");
     if overrides.is_dir() {
         overlay_manifests(&overrides, &manifests)?;
+    }
+    if orbstack {
+        // After overlays, so a replaced IstioStack still runs on k3s.
+        set_k3s_istio_cni_paths(&manifests.join(ISTIO_STACK_FILE))?;
+        add_https_listener(&manifests.join(ISTIO_STACK_FILE))?;
     }
     fs::write(
         manifests.join(MANAGED_MARKER),
@@ -155,6 +160,12 @@ fn add_https_listener(path: &Path) -> Result<(), Box<dyn Error>> {
         .and_then(|gateway| gateway.get_mut("listeners"))
         .and_then(Value::as_sequence_mut)
         .ok_or_else(|| format!("{} has no ingressGateway.listeners", path.display()))?;
+    if listeners
+        .iter()
+        .any(|listener| listener.get("name").and_then(Value::as_str) == Some("https"))
+    {
+        return Ok(());
+    }
     let https: Value = serde_yaml::from_str(&format!(
         "name: https\nport: 443\nprotocol: HTTPS\ntls:\n  mode: Terminate\n  certificateRefs:\n  - name: {}\nallowedRoutes:\n  namespaces:\n    from: All\n",
         gateway_tls::GATEWAY_TLS_SECRET
@@ -614,6 +625,48 @@ spec:
         )
         .unwrap();
         assert!(defaults.contains("nodePort: 30080"), "{defaults}");
+        cleanup(&home);
+    }
+
+    #[test]
+    fn orbstack_patches_survive_machine_overrides() {
+        let home = temp_home();
+        let overrides = home.join(".gitops/local/overrides/stacks");
+        fs::create_dir_all(&overrides).unwrap();
+        let template = FILES
+            .iter()
+            .find(|(path, _)| *path == ISTIO_STACK_FILE)
+            .unwrap()
+            .1;
+        let replaced = template.replace(
+            "metadata:",
+            "metadata:\n  labels:\n    overridden: \"true\"",
+        );
+        fs::write(overrides.join("istio.yaml"), replaced).unwrap();
+        let orbstack = ProviderPair {
+            cluster: ClusterProvider::Orbstack,
+            docker: crate::commands::local::backend::providers::DockerProvider::Orbstack,
+        };
+        materialize(&home, None, "hops", None, None, orbstack).unwrap();
+        // A second run must not add the listener twice.
+        materialize(&home, None, "hops", None, None, orbstack).unwrap();
+        let istio = home.join(".gitops/local/cluster").join(ISTIO_STACK_FILE);
+        let doc: Value = serde_yaml::from_str(&fs::read_to_string(istio).unwrap()).unwrap();
+        assert_eq!(doc["metadata"]["labels"]["overridden"], "true");
+        assert_eq!(
+            doc["spec"]["cni"]["values"]["cni"]["cniConfDir"],
+            orbstack::ISTIO_CNI_CONF_DIR
+        );
+        let listeners = doc["spec"]["ingressGateway"]["listeners"]
+            .as_sequence()
+            .unwrap();
+        assert_eq!(
+            listeners
+                .iter()
+                .filter(|listener| listener["name"] == "https")
+                .count(),
+            1
+        );
         cleanup(&home);
     }
 
