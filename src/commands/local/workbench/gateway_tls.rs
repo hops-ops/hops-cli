@@ -10,6 +10,10 @@
 //!
 //!     security add-trusted-cert -r trustRoot \
 //!       -k ~/Library/Keychains/login.keychain-db ~/.hops/local/tls/ca.crt
+//!
+//! The CA carries name constraints (`localhost` and its subdomains,
+//! 127.0.0.0/8), so even a leaked `ca.key` cannot mint a certificate for a
+//! real site.
 
 use super::ingress::ingress_routes_from_value;
 use crate::commands::local::{kubectl_apply_stdin, kubectl_command, run_cmd};
@@ -18,6 +22,9 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Once;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const GATEWAY_TLS_SECRET: &str = "platform-tls";
 pub const GATEWAY_NAMESPACE: &str = "istio-ingress";
@@ -27,12 +34,16 @@ const LEAF_DAYS: &str = "825";
 const RENEW_WITHIN_SECS: &str = "2592000";
 /// Names always on the leaf, whatever routes exist yet.
 const BASE_NAMES: &[&str] = &["localhost", "*.hops.localhost"];
+/// The IstioStack creates the namespace; give it this long on a fresh cluster.
+const NAMESPACE_WAIT: Duration = Duration::from_secs(180);
 
 /// Reissue the Gateway certificate when routes change and make sure the
 /// cluster Secret holds it. Returns true when the Secret was (re)applied.
 pub fn ensure_gateway_tls(state_dir: &Path) -> Result<bool, Box<dyn Error>> {
     let dir = state_dir.join(TLS_SUBDIR);
     fs::create_dir_all(&dir)?;
+    // Keys are only ever written inside this directory.
+    restrict(&dir, 0o700)?;
     ensure_ca(&dir)?;
     let names = desired_names(discover_route_hostnames()?);
     let issued = if leaf_is_current(&dir, &names) {
@@ -44,6 +55,7 @@ pub fn ensure_gateway_tls(state_dir: &Path) -> Result<bool, Box<dyn Error>> {
     if !issued && secret_exists()? {
         return Ok(false);
     }
+    wait_for_namespace()?;
     apply_secret(&dir)?;
     log::info!(
         "Gateway TLS {GATEWAY_NAMESPACE}/{GATEWAY_TLS_SECRET} covers: {}",
@@ -88,6 +100,7 @@ fn ensure_ca(dir: &Path) -> Result<(), Box<dyn Error>> {
     let key = dir.join("ca.key");
     let crt = dir.join("ca.crt");
     if key.is_file() && crt.is_file() {
+        warn_if_unconstrained(&crt);
         return Ok(());
     }
     log::info!("Creating the hops local CA in {}", dir.display());
@@ -104,7 +117,8 @@ fn ensure_ca(dir: &Path) -> Result<(), Box<dyn Error>> {
          [ext]\n\
          basicConstraints = critical, CA:TRUE, pathlen:0\n\
          keyUsage = critical, keyCertSign, cRLSign\n\
-         subjectKeyIdentifier = hash\n",
+         subjectKeyIdentifier = hash\n\
+         nameConstraints = critical, permitted;DNS:localhost, permitted;IP:127.0.0.0/255.0.0.0\n",
     )?;
     run_cmd(
         "openssl",
@@ -124,12 +138,37 @@ fn ensure_ca(dir: &Path) -> Result<(), Box<dyn Error>> {
             path_str(&config)?,
         ],
     )?;
-    restrict_key(&key)?;
+    restrict(&key, 0o600)?;
+    // A leaf from a previous CA would no longer chain to the trusted one.
+    for stale in ["gateway.crt", "gateway.key", "gateway.names"] {
+        let _ = fs::remove_file(dir.join(stale));
+    }
     log::info!(
         "Trust it for browsers once: security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db {}",
         crt.display()
     );
     Ok(())
+}
+
+/// CAs from before name constraints keep working; say how to replace one.
+fn warn_if_unconstrained(crt: &Path) {
+    static WARNED: Once = Once::new();
+    let Some(path) = crt.to_str() else {
+        return;
+    };
+    let constrained = Command::new("openssl")
+        .args(["x509", "-noout", "-text", "-in", path])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains("Name Constraints"))
+        .unwrap_or(true);
+    if !constrained {
+        WARNED.call_once(|| {
+            log::warn!(
+                "The hops local CA {path} has no name constraints; delete {} and re-trust the new CA to limit it to localhost names",
+                crt.parent().unwrap_or(crt).display()
+            )
+        });
+    }
 }
 
 fn names_file_body(names: &BTreeSet<String>) -> String {
@@ -144,14 +183,20 @@ fn leaf_is_current(dir: &Path, names: &BTreeSet<String>) -> bool {
     if fs::read_to_string(dir.join("gateway.names")).ok() != Some(names_file_body(names)) {
         return false;
     }
-    let Some(crt) = crt.to_str() else {
+    let (Some(crt), Some(ca)) = (crt.to_str(), dir.join("ca.crt").to_str().map(String::from))
+    else {
         return false;
     };
-    Command::new("openssl")
-        .args(["x509", "-checkend", RENEW_WITHIN_SECS, "-noout", "-in", crt])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    let succeeds = |args: &[&str]| {
+        Command::new("openssl")
+            .args(args)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    };
+    // Chains to the current CA (catches a recreated CA) and is not expiring.
+    succeeds(&["verify", "-CAfile", &ca, crt])
+        && succeeds(&["x509", "-checkend", RENEW_WITHIN_SECS, "-noout", "-in", crt])
 }
 
 fn leaf_config(names: &BTreeSet<String>) -> String {
@@ -182,6 +227,11 @@ fn issue_leaf(dir: &Path, names: &BTreeSet<String>) -> Result<(), Box<dyn Error>
     let key = dir.join("gateway.key");
     let csr = dir.join("gateway.csr");
     let crt = dir.join("gateway.crt");
+    // Drop the old pair first, so a failed issuance never leaves a new key
+    // beside the old certificate and names.
+    for stale in [&crt, &dir.join("gateway.names")] {
+        let _ = fs::remove_file(stale);
+    }
     fs::write(&config, leaf_config(names))?;
     run_cmd(
         "openssl",
@@ -198,7 +248,7 @@ fn issue_leaf(dir: &Path, names: &BTreeSet<String>) -> Result<(), Box<dyn Error>
             path_str(&config)?,
         ],
     )?;
-    restrict_key(&key)?;
+    restrict(&key, 0o600)?;
     run_cmd(
         "openssl",
         &[
@@ -228,15 +278,36 @@ fn issue_leaf(dir: &Path, names: &BTreeSet<String>) -> Result<(), Box<dyn Error>
 }
 
 #[cfg(unix)]
-fn restrict_key(path: &Path) -> Result<(), Box<dyn Error>> {
+fn restrict(path: &Path, mode: u32) -> Result<(), Box<dyn Error>> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict_key(_path: &Path) -> Result<(), Box<dyn Error>> {
+fn restrict(_path: &Path, _mode: u32) -> Result<(), Box<dyn Error>> {
     Ok(())
+}
+
+fn wait_for_namespace() -> Result<(), Box<dyn Error>> {
+    let started = Instant::now();
+    loop {
+        let found = kubectl_command(&["get", "namespace", GATEWAY_NAMESPACE, "-o", "name"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if found {
+            return Ok(());
+        }
+        if started.elapsed() >= NAMESPACE_WAIT {
+            return Err(format!(
+                "namespace {GATEWAY_NAMESPACE} did not appear within {}s; is the IstioStack ready?",
+                NAMESPACE_WAIT.as_secs()
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_secs(3));
+    }
 }
 
 fn secret_exists() -> Result<bool, Box<dyn Error>> {
@@ -301,6 +372,44 @@ mod tests {
                 "mobpit.localhost"
             ]
         );
+    }
+
+    #[test]
+    fn leaf_follows_the_current_ca() {
+        let dir = std::env::temp_dir().join(format!("hops-gateway-tls-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let names: BTreeSet<String> = ["localhost", "mobpit.localhost"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        ensure_ca(&dir).unwrap();
+        let ca_text = Command::new("openssl")
+            .args(["x509", "-noout", "-text", "-in"])
+            .arg(dir.join("ca.crt"))
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&ca_text.stdout).contains("Name Constraints"));
+        assert!(!leaf_is_current(&dir, &names));
+        issue_leaf(&dir, &names).unwrap();
+        assert!(leaf_is_current(&dir, &names));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join("gateway.key"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // A recreated CA invalidates the old leaf.
+        fs::remove_file(dir.join("ca.key")).unwrap();
+        ensure_ca(&dir).unwrap();
+        assert!(!leaf_is_current(&dir, &names));
+        issue_leaf(&dir, &names).unwrap();
+        assert!(leaf_is_current(&dir, &names));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

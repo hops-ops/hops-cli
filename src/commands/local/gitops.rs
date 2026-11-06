@@ -312,6 +312,10 @@ fn run_cluster_reconcile_loop(
         reconcile_cluster_secret_sync(&definition, dry_run)?;
         reconcile_cluster_browser_ingress(&definition, dry_run)?;
         reconcile_cluster_environments_with_retry(&definition, dry_run)?;
+        if definition.cluster.cluster_provider == ClusterProvider::Orbstack && !dry_run {
+            // Environments may have added routes the certificate must name.
+            ensure_gateway_tls(&local_state_dir()?)?;
+        }
         Ok(())
     };
 

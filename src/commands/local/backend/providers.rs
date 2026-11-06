@@ -240,14 +240,9 @@ pub fn apply_docker_provider_env(dp: DockerProvider) -> Result<(), Box<dyn Error
         }
         DockerProvider::Orbstack => {
             if std::env::var_os("DOCKER_HOST").is_none() {
+                // The path is fixed; OrbStack creates the socket when it
+                // starts, which may be later in this run (install, start).
                 let sock = super::orbstack::engine_socket()?;
-                if !sock.exists() {
-                    return Err(format!(
-                        "docker-provider orbstack: socket {} missing; run `orb start`",
-                        sock.display()
-                    )
-                    .into());
-                }
                 let host = format!("unix://{}", sock.display());
                 log::info!("docker-provider orbstack: DOCKER_HOST={host}");
                 std::env::set_var("DOCKER_HOST", host);
