@@ -876,12 +876,14 @@ fn run_environment_definition(
     let source = path
         .canonicalize()
         .map_err(|error| format!("Environment path {}: {error}", path.display()))?;
-    let cluster_path = discover_cluster_definition(&source).ok_or_else(|| {
-        format!(
-            "no sibling or ancestor Cluster definition found for {}",
-            source.display()
-        )
-    })?;
+    let cluster_path = machine_cluster_definition()
+        .or_else(|| discover_cluster_definition(&source))
+        .ok_or_else(|| {
+            format!(
+                "no sibling or ancestor Cluster definition found for {}",
+                source.display()
+            )
+        })?;
     let (cluster, _) = prepare_cluster(Some(&cluster_path), overrides)?;
     let loaded = load_environment_definition(
         &source,
@@ -978,6 +980,14 @@ fn run_environment_definition(
         args.debounce,
         reconcile,
     )
+}
+
+/// The machine Cluster every Environment deploys to. A project's own
+/// `cluster.yaml` is only an overlay: its providers must not redirect an
+/// Environment away from the machine's cluster.
+fn machine_cluster_definition() -> Option<PathBuf> {
+    let record = super::workbench::machine::load(&local_state_dir().ok()?).ok()??;
+    record.source.is_file().then_some(record.source)
 }
 
 fn discover_cluster_definition(environment_file: &Path) -> Option<PathBuf> {
