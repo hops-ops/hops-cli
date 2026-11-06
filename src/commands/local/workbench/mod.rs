@@ -11,6 +11,7 @@ pub mod cluster_template;
 pub mod controller;
 pub mod definition;
 pub mod delivery;
+pub mod gateway_tls;
 pub mod ingress;
 pub mod machine;
 pub mod net;

@@ -1146,7 +1146,10 @@ mod tests {
             image,
             format!("{}/hops-ops/provider-helm-arm64:v1.999.3", registry_push())
         );
-        assert!(!image.contains(registry_pull()));
+        // OrbStack pushes and pulls through the same in-cluster name.
+        if registry_push() != registry_pull() {
+            assert!(!image.contains(registry_pull()));
+        }
     }
 
     #[test]

@@ -24,6 +24,7 @@ use super::workbench::definition::{
 use super::workbench::delivery::{
     stop_delivery_runtime, DeliveryStrategy, NodePathProber, SystemNodeProber,
 };
+use super::workbench::gateway_tls::ensure_gateway_tls;
 use super::workbench::ingress::{ensure_cluster_ingress_access, ensure_ingress_access};
 use super::workbench::reconcile::{ReconcileOptions, SystemHelm, SystemKubectl, SystemKustomize};
 use super::workbench::registry::{load_workspace, save_workspace, WorkspaceRecord};
@@ -466,6 +467,14 @@ fn reconcile_cluster_browser_ingress(
     definition: &super::workbench::definition::LoadedDefinition,
     dry_run: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if definition.cluster.cluster_provider == ClusterProvider::Orbstack {
+        // The LoadBalancer Gateway is already on the host; only its
+        // certificate follows the cluster's HTTPRoute hostnames.
+        if !dry_run {
+            ensure_gateway_tls(&local_state_dir()?)?;
+        }
+        return Ok(());
+    }
     if definition.cluster.cluster_provider != ClusterProvider::Kind
         || definition.cluster.docker_provider != DockerProvider::Dory
         || dry_run
@@ -867,12 +876,14 @@ fn run_environment_definition(
     let source = path
         .canonicalize()
         .map_err(|error| format!("Environment path {}: {error}", path.display()))?;
-    let cluster_path = discover_cluster_definition(&source).ok_or_else(|| {
-        format!(
-            "no sibling or ancestor Cluster definition found for {}",
-            source.display()
-        )
-    })?;
+    let cluster_path = machine_cluster_definition()
+        .or_else(|| discover_cluster_definition(&source))
+        .ok_or_else(|| {
+            format!(
+                "no sibling or ancestor Cluster definition found for {}",
+                source.display()
+            )
+        })?;
     let (cluster, _) = prepare_cluster(Some(&cluster_path), overrides)?;
     let loaded = load_environment_definition(
         &source,
@@ -969,6 +980,14 @@ fn run_environment_definition(
         args.debounce,
         reconcile,
     )
+}
+
+/// The machine Cluster every Environment deploys to. A project's own
+/// `cluster.yaml` is only an overlay: its providers must not redirect an
+/// Environment away from the machine's cluster.
+fn machine_cluster_definition() -> Option<PathBuf> {
+    let record = super::workbench::machine::load(&local_state_dir().ok()?).ok()??;
+    record.source.is_file().then_some(record.source)
 }
 
 fn discover_cluster_definition(environment_file: &Path) -> Option<PathBuf> {

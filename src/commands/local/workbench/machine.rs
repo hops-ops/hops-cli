@@ -3,6 +3,7 @@
 //! `hops local up` uses this record to reconnect instead of creating a second
 //! kind cluster from a leaf `.gitops/local/cluster.yaml`.
 
+use crate::commands::local::backend::providers::{ClusterProvider, ProviderPair};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
@@ -22,6 +23,15 @@ pub struct MachineClusterRecord {
     pub host_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_domain: Option<String>,
+    /// Cluster.spec.clusterProvider/dockerProvider; absent means kind on Dory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<ProviderPair>,
+}
+
+impl MachineClusterRecord {
+    pub fn provider_pair(&self) -> ProviderPair {
+        self.providers.unwrap_or_else(ProviderPair::kind_on_dory)
+    }
 }
 
 pub fn record_path(state_dir: &Path) -> PathBuf {
@@ -53,6 +63,14 @@ pub fn save(state_dir: &Path, record: &MachineClusterRecord) -> Result<(), Box<d
 
 pub fn kube_context_for_name(name: &str) -> String {
     format!("kind-{name}")
+}
+
+/// kind contexts carry the cluster name; vendor clusters keep their own.
+pub fn kube_context_for(name: &str, providers: ProviderPair) -> String {
+    match providers.cluster {
+        ClusterProvider::Kind => kube_context_for_name(name),
+        _ => providers.as_backend().kube_context(),
+    }
 }
 
 /// Prefer `~/dev` when it exists; otherwise `$HOME`.
@@ -100,4 +118,32 @@ pub fn expand_host_path(raw: &str) -> Result<PathBuf, Box<dyn Error>> {
         return Err(format!("hostPath is not a directory: {}", path.display()).into());
     }
     Ok(path.canonicalize().unwrap_or(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::local::backend::providers::DockerProvider;
+
+    #[test]
+    fn record_without_providers_defaults_to_kind_on_dory() {
+        let record: MachineClusterRecord = serde_json::from_str(
+            r#"{"name":"hops","kubeContext":"kind-hops","source":"/h/.gitops/local/cluster.yaml"}"#,
+        )
+        .unwrap();
+        assert_eq!(record.provider_pair(), ProviderPair::kind_on_dory());
+    }
+
+    #[test]
+    fn kube_context_follows_cluster_provider() {
+        let orbstack = ProviderPair {
+            cluster: ClusterProvider::Orbstack,
+            docker: DockerProvider::Orbstack,
+        };
+        assert_eq!(kube_context_for("hops", orbstack), "orbstack");
+        assert_eq!(
+            kube_context_for("hops", ProviderPair::kind_on_dory()),
+            "kind-hops"
+        );
+    }
 }
