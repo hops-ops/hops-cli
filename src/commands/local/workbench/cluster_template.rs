@@ -10,6 +10,7 @@ use super::definition::{
     CLUSTER_MANIFESTS_PATH, DEFAULT_CROSSPLANE_CHART, DEFAULT_CROSSPLANE_VERSION,
     DEFAULT_LOCAL_DOMAIN,
 };
+use super::gateway_tls;
 use super::machine::DEFAULT_MACHINE_CLUSTER_NAME;
 use crate::commands::local::backend::orbstack;
 use crate::commands::local::backend::providers::{ClusterProvider, ProviderPair};
@@ -79,6 +80,11 @@ pub fn materialize(
     write_embed(&manifests)?;
     if providers.cluster == ClusterProvider::Orbstack {
         set_k3s_istio_cni_paths(&manifests.join(ISTIO_STACK_FILE))?;
+        add_https_listener(&manifests.join(ISTIO_STACK_FILE))?;
+        fs::write(
+            manifests.join(GATEWAY_DEFAULTS_FILE),
+            ORBSTACK_GATEWAY_DEFAULTS,
+        )?;
     }
     if let Some(overlay) = overlay_cluster_yaml {
         if let Some(parent) = overlay.parent() {
@@ -112,6 +118,51 @@ pub fn materialize(
 }
 
 const ISTIO_STACK_FILE: &str = "stacks/istio.yaml";
+const GATEWAY_DEFAULTS_FILE: &str = "stacks/istio-gateway-defaults.yaml";
+
+/// OrbStack binds LoadBalancer Services on the Mac's own ports, so the shared
+/// Gateway answers `http://<host>.localhost` and `https://<host>.localhost`
+/// directly; no host-port discovery or forwarding is involved.
+const ORBSTACK_GATEWAY_DEFAULTS: &str = r#"# Istio overlays this onto every automatically generated local Gateway Service.
+# OrbStack publishes LoadBalancer ports on the Mac, so the Gateway serves
+# localhost :80 and :443 directly.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-istio-gateway-defaults
+  namespace: istio-system
+  labels:
+    gateway.istio.io/defaults-for-class: istio
+data:
+  service: |
+    spec:
+      type: LoadBalancer
+      ports:
+        - name: http
+          port: 80
+        - name: https
+          port: 443
+"#;
+
+/// Terminate TLS at the shared Gateway with the hops local CA's certificate
+/// (see `gateway_tls`); unpinned HTTPRoutes attach to both listeners.
+fn add_https_listener(path: &Path) -> Result<(), Box<dyn Error>> {
+    let raw = fs::read_to_string(path)?;
+    let mut doc: Value = serde_yaml::from_str(&raw)?;
+    let listeners = doc
+        .get_mut("spec")
+        .and_then(|spec| spec.get_mut("ingressGateway"))
+        .and_then(|gateway| gateway.get_mut("listeners"))
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| format!("{} has no ingressGateway.listeners", path.display()))?;
+    let https: Value = serde_yaml::from_str(&format!(
+        "name: https\nport: 443\nprotocol: HTTPS\ntls:\n  mode: Terminate\n  certificateRefs:\n  - name: {}\nallowedRoutes:\n  namespaces:\n    from: All\n",
+        gateway_tls::GATEWAY_TLS_SECRET
+    ))?;
+    listeners.push(https);
+    fs::write(path, serde_yaml::to_string(&doc)?)?;
+    Ok(())
+}
 
 /// k3s keeps CNI binaries and config outside the chart's default paths, so
 /// istio-cni must be pointed at them for ambient capture to work.
@@ -514,6 +565,25 @@ spec:
             Some(orbstack::ISTIO_CNI_CONF_DIR)
         );
         assert_eq!(doc["spec"]["chartVersion"].as_str(), Some("1.29.2"));
+        let listeners = doc["spec"]["ingressGateway"]["listeners"]
+            .as_sequence()
+            .unwrap();
+        let names = listeners
+            .iter()
+            .map(|listener| listener["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["http", "https"]);
+        assert_eq!(
+            listeners[1]["tls"]["certificateRefs"][0]["name"].as_str(),
+            Some(gateway_tls::GATEWAY_TLS_SECRET)
+        );
+        let defaults = fs::read_to_string(
+            home.join(".gitops/local/cluster")
+                .join(GATEWAY_DEFAULTS_FILE),
+        )
+        .unwrap();
+        assert!(defaults.contains("type: LoadBalancer"), "{defaults}");
+        assert!(!defaults.contains("nodePort"), "{defaults}");
         cleanup(&home);
     }
 
@@ -532,6 +602,18 @@ spec:
         let istio = home.join(".gitops/local/cluster").join(ISTIO_STACK_FILE);
         let doc: Value = serde_yaml::from_str(&fs::read_to_string(istio).unwrap()).unwrap();
         assert!(doc["spec"].get("cni").is_none());
+        assert_eq!(
+            doc["spec"]["ingressGateway"]["listeners"]
+                .as_sequence()
+                .map(Vec::len),
+            Some(1)
+        );
+        let defaults = fs::read_to_string(
+            home.join(".gitops/local/cluster")
+                .join(GATEWAY_DEFAULTS_FILE),
+        )
+        .unwrap();
+        assert!(defaults.contains("nodePort: 30080"), "{defaults}");
         cleanup(&home);
     }
 

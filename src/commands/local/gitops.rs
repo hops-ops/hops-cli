@@ -24,6 +24,7 @@ use super::workbench::definition::{
 use super::workbench::delivery::{
     stop_delivery_runtime, DeliveryStrategy, NodePathProber, SystemNodeProber,
 };
+use super::workbench::gateway_tls::ensure_gateway_tls;
 use super::workbench::ingress::{ensure_cluster_ingress_access, ensure_ingress_access};
 use super::workbench::reconcile::{ReconcileOptions, SystemHelm, SystemKubectl, SystemKustomize};
 use super::workbench::registry::{load_workspace, save_workspace, WorkspaceRecord};
@@ -466,6 +467,14 @@ fn reconcile_cluster_browser_ingress(
     definition: &super::workbench::definition::LoadedDefinition,
     dry_run: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if definition.cluster.cluster_provider == ClusterProvider::Orbstack {
+        // The LoadBalancer Gateway is already on the host; only its
+        // certificate follows the cluster's HTTPRoute hostnames.
+        if !dry_run {
+            ensure_gateway_tls(&local_state_dir()?)?;
+        }
+        return Ok(());
+    }
     if definition.cluster.cluster_provider != ClusterProvider::Kind
         || definition.cluster.docker_provider != DockerProvider::Dory
         || dry_run

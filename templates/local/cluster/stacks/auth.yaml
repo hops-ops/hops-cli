@@ -35,7 +35,7 @@ spec:
     parentRef:
       name: platform
       namespace: istio-ingress
-      sectionName: http
+      # No sectionName: attach to every listener (HTTPS where it exists).
   externalSecrets:
     enabled: false
   firstInstance:
