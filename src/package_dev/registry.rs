@@ -2,7 +2,7 @@
 //! No Docker daemon, registry credentials, redirect, or environment proxy.
 use sha2::{Digest, Sha256};
 use std::error::Error;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
@@ -10,8 +10,16 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 pub const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
+fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 pub fn digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!("sha256:{}", hex_lower(Sha256::digest(bytes)))
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -316,9 +324,9 @@ pub fn sha256_reader(mut reader: impl Read) -> Result<String> {
         if size == 0 {
             break;
         }
-        hash.write_all(&buffer[..size])?;
+        hash.update(&buffer[..size]);
     }
-    Ok(format!("sha256:{:x}", hash.finalize()))
+    Ok(format!("sha256:{}", hex_lower(hash.finalize())))
 }
 
 #[cfg(test)]
