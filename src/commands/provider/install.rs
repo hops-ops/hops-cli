@@ -451,7 +451,11 @@ fn dev_tag_for_file(
         hasher.update(&buf[..read]);
     }
 
-    let hex = format!("{:x}", hasher.finalize());
+    let hex = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     let short = &hex[..12];
 
     // Explicit --version-prefix (highest precedence):
