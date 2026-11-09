@@ -14,6 +14,7 @@ use super::gateway_tls;
 use super::machine::DEFAULT_MACHINE_CLUSTER_NAME;
 use crate::commands::local::backend::orbstack;
 use crate::commands::local::backend::providers::{ClusterProvider, ProviderPair};
+use serde::Deserialize;
 use serde_yaml::Value;
 use std::error::Error;
 use std::fs;
@@ -77,10 +78,17 @@ pub fn materialize(
     let manifests = gitops_local.join("cluster");
     let yaml_path = gitops_local.join("cluster.yaml");
     prepare_manifests_dir(&manifests)?;
+    // Mark first, so a failed overlay or patch leaves a directory the next
+    // run may refresh rather than one it refuses as unmanaged.
+    fs::write(
+        manifests.join(MANAGED_MARKER),
+        "Materialized by hops local up from the CLI local-cluster template.\n\
+         Project extras overlay from <repo>/.gitops/local/cluster/. Do not edit in place.\n",
+    )?;
     write_embed(&manifests)?;
-    if providers.cluster == ClusterProvider::Orbstack {
-        set_k3s_istio_cni_paths(&manifests.join(ISTIO_STACK_FILE))?;
-        add_https_listener(&manifests.join(ISTIO_STACK_FILE))?;
+    let orbstack = providers.cluster == ClusterProvider::Orbstack;
+    if orbstack {
+        // Overlays may replace these defaults.
         fs::write(
             manifests.join(GATEWAY_DEFAULTS_FILE),
             ORBSTACK_GATEWAY_DEFAULTS,
@@ -100,11 +108,11 @@ pub fn materialize(
     if overrides.is_dir() {
         overlay_manifests(&overrides, &manifests)?;
     }
-    fs::write(
-        manifests.join(MANAGED_MARKER),
-        "Materialized by hops local up from the CLI local-cluster template.\n\
-         Project extras overlay from <repo>/.gitops/local/cluster/. Do not edit in place.\n",
-    )?;
+    if orbstack {
+        // After overlays, so a replaced IstioStack still runs on k3s.
+        set_k3s_istio_cni_paths(&manifests.join(ISTIO_STACK_FILE))?;
+        add_https_listener(&manifests.join(ISTIO_STACK_FILE))?;
+    }
     let body = cluster_document_yaml(
         machine_name,
         overlay_cluster_yaml,
@@ -144,43 +152,90 @@ data:
           port: 443
 "#;
 
-/// Terminate TLS at the shared Gateway with the hops local CA's certificate
-/// (see `gateway_tls`); unpinned HTTPRoutes attach to both listeners.
-fn add_https_listener(path: &Path) -> Result<(), Box<dyn Error>> {
+/// Apply `patch` to the IstioStack document in `path`, keeping any other
+/// documents an overlay put in the same file.
+fn patch_istio_stack(
+    path: &Path,
+    patch: impl FnOnce(&mut Value) -> Result<(), String>,
+) -> Result<(), Box<dyn Error>> {
     let raw = fs::read_to_string(path)?;
-    let mut doc: Value = serde_yaml::from_str(&raw)?;
-    let listeners = doc
-        .get_mut("spec")
-        .and_then(|spec| spec.get_mut("ingressGateway"))
-        .and_then(|gateway| gateway.get_mut("listeners"))
-        .and_then(Value::as_sequence_mut)
-        .ok_or_else(|| format!("{} has no ingressGateway.listeners", path.display()))?;
-    let https: Value = serde_yaml::from_str(&format!(
-        "name: https\nport: 443\nprotocol: HTTPS\ntls:\n  mode: Terminate\n  certificateRefs:\n  - name: {}\nallowedRoutes:\n  namespaces:\n    from: All\n",
-        gateway_tls::GATEWAY_TLS_SECRET
-    ))?;
-    listeners.push(https);
-    fs::write(path, serde_yaml::to_string(&doc)?)?;
+    let mut docs = serde_yaml::Deserializer::from_str(&raw)
+        .map(Value::deserialize)
+        .filter(|doc| !matches!(doc, Ok(Value::Null)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let stack = docs
+        .iter_mut()
+        .find(|doc| doc.get("kind").and_then(Value::as_str) == Some("IstioStack"))
+        .ok_or_else(|| format!("{} has no IstioStack document", path.display()))?;
+    patch(stack).map_err(|error| format!("{}: {error}", path.display()))?;
+    let body = docs
+        .iter()
+        .map(serde_yaml::to_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("---\n");
+    fs::write(path, body)?;
     Ok(())
 }
 
+/// Terminate TLS at the shared Gateway with the hops local CA's certificate
+/// (see `gateway_tls`); unpinned HTTPRoutes attach to both listeners.
+fn add_https_listener(path: &Path) -> Result<(), Box<dyn Error>> {
+    patch_istio_stack(path, |stack| {
+        let listeners = stack
+            .get_mut("spec")
+            .and_then(|spec| spec.get_mut("ingressGateway"))
+            .and_then(|gateway| gateway.get_mut("listeners"))
+            .and_then(Value::as_sequence_mut)
+            .ok_or("IstioStack has no spec.ingressGateway.listeners")?;
+        if listeners
+            .iter()
+            .any(|listener| listener.get("name").and_then(Value::as_str) == Some("https"))
+        {
+            return Ok(());
+        }
+        let https: Value = serde_yaml::from_str(&format!(
+            "name: https\nport: 443\nprotocol: HTTPS\ntls:\n  mode: Terminate\n  certificateRefs:\n  - name: {}\nallowedRoutes:\n  namespaces:\n    from: All\n",
+            gateway_tls::GATEWAY_TLS_SECRET
+        ))
+        .map_err(|error| error.to_string())?;
+        listeners.push(https);
+        Ok(())
+    })
+}
+
 /// k3s keeps CNI binaries and config outside the chart's default paths, so
-/// istio-cni must be pointed at them for ambient capture to work.
+/// istio-cni must be pointed at them for ambient capture to work. Other
+/// `spec.cni` settings (resources, overrideAllValues, other values) stay.
 fn set_k3s_istio_cni_paths(path: &Path) -> Result<(), Box<dyn Error>> {
-    let raw = fs::read_to_string(path)?;
-    let mut doc: Value = serde_yaml::from_str(&raw)?;
-    let spec = doc
-        .get_mut("spec")
-        .and_then(Value::as_mapping_mut)
-        .ok_or_else(|| format!("{} has no spec", path.display()))?;
-    let values: Value = serde_yaml::from_str(&format!(
-        "values:\n  cni:\n    cniBinDir: {}\n    cniConfDir: {}\n",
-        orbstack::ISTIO_CNI_BIN_DIR,
-        orbstack::ISTIO_CNI_CONF_DIR
-    ))?;
-    spec.insert(Value::from("cni"), values);
-    fs::write(path, serde_yaml::to_string(&doc)?)?;
-    Ok(())
+    patch_istio_stack(path, |stack| {
+        let mut node = stack
+            .get_mut("spec")
+            .filter(|spec| spec.is_mapping())
+            .ok_or("IstioStack has no spec")?;
+        for key in ["cni", "values", "cni"] {
+            let map = node
+                .as_mapping_mut()
+                .ok_or_else(|| format!("IstioStack spec.cni: `{key}` parent is not a mapping"))?;
+            node = map
+                .entry(Value::from(key))
+                .or_insert_with(|| Value::Mapping(Default::default()));
+            if node.is_null() {
+                *node = Value::Mapping(Default::default());
+            }
+        }
+        let cni = node
+            .as_mapping_mut()
+            .ok_or("IstioStack spec.cni.values.cni is not a mapping")?;
+        cni.insert(
+            Value::from("cniBinDir"),
+            Value::from(orbstack::ISTIO_CNI_BIN_DIR),
+        );
+        cni.insert(
+            Value::from("cniConfDir"),
+            Value::from(orbstack::ISTIO_CNI_CONF_DIR),
+        );
+        Ok(())
+    })
 }
 
 fn prepare_manifests_dir(manifests: &Path) -> Result<(), Box<dyn Error>> {
@@ -614,6 +669,109 @@ spec:
         )
         .unwrap();
         assert!(defaults.contains("nodePort: 30080"), "{defaults}");
+        cleanup(&home);
+    }
+
+    #[test]
+    fn orbstack_patches_survive_machine_overrides() {
+        let home = temp_home();
+        let overrides = home.join(".gitops/local/overrides/stacks");
+        fs::create_dir_all(&overrides).unwrap();
+        let template = FILES
+            .iter()
+            .find(|(path, _)| *path == ISTIO_STACK_FILE)
+            .unwrap()
+            .1;
+        let replaced = template.replace(
+            "metadata:",
+            "metadata:\n  labels:\n    overridden: \"true\"",
+        );
+        fs::write(overrides.join("istio.yaml"), replaced).unwrap();
+        let orbstack = ProviderPair {
+            cluster: ClusterProvider::Orbstack,
+            docker: crate::commands::local::backend::providers::DockerProvider::Orbstack,
+        };
+        materialize(&home, None, "hops", None, None, orbstack).unwrap();
+        // A second run must not add the listener twice.
+        materialize(&home, None, "hops", None, None, orbstack).unwrap();
+        let istio = home.join(".gitops/local/cluster").join(ISTIO_STACK_FILE);
+        let doc: Value = serde_yaml::from_str(&fs::read_to_string(istio).unwrap()).unwrap();
+        assert_eq!(doc["metadata"]["labels"]["overridden"], "true");
+        assert_eq!(
+            doc["spec"]["cni"]["values"]["cni"]["cniConfDir"],
+            orbstack::ISTIO_CNI_CONF_DIR
+        );
+        let listeners = doc["spec"]["ingressGateway"]["listeners"]
+            .as_sequence()
+            .unwrap();
+        assert_eq!(
+            listeners
+                .iter()
+                .filter(|listener| listener["name"] == "https")
+                .count(),
+            1
+        );
+        cleanup(&home);
+    }
+
+    fn orbstack_pair() -> ProviderPair {
+        ProviderPair {
+            cluster: ClusterProvider::Orbstack,
+            docker: crate::commands::local::backend::providers::DockerProvider::Orbstack,
+        }
+    }
+
+    fn istio_template() -> &'static str {
+        FILES
+            .iter()
+            .find(|(path, _)| *path == ISTIO_STACK_FILE)
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn orbstack_patches_keep_other_documents_and_cni_settings() {
+        let home = temp_home();
+        let overrides = home.join(".gitops/local/overrides/stacks");
+        fs::create_dir_all(&overrides).unwrap();
+        let stack = istio_template().replace(
+            "  awsLoadBalancerController:",
+            "  cni:\n    overrideAllValues: true\n    values:\n      cni:\n        logLevel: debug\n  awsLoadBalancerController:",
+        );
+        fs::write(
+            overrides.join("istio.yaml"),
+            format!("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: extra\n---\n{stack}"),
+        )
+        .unwrap();
+        materialize(&home, None, "hops", None, None, orbstack_pair()).unwrap();
+        let raw =
+            fs::read_to_string(home.join(".gitops/local/cluster").join(ISTIO_STACK_FILE)).unwrap();
+        let docs: Vec<Value> = serde_yaml::Deserializer::from_str(&raw)
+            .map(|doc| Value::deserialize(doc).unwrap())
+            .collect();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0]["metadata"]["name"], "extra");
+        let cni = &docs[1]["spec"]["cni"];
+        assert_eq!(cni["overrideAllValues"], true);
+        assert_eq!(cni["values"]["cni"]["logLevel"], "debug");
+        assert_eq!(
+            cni["values"]["cni"]["cniBinDir"],
+            orbstack::ISTIO_CNI_BIN_DIR
+        );
+        cleanup(&home);
+    }
+
+    #[test]
+    fn failed_orbstack_patch_stays_retryable() {
+        let home = temp_home();
+        let overrides = home.join(".gitops/local/overrides/stacks");
+        fs::create_dir_all(&overrides).unwrap();
+        let broken = istio_template().replace("    listeners:", "    otherListeners:");
+        fs::write(overrides.join("istio.yaml"), broken).unwrap();
+        let err = materialize(&home, None, "hops", None, None, orbstack_pair()).unwrap_err();
+        assert!(err.to_string().contains("listeners"), "{err}");
+        fs::write(overrides.join("istio.yaml"), istio_template()).unwrap();
+        materialize(&home, None, "hops", None, None, orbstack_pair()).unwrap();
         cleanup(&home);
     }
 

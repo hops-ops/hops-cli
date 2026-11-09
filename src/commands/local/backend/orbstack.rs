@@ -74,18 +74,19 @@ pub fn start(size: &SizeArgs) -> Result<(), Box<dyn Error>> {
     if !k8s_enabled() {
         log::info!("Starting OrbStack Kubernetes...");
     }
-    // Enables k8s and starts OrbStack if needed, without restarting OrbStack's
-    // other containers; returns before the node is up. No-op when running.
-    let previous = current_kube_context();
-    run_cmd("orb", &["start", "k8s"])?;
-    // A first enable creates the context after activation saw it missing, and
-    // the restored current-context belongs to some other cluster: pin it.
-    if kube_context_from_env().is_none() {
-        std::env::set_var(HOPS_KUBE_CONTEXT_ENV, CONTEXT_NAME);
-    }
-    wait_for_node_ready()?;
     // OrbStack switches current-context once the cluster is up.
-    restore_kube_context(previous.as_deref())
+    keeping_kube_context(|| {
+        // Enables k8s and starts OrbStack if needed, without restarting
+        // OrbStack's other containers; returns before the node is up. No-op
+        // when running.
+        run_cmd("orb", &["start", "k8s"])?;
+        // A first enable creates the context after activation saw it missing,
+        // and the restored current-context belongs to some other cluster: pin it.
+        if kube_context_from_env().is_none() {
+            std::env::set_var(HOPS_KUBE_CONTEXT_ENV, CONTEXT_NAME);
+        }
+        wait_for_node_ready()
+    })
 }
 
 /// Stops only Kubernetes (OrbStack records it as disabled; cluster data is
@@ -150,9 +151,7 @@ fn preflight() -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
-    if !command_exists("docker") {
-        return Err("docker CLI not found; OrbStack installs it on first start".into());
-    }
+    // No docker CLI check: OrbStack installs it on first start.
     Ok(())
 }
 
@@ -161,6 +160,25 @@ fn current_kube_context() -> Option<String> {
         .ok()
         .map(|ctx| ctx.trim().to_string())
         .filter(|ctx| !ctx.is_empty())
+}
+
+/// Run `operation` and put back the kubeconfig current-context it found,
+/// whether or not the operation succeeds. The operation's error wins.
+fn keeping_kube_context(
+    operation: impl FnOnce() -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    let previous = current_kube_context();
+    let result = operation();
+    let restored = restore_kube_context(previous.as_deref());
+    match (result, restored) {
+        (Err(error), Err(restore_error)) => {
+            log::warn!(
+                "could not restore kubeconfig current-context {previous:?}: {restore_error}"
+            );
+            Err(error)
+        }
+        (result, restored) => result.and(restored),
+    }
 }
 
 fn restore_kube_context(previous: Option<&str>) -> Result<(), Box<dyn Error>> {
@@ -212,10 +230,10 @@ pub fn ensure_registry_trust() -> Result<(), Box<dyn Error>> {
         "Restarting OrbStack's Docker engine to trust {}...",
         REGISTRY_PULL_INCLUSTER
     );
-    let previous = current_kube_context();
-    run_cmd("orb", &["restart", "docker"])?;
-    wait_for_node_ready()?;
-    restore_kube_context(previous.as_deref())
+    keeping_kube_context(|| {
+        run_cmd("orb", &["restart", "docker"])?;
+        wait_for_node_ready()
+    })
 }
 
 /// Add `registry` to `insecure-registries` in a docker.json document.

@@ -24,7 +24,7 @@ use super::workbench::definition::{
 use super::workbench::delivery::{
     stop_delivery_runtime, DeliveryStrategy, NodePathProber, SystemNodeProber,
 };
-use super::workbench::gateway_tls::ensure_gateway_tls;
+use super::workbench::gateway_tls::{ensure_gateway_tls, NAMESPACE_WAIT};
 use super::workbench::ingress::{ensure_cluster_ingress_access, ensure_ingress_access};
 use super::workbench::reconcile::{ReconcileOptions, SystemHelm, SystemKubectl, SystemKustomize};
 use super::workbench::registry::{load_workspace, save_workspace, WorkspaceRecord};
@@ -310,8 +310,12 @@ fn run_cluster_reconcile_loop(
             wait_for_cluster_packages_healthy()?;
         }
         reconcile_cluster_secret_sync(&definition, dry_run)?;
-        reconcile_cluster_browser_ingress(&definition, dry_run)?;
+        reconcile_cluster_browser_ingress(&definition, dry_run, NAMESPACE_WAIT)?;
         reconcile_cluster_environments_with_retry(&definition, dry_run)?;
+        if definition.cluster.cluster_provider == ClusterProvider::Orbstack && !dry_run {
+            // Environments may have added routes the certificate must name.
+            ensure_gateway_tls(&local_state_dir()?, NAMESPACE_WAIT)?;
+        }
         Ok(())
     };
 
@@ -425,7 +429,8 @@ fn reconcile_all_browser_ingress(
     definition: &super::workbench::definition::LoadedDefinition,
 ) -> Result<(), Box<dyn Error>> {
     let mut errors = Vec::new();
-    if let Err(error) = reconcile_cluster_browser_ingress(definition, false) {
+    // Never block the watch loop; a missing namespace retries next pass.
+    if let Err(error) = reconcile_cluster_browser_ingress(definition, false, Duration::ZERO) {
         errors.push(format!("Cluster: {error}"));
     }
     match list_environment_snapshots(&definition.cluster.name) {
@@ -466,12 +471,13 @@ fn reconcile_each<T>(
 fn reconcile_cluster_browser_ingress(
     definition: &super::workbench::definition::LoadedDefinition,
     dry_run: bool,
+    namespace_wait: Duration,
 ) -> Result<(), Box<dyn Error>> {
     if definition.cluster.cluster_provider == ClusterProvider::Orbstack {
         // The LoadBalancer Gateway is already on the host; only its
         // certificate follows the cluster's HTTPRoute hostnames.
         if !dry_run {
-            ensure_gateway_tls(&local_state_dir()?)?;
+            ensure_gateway_tls(&local_state_dir()?, namespace_wait)?;
         }
         return Ok(());
     }
@@ -947,7 +953,7 @@ fn run_environment_definition(
                 &namespace,
                 delivery_strategy,
             )?;
-            reconcile_cluster_browser_ingress(&cluster, false)?;
+            reconcile_cluster_browser_ingress(&cluster, false, NAMESPACE_WAIT)?;
             reconcile_browser_ingress(
                 cluster.cluster.cluster_provider,
                 cluster.cluster.docker_provider,

@@ -107,11 +107,25 @@ pub fn run(args: &UpArgs, overrides: ClusterOverrides<'_>) -> Result<(), Box<dyn
 }
 
 /// Provider flags pick (or switch) the machine's providers; otherwise the
-/// recorded pair, then kind on Dory.
+/// recorded pair, then kind on Dory. A Docker-only flag keeps the recorded
+/// cluster provider when that pairing is valid.
 fn resolve_up_providers(
     overrides: &ClusterOverrides<'_>,
     record: Option<&MachineClusterRecord>,
 ) -> Result<ProviderPair, Box<dyn Error>> {
+    if let (None, Some(docker), Some(record)) = (
+        overrides.cluster_provider,
+        overrides.docker_provider,
+        record,
+    ) {
+        let pair = ProviderPair {
+            cluster: record.provider_pair().cluster,
+            docker,
+        };
+        if pair.validate().is_ok() {
+            return Ok(pair);
+        }
+    }
     if let Some(pair) =
         resolve_provider_pair(overrides.cluster_provider, overrides.docker_provider)?
     {
@@ -170,4 +184,60 @@ fn warn_multiple_kind_clusters(machine: &str) -> Result<(), Box<dyn Error>> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::local::backend::providers::DockerProvider;
+
+    fn record(providers: ProviderPair) -> MachineClusterRecord {
+        MachineClusterRecord {
+            name: "hops".into(),
+            kube_context: "orbstack".into(),
+            source: PathBuf::from("/tmp/cluster.yaml"),
+            host_path: None,
+            local_domain: None,
+            providers: Some(providers),
+        }
+    }
+
+    fn orbstack_pair() -> ProviderPair {
+        ProviderPair {
+            cluster: ClusterProvider::Orbstack,
+            docker: DockerProvider::Orbstack,
+        }
+    }
+
+    #[test]
+    fn docker_only_flag_keeps_recorded_cluster_provider() {
+        let overrides = ClusterOverrides {
+            docker_provider: Some(DockerProvider::Orbstack),
+            ..Default::default()
+        };
+        let pair = resolve_up_providers(&overrides, Some(&record(orbstack_pair()))).unwrap();
+        assert_eq!(pair, orbstack_pair());
+    }
+
+    #[test]
+    fn docker_only_flag_switches_away_from_incompatible_record() {
+        let overrides = ClusterOverrides {
+            docker_provider: Some(DockerProvider::Dory),
+            ..Default::default()
+        };
+        let pair = resolve_up_providers(&overrides, Some(&record(orbstack_pair()))).unwrap();
+        assert_eq!(pair.cluster, ClusterProvider::Kind);
+        assert_eq!(pair.docker, DockerProvider::Dory);
+    }
+
+    #[test]
+    fn docker_only_flag_without_record_uses_defaults() {
+        let overrides = ClusterOverrides {
+            docker_provider: Some(DockerProvider::Orbstack),
+            ..Default::default()
+        };
+        let pair = resolve_up_providers(&overrides, None).unwrap();
+        assert_eq!(pair.cluster, ClusterProvider::Kind);
+        assert_eq!(pair.docker, DockerProvider::Orbstack);
+    }
 }
