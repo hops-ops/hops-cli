@@ -985,11 +985,14 @@ pub(crate) fn replace_delivery_runtime(
     Ok(())
 }
 
+/// Stop only watcher process groups whose full command contains our workspace marker.
 fn stop_tar_watchers(pids: &[u32], workspace: &str) {
     let marker = format!("hops-source-sync:{workspace}");
     for pid in pids {
         let owned = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "command="])
+            // The marker follows a long shell script. Request unlimited width
+            // on both BSD and procps, even when COLUMNS limits piped output.
+            .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
             .output()
             .ok()
             .is_some_and(|out| {
@@ -1260,6 +1263,120 @@ mod tests {
             still_running,
             "delivery cleanup must verify process ownership before signaling a PID"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_cleanup_stops_a_real_watcher_with_narrow_columns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_ENV: &str = "HOPS_TEST_NARROW_WATCHER_CHILD";
+        let Ok(root) = std::env::var(CHILD_ENV) else {
+            // Isolate COLUMNS, HOME and PATH from parallel tests. The child runs
+            // only this test and its kubectl cannot contact a real cluster.
+            let root = std::env::temp_dir().join(format!("hops-narrow-{}", uuid::Uuid::new_v4()));
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("kubectl"), "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(bin.join("kubectl"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            let path = std::env::join_paths(
+                std::iter::once(bin)
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, &root)
+                .env("HOME", &root)
+                .env("PATH", path)
+                .env("COLUMNS", "40")
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+
+        struct Watcher(u32, bool);
+        impl Drop for Watcher {
+            fn drop(&mut self) {
+                // Always reap our child, including if an assertion fails.
+                if !self.1 {
+                    unsafe {
+                        libc::kill(-(self.0 as i32), libc::SIGTERM);
+                        libc::waitpid(self.0 as i32, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+
+        let root = PathBuf::from(root);
+        let mut target = target("api");
+        target.host_source_path = root.clone();
+        let workspace = format!("narrow-{}", uuid::Uuid::new_v4());
+        let marker = format!("hops-source-sync:{workspace}");
+        let mut watcher = Watcher(
+            spawn_tar_sync_watcher(vec![target], &workspace).unwrap(),
+            false,
+        );
+        let command_line = |wide| {
+            let mut ps = Command::new("ps");
+            if wide {
+                ps.arg("-ww");
+            }
+            let output = ps
+                .args(["-p", &watcher.0.to_string(), "-o", "command="])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        // Wait for spawn's fork/exec transition before inspecting ownership.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !command_line(true)
+            .split_whitespace()
+            .any(|part| part == marker)
+        {
+            assert!(Instant::now() < deadline, "watcher did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        #[cfg(target_os = "linux")]
+        assert!(
+            !command_line(false).contains(&marker),
+            "fixture must reproduce Linux ps truncation"
+        );
+
+        save_delivery_runtime(&root, &workspace, &[], &[watcher.0]).unwrap();
+        stop_delivery_runtime(&root, &workspace);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(watcher.0 as i32, &mut status, libc::WNOHANG) };
+            if waited == watcher.0 as i32 {
+                watcher.1 = true;
+                assert!(libc::WIFSIGNALED(status));
+                assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "delivery cleanup left its watcher alive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!root
+            .join("runtime")
+            .join(format!("{workspace}.delivery.json"))
+            .exists());
     }
 
     #[test]
