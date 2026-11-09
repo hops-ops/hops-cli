@@ -170,7 +170,15 @@ fn keeping_kube_context(
     let previous = current_kube_context();
     let result = operation();
     let restored = restore_kube_context(previous.as_deref());
-    result.and(restored)
+    match (result, restored) {
+        (Err(error), Err(restore_error)) => {
+            log::warn!(
+                "could not restore kubeconfig current-context {previous:?}: {restore_error}"
+            );
+            Err(error)
+        }
+        (result, restored) => result.and(restored),
+    }
 }
 
 fn restore_kube_context(previous: Option<&str>) -> Result<(), Box<dyn Error>> {

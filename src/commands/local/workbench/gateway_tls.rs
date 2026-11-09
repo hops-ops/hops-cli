@@ -35,11 +35,16 @@ const RENEW_WITHIN_SECS: &str = "2592000";
 /// Names always on the leaf, whatever routes exist yet.
 const BASE_NAMES: &[&str] = &["localhost", "*.hops.localhost"];
 /// The IstioStack creates the namespace; give it this long on a fresh cluster.
-const NAMESPACE_WAIT: Duration = Duration::from_secs(180);
+/// Watch-loop refreshes pass zero and simply retry on the next pass.
+pub const NAMESPACE_WAIT: Duration = Duration::from_secs(180);
 
 /// Reissue the Gateway certificate when routes change and make sure the
-/// cluster Secret holds it. Returns true when the Secret was (re)applied.
-pub fn ensure_gateway_tls(state_dir: &Path) -> Result<bool, Box<dyn Error>> {
+/// cluster Secret holds it, waiting up to `namespace_wait` for the Gateway
+/// namespace. Returns true when the Secret was (re)applied.
+pub fn ensure_gateway_tls(
+    state_dir: &Path,
+    namespace_wait: Duration,
+) -> Result<bool, Box<dyn Error>> {
     let dir = state_dir.join(TLS_SUBDIR);
     fs::create_dir_all(&dir)?;
     // Keys are only ever written inside this directory.
@@ -55,7 +60,7 @@ pub fn ensure_gateway_tls(state_dir: &Path) -> Result<bool, Box<dyn Error>> {
     if !issued && secret_exists()? {
         return Ok(false);
     }
-    wait_for_namespace()?;
+    wait_for_namespace(namespace_wait)?;
     apply_secret(&dir)?;
     log::info!(
         "Gateway TLS {GATEWAY_NAMESPACE}/{GATEWAY_TLS_SECRET} covers: {}",
@@ -289,20 +294,26 @@ fn restrict(_path: &Path, _mode: u32) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn wait_for_namespace() -> Result<(), Box<dyn Error>> {
+fn wait_for_namespace(timeout: Duration) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     loop {
-        let found = kubectl_command(&["get", "namespace", GATEWAY_NAMESPACE, "-o", "name"])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-        if found {
-            return Ok(());
-        }
-        if started.elapsed() >= NAMESPACE_WAIT {
+        let last_error = match kubectl_command(&[
+            "get",
+            "namespace",
+            GATEWAY_NAMESPACE,
+            "-o",
+            "name",
+        ])
+        .output()
+        {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            Err(error) => format!("kubectl: {error}"),
+        };
+        if started.elapsed() >= timeout {
             return Err(format!(
-                "namespace {GATEWAY_NAMESPACE} did not appear within {}s; is the IstioStack ready?",
-                NAMESPACE_WAIT.as_secs()
+                "namespace {GATEWAY_NAMESPACE} not found after {}s (is the IstioStack ready?): {last_error}",
+                started.elapsed().as_secs()
             )
             .into());
         }
