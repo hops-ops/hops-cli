@@ -306,7 +306,10 @@ fn string_field(
 fn content_revision(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
+    format!(
+        "sha256:{}",
+        hops_cli::package_dev::registry::lower_hex(&hasher.finalize())
+    )
 }
 
 /// Collect YAML manifests under cluster_path (recursive).

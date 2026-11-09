@@ -451,7 +451,7 @@ fn dev_tag_for_file(
         hasher.update(&buf[..read]);
     }
 
-    let hex = format!("{:x}", hasher.finalize());
+    let hex = hops_cli::package_dev::registry::lower_hex(&hasher.finalize());
     let short = &hex[..12];
 
     // Explicit --version-prefix (highest precedence):
