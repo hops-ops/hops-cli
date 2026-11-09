@@ -374,3 +374,95 @@ fn explicit_sops_default_profile_cannot_override_an_account_only_default_chain()
         "secrets",
     );
 }
+
+#[test]
+fn grouped_ciphertext_profile_conflicts_stop_before_output() {
+    for conflicting_group in 0..2 {
+        let repo = Repo::new();
+        repo.config("    profile: repo-profile\n    account_id: '111111111111'\n");
+        let (source, destination) = repo.source("decrypt");
+        let mut groups = serde_json::json!([
+            {"kms": [{"aws_profile": "repo-profile"}]},
+            {"kms": [{"aws_profile": "repo-profile"}]}
+        ]);
+        groups[conflicting_group]["kms"][0]["aws_profile"] = "other-profile".into();
+        let ciphertext = serde_json::json!({
+            "sops": {"key_groups": groups, "shamir_threshold": 2},
+            "data": "fixture-ciphertext"
+        })
+        .to_string();
+        repo.write(source, &ciphertext);
+        let output = repo.command(&["secrets", "decrypt"]).output().unwrap();
+        repo.assert_failure(
+            output,
+            "conflicts with the selected Hops AWS profile",
+            destination,
+        );
+        assert_eq!(repo.read(source), ciphertext);
+        assert!(!repo.root.join("aws-args").exists());
+    }
+}
+
+#[test]
+fn grouped_ciphertext_allows_matching_empty_and_missing_profiles() {
+    let repo = Repo::new();
+    repo.config("    profile: repo-profile\n    account_id: '111111111111'\n");
+    let (source, _) = repo.source("decrypt");
+    let ciphertext = serde_json::json!({
+        "sops": {"key_groups": [
+            {"kms": [{"aws_profile": "repo-profile"}]},
+            {"kms": [{"aws_profile": ""}, {}]}
+        ]},
+        "data": "fixture-ciphertext"
+    })
+    .to_string();
+    repo.write(source, &ciphertext);
+    let output = repo.command(&["secrets", "decrypt"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.read(source), ciphertext);
+    assert_eq!(repo.read("secrets/input"), "fixture-output");
+}
+
+#[test]
+fn encryption_context_profile_names_are_not_identity_settings() {
+    for (mode, grouped) in [("encrypt", true), ("decrypt", false), ("decrypt", true)] {
+        let repo = Repo::new();
+        repo.config("    profile: repo-profile\n    account_id: '111111111111'\n");
+        let (source, _) = repo.source(mode);
+        let key = serde_json::json!({
+            "arn": "arn:aws:kms:us-east-2:111111111111:key/fixture",
+            "aws_profile": "repo-profile",
+            "context": {"aws_profile": "encryption-context-data"}
+        });
+        let keys = if grouped {
+            serde_json::json!({"key_groups": [{"kms": [key]}]})
+        } else {
+            serde_json::json!({"kms": [key]})
+        };
+        if mode == "encrypt" {
+            repo.write(
+                ".sops.yaml",
+                &serde_json::json!({"creation_rules": [keys]}).to_string(),
+            );
+        } else {
+            repo.write(
+                source,
+                &serde_json::json!({"sops": keys, "data": "fixture-ciphertext"}).to_string(),
+            );
+        }
+        let original = repo.read(source);
+        let config = fs::read(repo.root.join(".sops.yaml")).ok();
+        let output = repo.command(&["secrets", mode]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(repo.read(source), original);
+        assert_eq!(fs::read(repo.root.join(".sops.yaml")).ok(), config);
+    }
+}

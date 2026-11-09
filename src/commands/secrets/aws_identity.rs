@@ -154,6 +154,7 @@ fn sops_config_path() -> Result<Option<PathBuf>, Box<dyn Error>> {
         .find(|path| path.is_file()))
 }
 
+/// Inspect both ciphertext metadata layouts, leaving encrypted values untouched.
 fn validate_ciphertext_profiles(path: &Path, profile: Option<&str>) -> Result<(), Box<dyn Error>> {
     if path.is_dir() {
         for entry in fs::read_dir(path)? {
@@ -162,33 +163,51 @@ fn validate_ciphertext_profiles(path: &Path, profile: Option<&str>) -> Result<()
     } else if path.is_file() {
         let ciphertext: Value = serde_yaml::from_slice(&fs::read(path)?)
             .map_err(|_| format!("Cannot inspect SOPS metadata in {}", path.display()))?;
-        validate_profiles(&ciphertext["sops"]["kms"], profile)?;
+        validate_kms_profiles(&ciphertext["sops"]["kms"], profile)?;
+        validate_key_groups(&ciphertext["sops"]["key_groups"], profile)?;
     }
     Ok(())
 }
 
-fn validate_profiles(value: &Value, profile: Option<&str>) -> Result<(), Box<dyn Error>> {
-    match value {
-        Value::Mapping(mapping) => {
-            if let Some(stored) = mapping
-                .get(Value::String("aws_profile".into()))
-                .and_then(Value::as_str)
-            {
-                if !stored.is_empty() && Some(stored) != profile {
-                    let profile = profile.unwrap_or("<default credential chain>");
-                    return Err(format!("SOPS aws_profile '{stored}' conflicts with the selected Hops AWS profile '{profile}'. Existing SOPS configuration and ciphertext were left unchanged.").into());
-                }
-            }
-            for child in mapping.values() {
-                validate_profiles(child, profile)?;
-            }
+/// Check profile settings in creation rules, never arbitrary context values.
+fn validate_profiles(rules: &Value, profile: Option<&str>) -> Result<(), Box<dyn Error>> {
+    if let Some(rules) = rules.as_sequence() {
+        for rule in rules {
+            validate_profile(rule["aws_profile"].as_str(), profile)?;
+            validate_kms_profiles(&rule["kms"], profile)?;
+            validate_key_groups(&rule["key_groups"], profile)?;
         }
-        Value::Sequence(values) => {
-            for child in values {
-                validate_profiles(child, profile)?;
-            }
+    }
+    Ok(())
+}
+
+/// Every group can select KMS credentials independently of the other groups.
+fn validate_key_groups(groups: &Value, profile: Option<&str>) -> Result<(), Box<dyn Error>> {
+    if let Some(groups) = groups.as_sequence() {
+        for group in groups {
+            validate_kms_profiles(&group["kms"], profile)?;
         }
-        _ => {}
+    }
+    Ok(())
+}
+
+/// Only a KMS entry's own aws_profile field selects credentials; context is data.
+fn validate_kms_profiles(keys: &Value, profile: Option<&str>) -> Result<(), Box<dyn Error>> {
+    if let Some(keys) = keys.as_sequence() {
+        for key in keys {
+            validate_profile(key["aws_profile"].as_str(), profile)?;
+        }
+    }
+    Ok(())
+}
+
+/// Empty or missing profiles inherit credentials; explicit profiles must match.
+fn validate_profile(stored: Option<&str>, profile: Option<&str>) -> Result<(), Box<dyn Error>> {
+    if let Some(stored) = stored.filter(|stored| !stored.is_empty()) {
+        if Some(stored) != profile {
+            let profile = profile.unwrap_or("<default credential chain>");
+            return Err(format!("SOPS aws_profile '{stored}' conflicts with the selected Hops AWS profile '{profile}'. Existing SOPS configuration and ciphertext were left unchanged.").into());
+        }
     }
     Ok(())
 }
