@@ -128,6 +128,9 @@ YAML
     exit 0
     ;;
   kubectl)
+    # A real kubectl drains manifest stdin. Exiting early can race the writer
+    # and produce EPIPE on Linux even when small writes happen to pass on macOS.
+    case "$*" in *'apply '*'-f -') cat >/dev/null; exit 0 ;; esac
     if test -n "$HOPS_TEST_SOURCE_PROBE"; then
       case "$*" in
         *'create -f -')
