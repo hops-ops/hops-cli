@@ -161,6 +161,8 @@ pub struct SyncPodTarget {
     pub container: Option<String>,
     pub mount_path: String,
     pub app_name: String,
+    /// EmptyDir volume checked again before each background copy.
+    pub source_volume: String,
     /// Per-app host directory to tar/sync (NOT a shared monorepo root for all apps).
     pub host_source_path: PathBuf,
 }
@@ -198,11 +200,11 @@ impl NodePathProber for SystemNodeProber {
 /// Production probe entrypoint.
 pub fn probe_node_path_visibility(host_path: &Path) -> Result<DeliveryProbe, Box<dyn Error>> {
     if !host_path.is_dir() {
-        return Ok(probe_from_visibility(
-            host_path,
-            false,
-            "host path is not a directory",
-        ));
+        return Err(format!(
+            "source is not a directory: {}; cannot mount or sync it",
+            host_path.display()
+        )
+        .into());
     }
     let abs = host_path
         .canonicalize()
@@ -216,24 +218,35 @@ pub fn probe_node_path_visibility(host_path: &Path) -> Result<DeliveryProbe, Box
     }
 
     // 2) kubectl hostPath probe pod
-    match try_kubectl_hostpath_probe(&abs) {
-        Ok(probe) => return Ok(probe),
-        Err(e) => log::debug!("kubectl hostPath probe failed: {e}"),
-    }
+    // An inconclusive observation must not change an existing workload's
+    // volume type. Only a confirmed missing node path can select sync.
+    try_kubectl_hostpath_probe(&abs)
+}
 
-    // Fail closed → Sync (do not assume hostPath for Mac paths on remote nodes)
-    Ok(probe_from_visibility(
-        &abs,
-        false,
-        "node path not visible (docker+kubectl probes failed or inconclusive); selecting sync",
-    ))
+struct PathProbePod(String);
+
+impl Drop for PathProbePod {
+    fn drop(&mut self) {
+        let _ = kubectl_command(&[
+            "--request-timeout=2s",
+            "delete",
+            "pod",
+            &self.0,
+            "-n",
+            "default",
+            "--wait=false",
+            "--ignore-not-found=true",
+        ])
+        .output();
+    }
 }
 
 fn try_docker_node_probe(host_path: &Path) -> Result<Option<DeliveryProbe>, Box<dyn Error>> {
     if !command_exists("docker") || !command_exists("kubectl") {
         return Ok(None);
     }
-    let nodes_json = kubectl_command(&["get", "nodes", "-o", "json"]).output()?;
+    let nodes_json =
+        kubectl_command(&["--request-timeout=2s", "get", "nodes", "-o", "json"]).output()?;
     if !nodes_json.status.success() {
         return Ok(None);
     }
@@ -266,11 +279,11 @@ fn try_docker_node_probe(host_path: &Path) -> Result<Option<DeliveryProbe>, Box<
 
     let path_str = host_path.display().to_string();
     for container in candidates {
-        let status = Command::new("docker")
-            .args(["exec", &container, "test", "-d", &path_str])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let status = bounded_probe_command(
+            Command::new("docker").args(["exec", &container, "test", "-d", &path_str]),
+            Duration::from_secs(3),
+        )
+        .map(|output| output.status);
         match status {
             Ok(s) if s.success() => {
                 return Ok(Some(probe_from_visibility(
@@ -279,12 +292,13 @@ fn try_docker_node_probe(host_path: &Path) -> Result<Option<DeliveryProbe>, Box<
                     format!("docker exec {container}: path visible on node"),
                 )));
             }
-            Ok(_) => {
+            Ok(status) => {
                 // Path missing: only treat as definitive for containers that match an
                 // actual node name. Hardcoded fallbacks (`dory-k8s`, `hops-control-plane`)
                 // may be a *different* cluster (e.g. product dory k3s vs kind-hops) and
                 // must not short-circuit before trying the real node container.
-                if docker_container_running(&container)
+                if status.code() == Some(1)
+                    && docker_container_running(&container)
                     && node_names.iter().any(|n| n == &container)
                 {
                     return Ok(Some(probe_from_visibility(
@@ -300,18 +314,46 @@ fn try_docker_node_probe(host_path: &Path) -> Result<Option<DeliveryProbe>, Box<
     Ok(None)
 }
 
+fn bounded_probe_command(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, Box<dyn Error>> {
+    // Docker's client can stall on a stale engine socket. These probe commands
+    // emit only a bool (or nothing), so output cannot fill a pipe while waiting.
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Docker node visibility probe timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn docker_container_running(name: &str) -> bool {
-    Command::new("docker")
-        .args(["inspect", "-f", "{{.State.Running}}", name])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "true")
-        .unwrap_or(false)
+    bounded_probe_command(
+        Command::new("docker").args(["inspect", "-f", "{{.State.Running}}", name]),
+        Duration::from_secs(3),
+    )
+    .ok()
+    .is_some_and(|out| {
+        out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
+    })
 }
 
 fn try_kubectl_hostpath_probe(host_path: &Path) -> Result<DeliveryProbe, Box<dyn Error>> {
-    let name = format!("hops-path-probe-{}", std::process::id() % 100_000);
+    // Deletion is asynchronous. Reusing a PID-based name races the preceding
+    // probe's deletion (and can observe its old phase or logs).
+    let name = format!("hops-path-probe-{}", uuid::Uuid::new_v4().simple());
+    let _cleanup = PathProbePod(name.clone());
     let path_str = host_path.display().to_string();
     // Escape for YAML double quotes
     let path_yaml = path_str.replace('\\', "\\\\").replace('"', "\\\"");
@@ -347,7 +389,7 @@ spec:
     );
 
     // Apply
-    let mut apply = kubectl_command(&["apply", "-f", "-"]);
+    let mut apply = kubectl_command(&["--request-timeout=5s", "create", "-f", "-"]);
     let mut child = apply
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -358,8 +400,6 @@ spec:
     }
     let apply_out = child.wait_with_output()?;
     if !apply_out.status.success() {
-        let _ =
-            kubectl_command(&["delete", "pod", &name, "-n", "default", "--wait=false"]).output();
         return Err(format!(
             "probe pod apply failed: {}",
             String::from_utf8_lossy(&apply_out.stderr)
@@ -368,12 +408,12 @@ spec:
     }
 
     // Wait up to ~15s for Succeeded/Failed
-    let mut visible = false;
-    let mut detail = String::from("kubectl hostPath probe: timeout");
+    let mut observation = None;
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(400));
         let phase_out = kubectl_command(&[
+            "--request-timeout=2s",
             "get",
             "pod",
             &name,
@@ -388,51 +428,85 @@ spec:
             .to_string();
 
         // FailedMount appears in events / container statuses
-        let desc = kubectl_command(&["describe", "pod", &name, "-n", "default"]).output()?;
+        let desc = kubectl_command(&[
+            "--request-timeout=2s",
+            "describe",
+            "pod",
+            &name,
+            "-n",
+            "default",
+        ])
+        .output()?;
         let desc_s = String::from_utf8_lossy(&desc.stdout);
-        if desc_s.contains("FailedMount")
-            || desc_s.contains("failed to mount")
-            || desc_s.contains("hostPath type check failed")
-            || desc_s.contains("not a directory")
-        {
-            visible = false;
-            detail = "kubectl hostPath probe: FailedMount (path not on node)".into();
+        if source_path_is_missing(&desc_s, &path_str) {
+            observation = Some((
+                false,
+                "kubectl hostPath probe: FailedMount (path not on node)".into(),
+            ));
             break;
         }
 
         if phase == "Succeeded" || phase == "Failed" || phase == "Running" {
-            let logs = kubectl_command(&["logs", &name, "-n", "default", "--tail=20"]).output()?;
+            let logs = kubectl_command(&[
+                "--request-timeout=2s",
+                "logs",
+                &name,
+                "-n",
+                "default",
+                "--tail=20",
+                "--pod-running-timeout=1s",
+            ])
+            .output()?;
             let log_s = String::from_utf8_lossy(&logs.stdout);
-            if log_s.contains("HOPS_PATH_VISIBLE") {
-                visible = true;
-                detail = "kubectl hostPath probe: path visible on node".into();
-            } else if log_s.contains("HOPS_PATH_MISSING") {
-                visible = false;
-                detail = "kubectl hostPath probe: mount empty/missing".into();
-            } else if phase == "Succeeded" {
-                // Treat success without marker as visible (container started = mount ok)
-                visible = true;
-                detail = format!("kubectl hostPath probe: phase={phase}");
-            } else {
-                visible = false;
-                detail = format!("kubectl hostPath probe: phase={phase} logs={log_s}");
+            if let Some(visible) = probe_visibility(&phase, &log_s) {
+                observation = Some((
+                    visible,
+                    format!("kubectl hostPath probe: phase={phase}, visible={visible}"),
+                ));
+                break;
             }
-            break;
+            if phase == "Failed" {
+                break;
+            }
+            // Running without output is still pending, not proof of a missing
+            // path. Give the probe time to emit its marker.
         }
     }
 
-    let _ = kubectl_command(&[
-        "delete",
-        "pod",
-        &name,
-        "-n",
-        "default",
-        "--wait=false",
-        "--ignore-not-found=true",
-    ])
-    .output();
+    finish_path_probe(host_path, observation)
+}
 
-    Ok(probe_from_visibility(host_path, visible, detail))
+fn source_path_is_missing(description: &str, source: &str) -> bool {
+    // Token/config projection failures are not evidence that source is absent.
+    description.contains("hostPath type check failed") && description.contains(source)
+}
+
+fn probe_visibility(phase: &str, logs: &str) -> Option<bool> {
+    if logs.contains("HOPS_PATH_VISIBLE") || phase == "Succeeded" {
+        // The owned probe's Directory hostPath had to mount for it to succeed.
+        if logs.contains("HOPS_PATH_MISSING") {
+            Some(false)
+        } else {
+            Some(true)
+        }
+    } else if logs.contains("HOPS_PATH_MISSING") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn finish_path_probe(
+    host_path: &Path,
+    observation: Option<(bool, String)>,
+) -> Result<DeliveryProbe, Box<dyn Error>> {
+    match observation {
+        Some((visible, detail)) => Ok(probe_from_visibility(host_path, visible, detail)),
+        None => Err(format!(
+            "hostPath probe for {} timed out or failed without a visibility result; leaving source delivery unchanged",
+            host_path.display()
+        ).into()),
+    }
 }
 
 fn command_exists(program: &str) -> bool {
@@ -596,60 +670,108 @@ pub fn discover_sync_targets(
         .into());
     }
     let value: serde_json::Value = serde_json::from_slice(&json.stdout)?;
+    sync_targets_from_pods(&value, namespace, mount_path, app_host_paths)
+}
+
+fn sync_targets_from_pods(
+    value: &serde_json::Value,
+    namespace: &str,
+    mount_path: &str,
+    app_host_paths: &std::collections::BTreeMap<String, PathBuf>,
+) -> Result<Vec<SyncPodTarget>, Box<dyn Error>> {
     let mut out = Vec::new();
-    if let Some(items) = value.get("items").and_then(|i| i.as_array()) {
-        for item in items {
-            let phase = item
-                .pointer("/status/phase")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            // Only Running pods accept kubectl exec for tar extract.
-            if phase != "Running" {
+    for item in value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if item.pointer("/status/phase").and_then(|v| v.as_str()) != Some("Running") {
+            continue;
+        }
+        let Some(pod) = item.pointer("/metadata/name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(app) = item
+            .pointer("/metadata/labels/hops.ops.com.ai~1local-app")
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        // Never fall back to the caller's current directory or a fuzzy app
+        // match: only explicitly declared roots may be copied into a pod.
+        let Some(host_source_path) = app_host_paths.get(app) else {
+            continue;
+        };
+        for container in item
+            .pointer("/spec/containers")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let Some(source_volume) = sync_source_volume(
+                item.get("spec").unwrap_or(&serde_json::Value::Null),
+                container,
+                mount_path,
+            ) else {
                 continue;
-            }
-            let pod = item
-                .pointer("/metadata/name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if pod.is_empty() {
+            };
+            let Some(name) = container.get("name").and_then(|v| v.as_str()) else {
                 continue;
-            }
-            let app = item
-                .pointer("/metadata/labels/hops.ops.com.ai~1local-app")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    item.pointer("/metadata/labels/app.kubernetes.io~1name")
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or("app")
-                .to_string();
-            let container = item
-                .pointer("/spec/containers/0/name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let host_source_path = app_host_paths
-                .get(&app)
-                .cloned()
-                .or_else(|| {
-                    // Fuzzy: app name contains key
-                    app_host_paths
-                        .iter()
-                        .find(|(k, _)| app.contains(k.as_str()) || k.contains(&app))
-                        .map(|(_, p)| p.clone())
-                })
-                .unwrap_or_else(|| PathBuf::from("."));
+            };
             out.push(SyncPodTarget {
                 namespace: namespace.to_string(),
-                pod,
-                container,
+                pod: pod.to_string(),
+                container: Some(name.to_string()),
                 mount_path: mount_path.to_string(),
-                app_name: app,
-                host_source_path,
+                app_name: app.to_string(),
+                source_volume,
+                host_source_path: host_source_path.clone(),
             });
+            // Multiple containers share the same source volume; copy once.
+            break;
         }
     }
     Ok(out)
+}
+
+pub(crate) fn has_sync_source_mount(
+    spec: &serde_json::Value,
+    container: &serde_json::Value,
+    mount_path: &str,
+) -> bool {
+    sync_source_volume(spec, container, mount_path).is_some()
+}
+
+fn sync_source_volume(
+    spec: &serde_json::Value,
+    container: &serde_json::Value,
+    mount_path: &str,
+) -> Option<String> {
+    for mount in container
+        .get("volumeMounts")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if mount.get("mountPath").and_then(|v| v.as_str()) != Some(mount_path) {
+            continue;
+        }
+        let name = mount.get("name")?.as_str()?;
+        if spec
+            .get("volumes")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .any(|volume| {
+                volume.get("name").and_then(|v| v.as_str()) == Some(name)
+                    && volume.get("emptyDir").is_some()
+            })
+        {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 /// Start mutagen session if mutagen is on PATH; returns session name.
@@ -710,10 +832,16 @@ pub(crate) fn save_delivery_runtime(
         mutagen_sessions: sessions.to_vec(),
         sync_pids: pids.to_vec(),
     };
-    std::fs::write(
-        dir.join(format!("{workspace}.delivery.json")),
-        serde_json::to_string_pretty(&runtime)?,
-    )?;
+    let temporary = dir.join(format!(
+        ".{workspace}-{}.delivery.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&temporary, serde_json::to_string_pretty(&runtime)?)?;
+    if let Err(error) = std::fs::rename(&temporary, dir.join(format!("{workspace}.delivery.json")))
+    {
+        let _ = std::fs::remove_file(temporary);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -725,11 +853,7 @@ pub(crate) fn stop_delivery_runtime(state_dir: &Path, workspace: &str) {
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(rt) = serde_json::from_str::<DeliveryRuntime>(&text) {
             stop_mutagen_sessions(&rt.mutagen_sessions);
-            for pid in rt.sync_pids {
-                let _ = Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status();
-            }
+            stop_tar_watchers(&rt.sync_pids, workspace);
         }
     }
     let _ = std::fs::remove_file(path);
@@ -752,16 +876,9 @@ pub fn attach_sync_delivery(
         messages: Vec::new(),
     };
 
-    if targets.is_empty() {
-        result
-            .messages
-            .push(
-                "no Running pods to sync into yet; re-run `hops local gitops environment` after pods are Ready"
-                    .into(),
-            );
-        return Ok(result);
-    }
-
+    initialize_sync(targets, |target| {
+        sync_directory_to_pod(&target.host_source_path, target)
+    })?;
     let mutagen = command_exists("mutagen");
     for target in targets {
         let host_path = &target.host_source_path;
@@ -789,48 +906,107 @@ pub fn attach_sync_delivery(
                 }
             }
         }
-
-        // Tar-based real sync (per-app host path + default_sync_ignores).
-        // Per-target errors must not abort the other apps.
-        match sync_directory_to_pod(host_path, target) {
-            Ok(()) => result.messages.push(format!(
-                "tar sync {} → {}/{}:{}",
-                host_path.display(),
-                target.namespace,
-                target.pod,
-                target.mount_path
-            )),
-            Err(e) => result.messages.push(format!(
-                "tar sync FAILED for {} ← {}: {e}",
-                target.pod,
-                host_path.display()
-            )),
-        }
     }
 
-    // Always keep a multi-app tar re-sync loop for Sync mode: emptyDir is wiped
-    // on container restart, so a one-shot tar is not durable without continuous
-    // delivery. `--watch` only controls gitops chart re-apply (caller).
     let _ = watch;
-    if result.mutagen_sessions.is_empty() && !targets.is_empty() {
-        // Immediate second pass after a short delay (covers race with first start).
-        for target in targets {
-            let _ = sync_directory_to_pod(&target.host_source_path, target);
-        }
-        match spawn_tar_sync_watcher(targets.to_vec()) {
+    // Mutagen sessions target a particular pod. Keep the label-resolving
+    // watcher as well so a rollout's replacement pods receive their source.
+    if !targets.is_empty() {
+        match spawn_tar_sync_watcher(targets.to_vec(), workspace) {
             Ok(pid) => {
                 result.sync_pids.push(pid);
-                result
-                    .messages
-                    .push(format!("tar sync watcher pid={pid} (all apps, continuous)"));
+                result.messages.push(format!("tar sync watcher pid={pid}"));
             }
-            Err(e) => result
-                .messages
-                .push(format!("tar sync watcher not started: {e}")),
+            Err(error) => {
+                stop_mutagen_sessions(&result.mutagen_sessions);
+                return Err(error);
+            }
         }
     }
 
     Ok(result)
+}
+
+fn initialize_sync(
+    targets: &[SyncPodTarget],
+    mut sync: impl FnMut(&SyncPodTarget) -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    if targets.is_empty() {
+        return Err("no source pods available for sync; retry when containers are running".into());
+    }
+    let mut failures = Vec::new();
+    for target in targets {
+        if let Err(error) = sync(target) {
+            failures.push(format!("{}: {error}", target.pod));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!("initial source delivery failed: {}", failures.join("; ")).into());
+    }
+    Ok(())
+}
+
+/// Commit new delivery state before retiring the old processes. In particular,
+/// do not terminate a newly replaced mutagen session with the same name.
+pub(crate) fn replace_delivery_runtime(
+    state_dir: &Path,
+    workspace: &str,
+    result: &DeliveryAttachResult,
+) -> Result<(), Box<dyn Error>> {
+    let path = state_dir
+        .join("runtime")
+        .join(format!("{workspace}.delivery.json"));
+    let old = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<DeliveryRuntime>(&text).ok())
+        .unwrap_or_default();
+    if let Err(error) = save_delivery_runtime(
+        state_dir,
+        workspace,
+        &result.mutagen_sessions,
+        &result.sync_pids,
+    ) {
+        stop_mutagen_sessions(&result.mutagen_sessions);
+        stop_tar_watchers(&result.sync_pids, workspace);
+        return Err(error);
+    }
+    stop_mutagen_sessions(
+        &old.mutagen_sessions
+            .into_iter()
+            .filter(|s| !result.mutagen_sessions.contains(s))
+            .collect::<Vec<_>>(),
+    );
+    let stale = old
+        .sync_pids
+        .into_iter()
+        .filter(|pid| !result.sync_pids.contains(pid))
+        .collect::<Vec<_>>();
+    stop_tar_watchers(&stale, workspace);
+    Ok(())
+}
+
+fn stop_tar_watchers(pids: &[u32], workspace: &str) {
+    let marker = format!("hops-source-sync:{workspace}");
+    for pid in pids {
+        let owned = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .ok()
+            .is_some_and(|out| {
+                out.status.success()
+                    && String::from_utf8_lossy(&out.stdout)
+                        .split_whitespace()
+                        .any(|part| part == marker)
+            });
+        if owned {
+            #[cfg(unix)]
+            // SAFETY: only a verified watcher leader created by this module
+            // names the private process group; stop its transfer children too.
+            unsafe {
+                libc::kill(-(*pid as i32), libc::SIGTERM);
+            }
+        }
+    }
 }
 
 /// Build the continuous multi-app tar re-sync shell script (testable pure builder).
@@ -841,96 +1017,108 @@ pub fn attach_sync_delivery(
 /// - host tree fingerprint changes, or
 /// - the live pod is missing `/.hops-synced` (fresh pod / failed prior sync).
 pub fn build_multi_app_tar_watch_script(targets: &[SyncPodTarget]) -> String {
-    let excludes = tar_exclude_args().join(" ");
-    let mut script = String::from("set +e\n");
-    // macOS tar emits AppleDouble / xattr headers that clutter logs; disable.
-    script.push_str("export COPYFILE_DISABLE=1\n");
-    // Honor hops' selected kube context (dory/colima/kind) for every kubectl call.
-    // Without this, the watcher hits whatever current-context is — often a stale
-    // hops-dory CA and silent sync failure.
-    script.push_str(
-        r#"
+    let mut script = r#"set +e
+set -o pipefail
+export COPYFILE_DISABLE=1
 KCTX="${HOPS_KUBE_CONTEXT:-}"
 k() {
-  if [ -n "$KCTX" ]; then
-    command kubectl --context "$KCTX" "$@"
-  else
-    command kubectl "$@"
-  fi
+  if [ -n "$KCTX" ]; then command kubectl --context "$KCTX" "$@"; else command kubectl "$@"; fi
 }
-"#,
-    );
-
-    // sync_one app host ns mount container
-    // Resolves pod by label every call — survives Deployment rollouts.
-    script.push_str(&format!(
-        r#"
-sync_one() {{
-  app="$1"; host="$2"; ns="$3"; mount="$4"; cont="$5"
-  pod=$(k get pod -n "$ns" -l "hops.ops.com.ai/local-app=$app" \
+pods_for() {
+  k get pod -n "$1" -l "hops.ops.com.ai/local-app=$2" \
     --field-selector=status.phase=Running \
-    -o jsonpath='{{.items[0].metadata.name}}' 2>/dev/null)
-  [ -n "$pod" ] || return 0
-  cflag=""
-  [ -n "$cont" ] && cflag="-c $cont"
-  # Always tar into the *current* pod; ignore extract noise.
-  echo "[$(date +%H:%M:%S)] sync $app → $ns/$pod" >&2
-  if tar cf - {excl} -C "$host" . 2>/dev/null \
-    | k exec -i -n "$ns" "$pod" $cflag -- tar xf - -C "$mount" 2>/dev/null
-  then
-    k exec -n "$ns" "$pod" $cflag -- sh -c "touch \"$mount/.hops-synced\"" 2>/dev/null || true
-  else
-    echo "[$(date +%H:%M:%S)] sync FAILED $app → $ns/$pod" >&2
-  fi
-}}
-"#,
-        excl = excludes
-    ));
-
-    script.push_str("sync_all() {\n");
-    for t in targets {
-        let cont = t.container.as_deref().unwrap_or("");
-        script.push_str(&format!(
-            "  sync_one \"{app}\" \"{host}\" \"{ns}\" \"{mount}\" \"{cont}\"\n",
-            app = t.app_name,
-            host = t.host_source_path.display(),
-            ns = t.namespace,
-            mount = t.mount_path,
-            cont = cont,
-        ));
-    }
-    script.push_str("}\n");
-
-    // needs_marker: true if any live pod is missing /.hops-synced
-    script.push_str("needs_marker() {\n");
-    for t in targets {
-        let cont = t.container.as_deref().unwrap_or("");
-        script.push_str(&format!(
-            r#"  pod=$(k get pod -n "{ns}" -l "hops.ops.com.ai/local-app={app}" \
-    --field-selector=status.phase=Running \
-    -o jsonpath='{{.items[0].metadata.name}}' 2>/dev/null)
-  if [ -n "$pod" ]; then
-    cflag=""
-    [ -n "{cont}" ] && cflag="-c {cont}"
-    if ! k exec -n "{ns}" "$pod" $cflag -- test -f "{mount}/.hops-synced" 2>/dev/null; then
-      return 0
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null
+}
+is_sync_pod() {
+  # A rollout may still have old hostPath pods. Never extract an archive into
+  # those: that would write back into the developer's source directory.
+  value=$(k get pod -n "$1" "$2" -o "jsonpath={.spec.volumes[?(@.name==\"$3\")].emptyDir}" 2>/dev/null)
+  [ -n "$value" ]
+}
+sync_one() {
+  app="$1"; host="$2"; ns="$3"; mount="$4"; cont="$5"; volume="$6"
+  pods=$(pods_for "$ns" "$app")
+  [ -n "$pods" ] || return 1
+  failed=0
+  for pod in $pods; do
+    is_sync_pod "$ns" "$pod" "$volume" || continue
+    echo "sync $app -> $ns/$pod" >&2
+    if tar cf - __EXCLUDES__ -C "$host" . 2>/dev/null \
+      | k exec -i -n "$ns" "$pod" -c "$cont" -- tar xf - -C "$mount" 2>/dev/null
+    then
+      k exec -n "$ns" "$pod" -c "$cont" -- touch "$mount/.hops-synced" 2>/dev/null || failed=1
+    else
+      echo "sync FAILED $app -> $ns/$pod" >&2
+      failed=1
     fi
-  fi
-"#,
-            ns = t.namespace,
-            app = t.app_name,
-            cont = cont,
-            mount = t.mount_path,
-        ));
+  done
+  return "$failed"
+}
+needs_one() {
+  ns="$1"; app="$2"; mount="$3"; cont="$4"; volume="$5"
+  pods=$(pods_for "$ns" "$app")
+  [ -n "$pods" ] || return 0
+  for pod in $pods; do
+    is_sync_pod "$ns" "$pod" "$volume" || continue
+    k exec -n "$ns" "$pod" -c "$cont" -- test -f "$mount/.hops-synced" 2>/dev/null || return 0
+  done
+  return 1
+}
+"#.replace("__EXCLUDES__", &tar_exclude_args().join(" "));
+    let mut unique = std::collections::BTreeSet::new();
+    let mut selected = Vec::new();
+    for target in targets {
+        let key = (
+            &target.app_name,
+            &target.namespace,
+            &target.mount_path,
+            &target.container,
+            &target.source_volume,
+        );
+        if unique.insert(key) {
+            selected.push(target);
+        }
+    }
+    script.push_str("sync_all() {\n  all_failed=0\n");
+    for target in &selected {
+        let args = [
+            &target.app_name,
+            &target.host_source_path.display().to_string(),
+            &target.namespace,
+            &target.mount_path,
+            target.container.as_deref().unwrap_or(""),
+            &target.source_volume,
+        ]
+        .into_iter()
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+        script.push_str(&format!("  sync_one {args} || all_failed=1\n"));
+    }
+    script.push_str("  return \"$all_failed\"\n}\nneeds_marker() {\n");
+    for target in &selected {
+        let args = [
+            &*target.namespace,
+            &*target.app_name,
+            &*target.mount_path,
+            target.container.as_deref().unwrap_or(""),
+            &*target.source_volume,
+        ]
+        .into_iter()
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+        script.push_str(&format!("  needs_one {args} && return 0\n"));
     }
     script.push_str("  return 1\n}\n");
-
-    // Fingerprint union of all host roots so any app source change triggers full resync.
-    let mut find_parts = Vec::new();
-    for t in targets {
-        find_parts.push(format!("\"{}\"", t.host_source_path.display()));
-    }
-    let roots = find_parts.join(" ");
+    let roots = targets
+        .iter()
+        .map(|target| &target.host_source_path)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|root| shell_quote(&root.display().to_string()))
+        .collect::<Vec<_>>()
+        .join(" ");
     script.push_str(&format!(
         r#"
 prev=""
@@ -944,18 +1132,23 @@ while true; do
       done
     ' sh | cksum | awk '{{print $1}}')
   if [ "$cur" != "$prev" ] || needs_marker; then
-    prev="$cur"
-    sync_all
+    if sync_all; then prev="$cur"; fi
   fi
   sleep 2
 done
-"#,
-        roots = roots
+"#
     ));
     script
 }
 
-fn spawn_tar_sync_watcher(targets: Vec<SyncPodTarget>) -> Result<u32, Box<dyn Error>> {
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn spawn_tar_sync_watcher(
+    targets: Vec<SyncPodTarget>,
+    workspace: &str,
+) -> Result<u32, Box<dyn Error>> {
     let script = build_multi_app_tar_watch_script(&targets);
     // Log path: ~/.hops/local/runtime/delivery-watch.log (shared; PIDs are per-workspace).
     let log_path = crate::commands::local::local_state_dir().ok().map(|d| {
@@ -973,10 +1166,11 @@ fn spawn_tar_sync_watcher(targets: Vec<SyncPodTarget>) -> Result<u32, Box<dyn Er
     } else {
         (Stdio::null(), Stdio::null())
     };
-    let mut child = Command::new("sh");
+    let mut child = Command::new("bash");
     child
         .arg("-c")
         .arg(script)
+        .arg(format!("hops-source-sync:{workspace}"))
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr);
@@ -986,6 +1180,11 @@ fn spawn_tar_sync_watcher(targets: Vec<SyncPodTarget>) -> Result<u32, Box<dyn Er
         if !ctx.is_empty() {
             child.env(crate::commands::local::HOPS_KUBE_CONTEXT_ENV, ctx);
         }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        child.process_group(0);
     }
     let child = child.spawn()?;
     if let Some(path) = log_path {
@@ -1003,6 +1202,138 @@ pub fn should_resync_on_path_change(changed: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_probe_deadline_terminates_a_stalled_client() {
+        let started = Instant::now();
+        assert!(bounded_probe_command(Command::new("sleep").arg("30"), Duration::ZERO).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn unrelated_failed_mount_is_not_a_missing_source_directory() {
+        assert!(!source_path_is_missing(
+            "FailedMount: service account token unavailable",
+            "/source"
+        ));
+        assert!(!source_path_is_missing(
+            "hostPath type check failed: /other is not a directory",
+            "/source"
+        ));
+        assert!(source_path_is_missing(
+            "hostPath type check failed: /source is not a directory",
+            "/source"
+        ));
+    }
+
+    #[test]
+    fn generated_watcher_is_valid_bash_with_quoted_source_paths() {
+        let mut target = target("api");
+        target.host_source_path = PathBuf::from("/source/quote' and $(no-command)");
+        let script = build_multi_app_tar_watch_script(&[target]);
+        let mut bash = Command::new("bash")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        bash.stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        assert!(bash.wait().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_delivery_pid_cannot_terminate_an_unrelated_process() {
+        let state = std::env::temp_dir().join(format!("hops-pid-owner-{}", uuid::Uuid::new_v4()));
+        let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
+        save_delivery_runtime(&state, "preview", &[], &[unrelated.id()]).unwrap();
+        stop_delivery_runtime(&state, "preview");
+        let still_running = unrelated.try_wait().unwrap().is_none();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+        let _ = std::fs::remove_dir_all(state);
+        assert!(
+            still_running,
+            "delivery cleanup must verify process ownership before signaling a PID"
+        );
+    }
+
+    #[test]
+    fn pending_or_failed_probe_is_not_a_missing_path() {
+        assert_eq!(probe_visibility("Running", ""), None);
+        assert_eq!(probe_visibility("Failed", ""), None);
+        assert_eq!(probe_visibility("Running", "HOPS_PATH_VISIBLE"), Some(true));
+        assert_eq!(probe_visibility("Succeeded", ""), Some(true));
+        assert_eq!(
+            probe_visibility("Succeeded", "HOPS_PATH_MISSING"),
+            Some(false)
+        );
+        assert!(finish_path_probe(Path::new("/source"), None).is_err());
+        assert!(
+            !finish_path_probe(
+                Path::new("/source"),
+                Some((false, "confirmed missing".into()))
+            )
+            .unwrap()
+            .host_path_visible
+        );
+    }
+
+    fn target(app: &str) -> SyncPodTarget {
+        SyncPodTarget {
+            namespace: "preview".into(),
+            pod: format!("{app}-pod"),
+            container: Some(app.into()),
+            mount_path: "/workspace".into(),
+            source_volume: "source".into(),
+            app_name: app.into(),
+            host_source_path: PathBuf::from(format!("/source/{app}")),
+        }
+    }
+
+    #[test]
+    fn initial_sync_must_complete_for_every_target() {
+        assert!(initialize_sync(&[], |_| Ok(())).is_err());
+        let mut copied = Vec::new();
+        let result = initialize_sync(&[target("api"), target("ui")], |target| {
+            copied.push(target.app_name.clone());
+            if target.app_name == "api" {
+                Err("copy failed".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.unwrap_err().to_string().contains("api-pod"));
+        assert_eq!(copied, ["api", "ui"]);
+    }
+
+    #[test]
+    fn discovers_only_declared_emptydir_source_pods() {
+        let pod = |name: &str, app: &str, source: serde_json::Value| {
+            serde_json::json!({
+                "metadata": {"name": name, "labels": {"hops.ops.com.ai/local-app": app}},
+                "status": {"phase": "Running"},
+                "spec": {
+                    "containers": [{"name": "app", "volumeMounts": [{"name":"source", "mountPath":"/workspace"}]}],
+                    "volumes": [source]
+                }
+            })
+        };
+        let value = serde_json::json!({"items": [
+            pod("new", "api", serde_json::json!({"name":"source", "emptyDir":{}})),
+            pod("old", "api", serde_json::json!({"name":"source", "hostPath":{"path":"/source"}})),
+            pod("unrelated", "other", serde_json::json!({"name":"source", "emptyDir":{}}))
+        ]});
+        let paths = std::collections::BTreeMap::from([("api".into(), PathBuf::from("/declared"))]);
+        let targets = sync_targets_from_pods(&value, "preview", "/workspace", &paths).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].pod, "new");
+        assert_eq!(targets[0].host_source_path, PathBuf::from("/declared"));
+    }
 
     #[test]
     fn prefers_host_path_when_probe_passes() {
@@ -1079,6 +1410,7 @@ mod tests {
             pod: "e2e-ui-ui-xyz".into(),
             container: Some("ui".into()),
             mount_path: "/workspace".into(),
+            source_volume: "source".into(),
             app_name: "e2e-ui-ui".into(),
             host_source_path: PathBuf::from("/proj/ui"),
         };
@@ -1099,6 +1431,7 @@ mod tests {
                 pod: "api-pod".into(), // frozen name must NOT be used by watcher
                 container: Some("api".into()),
                 mount_path: "/workspace".into(),
+                source_volume: "source".into(),
                 app_name: "e2e-ui-api".into(),
                 host_source_path: PathBuf::from("/proj"),
             },
@@ -1107,6 +1440,7 @@ mod tests {
                 pod: "ui-pod".into(),
                 container: Some("ui".into()),
                 mount_path: "/workspace".into(),
+                source_volume: "source".into(),
                 app_name: "e2e-ui-ui".into(),
                 host_source_path: PathBuf::from("/proj/ui"),
             },

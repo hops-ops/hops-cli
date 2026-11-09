@@ -37,6 +37,7 @@ tool=${0##*/}
 printf '%s %s\n' "$tool" "$*" >> "$HOPS_TEST_COMMAND_LOG"
 
 case "$tool" in
+  mutagen) exit 1 ;;
   kind)
     if test "$1" = "--version" || test "$1" = "version"; then
       echo "kind v0.32.0 go1.24 darwin/arm64"
@@ -81,12 +82,30 @@ case "$tool" in
           ;;
       esac
     fi
-    if test "$1" = "exec"; then cat >/dev/null; exit 0; fi
+    if test "$1" = "exec"; then
+      case "$*" in *'test -d'*) if test -n "$HOPS_TEST_SOURCE_PROBE"; then exit 125; fi ;; esac
+      cat >/dev/null; exit 0
+    fi
     if test "$1" = "start" || test "$1" = "stop"; then exit 0; fi
     exit 0
     ;;
   helm)
     if test "$1" = "template"; then
+      if test "$HOPS_TEST_SYNC_FIXTURE" = 1; then
+        cat <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: source-app}
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          volumeMounts: [{name: source, mountPath: /workspace}]
+      volumes: [{name: source, emptyDir: {}}]
+YAML
+        exit 0
+      fi
       values_file=
       while test "$#" -gt 0; do
         if test "$1" = "--values"; then
@@ -109,6 +128,46 @@ YAML
     exit 0
     ;;
   kubectl)
+    if test -n "$HOPS_TEST_SOURCE_PROBE"; then
+      case "$*" in
+        *'create -f -')
+          cat > "$HOPS_TEST_COMMAND_LOG.probe"
+          sed 's/^/probe-yaml /' "$HOPS_TEST_COMMAND_LOG.probe" >> "$HOPS_TEST_COMMAND_LOG"
+          rm -f "$HOPS_TEST_COMMAND_LOG.polls"
+          exit 0 ;;
+        *'get pod hops-path-probe-'*'jsonpath={.status.phase}')
+          count=0
+          test ! -f "$HOPS_TEST_COMMAND_LOG.polls" || count=$(cat "$HOPS_TEST_COMMAND_LOG.polls")
+          count=$((count + 1)); echo "$count" > "$HOPS_TEST_COMMAND_LOG.polls"
+          if test "$HOPS_TEST_SOURCE_PROBE" = unknown; then echo Failed; else echo Running; fi
+          exit 0 ;;
+        *'describe pod hops-path-probe-'*) exit 0 ;;
+        *'logs hops-path-probe-'*)
+          case "$HOPS_TEST_SOURCE_PROBE" in
+            missing) echo HOPS_PATH_MISSING ;;
+            visible) if test "$(cat "$HOPS_TEST_COMMAND_LOG.polls")" -gt 1; then echo HOPS_PATH_VISIBLE; fi ;;
+          esac
+          exit 0 ;;
+        *'delete pod hops-path-probe-'*) exit 0 ;;
+      esac
+    fi
+    if test "$HOPS_TEST_SYNC_FIXTURE" = 1; then
+      case "$*" in
+        *'get httproute -n feature -o json') echo '{"items":[]}'; exit 0 ;;
+        *'get configmap hops-lgi-'*) echo NotFound >&2; exit 1 ;;
+        *'get namespace feature'*)
+          printf '%s\n' '{"metadata":{"name":"feature","uid":"fixture-uid","labels":{"app.kubernetes.io/managed-by":"hops-local-gitops","hops.ops.com.ai/local-env":"feature"}}}'
+          exit 0 ;;
+        *'get pods -n feature -l hops.ops.com.ai/local-env=feature -o json')
+          printf '%s\n' '{"items":[{"metadata":{"name":"source-app-1","labels":{"hops.ops.com.ai/local-app":"gateway"}},"status":{"phase":"Running"},"spec":{"containers":[{"name":"app","volumeMounts":[{"name":"source","mountPath":"/workspace"}]}],"volumes":[{"name":"source","emptyDir":{}}]}}]}'
+          exit 0 ;;
+        *'-- tar xf - -C /workspace') tar xf - -C "$HOPS_TEST_POD_DIR"; exit $? ;;
+        *'touch /workspace/.hops-synced'*) touch "$HOPS_TEST_POD_DIR/.hops-synced"; exit 0 ;;
+        *'test -f /workspace/.hops-synced'*) test -f "$HOPS_TEST_POD_DIR/.hops-synced"; exit $? ;;
+        *'jsonpath={range .items[*]}'*) echo source-app-1; exit 0 ;;
+        *'jsonpath='*'emptyDir}'*) echo '{}'; exit 0 ;;
+      esac
+    fi
     if test "$1" = "config" && test "$2" = "get-contexts"; then
       printf 'colima\nkind-project-dev\n'
       exit 0
@@ -159,7 +218,7 @@ impl Fixture {
         .unwrap();
         let bin = root.join("fake-bin");
         fs::create_dir_all(&bin).unwrap();
-        for tool in ["kind", "docker", "helm", "kubectl"] {
+        for tool in ["kind", "docker", "helm", "kubectl", "mutagen"] {
             write_executable(&bin.join(tool), FAKE_TOOL);
         }
         fs::write(root.join(DEFINITION_PATH), VALID_DEFINITION).unwrap();
@@ -246,6 +305,27 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        let state = self
+            .root
+            .join("home/.hops/local/runtime/feature.delivery.json");
+        if let Ok(text) = fs::read_to_string(state) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                for pid in value
+                    .get("syncPids")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(pid) = pid.as_u64() {
+                        // SAFETY: this fixture's CLI started this process group
+                        // and recorded its leader in the fixture-owned state.
+                        unsafe {
+                            libc::kill(-(pid as i32), libc::SIGTERM);
+                        }
+                    }
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -556,15 +636,193 @@ fn environment_activates_its_declared_cluster_over_generic_state() {
     assert!(output.status.success(), "{}", output_text(&output));
     let log = fixture.log();
     assert!(
-        log.contains("kubectl --context kind-project-dev get nodes -o json"),
+        log.lines().any(
+            |line| line.starts_with("kubectl --context kind-project-dev ")
+                && line.contains("get nodes -o json")
+        ),
         "declared Cluster context was not used: {log}"
     );
     assert!(
-        !log.contains("kubectl --context colima get nodes -o json"),
+        !log.lines()
+            .any(|line| line.starts_with("kubectl --context colima ")
+                && line.contains("get nodes -o json")),
         "generic context leaked into Environment reconcile: {log}"
     );
     let providers = fs::read_to_string(state.join("providers.json")).unwrap();
     assert!(providers.contains(r#""clusterProvider": "kind""#));
     assert!(providers.contains(r#""dockerProvider": "dory""#));
     assert!(providers.contains(r#""clusterName": "project-dev""#));
+}
+
+fn accepted_hostpath_fixture() -> (Fixture, PathBuf, String) {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join(".gitops/local/environment.yaml"),
+        ENVIRONMENT_DEFINITION,
+    )
+    .unwrap();
+    fs::write(&fixture.cluster_exists, "existing").unwrap();
+    let state = fixture.root.join("home/.hops/local/envs");
+    fs::create_dir_all(&state).unwrap();
+    let record = state.join("feature.json");
+    let contents = serde_json::json!({
+        "name":"feature", "namespace":"feature", "envPath":fixture.root.join(".gitops/local/environment.yaml"),
+        "projectRoot":fixture.root, "deliveryMode":"hostPath", "clusterName":"project-dev", "kubeContext":"kind-project-dev"
+    }).to_string();
+    fs::write(&record, &contents).unwrap();
+    (fixture, record, contents)
+}
+
+#[test]
+fn running_probe_waits_for_output_and_shared_roots_are_probed_once() {
+    let (fixture, record, contents) = accepted_hostpath_fixture();
+    let chart = fixture.root.join("apps/second/.gitops/local");
+    fs::create_dir_all(&chart).unwrap();
+    fs::write(
+        chart.join("Chart.yaml"),
+        "apiVersion: v2\nname: second\nversion: 0.1.0\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join(".gitops/local/environment.yaml"),
+        format!(
+            "{ENVIRONMENT_DEFINITION}    - path: apps/second/.gitops/local\n      type: helm\n"
+        ),
+    )
+    .unwrap();
+    let output = fixture
+        .environment_command()
+        .args(["--name", "feature", "--namespace", "feature"])
+        .env("HOPS_TEST_SOURCE_PROBE", "visible")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        output_text(&output).contains("source delivery hostPath"),
+        "{}",
+        output_text(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.command_log.with_extension("log.polls"))
+            .unwrap()
+            .trim(),
+        "2"
+    );
+    let log = fixture.log();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("create -f -"))
+            .count(),
+        1
+    );
+    let name = log
+        .lines()
+        .find_map(|line| line.strip_prefix("probe-yaml   name: "))
+        .unwrap();
+    assert!(uuid::Uuid::parse_str(name.strip_prefix("hops-path-probe-").unwrap()).is_ok());
+    assert!(log.contains("delete pod hops-path-probe-"));
+    assert_eq!(fs::read_to_string(record).unwrap(), contents);
+}
+
+#[test]
+fn inconclusive_probe_keeps_accepted_mounts_and_registration() {
+    let (fixture, record, contents) = accepted_hostpath_fixture();
+    let output = fixture
+        .environment_command()
+        .args(["--name", "feature", "--namespace", "feature"])
+        .env("HOPS_TEST_SOURCE_PROBE", "unknown")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an inconclusive probe must defer, not report successful sync: {}",
+        output_text(&output)
+    );
+    assert!(output_text(&output).contains("leaving source delivery unchanged"));
+    assert!(!fixture.log().contains("helm template"));
+    assert!(!fixture.log().contains("apply -f"));
+    assert!(fixture.log().contains("delete pod hops-path-probe-"));
+    assert_eq!(fs::read_to_string(record).unwrap(), contents);
+}
+
+#[test]
+fn confirmed_missing_path_does_not_replace_existing_hostpath() {
+    let (fixture, record, contents) = accepted_hostpath_fixture();
+    let output = fixture
+        .environment_command()
+        .args(["--name", "feature", "--namespace", "feature"])
+        .env("HOPS_TEST_SOURCE_PROBE", "missing")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert!(output_text(&output).contains("preserving accepted hostPath volumes"));
+    assert!(!fixture.log().contains("helm template"));
+    assert_eq!(fs::read_to_string(record).unwrap(), contents);
+}
+
+#[test]
+fn initial_sync_delivers_files_before_recording_success() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join(".gitops/local/environment.yaml"),
+        ENVIRONMENT_DEFINITION,
+    )
+    .unwrap();
+    fs::write(&fixture.cluster_exists, "existing").unwrap();
+    fs::create_dir_all(fixture.root.join("src")).unwrap();
+    fs::write(
+        fixture.root.join("src/sentinel.txt"),
+        "source delivered through the real tar pipeline",
+    )
+    .unwrap();
+    let pod = fixture.root.join("target/fake-pod");
+    fs::create_dir_all(&pod).unwrap();
+    let output = fixture
+        .base_command()
+        .args([
+            "local",
+            "gitops",
+            "environment",
+            ".gitops/local/environment.yaml",
+            "--once",
+            "--name",
+            "feature",
+            "--namespace",
+            "feature",
+        ])
+        .env("HOPS_TEST_SOURCE_PROBE", "missing")
+        .env("HOPS_TEST_SYNC_FIXTURE", "1")
+        .env("HOPS_TEST_POD_DIR", &pod)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\nCOMMANDS:\n{}",
+        output_text(&output),
+        fixture.log()
+    );
+    assert!(
+        pod.join("src/sentinel.txt").is_file(),
+        "CLI reported sync success without delivering source"
+    );
+    assert_eq!(
+        fs::read_to_string(pod.join("src/sentinel.txt")).unwrap(),
+        "source delivered through the real tar pipeline"
+    );
+    assert!(pod.join(".hops-synced").is_file());
+    let record: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(fixture.root.join("home/.hops/local/envs/feature.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["deliveryMode"], "sync");
+    let runtime: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(
+            fixture
+                .root
+                .join("home/.hops/local/runtime/feature.delivery.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!runtime["syncPids"].as_array().unwrap().is_empty());
 }

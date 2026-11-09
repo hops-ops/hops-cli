@@ -22,11 +22,14 @@ use super::workbench::definition::{
     prepare_cluster, prepare_cluster_for_stop, ClusterOverrides,
 };
 use super::workbench::delivery::{
-    stop_delivery_runtime, DeliveryStrategy, NodePathProber, SystemNodeProber,
+    attach_sync_delivery, discover_sync_targets, has_sync_source_mount, replace_delivery_runtime,
+    stop_delivery_runtime, DeliveryStrategy, NodePathProber, SyncPodTarget, SystemNodeProber,
 };
 use super::workbench::gateway_tls::{ensure_gateway_tls, NAMESPACE_WAIT};
 use super::workbench::ingress::{ensure_cluster_ingress_access, ensure_ingress_access};
-use super::workbench::reconcile::{ReconcileOptions, SystemHelm, SystemKubectl, SystemKustomize};
+use super::workbench::reconcile::{
+    ReconcileOptions, ReconcileResult, SystemHelm, SystemKubectl, SystemKustomize,
+};
 use super::workbench::registry::{load_workspace, save_workspace, WorkspaceRecord};
 use super::workbench::slugify_name;
 use super::workbench::watch::should_ignore_watch_path;
@@ -614,6 +617,17 @@ fn reconcile_cluster_environments(
                 continue;
             }
         };
+        if let Err(error) = guard_delivery_transition(
+            &loaded.environment.name,
+            &loaded.environment.namespace,
+            &loaded.environment.root,
+            &definition.cluster.name,
+            &kube_context,
+            delivery_strategy,
+        ) {
+            errors.push(format!("{}: {error}", loaded.source.display()));
+            continue;
+        }
         log::info!(
             "controller Environment {}: source delivery {} ({})",
             loaded.environment.name,
@@ -629,19 +643,26 @@ fn reconcile_cluster_environments(
             dry_run,
             run_setup: false,
         };
+        if !dry_run && delivery_strategy == DeliveryStrategy::HostPath {
+            stop_delivery_runtime(&local_state_dir()?, &loaded.environment.name);
+        }
         match reconcile_environment(loaded, &opts, &SystemHelm, &SystemKustomize, &SystemKubectl) {
             Ok(results) => {
                 if !dry_run {
                     if let Err(error) = save_environment_snapshot(
                         &definition.cluster.name,
                         &kube_context,
-                        &loaded,
+                        loaded,
                         &results,
                     ) {
                         errors.push(format!(
                             "{}: save ownership: {error}",
                             loaded.source.display()
                         ));
+                        continue;
+                    }
+                    if let Err(error) = finish_source_delivery(&opts, &results) {
+                        errors.push(format!("{}: {error}", loaded.source.display()));
                         continue;
                     }
                     if let Err(error) = persist_environment_registration(
@@ -919,6 +940,14 @@ fn run_environment_definition(
     }
     let (delivery_strategy, delivery_detail) =
         resolve_worktree_delivery(&app_delivery_host_paths, &SystemNodeProber)?;
+    guard_delivery_transition(
+        &workspace_name,
+        &namespace,
+        &worktree_root,
+        &cluster.cluster.name,
+        &kube_context,
+        delivery_strategy,
+    )?;
     log::info!(
         "environment gitops: source delivery {} ({})",
         delivery_strategy.as_str(),
@@ -935,6 +964,9 @@ fn run_environment_definition(
     };
 
     let reconcile = || -> Result<(), Box<dyn Error>> {
+        if !args.dry_run && delivery_strategy == DeliveryStrategy::HostPath {
+            stop_delivery_runtime(&local_state_dir()?, &workspace_name);
+        }
         let results = reconcile_environment(
             &loaded,
             &opts,
@@ -944,6 +976,7 @@ fn run_environment_definition(
         )?;
         if !args.dry_run {
             save_environment_snapshot(&cluster.cluster.name, &kube_context, &loaded, &results)?;
+            finish_source_delivery(&opts, &results)?;
             persist_environment_registration(
                 &workspace_name,
                 &source,
@@ -1185,8 +1218,14 @@ fn resolve_worktree_delivery(
 
     let mut all_visible = true;
     let mut details = Vec::new();
+    let mut observations = BTreeMap::new();
     for (app, host) in app_paths {
-        let probe = prober.probe(host)?;
+        let root = host.canonicalize().unwrap_or_else(|_| host.clone());
+        if !observations.contains_key(&root) {
+            // Any inconclusive result aborts before rendering/applying volumes.
+            observations.insert(root.clone(), prober.probe(&root)?);
+        }
+        let probe = &observations[&root];
         all_visible &= probe.host_path_visible;
         details.push(format!("{app}: {}", probe.detail));
     }
@@ -1197,6 +1236,139 @@ fn resolve_worktree_delivery(
         DeliveryStrategy::Sync
     };
     Ok((strategy, details.join("; ")))
+}
+
+/// Do not replace accepted host mounts with emptyDir during a reconcile. A
+/// confirmed path loss needs recovery or a prepared migration, not a silent
+/// volume replacement. A different root/context is a fresh delivery decision.
+fn guard_delivery_transition(
+    workspace: &str,
+    namespace: &str,
+    root: &Path,
+    cluster: &str,
+    context: &str,
+    strategy: DeliveryStrategy,
+) -> Result<(), Box<dyn Error>> {
+    let previous = load_workspace(&local_state_dir()?, workspace)?;
+    validate_delivery_transition(
+        previous.as_ref(),
+        namespace,
+        root,
+        cluster,
+        context,
+        strategy,
+    )
+}
+
+fn validate_delivery_transition(
+    previous: Option<&WorkspaceRecord>,
+    namespace: &str,
+    root: &Path,
+    cluster: &str,
+    context: &str,
+    strategy: DeliveryStrategy,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(record) = previous {
+        if strategy == DeliveryStrategy::Sync
+            && record.delivery_mode.as_deref() == Some("hostPath")
+            && record.namespace == namespace
+            && record.project_root.as_deref() == root.to_str()
+            && record.cluster_name.as_deref() == Some(cluster)
+            && record.kube_context.as_deref() == Some(context)
+        {
+            return Err("source path is no longer visible; preserving accepted hostPath volumes instead of replacing them with unprepared sync volumes".into());
+        }
+    }
+    Ok(())
+}
+
+fn required_sync_apps(results: &[ReconcileResult]) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let mut required = BTreeSet::new();
+    for result in results {
+        for document in serde_yaml::Deserializer::from_str(&result.rendered_yaml) {
+            let value = <serde_json::Value as serde::Deserialize>::deserialize(document)?;
+            let spec = if value.get("kind").and_then(|v| v.as_str()) == Some("Pod") {
+                value.get("spec")
+            } else {
+                value
+                    .pointer("/spec/template/spec")
+                    .or_else(|| value.pointer("/spec/jobTemplate/spec/template/spec"))
+            };
+            if let Some(spec) = spec {
+                if spec
+                    .get("containers")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .any(|container| has_sync_source_mount(spec, container, "/workspace"))
+                {
+                    required.insert(result.app_name.clone());
+                }
+            }
+        }
+    }
+    Ok(required)
+}
+
+fn wait_for_sync_targets(
+    required: &BTreeSet<String>,
+    mut discover: impl FnMut() -> Result<Vec<SyncPodTarget>, Box<dyn Error>>,
+    timeout: Duration,
+) -> Result<Vec<SyncPodTarget>, Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let targets = discover()?;
+        let present = targets
+            .iter()
+            .map(|t| t.app_name.clone())
+            .collect::<BTreeSet<_>>();
+        if required.is_subset(&present) {
+            return Ok(targets);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "source sync is waiting for running emptyDir source pods: {}; retry reconciliation",
+                required
+                    .difference(&present)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn finish_source_delivery(
+    opts: &ReconcileOptions,
+    results: &[ReconcileResult],
+) -> Result<(), Box<dyn Error>> {
+    if opts.dry_run || opts.delivery_mode.as_deref() != Some("sync") {
+        return Ok(());
+    }
+    let required = required_sync_apps(results)?;
+    // Config-only deploys do not need a source volume or file-sync process.
+    if required.is_empty() {
+        return Ok(());
+    }
+    let paths = opts
+        .app_delivery_host_paths
+        .iter()
+        .filter(|(app, _)| required.contains(*app))
+        .map(|(app, path)| (app.clone(), path.clone()))
+        .collect();
+    let targets = wait_for_sync_targets(
+        &required,
+        || discover_sync_targets(&opts.namespace, &opts.workspace_name, "/workspace", &paths),
+        Duration::from_secs(30),
+    )?;
+    let runtime = attach_sync_delivery(&targets, &opts.workspace_name, true)?;
+    replace_delivery_runtime(&local_state_dir()?, &opts.workspace_name, &runtime)?;
+    for message in runtime.messages {
+        log::info!("source delivery {}: {message}", opts.workspace_name);
+    }
+    Ok(())
 }
 
 // ── shared watch helpers ─────────────────────────────────────────────────────
@@ -1357,6 +1529,158 @@ mod tests {
     use super::super::workbench::definition::load_definition;
     use super::*;
     use std::fs;
+
+    struct CountingProbe {
+        calls: std::cell::Cell<usize>,
+        result: Option<bool>,
+    }
+    impl NodePathProber for CountingProbe {
+        fn probe(
+            &self,
+            path: &Path,
+        ) -> Result<super::super::workbench::delivery::DeliveryProbe, Box<dyn Error>> {
+            self.calls.set(self.calls.get() + 1);
+            match self.result {
+                Some(visible) => Ok(super::super::workbench::delivery::probe_from_visibility(
+                    path, visible, "fixture",
+                )),
+                None => Err("probe timed out".into()),
+            }
+        }
+    }
+
+    #[test]
+    fn source_roots_are_probed_once_and_unknown_defers_reconciliation() {
+        let paths = BTreeMap::from([
+            ("api".into(), PathBuf::from("/project")),
+            ("ui".into(), PathBuf::from("/project")),
+            ("config-only".into(), PathBuf::from("/project")),
+        ]);
+        let success = CountingProbe {
+            calls: std::cell::Cell::new(0),
+            result: Some(true),
+        };
+        assert_eq!(
+            resolve_worktree_delivery(&paths, &success).unwrap().0,
+            DeliveryStrategy::HostPath
+        );
+        assert_eq!(success.calls.get(), 1);
+        let timeout = CountingProbe {
+            calls: std::cell::Cell::new(0),
+            result: None,
+        };
+        assert!(resolve_worktree_delivery(&paths, &timeout).is_err());
+        assert_eq!(timeout.calls.get(), 1);
+        let missing = CountingProbe {
+            calls: std::cell::Cell::new(0),
+            result: Some(false),
+        };
+        assert_eq!(
+            resolve_worktree_delivery(&paths, &missing).unwrap().0,
+            DeliveryStrategy::Sync
+        );
+    }
+
+    #[test]
+    fn accepted_hostpath_cannot_be_replaced_by_unprepared_sync() {
+        let record = WorkspaceRecord {
+            name: "preview".into(),
+            namespace: "preview".into(),
+            env_path: "/project/.gitops/local/environment.yaml".into(),
+            project_root: Some("/project".into()),
+            delivery_mode: Some("hostPath".into()),
+            updated_at: None,
+            cluster_name: Some("hops".into()),
+            kube_context: Some("orbstack".into()),
+        };
+        assert!(validate_delivery_transition(
+            Some(&record),
+            "preview",
+            Path::new("/project"),
+            "hops",
+            "orbstack",
+            DeliveryStrategy::Sync
+        )
+        .is_err());
+        assert!(validate_delivery_transition(
+            Some(&record),
+            "preview",
+            Path::new("/project"),
+            "hops",
+            "orbstack",
+            DeliveryStrategy::HostPath
+        )
+        .is_ok());
+        assert!(validate_delivery_transition(
+            None,
+            "preview",
+            Path::new("/project"),
+            "hops",
+            "orbstack",
+            DeliveryStrategy::Sync
+        )
+        .is_ok());
+        assert!(validate_delivery_transition(
+            Some(&record),
+            "preview",
+            Path::new("/project"),
+            "hops",
+            "other-context",
+            DeliveryStrategy::Sync
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn source_delivery_requires_all_apps_but_not_config_only_charts() {
+        let results = vec![ReconcileResult {
+            app_name: "api".into(),
+            source_path: PathBuf::from("/project/api"),
+            namespace: "preview".into(),
+            applied: true,
+            rendered_yaml: r#"apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          volumeMounts:
+            - name: source
+              mountPath: /workspace
+      volumes:
+        - name: source
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: settings}
+"#
+            .into(),
+        }];
+        let required = required_sync_apps(&results).unwrap();
+        assert_eq!(required, BTreeSet::from(["api".to_string()]));
+        assert!(wait_for_sync_targets(&required, || Ok(vec![]), Duration::ZERO).is_err());
+        let target = SyncPodTarget {
+            namespace: "preview".into(),
+            pod: "api-pod".into(),
+            container: Some("api".into()),
+            mount_path: "/workspace".into(),
+            source_volume: "source".into(),
+            app_name: "api".into(),
+            host_source_path: PathBuf::from("/project"),
+        };
+        assert_eq!(
+            wait_for_sync_targets(&required, || Ok(vec![target.clone()]), Duration::ZERO)
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut config_only = results[0].clone();
+        config_only.rendered_yaml =
+            "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: config}".into();
+        assert!(required_sync_apps(&[config_only]).unwrap().is_empty());
+    }
 
     #[test]
     fn ingress_reconciliation_attempts_targets_after_failures() {
