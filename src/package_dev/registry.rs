@@ -2,7 +2,7 @@
 //! No Docker daemon, registry credentials, redirect, or environment proxy.
 use sha2::{Digest, Sha256};
 use std::error::Error;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
@@ -10,8 +10,20 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 pub const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
+/// Lowercase hex encoding for digest output. sha2 0.11 digests are
+/// `hybrid_array::Array` values, which no longer implement `LowerHex`.
+pub fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 pub fn digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!("sha256:{}", lower_hex(&Sha256::digest(bytes)))
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -316,14 +328,23 @@ pub fn sha256_reader(mut reader: impl Read) -> Result<String> {
         if size == 0 {
             break;
         }
-        hash.write_all(&buffer[..size])?;
+        hash.update(&buffer[..size]);
     }
-    Ok(format!("sha256:{:x}", hash.finalize()))
+    Ok(format!("sha256:{}", lower_hex(&hash.finalize())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digest_matches_known_sha256_vector() {
+        assert_eq!(
+            digest(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(lower_hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+    }
 
     #[test]
     fn upload_locations_cannot_escape_tunnel_or_repository() {

@@ -1045,7 +1045,7 @@ fn dev_tag_for_uppkg(uppkg_path: &Path) -> Result<String, Box<dyn Error>> {
         hasher.update(&buf[..read]);
     }
 
-    let hex = format!("{:x}", hasher.finalize());
+    let hex = hops_cli::package_dev::registry::lower_hex(&hasher.finalize());
     Ok(format!("dev-{}", &hex[..12]))
 }
 
