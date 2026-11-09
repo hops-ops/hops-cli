@@ -13,6 +13,16 @@ use std::path::Path;
 pub fn run() -> Result<(), Box<dyn Error>> {
     let (plaintext_dir, _) = configured_secret_paths()?;
     let aws_settings = configured_aws_settings()?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let (client, sts_client) = aws_clients(&aws_settings)?;
+    if aws_settings.identity.account_id.is_some() {
+        use rusoto_sts::Sts;
+        let response = runtime.block_on(sts_client.get_caller_identity(Default::default()))?;
+        let account = response
+            .account
+            .ok_or("AWS account ID not available from STS GetCallerIdentity")?;
+        aws_settings.identity.verify_account(&account)?;
+    }
     let aws_root = plaintext_dir.join(&aws_settings.path);
     let local_names = collect_local_secret_names(Path::new(&aws_root));
     let local_lookup: HashSet<String> = local_names.iter().cloned().collect();
@@ -24,8 +34,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     expected_tags.insert("hops.ops.com.ai/secret".to_string(), "true".to_string());
     expected_tags.insert("hops.ops.com.ai/managed-by".to_string(), "sync".to_string());
 
-    let runtime = tokio::runtime::Runtime::new()?;
-    let (client, _) = aws_clients(&aws_settings.region)?;
     let remote_secrets = fetch_remote_secrets(&runtime, &client)?;
 
     let mut remote_by_name = HashMap::new();
