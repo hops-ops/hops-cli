@@ -1,3 +1,4 @@
+mod aws_identity;
 mod decrypt;
 mod encrypt;
 mod init;
@@ -78,6 +79,8 @@ struct SecretsConfig {
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct AwsSecretsConfig {
+    #[serde(flatten)]
+    identity: aws_identity::AwsIdentity,
     path: Option<String>,
     region: Option<String>,
     tags: Option<HashMap<String, String>>,
@@ -180,25 +183,16 @@ fn save_config(config: &RepoConfig) -> Result<(), Box<dyn Error>> {
 }
 
 pub(crate) fn configured_aws_settings() -> Result<AwsSecretsRuntimeConfig, Box<dyn Error>> {
-    let config = load_config()?;
-    let tags = config
-        .secrets
-        .aws
-        .tags
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<HashMap<_, _>>();
-    let path = config
-        .secrets
-        .aws
-        .path
-        .unwrap_or_else(|| DEFAULT_AWS_SECRET_SUBDIR.to_string());
-    let region = config
-        .secrets
-        .aws
-        .region
-        .unwrap_or_else(|| DEFAULT_AWS_REGION.to_string());
-    Ok(AwsSecretsRuntimeConfig { path, region, tags })
+    let aws = load_config()?.secrets.aws;
+    aws.identity.validate()?;
+    Ok(AwsSecretsRuntimeConfig {
+        path: aws
+            .path
+            .unwrap_or_else(|| DEFAULT_AWS_SECRET_SUBDIR.to_string()),
+        region: aws.region.unwrap_or_else(|| DEFAULT_AWS_REGION.to_string()),
+        tags: aws.tags.unwrap_or_default(),
+        identity: aws.identity,
+    })
 }
 
 fn configured_github_settings() -> Result<GithubSecretsRuntimeConfig, Box<dyn Error>> {
@@ -357,6 +351,7 @@ pub(crate) fn configured_secret_paths() -> Result<(PathBuf, PathBuf), Box<dyn Er
 
 #[derive(Debug, Clone)]
 pub(crate) struct AwsSecretsRuntimeConfig {
+    identity: aws_identity::AwsIdentity,
     pub(crate) path: String,
     pub(crate) region: String,
     #[allow(dead_code)]
@@ -441,7 +436,7 @@ fn export_aws_credentials(profile: &str) -> Result<AwsExportCredentials, Box<dyn
 }
 
 fn aws_clients(
-    region: &str,
+    settings: &AwsSecretsRuntimeConfig,
 ) -> Result<
     (
         rusoto_secretsmanager::SecretsManagerClient,
@@ -449,10 +444,11 @@ fn aws_clients(
     ),
     Box<dyn Error>,
 > {
-    let region = region
+    let region = settings
+        .region
         .parse::<Region>()
-        .map_err(|_| format!("unsupported AWS region '{}'", region))?;
-    if let Some(profile) = selected_aws_profile() {
+        .map_err(|_| format!("unsupported AWS region '{}'", settings.region))?;
+    if let Some(profile) = settings.identity.selected_profile() {
         require_command("aws")?;
         let credentials = export_aws_credentials(&profile)?;
         let provider = StaticProvider::new(
@@ -595,8 +591,20 @@ fn mirror_tree_with_sops(
         }
     };
 
+    let settings = configured_aws_settings()?;
+    settings
+        .identity
+        .validate_sops_profiles(&start, sops_mode)?;
+    settings.identity.verify_cli_account(&settings.region)?;
     fs::create_dir_all(&dest_root)?;
-    process_tree(&source_root, &start, &dest_root, sops_mode, force)
+    process_tree(
+        &source_root,
+        &start,
+        &dest_root,
+        sops_mode,
+        force,
+        &settings.identity,
+    )
 }
 
 fn normalized_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -630,11 +638,19 @@ fn process_tree(
     dest_root: &Path,
     sops_mode: &str,
     force: bool,
+    identity: &aws_identity::AwsIdentity,
 ) -> Result<(), Box<dyn Error>> {
     if current.is_dir() {
         for entry in fs::read_dir(current)? {
             let entry = entry?;
-            process_tree(source_root, &entry.path(), dest_root, sops_mode, force)?;
+            process_tree(
+                source_root,
+                &entry.path(),
+                dest_root,
+                sops_mode,
+                force,
+                identity,
+            )?;
         }
         return Ok(());
     }
@@ -653,17 +669,7 @@ fn process_tree(
     let source = current
         .to_str()
         .ok_or_else(|| format!("Non-UTF8 path not supported: {}", current.display()))?;
-    let output = match sops_mode {
-        "encrypt" => run_command_output(
-            "sops",
-            &["--encrypt", "--input-type=raw", "--output-type=raw", source],
-        )?,
-        "decrypt" => run_command_output(
-            "sops",
-            &["--decrypt", "--input-type=raw", "--output-type=raw", source],
-        )?,
-        _ => return Err(format!("Unsupported sops mode: {}", sops_mode).into()),
-    };
+    let output = identity.sops_output(sops_mode, source)?;
 
     fs::write(&destination, output)?;
     log::info!("Wrote {}", destination.display());

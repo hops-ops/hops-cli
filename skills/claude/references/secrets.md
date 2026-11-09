@@ -68,6 +68,29 @@ hops secrets decrypt    # Decrypts secrets-encrypted/ → secrets/
 
 Uses the KMS ARN from `.sops.yaml` for SOPS operations.
 
+### Optional repository AWS identity
+
+```yaml
+secrets:
+  aws:
+    profile: platform-staging
+    account_id: "123456789012"
+    region: us-east-2
+```
+
+The configured profile wins over ambient profile variables for encrypt/decrypt,
+AWS list and AWS sync. SOPS receives the profile in its arguments/environment,
+with ambient static/web-identity credentials removed. The optional quoted
+account ID is checked through STS before SOPS output or remote operations;
+`--yes` cannot bypass it. Encrypt/decrypt account checks require the AWS CLI
+and a valid profile login. It checks the caller account, not KMS key ownership.
+
+Omit both fields to retain existing credential behavior. Keys and ciphertext
+are not rewritten. When opting into a binding, explicit SOPS `aws_profile`
+settings in creation rules or ciphertext must match the selected profile or
+be omitted/empty; conflicts fail before output. All creation rules are checked.
+Keep multi-profile SOPS configurations unbound to preserve their own selection.
+
 ## Sync to AWS Secrets Manager
 
 ```bash

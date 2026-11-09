@@ -624,6 +624,40 @@ hops secrets encrypt
 hops secrets decrypt
 ```
 
+To bind a repository to one AWS identity, optionally add:
+
+```yaml
+secrets:
+  aws:
+    profile: platform-staging
+    account_id: "123456789012"
+    region: us-east-2
+```
+
+`profile` takes precedence over `AWS_PROFILE` and `AWS_DEFAULT_PROFILE` for
+SOPS encrypt/decrypt, AWS list, and AWS sync. Hops passes the profile to SOPS
+and removes ambient static/web-identity credentials from that subprocess so
+they cannot override it. Both fields are optional; without either field,
+existing SOPS behavior and AWS environment/default credential selection remain
+unchanged. With only `account_id`, the existing environment/default profile
+selection is used. Quote account IDs to preserve any leading zeroes.
+
+When `account_id` is set, STS must return that caller account before SOPS
+produces any output or AWS list/sync proceeds. `--yes` does not bypass this
+check, including during cleanup. Encrypt/decrypt account checks require AWS
+CLI access and a valid login; for SSO profiles, use
+`aws sso login --profile platform-staging`.
+
+`.sops.yaml` still selects the encryption keys, and existing encrypted files
+still select their stored keys. Hops does not rewrite recipients or ciphertext
+to apply a profile. A repository binding requires explicit `aws_profile`
+settings in SOPS creation rules and ciphertext metadata to match the selected
+profile (or be omitted/empty); conflicts stop before output is created. This
+includes all creation rules, so multi-profile SOPS configurations should keep
+their existing SOPS configuration without opting into a repo-wide binding.
+The expected account identifies the caller, not the owner of a KMS key; normal
+cross-account KMS access and SOPS key roles remain possible.
+
 AWS sync reads from `<plaintext_dir>/<aws.path>`:
 
 ```bash

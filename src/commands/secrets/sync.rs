@@ -140,7 +140,8 @@ fn run_aws(args: &AwsSyncArgs) -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let (client, sts_client) = aws_clients(&aws_settings.region)?;
+    let (client, sts_client) = aws_clients(&aws_settings)?;
+    confirm_target_account(&runtime, &sts_client, &aws_settings.identity, args.yes)?;
 
     let mut final_tags_map = if args.tags.is_empty() {
         aws_settings.tags
@@ -155,8 +156,6 @@ fn run_aws(args: &AwsSyncArgs) -> Result<(), Box<dyn Error>> {
     final_tags_map.insert("hops.ops.com.ai/managed-by".to_string(), "sync".to_string());
     let mut final_tags = final_tags_map.into_iter().collect::<Vec<_>>();
     final_tags.sort();
-
-    confirm_target_account(&runtime, &sts_client, args.yes)?;
 
     let mut synced = 0usize;
     process_aws_path(
@@ -1717,17 +1716,19 @@ fn has_managed_secret_tag(tags: Option<&Vec<rusoto_secretsmanager::Tag>>) -> boo
 fn confirm_target_account(
     runtime: &tokio::runtime::Runtime,
     client: &rusoto_sts::StsClient,
+    identity: &super::aws_identity::AwsIdentity,
     yes: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let profile = env::var("AWS_PROFILE")
-        .or_else(|_| env::var("AWS_DEFAULT_PROFILE"))
-        .unwrap_or_else(|_| "default".to_string());
+    let profile = identity
+        .selected_profile()
+        .unwrap_or_else(|| "default".to_string());
     let response = runtime
         .block_on(client.get_caller_identity(GetCallerIdentityRequest::default()))
         .map_err(|err| format!("Failed to determine AWS account: {}", err))?;
     let account = response
         .account
         .ok_or("AWS account ID not available from STS GetCallerIdentity")?;
+    identity.verify_account(&account)?;
 
     if yes
         || confirm(
@@ -1934,5 +1935,53 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         ))
+    }
+
+    #[test]
+    fn expected_account_is_enforced_before_yes_can_skip_confirmation() {
+        use rusoto_core::{HttpClient, Region};
+        use rusoto_credential::StaticProvider;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        for expected in [Some("111111111111"), Some("222222222222"), None] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 8192];
+                assert!(socket.read(&mut request).unwrap() > 0);
+                let body = "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><GetCallerIdentityResult><Account>111111111111</Account><Arn>arn:aws:iam::111111111111:user/fixture</Arn><UserId>fixture</UserId></GetCallerIdentityResult><ResponseMetadata><RequestId>fixture</RequestId></ResponseMetadata></GetCallerIdentityResponse>";
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let client = rusoto_sts::StsClient::new_with(
+                HttpClient::new().unwrap(),
+                StaticProvider::new_minimal("fixture-access".into(), "fixture-secret".into()),
+                Region::Custom {
+                    name: "us-east-1".into(),
+                    endpoint,
+                },
+            );
+            let identity = crate::commands::secrets::aws_identity::AwsIdentity {
+                profile: Some("fixture-profile".into()),
+                account_id: expected.map(str::to_owned),
+            };
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let result = super::confirm_target_account(&runtime, &client, &identity, true);
+            server.join().unwrap();
+            if expected == Some("222222222222") {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("AWS account mismatch"));
+            } else {
+                result.unwrap();
+            }
+        }
     }
 }
