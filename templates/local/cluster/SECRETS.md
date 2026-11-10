@@ -45,8 +45,9 @@ kubectl port-forward lifecycle and KV v2 synchronization through
 
 ## Phase 1: cluster bootstrap
 
-Create the AuthStack masterkey and MinIO credentials before starting the
-Cluster controller:
+Create the MinIO credentials and local personas before starting the Cluster
+controller (AuthStack generates the Zitadel masterkey and admin password into
+Vault at `local/zitadel` itself):
 
 ```bash
 make dev-gitops-cluster-secrets
@@ -57,7 +58,6 @@ creates:
 
 | Namespace | Secret | Keys |
 |---|---|---|
-| `auth` | `zitadel-masterkey` | `masterkey` |
 | `harmony-system` | `harmony-minio` | `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` |
 | `default` | `harmony-local-human-passwords` | `approved-admin`, `waitlisted`, `iac-approved`, `device-login`, `fixture-owner`, `fixture-viewer`, `bob`, `alice`, `carol` |
 | `default` | `harmony-local-smtp` | `password` |
