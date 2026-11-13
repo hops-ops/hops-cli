@@ -14,6 +14,10 @@ and a durable, in-cluster Vault. The `vault` `ClusterSecretStore` is shared by
 all worktree namespaces. Vault persists on its own PVC; deleting that PVC is a
 full local secret reset.
 
+Vault also holds the only durable copy of the generated Zitadel masterkey
+(`local/zitadel`). Deleting the Vault PVC while Zitadel's database persists
+makes that database unreadable, so reset both together or neither.
+
 Plaintext local inputs live only under the root `secrets/` directory, which is
 gitignored. No SOPS step is required because no encrypted secret is committed.
 `make local-gitops` generates or reuses stable shared application values,
