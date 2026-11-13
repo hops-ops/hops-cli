@@ -36,8 +36,18 @@ spec:
       name: platform
       namespace: istio-ingress
       # No sectionName: attach to every listener (HTTPS where it exists).
+  # The masterkey and first admin password are generated once and kept in the
+  # cluster Vault at `local/zitadel` (never overwritten), then pulled into the
+  # `zitadel-masterkey` / `zitadel-admin-password` Secrets. No manual step.
+  # Vault's PVC is the durable copy: deleting it on a cluster that still has
+  # Zitadel's database loses the key that database is encrypted with.
   externalSecrets:
-    enabled: false
+    enabled: true
+    generate: true
+    secretStoreName: vault
+    secretPath: local/zitadel
+    pushCredentials:
+      enabled: false
   firstInstance:
     org: hops
     masterkey:

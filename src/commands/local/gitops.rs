@@ -263,6 +263,10 @@ fn run_cluster_reconcile_loop(
     _controller: super::workbench::controller::ControllerHandle,
 ) -> Result<(), Box<dyn Error>> {
     let do_once = || -> Result<(), Box<dyn Error>> {
+        if !dry_run {
+            // Before AuthStack can replace a hand-made masterkey.
+            super::workbench::auth_inputs::adopt_existing_inputs(&cluster)?;
+        }
         log::info!("cluster gitops → local CP: {}", cluster.display());
         let started = Instant::now();
         let mut pass = 0;

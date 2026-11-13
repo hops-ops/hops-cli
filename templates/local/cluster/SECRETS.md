@@ -14,6 +14,10 @@ and a durable, in-cluster Vault. The `vault` `ClusterSecretStore` is shared by
 all worktree namespaces. Vault persists on its own PVC; deleting that PVC is a
 full local secret reset.
 
+Vault also holds the only durable copy of the generated Zitadel masterkey
+(`local/zitadel`). Deleting the Vault PVC while Zitadel's database persists
+makes that database unreadable, so reset both together or neither.
+
 Plaintext local inputs live only under the root `secrets/` directory, which is
 gitignored. No SOPS step is required because no encrypted secret is committed.
 `make local-gitops` generates or reuses stable shared application values,
@@ -45,8 +49,9 @@ kubectl port-forward lifecycle and KV v2 synchronization through
 
 ## Phase 1: cluster bootstrap
 
-Create the AuthStack masterkey and MinIO credentials before starting the
-Cluster controller:
+Create the MinIO credentials and local personas before starting the Cluster
+controller (AuthStack generates the Zitadel masterkey and admin password into
+Vault at `local/zitadel` itself):
 
 ```bash
 make dev-gitops-cluster-secrets
@@ -57,7 +62,6 @@ creates:
 
 | Namespace | Secret | Keys |
 |---|---|---|
-| `auth` | `zitadel-masterkey` | `masterkey` |
 | `harmony-system` | `harmony-minio` | `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` |
 | `default` | `harmony-local-human-passwords` | `approved-admin`, `waitlisted`, `iac-approved`, `device-login`, `fixture-owner`, `fixture-viewer`, `bob`, `alice`, `carol` |
 | `default` | `harmony-local-smtp` | `password` |

@@ -5,6 +5,7 @@
 //! Pure logic is unit-tested without a cluster; kubectl/helm live behind thin
 //! adapters used by the CLI entrypoints.
 
+pub mod auth_inputs;
 pub mod cluster_dns;
 pub mod cluster_gitops;
 pub mod cluster_template;
