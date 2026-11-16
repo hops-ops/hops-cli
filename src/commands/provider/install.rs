@@ -243,7 +243,7 @@ fn run_local_path(
     reject_controller_owned_provider(&target_name)?;
     let (upstream_url_prefix, upstream_major) = match &resolved {
         Some(resolved) => (
-            Some(recover_upstream_url_prefix(resolved, registry_pull())?),
+            recover_upstream_url_prefix(resolved, &provider_name, registry_pull())?,
             parse_major_version(&resolved.existing_package),
         ),
         None => (None, None),
@@ -302,7 +302,21 @@ fn run_local_path(
                 skip_dependency_resolution,
             )
         }
-        _ => {
+        (Some(resolved), None) => {
+            // A Provider an earlier source build created: it already names the
+            // local registry, so point it at the new tag.
+            log_patch_target(&provider_name, resolved);
+            let spec_package = format!("{}:{}", local_pull_xpkg_path, dev_tag);
+            apply_provider_resources(
+                &resolved.existing_name,
+                resolved.existing_drc_name.as_deref(),
+                &spec_package,
+                None,
+                Some(&push_runtime_ref),
+                skip_dependency_resolution,
+            )
+        }
+        (None, _) => {
             // A new Provider has no upstream URL for a Lock to match, so it
             // names the local registry directly and needs no ImageConfig.
             log::info!(
@@ -677,11 +691,13 @@ fn split_package_ref(package_ref: &str) -> Option<(&str, &str)> {
 /// Provider may already have been patched in a previous (broken) install to
 /// point at the local registry; in that case we look up a paired ImageConfig
 /// whose `rewriteImage.prefix` matches and recover the original upstream URL
-/// from its `matchImages.prefix`.
+/// from its `matchImages.prefix`. `None` means the Provider has no upstream
+/// URL: an earlier source build created it pointing at the local registry.
 fn recover_upstream_url_prefix(
     resolved: &ResolvedProvider,
+    provider_name: &str,
     local_registry_host: &str,
-) -> Result<String, Box<dyn Error>> {
+) -> Result<Option<String>, Box<dyn Error>> {
     let (prefix, _tag) = split_package_ref(&resolved.existing_package).ok_or_else(|| {
         format!(
             "existing Provider '{}' has no tag in spec.package ({}); cannot \
@@ -692,7 +708,7 @@ fn recover_upstream_url_prefix(
 
     if !prefix.contains(local_registry_host) {
         // Fresh install path — the existing Provider still has the upstream URL.
-        return Ok(prefix.to_string());
+        return Ok(Some(prefix.to_string()));
     }
 
     // Re-run path — look up an ImageConfig that rewrites to this local prefix.
@@ -701,7 +717,10 @@ fn recover_upstream_url_prefix(
         &["get", "imageconfig.pkg.crossplane.io", "-o", "json"],
     )?;
     if let Some(upstream) = find_upstream_for_rewrite(&ic_json, prefix)? {
-        return Ok(upstream);
+        return Ok(Some(upstream));
+    }
+    if is_local_build_package(prefix, local_registry_host, provider_name) {
+        return Ok(None);
     }
 
     Err(format!(
@@ -711,6 +730,12 @@ fn recover_upstream_url_prefix(
         resolved.existing_name, prefix
     )
     .into())
+}
+
+/// Whether `prefix` is the local-registry path a source build creates a new
+/// Provider with (`<registry>/hops-ops/<provider_name>`).
+fn is_local_build_package(prefix: &str, local_registry_host: &str, provider_name: &str) -> bool {
+    prefix == format!("{}/hops-ops/{}", local_registry_host, provider_name)
 }
 
 fn find_upstream_for_rewrite(
@@ -1446,5 +1471,30 @@ mod tests {
         assert!(err
             .to_string()
             .contains("failed to parse providers list JSON"));
+    }
+
+    #[test]
+    fn is_local_build_package_matches_only_the_source_build_path() {
+        let host = TEST_LOCAL_REGISTRY;
+        assert!(is_local_build_package(
+            &format!("{}/hops-ops/crossplane-provider-neon", host),
+            host,
+            "crossplane-provider-neon"
+        ));
+        assert!(!is_local_build_package(
+            &format!("{}/hops-ops/provider-helm", host),
+            host,
+            "crossplane-provider-neon"
+        ));
+        assert!(!is_local_build_package(
+            &format!("{}/other-org/crossplane-provider-neon", host),
+            host,
+            "crossplane-provider-neon"
+        ));
+        assert!(!is_local_build_package(
+            "xpkg.crossplane.io/crossplane-contrib/crossplane-provider-neon",
+            host,
+            "crossplane-provider-neon"
+        ));
     }
 }
