@@ -533,8 +533,15 @@ values, worktree inventories, restart counters, or source-generation values.
 control plane imperatively, then use plain `hops local aws`, `hops config
 install`, or `hops provider install` to bootstrap an AWS/cloud environment.
 That mode is intentionally separate from `hops local gitops cluster`; do not
-run both owners against the same backend. When the GitOps controller owns a
-Cluster, imperative package/provider installers reject the conflicting owner.
+run both owners against the same backend. When a running GitOps controller owns
+a Cluster, `hops config install` and `hops local aws` reject the conflicting
+owner, and `hops provider install` refuses only a Provider in that controller's
+inventory (its next reconcile would revert the install). A controller lock whose
+process is no longer running owns nothing.
+
+`hops provider install --path` (or `--repo` without `--version`) builds the
+package from source. When a Provider for the package already exists it is
+patched in place; otherwise a new Provider is created from the local build.
 
 Provider credential commands have a deliberate secret boundary. For example:
 

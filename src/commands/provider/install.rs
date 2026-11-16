@@ -4,7 +4,8 @@ use crate::commands::local::package_install::{
     registry_push, resolve_repo_install_target, run_watch, sanitize_name_component,
     RepoInstallTarget, RepoSpec,
 };
-use crate::commands::local::workbench::controller::reject_imperative_owner;
+use crate::commands::local::workbench::cluster_gitops::ClusterObjectIdentity;
+use crate::commands::local::workbench::controller::reject_owned_by_controller;
 use crate::commands::local::{
     kubectl_apply_stdin, run_cmd, run_cmd_output, MANAGED_BY_LABEL, PROVIDER_INSTALL_MANAGED_BY,
 };
@@ -93,8 +94,6 @@ pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
         args.cluster_name.as_deref(),
         args.context.as_deref(),
     )?;
-    reject_imperative_owner(&backend::kind::active_cluster_name())?;
-
     match (args.repo.as_deref(), args.version.as_deref()) {
         (Some(repo), Some(version)) => {
             apply_repo_version(repo, version, args.skip_dependency_resolution)
@@ -119,7 +118,6 @@ pub fn run(args: &ProviderInstallArgs) -> Result<(), Box<dyn Error>> {
                 let skip = args.skip_dependency_resolution;
                 let prefix_owned = prefix;
                 run_watch(path, args.debounce, move || {
-                    reject_imperative_owner(&backend::kind::active_cluster_name())?;
                     run_local_path(&path_owned, skip, prefix_owned.as_deref())
                 })?;
             }
@@ -196,11 +194,13 @@ fn apply_repo_version_spec(
         &["get", "providers.pkg.crossplane.io", "-o", "json"],
     )?;
     let resolved = resolve_provider_target(&provider_name, &providers_json, registry_pull())?;
+    reject_controller_owned_provider(&resolved.existing_name)?;
+    log_patch_target(&provider_name, &resolved);
     // Published install pulls directly from ghcr.io — no ImageConfig rewrite,
     // no local registry push, no runtime-image override.
     apply_provider_resources(
-        &provider_name,
-        &resolved,
+        &resolved.existing_name,
+        resolved.existing_drc_name.as_deref(),
         &package_ref,
         None,
         None,
@@ -233,9 +233,21 @@ fn run_local_path(
         "kubectl",
         &["get", "providers.pkg.crossplane.io", "-o", "json"],
     )?;
-    let resolved = resolve_provider_target(&provider_name, &providers_json, registry_pull())?;
-    let upstream_url_prefix = recover_upstream_url_prefix(&resolved, registry_pull())?;
-    let upstream_major = parse_major_version(&resolved.existing_package);
+    // No match means nothing else owns this package's CRDs yet, so a new
+    // Provider can be created from the local build.
+    let resolved = find_provider_target(&provider_name, &providers_json, registry_pull())?;
+    let target_name = resolved
+        .as_ref()
+        .map_or(provider_name.as_str(), |r| r.existing_name.as_str())
+        .to_string();
+    reject_controller_owned_provider(&target_name)?;
+    let (upstream_url_prefix, upstream_major) = match &resolved {
+        Some(resolved) => (
+            Some(recover_upstream_url_prefix(resolved, registry_pull())?),
+            parse_major_version(&resolved.existing_package),
+        ),
+        None => (None, None),
+    };
 
     ensure_build_submodule(dir)?;
 
@@ -273,18 +285,70 @@ fn run_local_path(
     log::info!("Pushing {}...", push_runtime_ref);
     run_cmd("docker", &["push", &push_runtime_ref])?;
 
-    // Apply the Provider with the UPSTREAM URL + dev tag in `spec.package` so
-    // Crossplane's dep manager records the upstream URL in the Lock. Fetching
-    // is redirected to the local registry via the paired ImageConfig.
-    let spec_package = format!("{}:{}", upstream_url_prefix, dev_tag);
-    apply_provider_resources(
-        &provider_name,
-        &resolved,
-        &spec_package,
-        Some((&upstream_url_prefix, &local_pull_xpkg_path)),
-        Some(&push_runtime_ref),
-        skip_dependency_resolution,
+    match (&resolved, &upstream_url_prefix) {
+        (Some(resolved), Some(upstream_url_prefix)) => {
+            log_patch_target(&provider_name, resolved);
+            // Apply the Provider with the UPSTREAM URL + dev tag in
+            // `spec.package` so Crossplane's dep manager records the upstream
+            // URL in the Lock. Fetching is redirected to the local registry
+            // via the paired ImageConfig.
+            let spec_package = format!("{}:{}", upstream_url_prefix, dev_tag);
+            apply_provider_resources(
+                &resolved.existing_name,
+                resolved.existing_drc_name.as_deref(),
+                &spec_package,
+                Some((upstream_url_prefix, &local_pull_xpkg_path)),
+                Some(&push_runtime_ref),
+                skip_dependency_resolution,
+            )
+        }
+        _ => {
+            // A new Provider has no upstream URL for a Lock to match, so it
+            // names the local registry directly and needs no ImageConfig.
+            log::info!(
+                "No existing Provider matches '{}'; creating Provider '{}' from the local build",
+                provider_name,
+                target_name
+            );
+            let spec_package = format!("{}:{}", local_pull_xpkg_path, dev_tag);
+            apply_provider_resources(
+                &target_name,
+                None,
+                &spec_package,
+                None,
+                Some(&push_runtime_ref),
+                skip_dependency_resolution,
+            )
+        }
+    }
+}
+
+/// Refuse to install over a Provider that a live Cluster controller manages.
+fn reject_controller_owned_provider(name: &str) -> Result<(), Box<dyn Error>> {
+    reject_owned_by_controller(
+        &backend::kind::active_cluster_name(),
+        &ClusterObjectIdentity {
+            api_version: "pkg.crossplane.io/v1".into(),
+            kind: "Provider".into(),
+            namespace: String::new(),
+            name: name.into(),
+        },
     )
+}
+
+fn log_patch_target(provider_name: &str, resolved: &ResolvedProvider) {
+    if resolved.existing_name != provider_name {
+        log::info!(
+            "Reusing existing Provider '{}' (matches package substring '{}'); patching in place",
+            resolved.existing_name,
+            provider_name
+        );
+    } else {
+        log::info!(
+            "Reusing existing Provider '{}'; patching in place",
+            resolved.existing_name
+        );
+    }
 }
 
 fn read_provider_name(dir: &Path) -> Result<String, Box<dyn Error>> {
@@ -752,13 +816,12 @@ spec:
 }
 
 /// Apply a Provider plus its supporting DeploymentRuntimeConfig and
-/// ClusterRoleBinding by patching an existing Provider in place.
+/// ClusterRoleBinding, named `target_name`.
 ///
-/// `hops provider install` only patches Providers that already exist in the
-/// cluster (e.g. installed via Crossplane bootstrap, GitOps, or kubectl apply).
-/// It never bootstraps a new Provider -- a sibling Provider would fight the
-/// upstream one for CRD ownership and stay `Healthy=False`. See
-/// `resolve_provider_target`.
+/// When a Provider already matches the package, `target_name` is that
+/// Provider and it is patched in place -- a sibling Provider would fight it for
+/// CRD ownership and stay `Healthy=False`. A source build that matches no
+/// Provider creates one named after the package. See `resolve_provider_target`.
 ///
 /// When `runtime_image` is provided the DRC overrides the package-runtime
 /// container image (used for source builds); otherwise the DRC only sets up a
@@ -770,30 +833,17 @@ spec:
 /// may already reference that DRC, and overwriting a shared DRC with this
 /// provider's image silently corrupts the other provider's pod.
 fn apply_provider_resources(
-    provider_name: &str,
-    resolved: &ResolvedProvider,
+    target_name: &str,
+    existing_drc_name: Option<&str>,
     spec_package: &str,
     image_config_rewrite: Option<(&str, &str)>,
     runtime_image: Option<&str>,
     skip_dependency_resolution: bool,
 ) -> Result<(), Box<dyn Error>> {
-    if resolved.existing_name != provider_name {
-        log::info!(
-            "Reusing existing Provider '{}' (matches package substring '{}'); patching in place",
-            resolved.existing_name,
-            provider_name
-        );
-    } else {
-        log::info!(
-            "Reusing existing Provider '{}'; patching in place",
-            resolved.existing_name
-        );
-    }
-
-    let target_name = resolved.existing_name.clone();
+    let target_name = target_name.to_string();
     let drc_name = format!("{}-runtime", target_name);
-    if let Some(prev) = &resolved.existing_drc_name {
-        if prev != &drc_name {
+    if let Some(prev) = existing_drc_name {
+        if prev != drc_name {
             log::warn!(
                 "Provider '{}' previously referenced DRC '{}'; switching to owned DRC '{}'. \
                  The old DRC is not deleted (it may still be referenced by another Provider).",
@@ -867,11 +917,11 @@ struct ResolvedProvider {
 
 /// Locate the existing Provider we should patch in place.
 ///
-/// `hops provider install` is strictly a patch operation: the upstream Provider
-/// is expected to already be installed in the cluster (Crossplane bootstrap,
-/// GitOps, or `kubectl apply`). We never bootstrap a sibling Provider because a
-/// second resource managing the same CRDs would race the existing one and stay
-/// `Healthy=False`.
+/// A matching Provider is always patched rather than given a sibling, because
+/// a second resource managing the same CRDs would race the existing one and
+/// stay `Healthy=False`. Published installs (`--repo --version`) require the
+/// match; source builds use `find_provider_target` and create a Provider when
+/// nothing matches.
 ///
 /// Pure function over `kubectl get providers.pkg.crossplane.io -o json` output
 /// so it is testable.
@@ -883,7 +933,7 @@ struct ResolvedProvider {
 ///   (same substring match but `spec.package` *does* live in the local
 ///   registry) so re-running the install is idempotent.
 /// - Exactly one match in either bucket -> patch it.
-/// - Zero matches -> error: refuse to bootstrap a sibling Provider.
+/// - Zero matches -> error (`find_provider_target`: `None`).
 /// - Two-or-more upstream matches -> error and ask the human to disambiguate;
 ///   we can't safely guess which Provider owns these CRDs.
 fn resolve_provider_target(
@@ -891,11 +941,22 @@ fn resolve_provider_target(
     providers_json: &str,
     local_registry_host: &str,
 ) -> Result<ResolvedProvider, Box<dyn Error>> {
+    find_provider_target(provider_name, providers_json, local_registry_host)?
+        .ok_or_else(|| no_existing_provider_error(provider_name))
+}
+
+/// Like `resolve_provider_target`, but no match is `Ok(None)` rather than an
+/// error: the source-build path creates the Provider in that case.
+fn find_provider_target(
+    provider_name: &str,
+    providers_json: &str,
+    local_registry_host: &str,
+) -> Result<Option<ResolvedProvider>, Box<dyn Error>> {
     let trimmed = providers_json.trim();
     if trimmed.is_empty() {
         // `kubectl get` returns nothing when the CRD exists but the resource
-        // list is empty -- treat as no matches and fail loudly below.
-        return Err(no_existing_provider_error(provider_name));
+        // list is empty -- treat as no matches.
+        return Ok(None);
     }
 
     let parsed: ProviderList = serde_json::from_str(trimmed)
@@ -943,14 +1004,14 @@ fn resolve_provider_target(
     };
 
     match pick.len() {
-        0 => Err(no_existing_provider_error(provider_name)),
+        0 => Ok(None),
         1 => {
             let entry = pick.into_iter().next().unwrap();
-            Ok(ResolvedProvider {
+            Ok(Some(ResolvedProvider {
                 existing_name: entry.name,
                 existing_package: entry.package,
                 existing_drc_name: entry.drc_name,
-            })
+            }))
         }
         _ => {
             let names: Vec<String> = pick
@@ -972,8 +1033,9 @@ fn resolve_provider_target(
 fn no_existing_provider_error(provider_name: &str) -> Box<dyn Error> {
     format!(
         "no existing Provider matching '{}' found in cluster; install the upstream Provider first \
-         (via Crossplane bootstrap, GitOps, or kubectl apply) and re-run. hops provider install \
-         patches existing Providers in place -- it does not bootstrap new ones.",
+         (via Crossplane bootstrap, GitOps, or kubectl apply) and re-run, or build it from source \
+         with --path or --repo. Installing a published --version patches existing Providers in \
+         place -- it does not bootstrap new ones.",
         provider_name
     )
     .into()
@@ -1223,9 +1285,27 @@ mod tests {
     }
 
     #[test]
+    fn find_provider_target_returns_none_without_a_match() {
+        // A source build creates the Provider when nothing matches.
+        assert_eq!(
+            find_provider_target("provider-neon", "", TEST_LOCAL_REGISTRY).unwrap(),
+            None
+        );
+        let json = provider_json(&[(
+            "crossplane-contrib-provider-helm",
+            "xpkg.upbound.io/crossplane-contrib/provider-helm:v1.0.0",
+            None,
+        )]);
+        assert_eq!(
+            find_provider_target("provider-neon", &json, TEST_LOCAL_REGISTRY).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn resolve_provider_target_errors_on_empty_input() {
-        // kubectl returns an empty body when the CRD has no resources; we must
-        // still refuse to bootstrap a sibling Provider.
+        // kubectl returns an empty body when the CRD has no resources; a
+        // published install must still refuse to bootstrap a Provider.
         let err = resolve_provider_target("provider-helm", "", TEST_LOCAL_REGISTRY)
             .expect_err("expected no-existing-Provider error");
         assert_no_existing_provider_error(err, "provider-helm");
