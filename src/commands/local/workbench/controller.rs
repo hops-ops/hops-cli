@@ -5,6 +5,7 @@
 //! diagnostic state and conflict protection, not a second desired-state
 //! document.  Secrets and rendered Helm values never enter this state.
 
+use super::cluster_gitops::{load_cluster_inventory, ClusterObjectIdentity};
 use super::definition::{DeployType, LoadedEnvironment};
 use super::reconcile::{
     ensure_environment_namespace, HelmRunner, KubectlApplier, KustomizeRunner, ReconcileOptions,
@@ -169,9 +170,66 @@ fn reset_absent_cluster_state_at(
 /// after a Cluster controller has claimed the backend. This deliberately
 /// reports the owner without attempting adoption or stale-lock cleanup.
 pub fn reject_imperative_owner(cluster_name: &str) -> Result<(), Box<dyn Error>> {
+    let Some(lease) = live_controller_lease(cluster_name)? else {
+        return Ok(());
+    };
+    Err(format!(
+        "Cluster {:?} is owned by GitOps controller pid {} ({}); use the Cluster tree/controller, or explicitly hand off the backend before running an imperative installer",
+        cluster_name, lease.pid, lease.definition_path
+    )
+    .into())
+}
+
+/// Guard an imperative install of one object. Only a live controller whose
+/// inventory holds that exact object conflicts with it: the controller
+/// re-applies its inventory on every reconcile (reverting the install) and
+/// prunes only what its inventory recorded, so any other object is the
+/// developer's own. A live controller with no readable inventory fails closed.
+pub fn reject_owned_by_controller(
+    cluster_name: &str,
+    object: &ClusterObjectIdentity,
+) -> Result<(), Box<dyn Error>> {
+    let Some(lease) = live_controller_lease(cluster_name)? else {
+        return Ok(());
+    };
+    let inventory_path = controller_state_dir(cluster_name)?.join("cluster-inventory.json");
+    let Some(inventory) = load_cluster_inventory(&inventory_path)? else {
+        return Err(format!(
+            "Cluster {:?} is owned by GitOps controller pid {} ({}) and has no inventory at {} yet; wait for its first reconcile and retry",
+            cluster_name,
+            lease.pid,
+            lease.definition_path,
+            inventory_path.display()
+        )
+        .into());
+    };
+    let owned = inventory
+        .entries
+        .iter()
+        .find(|entry| same_object(&entry.identity, object));
+    match owned {
+        None => Ok(()),
+        Some(entry) => Err(format!(
+            "{} {:?} is managed by GitOps controller pid {} for Cluster {:?} (from {}); its next reconcile would revert this install. Change it in the Cluster tree ({}), or stop that controller first",
+            object.kind,
+            object.name,
+            lease.pid,
+            cluster_name,
+            entry.source,
+            lease.definition_path
+        )
+        .into()),
+    }
+}
+
+/// Return the lease of the live controller that owns `cluster_name`, if any.
+/// A lock left by a process that is no longer running owns nothing:
+/// `acquire_controller` recovers such a lock the same way. This only reads the
+/// lock; it never removes or adopts it.
+fn live_controller_lease(cluster_name: &str) -> Result<Option<ControllerLease>, Box<dyn Error>> {
     let path = controller_lock_path(cluster_name)?;
     if !path.is_file() {
-        return Ok(());
+        return Ok(None);
     }
     let lease: ControllerLease = serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
         format!(
@@ -179,11 +237,27 @@ pub fn reject_imperative_owner(cluster_name: &str) -> Result<(), Box<dyn Error>>
             path.display()
         )
     })?;
-    Err(format!(
-        "Cluster {:?} is owned by GitOps controller pid {} ({}); use the Cluster tree/controller, or explicitly hand off the backend before running an imperative installer",
-        cluster_name, lease.pid, lease.definition_path
-    )
-    .into())
+    if !controller_pid_is_live(lease.pid) {
+        log::warn!(
+            "Ignoring stale GitOps controller lock {} (pid {} is not running)",
+            path.display(),
+            lease.pid
+        );
+        return Ok(None);
+    }
+    Ok(Some(lease))
+}
+
+/// Compare object identities by API group, kind, namespace and name. The
+/// version is ignored: the same object may be written under another version.
+fn same_object(a: &ClusterObjectIdentity, b: &ClusterObjectIdentity) -> bool {
+    fn group(api_version: &str) -> &str {
+        api_version.rsplit_once('/').map_or("", |(group, _)| group)
+    }
+    group(&a.api_version) == group(&b.api_version)
+        && a.kind == b.kind
+        && a.namespace == b.namespace
+        && a.name == b.name
 }
 
 /// Acquire the single GitOps owner for a Cluster. Existing matching ownership
@@ -1548,5 +1622,119 @@ mod tests {
         )
         .unwrap();
         assert!(objects[0].namespace.is_empty());
+    }
+
+    /// Write a controller lock for `pid` (and optionally an inventory holding
+    /// one Provider) under a fresh Cluster name; returns the name.
+    fn owned_cluster(pid: u32, inventory_provider: Option<Option<&str>>) -> String {
+        let cluster_name = format!("imperative-{}", uuid::Uuid::new_v4().simple());
+        let dir = controller_state_dir(&cluster_name).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let lease = ControllerLease {
+            schema_version: CONTROLLER_SCHEMA_VERSION,
+            mode: CONTROLLER_MODE.into(),
+            cluster_name: cluster_name.clone(),
+            definition_path: "/project/.gitops/local/cluster.yaml".into(),
+            kube_context: "orbstack".into(),
+            pid,
+            started_at: 0,
+        };
+        fs::write(
+            dir.join("controller.lock"),
+            serde_json::to_vec(&lease).unwrap(),
+        )
+        .unwrap();
+        if let Some(provider) = inventory_provider {
+            let entries = provider
+                .map(|name| {
+                    serde_json::json!([{
+                        "identity": {
+                            "api_version": "pkg.crossplane.io/v1",
+                            "kind": "Provider",
+                            "namespace": "",
+                            "name": name,
+                        },
+                        "category": "providers",
+                        "source": "providers/owned.yaml",
+                        "revision": "sha256:0",
+                    }])
+                })
+                .unwrap_or_else(|| serde_json::json!([]));
+            let inventory = serde_json::json!({
+                "schema_version": 1,
+                "cluster_path": "/project/.gitops/local/cluster",
+                "entries": entries,
+            });
+            fs::write(
+                dir.join("cluster-inventory.json"),
+                serde_json::to_vec(&inventory).unwrap(),
+            )
+            .unwrap();
+        }
+        cluster_name
+    }
+
+    fn provider(name: &str) -> ClusterObjectIdentity {
+        ClusterObjectIdentity {
+            // Another version of the same group still names the same object.
+            api_version: "pkg.crossplane.io/v1beta1".into(),
+            kind: "Provider".into(),
+            namespace: String::new(),
+            name: name.into(),
+        }
+    }
+
+    fn remove_cluster_state(cluster_name: &str) {
+        let _ = fs::remove_dir_all(controller_state_dir(cluster_name).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_controller_lock_does_not_block_imperative_installs() {
+        let cluster_name = owned_cluster(i32::MAX as u32, Some(Some("owned")));
+        reject_imperative_owner(&cluster_name).unwrap();
+        reject_owned_by_controller(&cluster_name, &provider("owned")).unwrap();
+        assert!(controller_lock_path(&cluster_name).unwrap().exists());
+        remove_cluster_state(&cluster_name);
+    }
+
+    #[test]
+    fn live_controller_rejects_imperative_owner() {
+        let cluster_name = owned_cluster(std::process::id(), Some(None));
+        let error = reject_imperative_owner(&cluster_name).unwrap_err();
+        assert!(error.to_string().contains("is owned by GitOps controller"));
+        remove_cluster_state(&cluster_name);
+    }
+
+    #[test]
+    fn live_controller_allows_objects_outside_its_inventory() {
+        let cluster_name = owned_cluster(std::process::id(), Some(Some("owned")));
+        reject_owned_by_controller(&cluster_name, &provider("developer-built")).unwrap();
+        remove_cluster_state(&cluster_name);
+    }
+
+    #[test]
+    fn live_controller_rejects_an_object_in_its_inventory() {
+        let cluster_name = owned_cluster(std::process::id(), Some(Some("owned")));
+        let error = reject_owned_by_controller(&cluster_name, &provider("owned")).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Provider \"owned\" is managed by GitOps controller"));
+        assert!(message.contains("providers/owned.yaml"));
+        remove_cluster_state(&cluster_name);
+    }
+
+    #[test]
+    fn live_controller_without_inventory_fails_closed() {
+        let cluster_name = owned_cluster(std::process::id(), None);
+        let error = reject_owned_by_controller(&cluster_name, &provider("anything")).unwrap_err();
+        assert!(error.to_string().contains("has no inventory"));
+        remove_cluster_state(&cluster_name);
+    }
+
+    #[test]
+    fn no_controller_lock_allows_everything() {
+        let cluster_name = format!("unowned-{}", uuid::Uuid::new_v4().simple());
+        reject_imperative_owner(&cluster_name).unwrap();
+        reject_owned_by_controller(&cluster_name, &provider("anything")).unwrap();
     }
 }
