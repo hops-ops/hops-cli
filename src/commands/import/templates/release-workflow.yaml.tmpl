@@ -27,7 +27,7 @@ jobs:
   promote-staging:
     name: Promote Staging
     needs: publish-image
-    uses: hops-ops/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@15299bfba8ca3eb0412d0973cff6307f6bee7096 # v2.1.1
+    uses: hops-ops/workflows-gitops/.github/workflows/argocd-promote-helm.yaml@a89566b48076c86babd9d7b57b077b0bf5eb354f # v2.1.3
     secrets:
       GH_APP_ID: ${{ secrets.GH_APP_ID }}
       GH_APP_KEY: ${{ secrets.GH_APP_KEY }}
