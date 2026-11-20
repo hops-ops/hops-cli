@@ -130,6 +130,9 @@ hops secrets sync github
 - `.env` files → one secret per `KEY=value` entry
 - Shared secrets fan out to all repos in `shared_secrets.repos`
 - Repo-specific values override shared values
+- Sync only writes: a secret removed locally stays in each repository until deleted there
+- `--cleanup` offers to delete repository Actions secrets that are not in the local tree (only works from the full root)
+- GitHub secrets have no ownership marker, so `--cleanup` asks about every secret it does not know, including ones set by hand or by other tools. Each deletion is confirmed with a default of "no"; `-y` does not skip these prompts, so it cannot run unattended
 
 ## Sync to HashiCorp Vault KV
 

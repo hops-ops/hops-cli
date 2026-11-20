@@ -78,6 +78,12 @@ pub struct GithubSyncArgs {
     /// Skip confirmation prompts
     #[arg(short, long)]
     pub yes: bool,
+
+    /// Offer to delete repository secrets that no longer exist locally.
+    /// GitHub secrets carry no ownership marker, so every deletion is
+    /// confirmed, even with --yes
+    #[arg(long)]
+    pub cleanup: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1146,8 +1152,17 @@ fn run_github(args: &GithubSyncArgs) -> Result<(), Box<dyn Error>> {
         .secret_path
         .clone()
         .map(PathBuf::from)
-        .unwrap_or(default_source);
+        .unwrap_or_else(|| default_source.clone());
     fs::metadata(&source_root)?;
+
+    if args.cleanup
+        && normalized_absolute_path(&source_root)? != normalized_absolute_path(&default_source)?
+    {
+        return Err(
+            "--cleanup can only be used when syncing the full configured GitHub secrets root"
+                .into(),
+        );
+    }
 
     let owner = resolve_github_owner(args.owner.as_deref(), github_settings.owner.as_deref())?;
     let repos = resolve_github_repos(&source_root, &github_settings, &args.repos)?;
@@ -1160,7 +1175,7 @@ fn run_github(args: &GithubSyncArgs) -> Result<(), Box<dyn Error>> {
 
     let mut synced = 0usize;
     for repo in repos {
-        sync_github_repo(
+        let desired = sync_github_repo(
             &owner,
             &repo,
             &source_root,
@@ -1169,6 +1184,9 @@ fn run_github(args: &GithubSyncArgs) -> Result<(), Box<dyn Error>> {
             args.yes,
             &mut synced,
         )?;
+        if args.cleanup {
+            delete_missing_github_secrets(&owner, &repo, &desired)?;
+        }
     }
 
     log::info!("GitHub sync complete - {} secrets processed", synced);
@@ -1256,7 +1274,7 @@ fn sync_github_repo(
     shared_secrets: &[(String, String, String)],
     yes: bool,
     synced: &mut usize,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Vec<String>, Box<dyn Error>> {
     let repo_dir = source_root.join(repo);
     let repo_file = source_root.join(format!("{repo}.json"));
     let mut merged = std::collections::BTreeMap::<String, (String, String)>::new();
@@ -1292,11 +1310,76 @@ fn sync_github_repo(
         );
     }
 
+    let desired = merged.keys().cloned().collect();
     for (secret_name, (secret_value, source_label)) in merged {
         set_github_secret(owner, repo, &secret_name, &secret_value, &source_label, yes)?;
         *synced += 1;
     }
+    Ok(desired)
+}
+
+// GitHub has no tags on Actions secrets, so nothing tells a secret this repo
+// once synced apart from one set by hand or by another tool. Every candidate
+// is therefore confirmed individually with a default of "no"; `--yes` does not
+// apply, and without a terminal nothing is deleted. Only repository Actions
+// secrets are listed: environment, organization, Dependabot and Codespaces
+// secrets are never touched.
+fn delete_missing_github_secrets(
+    owner: &str,
+    repo: &str,
+    desired: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let slug = format!("{}/{}", owner, repo);
+    let listed = run_command_output_string(
+        "gh",
+        &[
+            "api",
+            "--paginate",
+            &format!("repos/{}/actions/secrets?per_page=100", slug),
+            "--jq",
+            ".secrets[].name",
+        ],
+    )
+    .map_err(|err| format!("failed listing GitHub secrets in '{}': {}", slug, err))?;
+
+    for secret_name in github_secrets_missing_locally(&listed, desired) {
+        if !confirm(
+            &format!(
+                "Delete GitHub secret '{}' in '{}'? It is not in the local secrets tree, and may not have been set by hops.",
+                secret_name, slug
+            ),
+            false,
+        ) {
+            log::info!("Kept GitHub secret '{}' in '{}'", secret_name, slug);
+            continue;
+        }
+
+        let status = Command::new("gh")
+            .args(["secret", "delete", &secret_name, "--repo", &slug])
+            .status()?;
+        if !status.success() {
+            return Err(format!("gh secret delete exited with {}", status).into());
+        }
+        log::info!("Deleted GitHub secret '{}' in '{}'", secret_name, slug);
+    }
     Ok(())
+}
+
+// GitHub secret names are case-insensitive and stored uppercase.
+fn github_secrets_missing_locally(listed: &str, desired: &[String]) -> Vec<String> {
+    let desired = desired
+        .iter()
+        .map(|name| name.to_ascii_uppercase())
+        .collect::<HashSet<_>>();
+    let mut missing = listed
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !desired.contains(&name.to_ascii_uppercase()))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 fn collect_github_target_secrets(
@@ -1770,7 +1853,8 @@ mod tests {
 
     use super::{
         collect_desired_vault_secrets, ensure_vault_sources_are_ignored_at,
-        normalize_github_secret_name, parse_dotenv_secret_map, parse_github_dotenv_secret_map,
+        github_secrets_missing_locally, normalize_github_secret_name, parse_dotenv_secret_map,
+        parse_github_dotenv_secret_map,
     };
 
     #[test]
@@ -1803,6 +1887,23 @@ mod tests {
         assert_eq!(
             normalize_github_secret_name("app__prod.database-url"),
             "APP_PROD_DATABASE_URL"
+        );
+    }
+
+    #[test]
+    fn github_secrets_missing_locally_lists_only_remote_extras() {
+        let desired = vec!["NPM_TOKEN".to_string(), "app_token".to_string()];
+        assert_eq!(
+            github_secrets_missing_locally(
+                "NPM_TOKEN\nGH_APP_KEY\n\nAPP_TOKEN\nGH_APP_ID\n",
+                &desired
+            ),
+            vec!["GH_APP_ID".to_string(), "GH_APP_KEY".to_string()]
+        );
+        assert!(github_secrets_missing_locally("", &desired).is_empty());
+        assert_eq!(
+            github_secrets_missing_locally("ONLY_REMOTE\n", &[]),
+            vec!["ONLY_REMOTE".to_string()]
         );
     }
 

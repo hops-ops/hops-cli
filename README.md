@@ -703,6 +703,10 @@ GitHub rules:
 - Shared GitHub secrets come from `secrets/github/_shared/...` and fan out to the repos listed in `secrets.github.shared_secrets.repos` or passed with `--repo`.
 - If a shared secret and a repo-specific secret have the same final name, the repo-specific value wins for that repo.
 - GitHub secret names are normalized by the CLI to a stable format before syncing.
+- Sync only writes. A secret removed from the local tree stays in every repository it was synced to until it is deleted there.
+- `--cleanup` lists each target repository's Actions secrets after syncing and offers to delete the ones that are not in the local tree. It only works when syncing the full configured GitHub root.
+- GitHub secrets carry no ownership marker, unlike the AWS tags, so `--cleanup` cannot tell a secret hops once synced from one set by hand or by another tool. Every deletion is confirmed individually with a default of "no"; `--yes` does not skip these prompts, and nothing is deleted without a terminal.
+- `--cleanup` only looks at repository Actions secrets. Environment, organization, Dependabot and Codespaces secrets are never touched.
 
 Examples:
 
@@ -710,6 +714,12 @@ Examples:
 - `secrets/github/repo-a/actions.json` with `{"SLACK_WEBHOOK":"..."}` -> GitHub secret `SLACK_WEBHOOK` in `repo-a`
 - `secrets/github/repo-a/.env` with `NPM_TOKEN=...` -> GitHub secret `NPM_TOKEN` in `repo-a`
 - `secrets/github/_shared/ORG_TOKEN` -> synced to every configured shared target repo
+
+To remove a shared secret from every target repository, delete its file, encrypt, then run:
+
+```bash
+hops secrets sync github --cleanup
+```
 
 Vault sync reads only untracked, gitignored files below
 `<plaintext_dir>/<vault.path>`:
